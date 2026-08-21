@@ -7,17 +7,19 @@ Use a regex plugin for a stable value pattern. Use Wasm when you need context,
 policy logic, provider JSON, or an approved HTTP call. Normal Pentect secret
 and structured-data checks are built in and cannot be disabled by a plugin.
 
-Install and enable a plugin for the current project:
+Install and enable a plugin for the current user on this computer:
 
 ```text
 pentect plugins add github:@owner/repository/path
 ```
 
-The same configured plugin set is used by `mask`, `read`, Codex,
+The user plugin set is stored in `~/.pentect/config.toml` and is used by
+`mask`, `read`, Codex,
 Claude Code, and their desktop-app launchers. Use `--plugins SOURCE` only for a
 one-off addition. A one-off remote source must use a full 40-character Git
-commit; tags require a project content lock because Git does not make tags
-immutable.
+commit; tags require a content lock because Git does not make tags immutable.
+Pass `--project` to `add`, `remove`, `config`, `setup`, or `update` when the
+plugin and its approval must be isolated to the current repository.
 
 ```text
 pentect plugins new NAME
@@ -48,8 +50,9 @@ First-party examples are listed by `pentect plugins search`:
 - `openai-privacy-filter` connects a sandboxed adapter to OpenAI Privacy Filter
   running on `127.0.0.1`. It is optional and is not enabled automatically.
 
-Remote manifests and detector files are pinned by content digest in the
-project's `pentect.plugins.lock`. Commit it. Prefer an explicit release such as
+Remote manifests and detector files are pinned by content digest in
+`~/.pentect/pentect.plugins.lock`. Project-scoped installs instead use the
+repository's `pentect.plugins.lock`, which should be committed. Prefer an explicit release such as
 `github:@owner/repository/path@v1.2.3`; an unversioned `main` source is never
 used as runtime identity. Sources change only through an explicit `add`,
 `setup`, or `update`, never merely because a cache timer expired.

@@ -13,6 +13,8 @@ use std::time::{Duration, SystemTime};
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 pub(crate) const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
+pub(crate) const GLOBAL_BINARIES_ENV: &str = "PENTECT_GLOBAL_PLUGIN_BINARIES";
+pub(crate) const GLOBAL_BINARY_IDS_ENV: &str = "PENTECT_GLOBAL_PLUGIN_IDS";
 pub(crate) const PLUGIN_MANIFEST_FILE: &str = "plugin.toml";
 
 const PENTECT_DIR: &str = ".pentect";
@@ -33,10 +35,18 @@ const MAX_REMOTE_PLUGIN_CACHE_ENTRIES: usize = 256;
 const MAX_PROJECT_PLUGIN_LOCK_BYTES: u64 = 1024 * 1024;
 static PROJECT_LOCK_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PluginScope {
+    User,
+    Project,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ActivePlugins {
     config_paths: Vec<PathBuf>,
     binary_paths: Vec<PathBuf>,
+    global_binary_paths: Vec<PathBuf>,
+    global_binary_ids: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +55,8 @@ pub(crate) struct PluginSource {
     pub(crate) manifest_path: Option<PathBuf>,
     pub(crate) repository: Option<String>,
     pub(crate) remote_base: Option<String>,
+    pub(crate) scope: PluginScope,
+    pub(crate) runtime_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,6 +96,10 @@ impl ActivePlugins {
         &self.binary_paths
     }
 
+    pub(crate) fn has_binary(&self) -> bool {
+        !self.binary_paths.is_empty() || !self.global_binary_paths.is_empty()
+    }
+
     pub(crate) fn config_env_value(&self) -> Result<Option<OsString>> {
         if self.config_paths.is_empty() {
             return Ok(None);
@@ -100,6 +116,24 @@ impl ActivePlugins {
         std::env::join_paths(&self.binary_paths)
             .map(Some)
             .context("could not encode plugin binary manifests")
+    }
+
+    pub(crate) fn global_binary_env_value(&self) -> Result<Option<OsString>> {
+        if self.global_binary_paths.is_empty() {
+            return Ok(None);
+        }
+        std::env::join_paths(&self.global_binary_paths)
+            .map(Some)
+            .context("could not encode global plugin paths")
+    }
+
+    pub(crate) fn global_binary_ids_env_value(&self) -> Result<Option<OsString>> {
+        if self.global_binary_ids.is_empty() {
+            return Ok(None);
+        }
+        std::env::join_paths(&self.global_binary_ids)
+            .map(Some)
+            .context("could not encode global plugin identities")
     }
 }
 
@@ -119,6 +153,23 @@ pub(crate) fn parse_plugin_value(value: &str) -> Result<Vec<String>> {
         bail!("--plugins requires at least one plugin");
     }
     Ok(specs)
+}
+
+pub(crate) fn plugin_spec_for_scope(spec: &str, scope: PluginScope) -> Result<String> {
+    validate_plugin_spec(spec)?;
+    if scope == PluginScope::User && is_path_spec(spec) {
+        if config_specs_scoped()?
+            .into_iter()
+            .any(|(configured_scope, configured)| configured_scope == scope && configured == spec)
+        {
+            return Ok(spec.to_string());
+        }
+        return Path::new(spec)
+            .canonicalize()
+            .with_context(|| format!("could not resolve plugin path '{spec}'"))
+            .map(|path| path.to_string_lossy().into_owned());
+    }
+    Ok(spec.to_string())
 }
 
 pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>> {
@@ -223,19 +274,38 @@ pub(crate) fn active_from_specs(
     explicit_specs: Vec<String>,
     create_named: bool,
 ) -> Result<ActivePlugins> {
-    let mut specs = config_specs()?;
-    extend_unique(&mut specs, explicit_specs);
-    active_from_explicit_specs(specs, create_named)
+    let mut specs = config_specs_scoped()?;
+    for spec in explicit_specs {
+        if !specs.iter().any(|(_, existing)| existing == &spec) {
+            specs.push((PluginScope::Project, spec));
+        }
+    }
+    active_from_scoped_specs(specs, create_named)
 }
 
 pub(crate) fn active_from_explicit_specs(
     specs: Vec<String>,
     create_named: bool,
 ) -> Result<ActivePlugins> {
-    let (config_paths, binary_paths) = plugin_paths_for_specs(&specs, create_named)?;
+    active_from_scoped_specs(
+        specs
+            .into_iter()
+            .map(|spec| (PluginScope::Project, spec))
+            .collect(),
+        create_named,
+    )
+}
+
+pub(crate) fn active_from_scoped_specs(
+    specs: Vec<(PluginScope, String)>,
+    create_named: bool,
+) -> Result<ActivePlugins> {
+    let paths = plugin_paths_for_scoped_specs(&specs, create_named)?;
     Ok(ActivePlugins {
-        config_paths,
-        binary_paths,
+        config_paths: paths.config_paths,
+        binary_paths: paths.binary_paths,
+        global_binary_paths: paths.global_binary_paths,
+        global_binary_ids: paths.global_binary_ids,
     })
 }
 
@@ -279,11 +349,34 @@ pub(crate) fn load_plugin_config(path: &Path, source: &str) -> Result<Pack, Stri
 }
 
 pub(crate) fn config_specs() -> Result<Vec<String>> {
-    let path = PathBuf::from(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
+    Ok(config_specs_scoped()?
+        .into_iter()
+        .map(|(_, spec)| spec)
+        .collect())
+}
+
+pub(crate) fn config_specs_scoped() -> Result<Vec<(PluginScope, String)>> {
+    let mut specs = Vec::new();
+    for (scope, path) in [
+        (PluginScope::User, user_plugin_config_path()?),
+        (PluginScope::Project, project_plugin_config_path()),
+    ] {
+        for spec in config_specs_at(&path)? {
+            if let Some(existing) = specs.iter_mut().find(|(_, value)| value == &spec) {
+                *existing = (scope, spec);
+            } else {
+                specs.push((scope, spec));
+            }
+        }
+    }
+    Ok(specs)
+}
+
+fn config_specs_at(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let src = std::fs::read_to_string(&path)
+    let src = std::fs::read_to_string(path)
         .with_context(|| format!("could not read '{}'", path.display()))?;
     let value = src
         .parse::<toml::Value>()
@@ -292,6 +385,23 @@ pub(crate) fn config_specs() -> Result<Vec<String>> {
         return Ok(Vec::new());
     };
     parse_config_plugins(raw_plugins)
+        .with_context(|| format!("invalid plugin config '{}'", path.display()))
+}
+
+pub(crate) fn project_plugin_config_path() -> PathBuf {
+    PathBuf::from(PENTECT_DIR).join(PENTECT_CONFIG_FILE)
+}
+
+pub(crate) fn user_plugin_config_path() -> Result<PathBuf> {
+    home_dir()
+        .map(|home| home.join(PENTECT_DIR).join(PENTECT_CONFIG_FILE))
+        .ok_or_else(|| anyhow!("could not find a home directory for global Pentect config"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
 }
 
 fn parse_config_plugins(value: &toml::Value) -> Result<Vec<String>> {
@@ -311,33 +421,71 @@ fn parse_config_plugins(value: &toml::Value) -> Result<Vec<String>> {
     }
 }
 
-fn plugin_paths_for_specs(
-    specs: &[String],
+struct ScopedPluginPaths {
+    config_paths: Vec<PathBuf>,
+    binary_paths: Vec<PathBuf>,
+    global_binary_paths: Vec<PathBuf>,
+    global_binary_ids: Vec<PathBuf>,
+}
+
+fn plugin_paths_for_scoped_specs(
+    specs: &[(PluginScope, String)],
     create_named: bool,
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Result<ScopedPluginPaths> {
     let mut configs = Vec::new();
     let mut binaries = Vec::new();
-    for spec in specs {
-        let resolved = resolve_configured_plugin_spec(spec)?;
+    let mut global_binaries = Vec::new();
+    let mut global_ids = Vec::new();
+    for (scope, spec) in specs {
+        let resolved = resolve_configured_plugin_spec_in_scope(spec, *scope)?;
         let spec = resolved.as_str();
-        if is_remote_spec(spec) {
+        let found = if is_remote_spec(spec) {
             let found = plugin_paths_for_url(spec)?;
-            verify_project_remote_plugin(spec, &normalize_github_plugin_url(spec)?)?;
-            configs.extend(found.config_paths);
-            binaries.extend(found.binary_paths);
+            verify_remote_plugin(*scope, spec, &normalize_github_plugin_url(spec)?)?;
+            found
         } else if is_path_spec(spec) {
-            let found = plugin_paths_for_path(Path::new(spec))?;
-            configs.extend(found.config_paths);
-            binaries.extend(found.binary_paths);
+            plugin_paths_for_path(Path::new(spec))?
         } else {
-            let found = plugin_paths_for_named(spec, create_named)?;
-            configs.extend(found.config_paths);
-            binaries.extend(found.binary_paths);
+            plugin_paths_for_named_scoped(spec, create_named, *scope)?
+        };
+        configs.extend(found.config_paths);
+        match scope {
+            PluginScope::Project => binaries.extend(found.binary_paths),
+            PluginScope::User => {
+                let runtime_id = plugin_runtime_id(spec);
+                for path in found.binary_paths {
+                    global_binaries.push(path);
+                    global_ids.push(PathBuf::from(&runtime_id));
+                }
+            }
         }
     }
     dedup_paths(&mut configs);
     dedup_paths(&mut binaries);
-    Ok((configs, binaries))
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 0usize;
+    global_binaries.retain(|path| {
+        let keep = seen.insert(path.clone());
+        if !keep {
+            global_ids.remove(index);
+        } else {
+            index += 1;
+        }
+        keep
+    });
+    Ok(ScopedPluginPaths {
+        config_paths: configs,
+        binary_paths: binaries,
+        global_binary_paths: global_binaries,
+        global_binary_ids: global_ids,
+    })
+}
+
+fn plugin_runtime_id(spec: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pentect-global-plugin-v1");
+    digest.update(spec.as_bytes());
+    data_encoding::HEXLOWER.encode(&digest.finalize()[..16])
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
@@ -351,29 +499,41 @@ struct PluginPaths {
     binary_paths: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
+    plugin_paths_for_named_scoped(name, _create, PluginScope::Project)
+}
+
+fn plugin_paths_for_named_scoped(
+    name: &str,
+    _create: bool,
+    scope: PluginScope,
+) -> Result<PluginPaths> {
     validate_plugin_name(name)?;
     let project_dir = plugins_root().join(name);
     let official_dir = official_plugins_root().join(name);
 
-    if project_dir.is_dir() {
-        let paths = plugin_paths_in_dir(&project_dir)?;
-        if !paths.is_empty() {
-            return Ok(paths);
+    if scope == PluginScope::Project {
+        if project_dir.is_dir() {
+            let paths = plugin_paths_in_dir(&project_dir)?;
+            if !paths.is_empty() {
+                return Ok(paths);
+            }
         }
-    }
 
-    if official_dir.is_dir() {
-        let paths = plugin_paths_in_dir(&official_dir)?;
-        if !paths.is_empty() {
-            return Ok(paths);
+        if official_dir.is_dir() {
+            let paths = plugin_paths_in_dir(&official_dir)?;
+            if !paths.is_empty() {
+                return Ok(paths);
+            }
         }
     }
 
     let remote_error = if remote_plugins_enabled() {
         match remote_plugin_paths_for_name(name) {
             Ok(paths) if !paths.is_empty() => {
-                verify_project_remote_plugin(
+                verify_remote_plugin(
+                    scope,
                     name,
                     &format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{name}"),
                 )?;
@@ -385,7 +545,7 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
     } else {
         None
     };
-    if project_dir.is_dir() || official_dir.is_dir() {
+    if scope == PluginScope::Project && (project_dir.is_dir() || official_dir.is_dir()) {
         let suggestion_dir = if project_dir.is_dir() {
             &project_dir
         } else {
@@ -402,11 +562,14 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
         bail!(message);
     }
 
-    let mut message = format!(
-        "plugin '{name}' was not found at '{}' or '{}'",
-        project_dir.display(),
-        official_dir.display()
-    );
+    let mut message = match scope {
+        PluginScope::User => format!("global plugin '{name}' was not found in the remote catalog"),
+        PluginScope::Project => format!(
+            "plugin '{name}' was not found at '{}' or '{}'",
+            project_dir.display(),
+            official_dir.display()
+        ),
+    };
     if let Some(error) = remote_error {
         message.push_str(&format!("; remote lookup failed: {error}"));
     }
@@ -537,12 +700,28 @@ fn official_plugins_root() -> PathBuf {
 
 pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
     let spec = resolve_configured_plugin_spec(spec)?;
-    plugin_source_with_refresh(&spec, false)
+    let scope = configured_scope(&spec).unwrap_or(PluginScope::Project);
+    plugin_source_with_refresh(&spec, false, scope)
 }
 
-pub(crate) fn refresh_plugin_source(spec: &str) -> Result<PluginSource> {
-    let spec = resolve_configured_plugin_spec(spec)?;
-    plugin_source_with_refresh(&spec, true)
+pub(crate) fn refresh_plugin_source_in_scope(
+    spec: &str,
+    scope: PluginScope,
+) -> Result<PluginSource> {
+    let spec = resolve_configured_plugin_spec_in_scope(spec, scope)?;
+    plugin_source_with_refresh(&spec, true, scope)
+}
+
+pub(crate) fn plugin_source_in_scope(spec: &str, scope: PluginScope) -> Result<PluginSource> {
+    let spec = resolve_configured_plugin_spec_in_scope(spec, scope)?;
+    plugin_source_with_refresh(&spec, false, scope)
+}
+
+pub(crate) fn configured_scope(spec: &str) -> Option<PluginScope> {
+    config_specs_scoped()
+        .ok()?
+        .into_iter()
+        .find_map(|(scope, configured)| (configured == spec).then_some(scope))
 }
 
 fn resolve_configured_plugin_spec(spec: &str) -> Result<String> {
@@ -555,7 +734,8 @@ fn resolve_configured_plugin_spec(spec: &str) -> Result<String> {
     }
     let mut matches = Vec::new();
     for configured in configured_specs {
-        let Ok(source) = plugin_source_with_refresh(&configured, false) else {
+        let scope = configured_scope(&configured).unwrap_or(PluginScope::Project);
+        let Ok(source) = plugin_source_with_refresh(&configured, false, scope) else {
             continue;
         };
         let manifest_name = source
@@ -592,7 +772,63 @@ fn resolve_configured_plugin_spec(spec: &str) -> Result<String> {
     }
 }
 
-fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource> {
+fn resolve_configured_plugin_spec_in_scope(spec: &str, scope: PluginScope) -> Result<String> {
+    if is_remote_spec(spec) || is_path_spec(spec) {
+        return Ok(spec.to_string());
+    }
+    let configured_specs = config_specs_scoped()?
+        .into_iter()
+        .filter_map(|(configured_scope, configured)| {
+            (configured_scope == scope).then_some(configured)
+        })
+        .collect::<Vec<_>>();
+    if configured_specs.iter().any(|configured| configured == spec) {
+        return Ok(spec.to_string());
+    }
+    let mut matches = Vec::new();
+    for configured in configured_specs {
+        let Ok(source) = plugin_source_with_refresh(&configured, false, scope) else {
+            continue;
+        };
+        let manifest_name = source
+            .manifest_path
+            .as_deref()
+            .and_then(|path| {
+                pentect_agent::read_bounded_utf8(
+                    path,
+                    MAX_REMOTE_PLUGIN_FILE_BYTES,
+                    "plugin manifest",
+                )
+                .ok()
+            })
+            .and_then(|text| text.parse::<toml::Value>().ok())
+            .and_then(|value| {
+                value
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+            });
+        if source.name == spec || manifest_name.as_deref() == Some(spec) {
+            matches.push(configured);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Ok(spec.to_string()),
+        [resolved] => Ok(resolved.clone()),
+        _ => bail!(
+            "plugin name '{spec}' is ambiguous in the selected scope; use one exact source: {}",
+            matches.join(", ")
+        ),
+    }
+}
+
+fn plugin_source_with_refresh(
+    spec: &str,
+    refresh: bool,
+    scope: PluginScope,
+) -> Result<PluginSource> {
     validate_plugin_spec(spec)?;
     if is_remote_spec(spec) {
         let normalized = normalize_github_plugin_url(spec)?;
@@ -629,6 +865,8 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
             manifest_path,
             repository,
             remote_base: Some(remote_base),
+            scope,
+            runtime_id: plugin_runtime_id(spec),
         });
     }
     if is_path_spec(spec) {
@@ -661,28 +899,34 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
             manifest_path: manifest.is_file().then_some(manifest),
             repository: None,
             remote_base: None,
+            scope,
+            runtime_id: plugin_runtime_id(spec),
         });
     }
 
     validate_plugin_name(spec)?;
-    for (root, repository) in [
-        (plugins_root().join(spec), None),
-        (
-            official_plugins_root().join(spec),
-            Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
-        ),
-    ] {
-        if root.is_dir() {
-            let root = root
-                .canonicalize()
-                .with_context(|| format!("could not resolve '{}'", root.display()))?;
-            let manifest = root.join(PLUGIN_MANIFEST_FILE);
-            return Ok(PluginSource {
-                name: spec.to_string(),
-                manifest_path: manifest.is_file().then_some(manifest),
-                repository,
-                remote_base: None,
-            });
+    if scope == PluginScope::Project {
+        for (root, repository) in [
+            (plugins_root().join(spec), None),
+            (
+                official_plugins_root().join(spec),
+                Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
+            ),
+        ] {
+            if root.is_dir() {
+                let root = root
+                    .canonicalize()
+                    .with_context(|| format!("could not resolve '{}'", root.display()))?;
+                let manifest = root.join(PLUGIN_MANIFEST_FILE);
+                return Ok(PluginSource {
+                    name: spec.to_string(),
+                    manifest_path: manifest.is_file().then_some(manifest),
+                    repository,
+                    remote_base: None,
+                    scope,
+                    runtime_id: plugin_runtime_id(spec),
+                });
+            }
         }
     }
     let base = format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{spec}");
@@ -697,6 +941,8 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
         manifest_path,
         repository: Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
         remote_base: Some(base),
+        scope,
+        runtime_id: plugin_runtime_id(spec),
     })
 }
 
@@ -806,6 +1052,19 @@ pub(crate) fn project_plugin_lock_path() -> PathBuf {
     PathBuf::from(PROJECT_PLUGIN_LOCK_FILE)
 }
 
+pub(crate) fn user_plugin_lock_path() -> Result<PathBuf> {
+    home_dir()
+        .map(|home| home.join(PENTECT_DIR).join(PROJECT_PLUGIN_LOCK_FILE))
+        .ok_or_else(|| anyhow!("could not find a home directory for global plugin lock"))
+}
+
+pub(crate) fn plugin_lock_path(scope: PluginScope) -> Result<PathBuf> {
+    match scope {
+        PluginScope::User => user_plugin_lock_path(),
+        PluginScope::Project => Ok(project_plugin_lock_path()),
+    }
+}
+
 pub(crate) fn remote_plugin_lock_entry(
     spec: &str,
     source: &PluginSource,
@@ -875,7 +1134,11 @@ pub(crate) fn remote_plugin_sources(source: &PluginSource) -> Result<BTreeMap<St
 pub(crate) fn snapshot_remote_plugin_cache(
     spec: &str,
 ) -> Result<Option<RemotePluginCacheSnapshot>> {
-    let source = plugin_source_with_refresh(spec, false)?;
+    let source = plugin_source_with_refresh(
+        spec,
+        false,
+        configured_scope(spec).unwrap_or(PluginScope::Project),
+    )?;
     let Some(resolved) = source.remote_base else {
         return Ok(None);
     };
@@ -941,18 +1204,19 @@ pub(crate) fn restore_remote_plugin_cache(snapshot: &RemotePluginCacheSnapshot) 
     Ok(())
 }
 
-pub(crate) fn lock_project_plugin_mutation() -> Result<ProjectPluginMutationGuard> {
-    ProjectPluginMutationGuard::acquire(&project_plugin_lock_path())
+pub(crate) fn lock_plugin_mutation(scope: PluginScope) -> Result<ProjectPluginMutationGuard> {
+    ProjectPluginMutationGuard::acquire(&plugin_lock_path(scope)?)
 }
 
-pub(crate) fn set_project_remote_plugin_lock_with_guard(
+pub(crate) fn set_remote_plugin_lock_with_guard(
+    scope: PluginScope,
     guard: &ProjectPluginMutationGuard,
     spec: &str,
     entry: Option<RemotePluginLockEntry>,
 ) -> Result<()> {
-    let path = project_plugin_lock_path();
+    let path = plugin_lock_path(scope)?;
     if guard.project_lock != path {
-        bail!("project plugin mutation guard does not match the project lock");
+        bail!("plugin mutation guard does not match the selected lock");
     }
     set_project_remote_plugin_lock_at_locked(&path, spec, entry)
 }
@@ -1019,14 +1283,24 @@ fn set_project_remote_plugin_lock_at_locked(
     Ok(())
 }
 
-fn verify_project_remote_plugin(spec: &str, resolved: &str) -> Result<()> {
-    let configured = config_specs()?.iter().any(|configured| configured == spec);
-    let path = project_plugin_lock_path();
+fn verify_remote_plugin(scope: PluginScope, spec: &str, resolved: &str) -> Result<()> {
+    let configured = config_specs_scoped()?
+        .iter()
+        .any(|(configured_scope, configured)| *configured_scope == scope && configured == spec);
+    let path = plugin_lock_path(scope)?;
+    let scope_name = match scope {
+        PluginScope::User => "user",
+        PluginScope::Project => "project",
+    };
+    let scope_flag = match scope {
+        PluginScope::User => "",
+        PluginScope::Project => " --project",
+    };
     if !path.is_file() {
         if remote_reference_may_run_without_lock(configured, resolved) {
             return Ok(());
         }
-        bail!("remote plugin is not locked for this project; run `pentect plugins add {spec}`");
+        bail!("remote plugin is not locked for this {scope_name} scope; run `pentect plugins add {spec}{scope_flag}`");
     }
     let source = pentect_agent::read_bounded_utf8(
         &path,
@@ -1049,7 +1323,7 @@ fn verify_project_remote_plugin(spec: &str, resolved: &str) -> Result<()> {
             if remote_reference_may_run_without_lock(configured, resolved) {
                 return Ok(());
             }
-            bail!("remote plugin is not locked; run `pentect plugins add {spec}`");
+            bail!("remote plugin is not locked; run `pentect plugins add {spec}{scope_flag}`");
         }
         bail!("remote plugin lock contains duplicate entries for {spec}");
     };

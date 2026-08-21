@@ -99,11 +99,13 @@ The release asset still comes from `repository` in the manifest.
 
 Pentect records the configured source, its normalized raw GitHub URL, and every
 fetched manifest and detector file with its full SHA-256 digest in
-`pentect.plugins.lock`. Commit this file. Normal runs
+`~/.pentect/pentect.plugins.lock`. Normal runs
 verify the cached bytes and never treat a moving `main` branch as the plugin's
 identity. `plugins update` fetches new bytes, shows detector label, category,
-confidence, and rule-digest changes, and rolls the source and project lock back
-when review or installation fails.
+confidence, and rule-digest changes, and rolls the source and user lock back
+when review or installation fails. For a reproducible repository install, add
+`--project`; Pentect then writes `pentect.plugins.lock`, which should be
+committed.
 
 ## Updates and approval
 

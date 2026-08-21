@@ -79,8 +79,9 @@ coverage. Optional does not mean that Pentect silently claims the plugin ran.
 
 ## Order and scope
 
-Project plugins run in the order stored in `.pentect/config.toml`. A one-off
-plugin passed with `--plugins` is added for that command or client launch.
+User plugins run first in the order stored in `~/.pentect/config.toml`, then
+project plugins from `.pentect/config.toml`. A one-off plugin passed with
+`--plugins` is added for that command or client launch.
 
 ```sh
 pentect codex --plugins ./plugins/company-policy
@@ -90,12 +91,12 @@ echo 'sample' | pentect mask --plugins first,second
 Use one plugin for one job. Small plugins are easier to approve, test, update,
 and remove than one plugin with unrelated access.
 
-`pentect plugins remove NAME` removes the project reference. A protected client
+`pentect plugins remove NAME` removes the user-wide reference. Add `--project`
+to remove a project reference. A protected client
 that is already running keeps its loaded middleware until that client exits;
 its supervised Command process is then stopped and reaped. Start a new client
 to use the updated project list. Pentect may retain verified shared cache and
-private plugin storage so removing one project reference cannot break another
-project that uses the same plugin.
+private plugin storage as appropriate for its scope.
 
 ## Sandbox boundary
 

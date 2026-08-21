@@ -2226,6 +2226,8 @@ mod tests {
                 ("PENTECT_HOME", Some(home.as_os_str().to_owned())),
                 (crate::plugins::CONFIGS_ENV, None),
                 (crate::plugins::BINARIES_ENV, None),
+                (crate::plugins::GLOBAL_BINARIES_ENV, None),
+                (crate::plugins::GLOBAL_BINARY_IDS_ENV, None),
             ]);
             let process_host_candidate = Some(
                 pentect_agent::register_process_host_candidate(
