@@ -67,6 +67,19 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SERVER._byte_offset("short", 6)
 
+    def test_device_comes_from_persisted_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "setup.json").write_text('{"device":"cuda"}', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"PENTECT_OPF_ROOT": str(root)}):
+                self.assertEqual(SERVER._selected_device("auto"), "cuda")
+                self.assertEqual(SERVER._selected_device("cpu"), "cpu")
+
+    def test_missing_setup_state_fails_safe_to_cpu(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {"PENTECT_OPF_ROOT": directory}):
+                self.assertEqual(SERVER._selected_device("auto"), "cpu")
+
     def test_command_protocol_response_matches_request(self) -> None:
         result = SERVER.handle_request(
             Redactor(),

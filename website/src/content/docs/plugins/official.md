@@ -42,42 +42,36 @@ JSONL over stdin/stdout. There is no local HTTP server.
 The model is large and mainly targets English. It can still miss private text
 or mark safe text, so built-in detection stays enabled.
 
-### 1. Install the model
-
-The commands create the location that the plugin automatically detects.
-
-::: code-group
-
-```powershell [Windows]
-$root = "$HOME\.pentect\openai-privacy-filter"
-py -m venv "$root\venv"
-& "$root\venv\Scripts\python.exe" -m pip install `
-  "git+https://github.com/openai/privacy-filter.git@f7f00ca7fb869683eb732c010299d901457f19c3"
-& "$root\venv\Scripts\python.exe" -c `
-  "from opf import OPF; OPF(device='cpu', output_mode='typed', output_text_only=False).get_runtime()"
-```
-
-```sh [macOS / Linux]
-root="$HOME/.pentect/openai-privacy-filter"
-python3 -m venv "$root/venv"
-"$root/venv/bin/python" -m pip install \
-  "git+https://github.com/openai/privacy-filter.git@f7f00ca7fb869683eb732c010299d901457f19c3"
-"$root/venv/bin/python" -c \
-  "from opf import OPF; OPF(device='cpu', output_mode='typed', output_text_only=False).get_runtime()"
-```
-
-:::
-
-### 2. Add the plugin
+### Install
 
 ```sh
 pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter
 ```
 
-Review the exact Python command, `server.py` hash, `inspect` hook, and required
-status. Pentect starts the process only when protected text needs inspection.
-The install command prepares the model runtime so the first protected request
-does not have to download it.
+Pentect shows the expected transfer and disk cost, asks once, detects a
+compatible NVIDIA driver, and installs the complete managed environment. The
+automatic profile chooses CUDA when a supported NVIDIA driver is visible and
+CPU otherwise. CPU installation uses PyTorch's official CPU-only wheel index,
+so it does not pull CUDA runtimes. macOS uses CPU because OPF currently exposes
+`cpu` and `cuda`, not an MPS profile.
+
+Force a profile when automatic selection is not what you want:
+
+```sh
+pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --profile cpu
+pentect plugins setup openai-privacy-filter --profile cuda
+```
+
+The selected profile is stored in
+`~/.pentect/openai-privacy-filter/setup.json`. Updates keep an explicit choice;
+run `plugins setup --profile auto` to return to driver-based selection. CPU and
+CUDA environments share the same roughly 2.8 GB checkpoint. Switching profiles
+therefore replaces PyTorch and the managed virtual environment, not the model.
+
+Review the exact runtime and environment setup commands, downloaded file
+hashes, `inspect` hook, and required status. Pentect prepares the model before
+enabling the plugin, so the first protected request does not unexpectedly start
+a multi-gigabyte download.
 
 Test with fake data:
 
@@ -103,9 +97,9 @@ OS access as the user; enable only plugins you trust.
 
 | Symptom | What to do |
 | --- | --- |
-| Python or `opf` is missing | Repeat the managed-environment install step |
-| First request times out | Let the checkpoint finish downloading, then retry |
-| CPU use is high | Remove the plugin when the local model is not needed |
+| Python or `opf` is missing | Run `pentect plugins setup openai-privacy-filter` |
+| CUDA setup is unavailable | Update the NVIDIA driver or select `--profile cpu` |
+| CPU use is high | Select CUDA, or remove the plugin when it is not needed |
 | Plugin file or command changed | Inspect it, then run `pentect plugins setup` |
 
 Remove the user-wide installation:

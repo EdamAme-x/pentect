@@ -15,7 +15,12 @@ PROTOCOL_SCHEMA = "pentect.plugin.v1"
 
 
 def _use_managed_python() -> None:
-    root = Path.home() / ".pentect" / "openai-privacy-filter" / "venv"
+    managed_root = os.environ.get("PENTECT_OPF_ROOT")
+    root = (
+        Path(managed_root).expanduser()
+        if managed_root
+        else Path.home() / ".pentect" / "openai-privacy-filter"
+    ) / "venv"
     candidate = (
         root / "Scripts" / "python.exe"
         if os.name == "nt"
@@ -36,6 +41,45 @@ def _use_managed_python() -> None:
             str(candidate),
             [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
         )
+
+
+def _selected_device(argument: str) -> str:
+    if argument != "auto":
+        return argument
+    managed_root = os.environ.get("PENTECT_OPF_ROOT")
+    root = (
+        Path(managed_root).expanduser()
+        if managed_root
+        else Path.home() / ".pentect" / "openai-privacy-filter"
+    )
+    try:
+        state = json.loads((root / "setup.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "cpu"
+    device = state.get("device") if isinstance(state, dict) else None
+    return device if device in {"cpu", "cuda"} else "cpu"
+
+
+def _managed_checkpoint(argument: Path | None) -> Path | None:
+    if argument is not None:
+        return argument
+    managed_root = os.environ.get("PENTECT_OPF_ROOT")
+    root = (
+        Path(managed_root).expanduser()
+        if managed_root
+        else Path.home() / ".pentect" / "openai-privacy-filter"
+    )
+    try:
+        state = json.loads((root / "setup.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    configured = state.get("checkpoint") if isinstance(state, dict) else None
+    if isinstance(configured, str) and configured:
+        checkpoint = Path(configured).expanduser()
+        if checkpoint.is_dir():
+            return checkpoint
+    checkpoint = root / "checkpoint"
+    return checkpoint if checkpoint.is_dir() else None
 
 
 def _byte_offset(text: str, character_offset: int) -> int:
@@ -124,15 +168,15 @@ def serve(redactor: Any) -> None:
 def main() -> None:
     _use_managed_python()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--checkpoint", type=Path)
     args = parser.parse_args()
 
     from opf import OPF
 
     redactor = OPF(
-        model=args.checkpoint,
-        device=args.device,
+        model=_managed_checkpoint(args.checkpoint),
+        device=_selected_device(args.device),
         output_mode="typed",
         output_text_only=False,
     )

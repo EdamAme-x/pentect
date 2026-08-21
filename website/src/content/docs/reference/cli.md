@@ -182,12 +182,12 @@ Treat redirected or in-place resolved output as plaintext secret material.
 | --- | --- |
 | `plugins search [QUERY]` | Search the first-party catalog |
 | `plugins inspect SOURCE` | Show the manifest, hooks, binary, and requested access |
-| `plugins add SOURCE [--yes] [--project]` | Verify, approve, and enable a plugin for the user (or this project) |
+| `plugins add SOURCE [--yes] [--project] [--profile NAME]` | Verify, approve, and enable a plugin for the user (or this project) |
 | `plugins remove NAME [--project]` | Disable a user plugin (or a project plugin) |
 | `plugins list [--json]` | Show enabled and installed plugins |
 | `plugins config NAME KEY=VALUE [--project]` | Save one setting in the selected scope |
 | `plugins config NAME --unset KEY [--project]` | Remove one setting in the selected scope |
-| `plugins setup NAME [--yes] [--project]` | Review changed hooks or access again |
+| `plugins setup NAME [--yes] [--project] [--profile NAME]` | Review changed hooks or access and run declared environment setup |
 | `plugins test SOURCE [--json]` | Validate a manifest or installed binary |
 | `plugins update [NAME] [--yes] [--project]` | Update user plugins (or project plugins) |
 | `plugins new NAME` | Create a Rust Wasm plugin project |

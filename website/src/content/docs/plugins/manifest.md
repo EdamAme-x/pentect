@@ -200,6 +200,24 @@ and checks them before every launch. The process stays alive and exchanges one
 `pentect.plugin.v1` request and response per line on stdin/stdout. Do not print
 logs to stdout.
 
+A trusted Command plugin may declare an explicit environment setup command:
+
+```toml
+[setup]
+command = ["python", "{plugin}/setup.py"]
+profiles = ["auto", "cpu", "cuda"]
+profile_arg = "--profile"
+download = "CPU: about 3 GB; CUDA: about 6 GB"
+disk = "CPU: about 5 GB; CUDA: about 8 GB"
+```
+
+Use `[setup.commands]` for `windows`, `macos`, and `linux` variants. Pentect
+shows this native command and the declared costs before approval, includes all
+referenced files in the command lock, and runs it without a shell. Users select
+a declared profile with `plugins add|setup --profile NAME`. The setup program
+owns its idempotency and persisted profile; omitting `--profile` lets it keep an
+existing choice or make its documented automatic selection.
+
 ## Full Wasm example
 
 ```toml

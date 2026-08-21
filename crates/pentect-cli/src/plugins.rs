@@ -856,6 +856,9 @@ fn plugin_source_with_refresh(
             )?;
         }
         let manifest_path = fetch_remote_plugin_file_with_refresh(&manifest_url, refresh)?;
+        if refresh {
+            refresh_remote_command_files(&base, manifest_path.as_deref())?;
+        }
         let name = remote_plugin_name(&base)?;
         let remote_base = if points_to_manifest {
             manifest_url.clone()
@@ -938,6 +941,9 @@ fn plugin_source_with_refresh(
     }
     let manifest_path =
         fetch_remote_plugin_file_with_refresh(&format!("{base}/{PLUGIN_MANIFEST_FILE}"), refresh)?;
+    if refresh {
+        refresh_remote_command_files(&base, manifest_path.as_deref())?;
+    }
     Ok(PluginSource {
         name: spec.to_string(),
         manifest_path,
@@ -1424,10 +1430,26 @@ fn command_files_from_manifest(base: &str, manifest: &Path) -> Result<Vec<(PathB
     if direct.is_some() && platforms.is_some() {
         bail!("plugin.toml cannot set both command and [commands]");
     }
+    let setup = value.get("setup").and_then(toml::Value::as_table);
+    let setup_direct = setup
+        .and_then(|table| table.get("command"))
+        .and_then(toml::Value::as_array);
+    let setup_platforms = setup
+        .and_then(|table| table.get("commands"))
+        .and_then(toml::Value::as_table);
+    if setup_direct.is_some() && setup_platforms.is_some() {
+        bail!("plugin.toml cannot set both setup.command and [setup.commands]");
+    }
     let commands = direct
         .into_iter()
         .chain(
             platforms
+                .into_iter()
+                .flat_map(|table| table.values().filter_map(toml::Value::as_array)),
+        )
+        .chain(setup_direct)
+        .chain(
+            setup_platforms
                 .into_iter()
                 .flat_map(|table| table.values().filter_map(toml::Value::as_array)),
         )
@@ -1464,6 +1486,17 @@ fn command_files_from_manifest(base: &str, manifest: &Path) -> Result<Vec<(PathB
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files.dedup_by(|left, right| left.0 == right.0);
     Ok(files)
+}
+
+fn refresh_remote_command_files(base: &str, manifest: Option<&Path>) -> Result<()> {
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    for (_, url) in command_files_from_manifest(base.trim_end_matches("/plugin.toml"), manifest)? {
+        fetch_remote_plugin_file_with_refresh(&url, true)?
+            .ok_or_else(|| anyhow!("remote command plugin file was not found: {url}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn remote_command_files(source: &PluginSource) -> Result<Vec<(PathBuf, PathBuf)>> {
@@ -2203,7 +2236,7 @@ label = "INLINE_SECRET"
         let manifest = root.join("plugin.toml");
         std::fs::write(
             &manifest,
-            "schema = \"pentect.plugin.v1\"\n[commands]\nwindows = [\"{plugin}/windows.exe\"]\nmacos = [\"{plugin}/macos\"]\nlinux = [\"{plugin}/linux\"]\n",
+            "schema = \"pentect.plugin.v1\"\n[commands]\nwindows = [\"{plugin}/windows.exe\"]\nmacos = [\"{plugin}/macos\"]\nlinux = [\"{plugin}/linux\"]\n[setup.commands]\nwindows = [\"py\", \"{plugin}/setup.py\"]\nmacos = [\"python3\", \"{plugin}/setup.py\"]\nlinux = [\"python3\", \"{plugin}/setup.py\"]\n",
         )
         .unwrap();
         let files = command_files_from_manifest("https://example.test/plugin", &manifest).unwrap();
@@ -2212,8 +2245,47 @@ label = "INLINE_SECRET"
                 .iter()
                 .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
                 .collect::<Vec<_>>(),
-            ["linux", "macos", "windows.exe"]
+            ["linux", "macos", "setup.py", "windows.exe"]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refreshing_a_manifest_refetches_cached_command_files() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let command_url = format!("{base}/server.py");
+        let cached = remote_cache_file(&command_url).unwrap();
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"old command").unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-refresh-command-files-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("plugin.toml");
+        std::fs::write(
+            &manifest,
+            "schema = \"pentect.plugin.v1\"\ncommand = [\"python3\", \"{plugin}/server.py\"]\n",
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nnew command")
+                .unwrap();
+        });
+
+        refresh_remote_command_files(&base, Some(&manifest)).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(std::fs::read(&cached).unwrap(), b"new command");
+        let _ = std::fs::remove_dir_all(cached.parent().unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 
