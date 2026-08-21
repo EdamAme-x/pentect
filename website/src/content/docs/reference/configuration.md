@@ -38,6 +38,7 @@ ignored.
 | `files.remember` | `true` | Remember safe local file-to-handle information |
 | `activity.share` | `true` | Share events with compatible local Pentect processes |
 | `agent.required` | `false` | Require supported agents to start through Pentect |
+| `output.restore` | `false` | Restore known handles in assistant text shown by supported clients |
 
 ## Handle identity
 
@@ -125,6 +126,26 @@ share = true
 
 Project values normally override user values. `agent.required` is stricter: if
 either file sets it to `true`, the effective value is true.
+
+## Assistant output restoration
+
+By default, assistant text keeps protected handles visible. To restore known
+handles in assistant text locally, opt in from the user config:
+
+```toml
+[output]
+restore = true
+```
+
+This affects supported JSON and streaming responses for Codex, Claude,
+OpenCode, and Pi. It does not send plaintext back to the model provider, but it
+does place the restored value in the client UI and may place it in terminal
+scrollback, screenshots, or client logs. Unknown and expired handles remain
+unchanged.
+
+A project config cannot enable this wider output boundary by itself. It may set
+`output.restore = false` to disable a user-level opt-in for that project. Restart
+the protected client after changing the setting.
 
 ## Require the agent to start through Pentect
 

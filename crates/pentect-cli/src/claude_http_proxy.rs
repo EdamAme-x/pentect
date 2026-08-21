@@ -2,7 +2,7 @@
 //!
 //! Security boundary:
 //! - outbound model-visible text and client tool results are masked;
-//! - inbound assistant text stays masked;
+//! - inbound assistant text stays masked unless the user opts into local restoration;
 //! - only completed client `tool_use.input` values are resolved;
 //! - unknown events and incomplete/invalid tool JSON remain unresolved.
 //!
@@ -37,9 +37,61 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INLINE_PDF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXTRACTED_PDF_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OUTPUT_HANDLE_BYTES: usize = 512;
 static WARNED_UNKNOWN_CONTENT_BLOCK: AtomicBool = AtomicBool::new(false);
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 static WARNED_PROVIDER_MCP_CREDENTIALS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+pub(crate) struct OutputTextRestorer {
+    pending: String,
+}
+
+impl OutputTextRestorer {
+    pub(crate) fn push<R>(&mut self, chunk: &str, resolve: &mut R) -> Result<String, String>
+    where
+        R: FnMut(&str) -> Result<String, String>,
+    {
+        self.pending.push_str(chunk);
+        let mut input = std::mem::take(&mut self.pending);
+        let mut output = String::with_capacity(input.len());
+        loop {
+            let Some(start) = input.find("<<") else {
+                if input.ends_with('<') {
+                    let split = input.len() - 1;
+                    output.push_str(&input[..split]);
+                    self.pending.push('<');
+                } else {
+                    output.push_str(&input);
+                }
+                return Ok(output);
+            };
+            output.push_str(&input[..start]);
+            input.drain(..start);
+            let Some(close) = input[2..].find(">>") else {
+                if input.len() <= MAX_OUTPUT_HANDLE_BYTES {
+                    self.pending = input;
+                    return Ok(output);
+                }
+                output.push_str("<<");
+                input.drain(..2);
+                continue;
+            };
+            let end = close + 4;
+            if end > MAX_OUTPUT_HANDLE_BYTES {
+                output.push_str("<<");
+                input.drain(..2);
+                continue;
+            }
+            output.push_str(&resolve(&input[..end])?);
+            input.drain(..end);
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+}
 
 fn diagnostic(event: &str, kind: &str, endpoint: &str, retryable: bool) {
     pentect_agent::record_http_diagnostic_activity(
@@ -472,6 +524,7 @@ async fn proxy_request_inner(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let restore_output = pentect_agent::output_restore_enabled()?;
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -494,6 +547,7 @@ async fn proxy_request_inner(
                 upstream_response,
                 transform,
                 Arc::clone(&state.plugins),
+                restore_output,
             ))
             .map_err(|error| format!("could not build Claude streaming response: {error}"));
     }
@@ -538,7 +592,7 @@ async fn proxy_request_inner(
     }
     let response_body = if status.is_success() && messages_path {
         let response_body = run_response_plugins(response_body, &state.plugins)?;
-        match rewrite_anthropic_json_response(&response_body) {
+        match rewrite_anthropic_json_response(&response_body, restore_output) {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(_error) => {
                 diagnostic("response-restore-skipped", "protection", "messages", false);
@@ -1011,6 +1065,7 @@ fn streaming_response_body(
     response: reqwest::Response,
     transform: bool,
     plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
+    restore_output: bool,
 ) -> ProxyBody {
     if !transform {
         let stream = response.bytes_stream().map(|item| {
@@ -1022,7 +1077,11 @@ fn streaming_response_body(
 
     let state = TransformedStreamState {
         upstream: Box::pin(response.bytes_stream()),
-        transformer: SseStreamTransformer::new(Box::new(request_scoped_resolver()), Some(plugins)),
+        transformer: SseStreamTransformer::new(
+            Box::new(request_scoped_resolver()),
+            Some(plugins),
+            restore_output,
+        ),
         ready: VecDeque::new(),
         finished: false,
     };
@@ -1075,6 +1134,8 @@ struct SseStreamTransformer<R> {
     active_tool: Option<ActiveToolStream>,
     passthrough: bool,
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
+    restore_output: bool,
+    output_text: HashMap<u64, OutputTextRestorer>,
 }
 
 struct ActiveToolStream {
@@ -1093,13 +1154,19 @@ impl<R> SseStreamTransformer<R>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
-    fn new(resolve: R, plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>) -> Self {
+    fn new(
+        resolve: R,
+        plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
+        restore_output: bool,
+    ) -> Self {
         Self {
             resolve,
             pending: Vec::new(),
             active_tool: None,
             passthrough: false,
             plugins,
+            restore_output,
+            output_text: HashMap::new(),
         }
     }
 
@@ -1121,7 +1188,7 @@ where
     }
 
     fn finish(&mut self) -> Vec<Bytes> {
-        let mut output = Vec::new();
+        let mut output = self.finish_output_text();
         if let Some(mut tool) = self.active_tool.take() {
             tool.bytes.append(&mut self.pending);
             if !tool.bytes.is_empty() {
@@ -1131,6 +1198,29 @@ where
             output.push(Bytes::from(std::mem::take(&mut self.pending)));
         }
         output
+    }
+
+    fn finish_output_text(&mut self) -> Vec<Bytes> {
+        let mut streams = self.output_text.drain().collect::<Vec<_>>();
+        streams.sort_by_key(|(index, _)| *index);
+        streams
+            .into_iter()
+            .filter_map(|(index, mut restorer)| {
+                let pending = restorer.finish();
+                if pending.is_empty() {
+                    return None;
+                }
+                Some(Bytes::from(render_sse(&[SseBlock {
+                    event: Some("content_block_delta".to_string()),
+                    data: Some(serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": pending},
+                    })),
+                    passthrough: Vec::new(),
+                }])))
+            })
+            .collect()
     }
 
     fn process_block(&mut self, block: Vec<u8>, output: &mut Vec<Bytes>) -> Result<(), String> {
@@ -1192,12 +1282,23 @@ where
                     bytes: block,
                 });
             }
+            _ if self.restore_output => {
+                match rewrite_anthropic_output_sse_block(
+                    &block,
+                    &mut self.output_text,
+                    &mut self.resolve,
+                )? {
+                    Some(rewritten) => output.push(Bytes::from(rewritten)),
+                    None => output.push(Bytes::from(block)),
+                }
+            }
             _ => output.push(Bytes::from(block)),
         }
         Ok(())
     }
 
     fn fail_open_with(&mut self, chunk: &[u8]) -> Vec<Bytes> {
+        let mut output = self.finish_output_text();
         let mut bytes = self
             .active_tool
             .take()
@@ -1205,8 +1306,89 @@ where
         bytes.append(&mut self.pending);
         bytes.extend_from_slice(chunk);
         self.passthrough = true;
-        vec![Bytes::from(bytes)]
+        output.push(Bytes::from(bytes));
+        output
     }
+}
+
+fn rewrite_anthropic_output_sse_block<R>(
+    block: &[u8],
+    streams: &mut HashMap<u64, OutputTextRestorer>,
+    resolve: &mut R,
+) -> Result<Option<Vec<u8>>, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let Ok(text) = std::str::from_utf8(block) else {
+        return Ok(None);
+    };
+    let mut blocks = parse_sse(text);
+    let Some(parsed) = blocks.first_mut() else {
+        return Ok(None);
+    };
+    let Some(data) = parsed.data.as_mut() else {
+        return Ok(None);
+    };
+    let event_type = data.get("type").and_then(Value::as_str).map(str::to_owned);
+    let Some(index) = data.get("index").and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+    match event_type.as_deref() {
+        Some("content_block_start")
+            if data
+                .get("content_block")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                == Some("text") =>
+        {
+            let restorer = streams.entry(index).or_default();
+            if let Some(Value::String(value)) = data
+                .get_mut("content_block")
+                .and_then(Value::as_object_mut)
+                .and_then(|value| value.get_mut("text"))
+            {
+                *value = restorer.push(value, resolve)?;
+            }
+        }
+        Some("content_block_delta")
+            if data
+                .get("delta")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                == Some("text_delta") =>
+        {
+            let restorer = streams.entry(index).or_default();
+            if let Some(Value::String(value)) = data
+                .get_mut("delta")
+                .and_then(Value::as_object_mut)
+                .and_then(|value| value.get_mut("text"))
+            {
+                *value = restorer.push(value, resolve)?;
+            }
+        }
+        Some("content_block_stop") => {
+            let Some(mut restorer) = streams.remove(&index) else {
+                return Ok(None);
+            };
+            let pending = restorer.finish();
+            if !pending.is_empty() {
+                let prefix = SseBlock {
+                    event: Some("content_block_delta".to_string()),
+                    data: Some(serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": pending},
+                    })),
+                    passthrough: Vec::new(),
+                };
+                return Ok(Some(
+                    format!("{}{}", render_sse(&[prefix]), render_sse(&blocks)).into_bytes(),
+                ));
+            }
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(render_sse(&blocks).into_bytes()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1643,7 +1825,7 @@ fn mask_value_strings(
     }
 }
 
-fn rewrite_anthropic_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
+fn rewrite_anthropic_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
     let mut resolve = request_scoped_resolver();
@@ -1653,6 +1835,10 @@ fn rewrite_anthropic_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
                 let tool_name = block.get("name").and_then(Value::as_str).map(str::to_owned);
                 if let Some(input) = block.get_mut("input") {
                     resolve_tool_input_value(input, tool_name.as_deref(), &mut resolve)?;
+                }
+            } else if restore_output && block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(Value::String(text)) = block.get_mut("text") {
+                    *text = resolve(text)?;
                 }
             }
         }
@@ -3099,7 +3285,8 @@ mod tests {
             "event: content_block_delta\r\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n"
         );
-        let mut transformer = SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None);
+        let mut transformer =
+            SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None, false);
         let split = event.len() - 2;
         assert!(transformer
             .push(&event.as_bytes()[..split])
@@ -3107,6 +3294,38 @@ mod tests {
             .is_empty());
         let output = transformer.push(&event.as_bytes()[split..]).unwrap();
         assert_eq!(output, vec![Bytes::from(event)]);
+    }
+
+    #[test]
+    fn opted_in_streaming_text_restores_handles_split_across_events() {
+        let start = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+        );
+        let first = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"before <<CHAR\"}}\n\n"
+        );
+        let second = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"GE_0123456789abcdef>> after\"}}\n\n"
+        );
+        let stop = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        );
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            None,
+            true,
+        );
+        let mut output = transformer.push(start.as_bytes()).unwrap();
+        output.extend(transformer.push(first.as_bytes()).unwrap());
+        output.extend(transformer.push(second.as_bytes()).unwrap());
+        output.extend(transformer.push(stop.as_bytes()).unwrap());
+        let output = join_bytes(output);
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
     }
 
     #[test]
@@ -3130,6 +3349,7 @@ mod tests {
         let mut transformer = SseStreamTransformer::new(
             |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret")),
             None,
+            false,
         );
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
         assert!(transformer.push(delta_one.as_bytes()).unwrap().is_empty());
@@ -3159,6 +3379,7 @@ mod tests {
         let mut transformer = SseStreamTransformer::new(
             |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
             None,
+            false,
         );
         assert!(transformer.push(incomplete.as_bytes()).unwrap().is_empty());
         let output = join_bytes(transformer.finish());
@@ -3182,6 +3403,7 @@ mod tests {
                     .replace("<<SECRET_two>>", "second"))
             },
             None,
+            false,
         );
         let mut output = transformer
             .push(tool(1, "<<SECRET_one>>").as_bytes())
@@ -3209,6 +3431,7 @@ mod tests {
         let mut transformer = SseStreamTransformer::new(
             |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
             None,
+            false,
         );
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
         assert_eq!(join_bytes(transformer.push(ping.as_bytes()).unwrap()), ping);

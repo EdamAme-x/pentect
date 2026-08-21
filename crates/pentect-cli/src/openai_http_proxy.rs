@@ -2,7 +2,8 @@
 //!
 //! Model-bound prompts and local function outputs are masked on requests.
 //! Completed client function-call arguments are resolved on responses. Local
-//! UI and provider-generated text remain unchanged.
+//! Provider-generated text remains masked unless the user opts into local
+//! output restoration.
 
 use futures_util::{stream, Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -62,6 +63,7 @@ type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+type HandleResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
 
 pub(crate) struct OpenAiHttpProxyGuard {
     base_url: String,
@@ -531,6 +533,7 @@ async fn proxy_request_inner(
     }) || ((responses_response || chat_response)
         && !request_streaming
         && response_media_type.is_none());
+    let restore_output = pentect_agent::output_restore_enabled()?;
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -558,6 +561,7 @@ async fn proxy_request_inner(
                     StreamTransform::None
                 },
                 Arc::clone(&state.plugins),
+                restore_output,
             ))
             .map_err(|error| format!("could not build OpenAI streaming response: {error}"));
     }
@@ -604,9 +608,9 @@ async fn proxy_request_inner(
         if (responses_response || chat_response) && status.is_success() && is_json_response {
             let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
             let rewritten = if chat_response {
-                rewrite_chat_completions_json_response(&response_body)
+                rewrite_chat_completions_json_response(&response_body, restore_output)
             } else {
-                rewrite_openai_json_response(&response_body)
+                rewrite_openai_json_response(&response_body, restore_output)
             };
             match rewritten {
                 Ok(rewritten) => Bytes::from(rewritten),
@@ -1698,22 +1702,91 @@ fn mask_text(
     crate::claude_http_proxy::mask_string(text, tool_result, masker)
 }
 
-fn rewrite_openai_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
+fn rewrite_openai_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
     rewrite_function_calls(&mut value, &mut resolve)?;
+    if restore_output {
+        restore_openai_output_text(&mut value, &mut resolve)?;
+    }
     serde_json::to_vec(&value)
         .map_err(|error| format!("could not encode restored OpenAI response: {error}"))
 }
 
-fn rewrite_chat_completions_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
+fn rewrite_chat_completions_json_response(
+    body: &[u8],
+    restore_output: bool,
+) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI Chat Completions response was not valid JSON: {error}"))?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
     rewrite_chat_tool_calls(&mut value, &mut resolve)?;
+    if restore_output {
+        restore_chat_output_text(&mut value, &mut resolve)?;
+    }
     serde_json::to_vec(&value)
         .map_err(|error| format!("could not encode restored Chat Completions response: {error}"))
+}
+
+fn restore_openai_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                restore_openai_output_text(value, resolve)?;
+            }
+        }
+        Value::Object(object) => {
+            let is_output_text = object.get("type").and_then(Value::as_str) == Some("output_text");
+            if is_output_text {
+                if let Some(Value::String(text)) = object.get_mut("text") {
+                    *text = resolve(text)?;
+                }
+            }
+            for key in ["output", "content", "response", "item"] {
+                if let Some(value) = object.get_mut(key) {
+                    restore_openai_output_text(value, resolve)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn restore_chat_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for choice in choices {
+        let Some(content) = choice
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|message| message.get_mut("content"))
+        else {
+            continue;
+        };
+        match content {
+            Value::String(text) => *text = resolve(text)?,
+            Value::Array(parts) => {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(Value::String(text)) = part.get_mut("text") {
+                            *text = resolve(text)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
@@ -1855,6 +1928,9 @@ struct StreamState {
     chat: ChatStreamState,
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+    restore_output: bool,
+    output_text: HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
+    output_resolve: HandleResolver,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1868,6 +1944,7 @@ fn streaming_response_body(
     response: reqwest::Response,
     transform: StreamTransform,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+    restore_output: bool,
 ) -> ProxyBody {
     let state = StreamState {
         upstream: Box::pin(response.bytes_stream()),
@@ -1877,6 +1954,9 @@ fn streaming_response_body(
         chat: ChatStreamState::default(),
         finished: false,
         plugins,
+        restore_output,
+        output_text: HashMap::new(),
+        output_resolve: Box::new(crate::claude_http_proxy::request_scoped_resolver()),
     };
     let stream = stream::unfold(state, |mut state| async move {
         loop {
@@ -1913,13 +1993,20 @@ fn streaming_response_body(
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
                         let rewritten = match state.transform {
-                            StreamTransform::Responses => {
-                                rewrite_openai_sse_block(&block, &state.plugins)
-                                    .map(|block| vec![block])
-                            }
-                            StreamTransform::ChatCompletions => {
-                                state.chat.rewrite_block(&block, &state.plugins)
-                            }
+                            StreamTransform::Responses => rewrite_openai_sse_block(
+                                &block,
+                                &state.plugins,
+                                state.restore_output,
+                                &mut state.output_text,
+                                &mut state.output_resolve,
+                            )
+                            .map(|block| vec![block]),
+                            StreamTransform::ChatCompletions => state.chat.rewrite_block(
+                                &block,
+                                &state.plugins,
+                                state.restore_output,
+                                &mut state.output_resolve,
+                            ),
                             StreamTransform::None => Ok(vec![Bytes::from(block)]),
                         };
                         match rewritten {
@@ -1968,6 +2055,7 @@ fn streaming_response_body(
 struct ChatStreamState {
     calls: HashMap<(u64, u64), ChatStreamCall>,
     buffered_bytes: usize,
+    output_text: HashMap<u64, crate::claude_http_proxy::OutputTextRestorer>,
 }
 
 #[derive(Default)]
@@ -1989,6 +2077,8 @@ impl ChatStreamState {
         &mut self,
         block: &[u8],
         plugins: &Mutex<pentect_agent::PluginMiddleware>,
+        restore_output: bool,
+        resolve: &mut HandleResolver,
     ) -> Result<Vec<Bytes>, String> {
         let Ok(text) = std::str::from_utf8(block) else {
             return Ok(vec![Bytes::copy_from_slice(block)]);
@@ -2012,15 +2102,37 @@ impl ChatStreamState {
         if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
             for choice in choices {
                 let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
-                if choice
+                let choice_finished = choice
                     .get("finish_reason")
-                    .is_some_and(|reason| !reason.is_null())
-                {
+                    .is_some_and(|reason| !reason.is_null());
+                if choice_finished {
                     completed_choices.push(choice_index);
                 }
                 let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
                     continue;
                 };
+                if restore_output {
+                    if let Some(Value::String(content)) = delta.get_mut("content") {
+                        *content = self
+                            .output_text
+                            .entry(choice_index)
+                            .or_default()
+                            .push(content, resolve)?;
+                    }
+                    if choice_finished {
+                        if let Some(mut restorer) = self.output_text.remove(&choice_index) {
+                            let pending = restorer.finish();
+                            if !pending.is_empty() {
+                                let content = delta
+                                    .entry("content".to_string())
+                                    .or_insert_with(|| Value::String(String::new()));
+                                if let Value::String(content) = content {
+                                    content.push_str(&pending);
+                                }
+                            }
+                        }
+                    }
+                }
                 let Some(tool_calls) = delta
                     .remove("tool_calls")
                     .and_then(|calls| calls.as_array().cloned())
@@ -2190,6 +2302,9 @@ fn encode_sse_value(template: &str, value: &Value) -> Result<Bytes, String> {
 fn rewrite_openai_sse_block(
     block: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    restore_output: bool,
+    output_text: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
+    resolve: &mut HandleResolver,
 ) -> Result<Bytes, String> {
     let Ok(text) = std::str::from_utf8(block) else {
         return Ok(Bytes::copy_from_slice(block));
@@ -2207,18 +2322,24 @@ fn rewrite_openai_sse_block(
     let Ok(mut value) = serde_json::from_str::<Value>(data) else {
         return Ok(Bytes::copy_from_slice(block));
     };
-    if !contains_completed_function_call(&value) {
+    let completed_function_call = contains_completed_function_call(&value);
+    let output_event = restore_output && contains_openai_output_text(&value);
+    if !completed_function_call && !output_event {
         return Ok(Bytes::copy_from_slice(block));
     }
-    let plugins = plugins
-        .lock()
-        .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
-    run_openai_tool_plugins(&mut value, &plugins)?;
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    if let Err(error) = rewrite_function_calls(&mut value, &mut resolve) {
+    if completed_function_call {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+        run_openai_tool_plugins(&mut value, &plugins)?;
+    }
+    if let Err(error) = rewrite_function_calls(&mut value, resolve) {
         let _ = error;
         proxy_diagnostic("sse-restore-skipped");
         return Ok(Bytes::copy_from_slice(block));
+    }
+    if output_event {
+        restore_openai_sse_output_text(&mut value, output_text, resolve)?;
     }
     let Ok(encoded) = serde_json::to_string(&value) else {
         return Ok(Bytes::copy_from_slice(block));
@@ -2240,6 +2361,70 @@ fn rewrite_openai_sse_block(
         }
     }
     Ok(Bytes::from(output))
+}
+
+fn contains_openai_output_text(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.output_text.delta" | "response.output_text.done" | "response.completed")
+    )
+}
+
+fn openai_output_stream_key(value: &Value) -> String {
+    if let Some(item_id) = value.get("item_id").and_then(Value::as_str) {
+        return format!(
+            "{item_id}:{}",
+            value
+                .get("content_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+    format!(
+        "{}:{}",
+        value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        value
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    )
+}
+
+fn restore_openai_sse_output_text<R>(
+    value: &mut Value,
+    streams: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
+    resolve: &mut R,
+) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let event_type = value.get("type").and_then(Value::as_str).map(str::to_owned);
+    match event_type.as_deref() {
+        Some("response.output_text.delta") => {
+            let key = openai_output_stream_key(value);
+            if let Some(Value::String(delta)) = value.get_mut("delta") {
+                *delta = streams.entry(key).or_default().push(delta, resolve)?;
+            }
+        }
+        Some("response.output_text.done") => {
+            let key = openai_output_stream_key(value);
+            streams.remove(&key);
+            if let Some(Value::String(text)) = value.get_mut("text") {
+                *text = resolve(text)?;
+            }
+        }
+        Some("response.completed") => {
+            if let Some(response) = value.get_mut("response") {
+                restore_openai_output_text(response, resolve)?;
+            }
+            streams.clear();
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn contains_completed_function_call(value: &Value) -> bool {
@@ -3037,14 +3222,19 @@ mod tests {
                 "id": "chat_1", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
             })
         );
-        let first_out = state.rewrite_block(first.as_bytes(), &plugins).unwrap();
+        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let first_out = state
+            .rewrite_block(first.as_bytes(), &plugins, false, &mut resolve)
+            .unwrap();
         assert_eq!(first_out.len(), 1);
         assert!(!String::from_utf8_lossy(&first_out[0]).contains("tool_calls"));
         assert!(state
-            .rewrite_block(second.as_bytes(), &plugins)
+            .rewrite_block(second.as_bytes(), &plugins, false, &mut resolve)
             .unwrap()
             .is_empty());
-        let finished = state.rewrite_block(finish.as_bytes(), &plugins).unwrap();
+        let finished = state
+            .rewrite_block(finish.as_bytes(), &plugins, false, &mut resolve)
+            .unwrap();
         assert_eq!(finished.len(), 2);
         let completed = String::from_utf8_lossy(&finished[0]);
         assert!(completed.contains("call_1"), "{completed}");
@@ -3257,6 +3447,47 @@ mod tests {
     }
 
     #[test]
+    fn opted_in_response_text_restores_known_handles_only() {
+        let mut value = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "use <<CHARGE_0123456789abcdef>> and <<UNKNOWN_0123456789abcdef>>"
+                }]
+            }]
+        });
+        let mut resolve =
+            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"));
+        restore_openai_output_text(&mut value, &mut resolve).unwrap();
+        assert_eq!(
+            value["output"][0]["content"][0]["text"],
+            "use local-value and <<UNKNOWN_0123456789abcdef>>"
+        );
+    }
+
+    #[test]
+    fn opted_in_openai_stream_restores_a_handle_split_across_events() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver =
+            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let first = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"before <<CHAR\"}\n\n";
+        let second = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"GE_0123456789abcdef>> after\"}\n\n";
+        let first =
+            rewrite_openai_sse_block(first, &plugins, true, &mut streams, &mut resolve).unwrap();
+        let second =
+            rewrite_openai_sse_block(second, &plugins, true, &mut streams, &mut resolve).unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        );
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
+    }
+
+    #[test]
     fn authenticated_path_does_not_accept_prefix_confusion() {
         assert_eq!(
             authenticated_request_path("/token/v1/responses", "token"),
@@ -3282,8 +3513,12 @@ mod tests {
     fn untouched_sse_framing_is_preserved() {
         let input = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\r\n\r\n";
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
         assert_eq!(
-            rewrite_openai_sse_block(input, &plugins).unwrap().as_ref(),
+            rewrite_openai_sse_block(input, &plugins, false, &mut streams, &mut resolve,)
+                .unwrap()
+                .as_ref(),
             input
         );
     }

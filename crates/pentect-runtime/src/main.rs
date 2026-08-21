@@ -127,6 +127,10 @@ pub fn load_decode_config(profile: Profile) -> Result<pentect_core::DecodeConfig
     config::decode_config(profile)
 }
 
+pub fn output_restore_enabled() -> Result<bool, String> {
+    config::output_restore_enabled()
+}
+
 pub fn load_environment_variable_prefix() -> Result<String, String> {
     config::environment_variable_prefix()
 }
