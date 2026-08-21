@@ -4251,7 +4251,6 @@ mod tests {
         )
         .unwrap();
         let source = plugins::plugin_source(&root.to_string_lossy()).unwrap();
-        let manifest = load_plugin_manifest(&source).unwrap().unwrap();
         let runtime = plugin_runtime_dirs_for_source(&name, &source).unwrap();
 
         setup_plugin_source(source, true, Some("cpu"), false).unwrap();
