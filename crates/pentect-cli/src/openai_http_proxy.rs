@@ -2752,8 +2752,14 @@ mod tests {
             !request.contains(&openrouter),
             "OpenRouter key reached upstream"
         );
-        assert!(request.contains("<<KEYED_SECRET_"), "{request}");
-        assert!(request.matches("<<").count() >= 2, "{request}");
+        assert!(
+            request.contains("<<KEYED_SECRET_"),
+            "keyed-secret handle did not reach upstream"
+        );
+        assert!(
+            request.matches("<<").count() >= 2,
+            "expected prompt handles did not reach upstream"
+        );
     }
 
     #[test]

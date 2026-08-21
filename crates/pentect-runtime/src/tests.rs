@@ -588,10 +588,19 @@ fn active_prompt_masks_keyed_and_vendor_secrets_in_prose() {
     let mut masker = ActiveToolOutputMasker::new().unwrap();
     let masked = masker.mask_prompt_text(&prompt).unwrap().unwrap();
 
-    assert!(!masked.contains(&password), "{masked}");
-    assert!(!masked.contains(&openrouter), "{masked}");
-    assert!(masked.contains("<<KEYED_SECRET_"), "{masked}");
-    assert!(masked.matches("<<").count() >= 2, "{masked}");
+    assert!(!masked.contains(&password), "password was not masked");
+    assert!(
+        !masked.contains(&openrouter),
+        "OpenRouter key was not masked"
+    );
+    assert!(
+        masked.contains("<<KEYED_SECRET_"),
+        "keyed-secret handle was not emitted"
+    );
+    assert!(
+        masked.matches("<<").count() >= 2,
+        "expected prompt handles were not emitted"
+    );
 }
 
 #[test]
