@@ -28,7 +28,7 @@ requests and responses without changing the client UI.
    does not need the real value. Protected launches also provide a local
    environment binding such as
    `$env:PENTECT_KAGGLE_API_TOKEN_85268c441f88c284` in PowerShell or
-   `$PENTECT_KAGGLE_API_TOKEN_85268c441f88c284` in a POSIX shell.
+   `${PENTECT_KAGGLE_API_TOKEN_85268c441f88c284}` in a POSIX shell.
 
 4. **Restore only before a local tool runs**
 

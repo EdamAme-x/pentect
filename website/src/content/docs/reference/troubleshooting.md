@@ -59,9 +59,9 @@ Use the complete name from the current handle. For example:
 PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a
 ```
 
-In PowerShell, reference it as
-`$env:PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a`. In Bash or Zsh, use
-`$PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a`.
+For a handle written as `<<LABEL_ID>>`, reference `$env:PENTECT_LABEL_ID` in
+PowerShell or `${PENTECT_LABEL_ID}` in Bash and Zsh. The angle brackets belong
+only to the handle, not to the environment variable name.
 
 If the command output shows another handle instead of the value, masking worked.
 Do not use `echo` as a test. Test the intended API call with a fake credential
@@ -192,10 +192,10 @@ before following live events, `--json` keeps the JSONL representation, and
 version, OS, architecture, PID, source location, and a backtrace so a crash can
 be investigated after the process exits.
 
-Gateway warnings include a fixed endpoint class, HTTP method, status, retry
-hint, PID, OS, and architecture. OCR entries report the backend and a fixed
-outcome such as `scan-complete`, `scan-failed kind=decode`, or
-`scan-unavailable-blocked`. They never include URLs, image bytes, recognized
+Gateway warnings include a fixed endpoint class, HTTP method, retry hint, PID,
+OS, and architecture, and can include an HTTP status. OCR entries report the
+backend and a fixed outcome such as `scan-complete`, `scan-failed kind=decode`,
+or `scan-unavailable-blocked`. They never include URLs, image bytes, recognized
 text, or raw provider/OCR errors.
 
 Repeated diagnostics with the same safe fields are combined into one entry

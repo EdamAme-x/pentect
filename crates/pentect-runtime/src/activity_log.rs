@@ -237,20 +237,20 @@ impl ActivityEvent {
         Self {
             time: jiff::Timestamp::now().to_string(),
             action: "warning".to_string(),
-            surface: safe_identifier(surface),
+            surface: diagnostic_surface(surface),
             count: 1,
             labels: Vec::new(),
             target: None,
-            event: Some(safe_identifier(event)),
-            kind: kind.map(safe_identifier),
-            endpoint: endpoint.map(safe_identifier),
-            method: method.map(safe_identifier),
+            event: Some(diagnostic_event(event)),
+            kind: kind.map(diagnostic_kind),
+            endpoint: endpoint.map(diagnostic_endpoint),
+            method: method.map(diagnostic_method),
             status,
             retryable,
             last_time: None,
             duration_ms: None,
             pid: Some(std::process::id()),
-            version: version.map(|value| value.chars().take(64).collect()),
+            version: version.and_then(diagnostic_version),
             os: Some(std::env::consts::OS.to_string()),
             arch: Some(std::env::consts::ARCH.to_string()),
             exit_code: None,
@@ -277,7 +277,11 @@ impl ActivityEvent {
         let mut out = Self::diagnostic(
             surface, event, kind, endpoint, method, status, retryable, version,
         );
-        out.action = safe_identifier(action);
+        out.action = match action {
+            "warning" => "warning",
+            _ => "diagnostic",
+        }
+        .to_string();
         out.count = count.max(1);
         out
     }
@@ -1046,6 +1050,153 @@ fn safe_identifier(value: &str) -> String {
     }
 }
 
+fn allowed_diagnostic_identifier(value: &str, allowed: &[&str]) -> String {
+    if allowed.contains(&value) {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn diagnostic_surface(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &["claude", "cloud-code", "gemini", "logger", "ocr", "openai"],
+    )
+}
+
+fn diagnostic_event(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "cmd-binding-skipped",
+            "connection-failed",
+            "diagnostic-queue-overflow",
+            "file-attestation-unavailable",
+            "file-registry-unavailable",
+            "gateway-busy",
+            "gateway-stopped",
+            "provider-mcp-credential-forwarded",
+            "request-content-encoding-skipped",
+            "request-encode-skipped",
+            "request-failed",
+            "request-invalid-json",
+            "request-protection-skipped",
+            "request-rejected",
+            "response-protection-skipped",
+            "response-restore-skipped",
+            "scan-complete",
+            "scan-failed",
+            "scan-failure-allowed",
+            "scan-failure-blocked",
+            "scan-unavailable-allowed",
+            "scan-unavailable-blocked",
+            "shell-secret-unresolved",
+            "sse-event-limit",
+            "sse-restore-skipped",
+            "sse-tool-limit",
+            "stream-event-protection-skipped",
+            "tool-input-restore-skipped",
+            "unknown-content-block",
+            "unknown-endpoint",
+            "upstream-response",
+        ],
+    )
+}
+
+fn diagnostic_kind(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "authentication",
+            "bundled",
+            "capacity",
+            "client-connection",
+            "conflict",
+            "connect",
+            "credential-forwarding",
+            "decode",
+            "disabled",
+            "initialize",
+            "internal",
+            "limit",
+            "model-load",
+            "policy",
+            "preprocess",
+            "protection",
+            "protocol",
+            "rate-limit",
+            "recognition",
+            "redirect",
+            "resolution",
+            "response-body",
+            "runtime",
+            "source-or-limit",
+            "storage",
+            "stream",
+            "timeout",
+            "unclassified",
+            "unexpected-status",
+            "unsupported",
+            "upstream-client",
+            "upstream-server",
+            "windows",
+            "macos",
+        ],
+    )
+}
+
+fn diagnostic_endpoint(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "bundled",
+            "chat-completions",
+            "control",
+            "count-tokens",
+            "disabled",
+            "files",
+            "files-collection",
+            "gateway",
+            "generate-content",
+            "health",
+            "image",
+            "input-tokens",
+            "macos",
+            "messages",
+            "models",
+            "responses",
+            "responses-resource",
+            "stream-generate-content",
+            "telemetry",
+            "tool-input",
+            "unknown",
+            "unsupported",
+            "windows",
+        ],
+    )
+}
+
+fn diagnostic_method(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "DELETE", "GET", "HEAD", "HTTP", "OPTIONS", "OTHER", "PATCH", "POST", "PUT", "SCAN",
+        ],
+    )
+}
+
+fn diagnostic_version(value: &str) -> Option<String> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let mut parts = value.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+    }) && parts.next().is_none();
+    valid.then(|| value.to_string())
+}
+
 fn safe_panic_location(value: &str) -> String {
     value
         .chars()
@@ -1327,5 +1478,37 @@ mod tests {
         assert!(drained.iter().all(|event| !serde_json::to_string(event)
             .unwrap()
             .contains("image bytes")));
+    }
+
+    #[test]
+    fn structured_diagnostics_reject_unlisted_identifier_shaped_input() {
+        let event = ActivityEvent::diagnostic(
+            "tenantCredential123",
+            "httpsApiExampleComPrivateRoute",
+            Some("apiKeyMaterial123"),
+            Some("accountIdentifier456"),
+            Some("SECRETVERB"),
+            Some(502),
+            Some(false),
+            Some("12345678901234567890"),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+
+        for rejected in [
+            "tenantCredential123",
+            "httpsApiExampleComPrivateRoute",
+            "apiKeyMaterial123",
+            "accountIdentifier456",
+            "SECRETVERB",
+            "12345678901234567890",
+        ] {
+            assert!(!json.contains(rejected), "persisted rejected field: {json}");
+        }
+        assert_eq!(event.surface, "unknown");
+        assert_eq!(event.event.as_deref(), Some("unknown"));
+        assert_eq!(event.kind.as_deref(), Some("unknown"));
+        assert_eq!(event.endpoint.as_deref(), Some("unknown"));
+        assert_eq!(event.method.as_deref(), Some("unknown"));
+        assert_eq!(event.version, None);
     }
 }

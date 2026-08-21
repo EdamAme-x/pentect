@@ -29,21 +29,22 @@ identity key stays on the local device.
 
 ## How a tool uses a handle
 
-Protected launches provide an environment binding for each handle. The binding
-name is `PENTECT_` followed by the text inside the handle:
+Protected launches provide an environment binding for each handle. Remove the
+angle brackets and add `PENTECT_` to the handle's label and ID. For example,
+`<<DATABASE_URL_ID>>` maps to `PENTECT_DATABASE_URL_ID`:
 
 ::: code-group
 
 ```powershell [PowerShell]
-# Handle: <<DATABASE_URL_4ce8a3b0a6f64e12>>
+# Handle: <<DATABASE_URL_ID>>
 irm https://api.example.test/status `
-  -Headers @{ Authorization = "Bearer $env:PENTECT_DATABASE_URL_4ce8a3b0a6f64e12" }
+  -Headers @{ Authorization = "Bearer $env:PENTECT_DATABASE_URL_ID" }
 ```
 
 ```sh [Bash / Zsh]
-# Handle: <<DATABASE_URL_4ce8a3b0a6f64e12>>
+# Handle: <<DATABASE_URL_ID>>
 curl https://api.example.test/status \
-  -H "Authorization: Bearer $PENTECT_DATABASE_URL_4ce8a3b0a6f64e12"
+  -H "Authorization: Bearer ${PENTECT_DATABASE_URL_ID}"
 ```
 
 :::
@@ -54,7 +55,8 @@ placing the real value in the command text.
 
 Do not assign the binding to a normal variable in one tool call and expect a
 later tool call to keep it. Agent shells may be separate processes. Reference
-the binding in each command that needs it.
+the complete binding literally in each command that needs it; do not construct
+its name dynamically or print it first.
 
 ## Lifetime and stability
 

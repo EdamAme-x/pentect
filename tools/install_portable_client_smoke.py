@@ -30,11 +30,11 @@ LATEST_CLIENTS = (
 )
 
 RELEASE_CLIENTS = (
-    "@anthropic-ai/claude-code@2.1.237",
-    "opencode-ai@1.18.19",
+    "@anthropic-ai/claude-code@2.1.238",
+    "opencode-ai@1.18.20",
     "@earendil-works/pi-coding-agent@0.84.2",
     "@continuedev/cli@1.5.47",
-    "cline@3.0.55",
+    "cline@3.0.56",
     "@google/gemini-cli@0.56.0",
 )
 
@@ -131,7 +131,7 @@ def main() -> int:
     parser.add_argument("--only", choices=("codex",), help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    codex = latest_installable_codex() if args.mode == "latest" else "@openai/codex@0.148.0"
+    codex = latest_installable_codex() if args.mode == "latest" else "@openai/codex@0.149.0"
     install(codex)
     if args.only != "codex":
         for client in LATEST_CLIENTS if args.mode == "latest" else RELEASE_CLIENTS:

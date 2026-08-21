@@ -208,15 +208,13 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let request_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
     let context = crate::gateway_diagnostics::RequestContext {
-        endpoint: classify_endpoint(
-            request
-                .uri()
-                .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/"),
-        )
-        .diagnostic_name(),
+        endpoint: diagnostic_endpoint_name(request_path, &state.auth),
         method: crate::gateway_diagnostics::method_name(request.method()),
     };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
@@ -531,6 +529,13 @@ fn classify_endpoint(path_and_query: &str) -> CloudCodeEndpoint {
         | "/v1internal:recordSmartchoicesFeedback" => CloudCodeEndpoint::Telemetry,
         _ => CloudCodeEndpoint::Unknown,
     }
+}
+
+fn diagnostic_endpoint_name(request_path: &str, auth: &str) -> &'static str {
+    authenticated_request_path(request_path, auth)
+        .map(classify_endpoint)
+        .unwrap_or(CloudCodeEndpoint::Unknown)
+        .diagnostic_name()
 }
 
 fn enforce_known_endpoint(
@@ -1625,6 +1630,14 @@ mod tests {
         assert_eq!(
             authenticated_request_path("/tokenx/v1internal:countTokens", "token"),
             None
+        );
+        assert_eq!(
+            diagnostic_endpoint_name("/token/v1internal:countTokens", "token"),
+            "count-tokens"
+        );
+        assert_eq!(
+            diagnostic_endpoint_name("/tokenx/v1internal:countTokens", "token"),
+            "unknown"
         );
     }
 

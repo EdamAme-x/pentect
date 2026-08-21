@@ -718,19 +718,12 @@ fn union_region_rects(regions: &[ImageTextRegion]) -> Option<NormalizedImageRect
 fn image_secret_findings(
     _bytes: &[u8],
     _key: &[u8; 32],
-    cfg: &ImageOcrConfig,
+    _cfg: &ImageOcrConfig,
 ) -> Result<ImageSecretFindings, String> {
-    if matches!(cfg.mode, crate::config::ImageOcrMode::Off) {
-        Ok(ImageSecretFindings {
-            findings: Vec::new(),
-            scan_failure: None,
-        })
-    } else {
-        Ok(ImageSecretFindings {
-            findings: Vec::new(),
-            scan_failure: Some("disabled"),
-        })
-    }
+    Ok(ImageSecretFindings {
+        findings: Vec::new(),
+        scan_failure: Some("disabled"),
+    })
 }
 
 fn ocr_failure_kind(error: &str) -> &'static str {
@@ -3036,6 +3029,16 @@ mod tests {
             fetch_seconds: 8,
             unscanned_images: UnscannedImagePolicy::Allow,
         }
+    }
+
+    #[cfg(not(feature = "ocr"))]
+    #[test]
+    fn disabled_build_never_reports_an_image_as_scanned() {
+        let mut cfg = test_config();
+        cfg.mode = ImageOcrMode::Off;
+        let findings = image_secret_findings(&[], &[7; 32], &cfg).unwrap();
+        assert_eq!(findings.scan_failure, Some("disabled"));
+        assert!(findings.is_empty());
     }
 
     #[cfg(feature = "ocr")]
