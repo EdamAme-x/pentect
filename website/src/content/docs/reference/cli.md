@@ -18,6 +18,13 @@ cannot complete a requested change.
 | `pentect codex app` | Launch Codex App for this protected session |
 | `pentect claude app` | Launch Claude Desktop for this protected session |
 
+### Unavailable client commands
+
+Antigravity, Aider, Continue, Cline, Roo Code, Zed, Goose, Junie, and Gemini
+CLI are not implemented in the public CLI. Commands such as `pentect aider`
+and `pentect gemini` return an unknown-command error. Their documentation pages
+describe status only; they do not indicate working protection.
+
 For Codex and Claude, `--set-default` adds a reviewed function to the current
 shell's user profile. The normal `codex` or `claude` command then launches
 through Pentect. `--unset-default` removes only the block Pentect added.

@@ -40,6 +40,10 @@ aside: false
     <small>CLI</small><strong>Pi</strong>
     <span>Run Pi through a temporary protected provider.</span><b aria-hidden="true">→</b>
   </a>
+  <a href="/reference/compatibility/#not-implemented" class="docs-grid__item">
+    <small>Status</small><strong>Not implemented</strong>
+    <span>See clients that are documented but not currently available.</span><b aria-hidden="true">→</b>
+  </a>
 </DocsGrid>
 
 ## Explore
