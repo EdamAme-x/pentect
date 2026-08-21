@@ -2866,6 +2866,11 @@ struct PluginFile {
     commands: Option<PlatformCommandsFile>,
     #[serde(default)]
     hooks: Vec<String>,
+    // Setup is executed and validated by pentect-cli before approval. The
+    // runtime only needs to tolerate this CLI-owned metadata when it loads an
+    // already approved command plugin.
+    #[serde(rename = "setup")]
+    _setup: Option<toml::Value>,
     publisher: Option<PublisherFile>,
     execution: Option<ExecutionFile>,
     #[serde(default)]
@@ -3876,6 +3881,26 @@ for line in sys.stdin:
                 Some(hook)
             );
         }
+    }
+
+    #[test]
+    fn runtime_manifest_accepts_cli_owned_setup_metadata() {
+        let file: PluginFile = toml::from_str(
+            r#"
+schema = "pentect.plugin.v1"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+
+[setup]
+command = ["python", "{plugin}/setup.py"]
+profiles = ["auto", "cpu", "cuda"]
+profile_arg = "--profile"
+download = "CPU: about 3 GB"
+disk = "CPU: about 5 GB"
+"#,
+        )
+        .unwrap();
+        assert!(file._setup.is_some());
     }
 
     #[test]
