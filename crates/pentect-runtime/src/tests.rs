@@ -572,6 +572,38 @@ fn active_tool_output_masker_reuses_in_memory_state() {
 }
 
 #[test]
+fn active_prompt_masks_keyed_and_vendor_secrets_in_prose() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-keyed-detector");
+
+    let password = ["test-pentect", "-password-284-regression"].concat();
+    let openrouter = [
+        "sk-or-v1-",
+        "0123456789abcdef0123456789abcdef",
+        "0123456789abcdef0123456789abcdef",
+    ]
+    .concat();
+    let prompt =
+        format!("Audit fixture: sudo password is {password} and OPENROUTER_API_KEY={openrouter}.");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let masked = masker.mask_prompt_text(&prompt).unwrap().unwrap();
+
+    assert!(!masked.contains(&password), "password was not masked");
+    assert!(
+        !masked.contains(&openrouter),
+        "OpenRouter key was not masked"
+    );
+    assert!(
+        masked.contains("<<KEYED_SECRET_"),
+        "keyed-secret handle was not emitted"
+    );
+    assert!(
+        masked.matches("<<").count() >= 2,
+        "expected prompt handles were not emitted"
+    );
+}
+
+#[test]
 fn bridge_masks_prompt_wraps_shell_and_masks_result() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("bridge-mask");

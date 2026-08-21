@@ -6,8 +6,8 @@ use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
     load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
-    EntropyDetector, EnvParser, EnvValueDetector, Input, JsonParser, Kind, MaskResult,
-    NdjsonParser, PemDetector, Profile, ProfilePolicy, Recovery, Region, RegionKind,
+    EntropyDetector, EnvParser, EnvValueDetector, Input, JsonParser, KeyValueDetector, Kind,
+    MaskResult, NdjsonParser, PemDetector, Profile, ProfilePolicy, Recovery, Region, RegionKind,
     SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -17,6 +17,7 @@ const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 static PENTECT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+static PENTECT_PROMPT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -35,6 +36,7 @@ pub(crate) struct ToolScalarInput {
 pub(crate) struct OutputMasker {
     store: MemoryStore,
     engine: &'static Engine,
+    prompt_engine: &'static Engine,
     plugin_middleware: PluginMiddleware,
     environment_prefix: String,
     mode: OutputMaskerMode,
@@ -67,6 +69,7 @@ impl OutputMasker {
         Ok(Self {
             store,
             engine: pentect_engine()?,
+            prompt_engine: pentect_prompt_engine()?,
             plugin_middleware,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Shared,
@@ -82,6 +85,7 @@ impl OutputMasker {
         Ok(Self {
             store,
             engine: pentect_engine()?,
+            prompt_engine: pentect_prompt_engine()?,
             plugin_middleware: PluginMiddleware::from_env()?,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
@@ -126,7 +130,7 @@ impl OutputMasker {
         // Prompt scalars are structurally text, but dotenv assignments can be
         // embedded in prose. Run the Env parser first so assignment labels are
         // preserved, then feed the result through the same cached text engine.
-        let env_result = self.engine.mask(
+        let env_result = self.prompt_engine.mask(
             Input {
                 kind: Kind::Env,
                 data: remasked,
@@ -141,7 +145,7 @@ impl OutputMasker {
         let mut result = mask_read_input_with_engine_plugins_and_identity(
             self.store.session.key,
             self.store.session.identity_key,
-            self.engine,
+            self.prompt_engine,
             &self.plugin_middleware,
             Input {
                 kind: Kind::Text,
@@ -155,7 +159,7 @@ impl OutputMasker {
             initially_masked,
             &Kind::Text,
         )?;
-        let final_result = self.engine.mask(
+        let final_result = self.prompt_engine.mask(
             Input {
                 kind: Kind::Text,
                 data: masked,
@@ -911,7 +915,22 @@ fn pentect_engine() -> Result<&'static Engine, String> {
     }
 }
 
+fn pentect_prompt_engine() -> Result<&'static Engine, String> {
+    match PENTECT_PROMPT_ENGINE.get_or_init(build_pentect_prompt_engine) {
+        Ok(engine) => Ok(engine),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 fn build_pentect_engine() -> Result<Engine, String> {
+    build_pentect_engine_with_prompt_detectors(false)
+}
+
+fn build_pentect_prompt_engine() -> Result<Engine, String> {
+    build_pentect_engine_with_prompt_detectors(true)
+}
+
+fn build_pentect_engine_with_prompt_detectors(prompt: bool) -> Result<Engine, String> {
     let mut builder = Engine::builder()
         .parser(Kind::Json, Box::new(JsonParser))
         .parser(Kind::Ndjson, Box::new(NdjsonParser))
@@ -919,7 +938,11 @@ fn build_pentect_engine() -> Result<Engine, String> {
         .structured_parsers()
         .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
-        .detector(Box::new(CredSweeperNativeDetector::builtin()))
+        .detector(Box::new(CredSweeperNativeDetector::builtin()));
+    if prompt {
+        builder = builder.detector(Box::new(KeyValueDetector));
+    }
+    builder = builder
         .detector(Box::new(EnvValueDetector))
         .detector(Box::new(PemDetector::default()))
         .detector(Box::new(EntropyDetector::default()))
