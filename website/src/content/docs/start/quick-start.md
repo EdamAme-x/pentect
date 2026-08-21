@@ -34,9 +34,10 @@ settings of Codex or Claude.
    `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the real value.
 
    When the agent needs the value in a shell command, it can use the matching
-   `PENTECT_DATABASE_URL_4ce8a3b0a6f64e12` environment binding. Pentect adds
-   the binding to the protected tool process; it is not a permanent user
-   environment variable.
+   `$env:PENTECT_LABEL_ID` PowerShell binding or `${PENTECT_LABEL_ID}` POSIX
+   binding for a `<<LABEL_ID>>` handle. Pentect adds the binding to the
+   protected tool process; it is not a permanent user environment variable.
+   See [Handles](/start/handles/) for the exact syntax.
 
 4. Watch local protection events when you need to verify a flow.
 
@@ -84,15 +85,22 @@ pentect codex exec --full-auto
 pentect claude --model sonnet
 ```
 
-The same launch pattern works for other supported clients:
+The same launch pattern works for other supported clients. The complete,
+release-tested matrix is on the [Compatibility](/reference/compatibility/) page:
 
 | Client | Command |
 | --- | --- |
+| OpenCode | `pentect opencode` |
+| Pi | `pentect pi` |
+| Antigravity CLI | `pentect antigravity` |
+| Aider | `pentect aider` |
 | Continue CLI | `pentect continue` |
 | Cline CLI | `pentect cline` |
+| Roo Code | `pentect roo` |
 | Zed | `pentect zed` |
 | Goose CLI | `pentect goose` |
 | Junie CLI | `pentect junie` |
+| Gemini CLI | `pentect gemini` |
 
 Each command protects a specific surface. Check the client page before you
 use desktop, autocomplete, or external-agent features.

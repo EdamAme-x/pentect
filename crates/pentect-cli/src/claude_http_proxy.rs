@@ -41,6 +41,19 @@ static WARNED_UNKNOWN_CONTENT_BLOCK: AtomicBool = AtomicBool::new(false);
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 static WARNED_PROVIDER_MCP_CREDENTIALS: AtomicBool = AtomicBool::new(false);
 
+fn diagnostic(event: &str, kind: &str, endpoint: &str, retryable: bool) {
+    pentect_agent::record_http_diagnostic_activity(
+        "claude",
+        event,
+        kind,
+        endpoint,
+        "HTTP",
+        None,
+        retryable,
+        env!("CARGO_PKG_VERSION"),
+    );
+}
+
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 
@@ -52,6 +65,19 @@ enum AnthropicEndpoint {
     Models,
     Health,
     Unknown,
+}
+
+impl AnthropicEndpoint {
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "count-tokens",
+            Self::Files => "files",
+            Self::Models => "models",
+            Self::Health => "health",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 pub(crate) struct ClaudeHttpProxyGuard {
@@ -84,6 +110,17 @@ impl ClaudeHttpProxyGuard {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    crate::gateway_diagnostics::record(
+                        "claude",
+                        "gateway-stopped",
+                        "runtime",
+                        crate::gateway_diagnostics::RequestContext {
+                            endpoint: "gateway",
+                            method: "HTTP",
+                        },
+                        None,
+                        false,
+                    );
                     let _ = ready_tx.send(Err(format!(
                         "could not start Claude HTTP proxy runtime: {error}"
                     )));
@@ -94,7 +131,18 @@ impl ClaudeHttpProxyGuard {
                 if let Err(error) =
                     run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
                 {
-                    eprintln!("[pentect] Claude HTTP proxy stopped: {error}");
+                    crate::gateway_diagnostics::record(
+                        "claude",
+                        "gateway-stopped",
+                        "runtime",
+                        crate::gateway_diagnostics::RequestContext {
+                            endpoint: "gateway",
+                            method: "HTTP",
+                        },
+                        None,
+                        false,
+                    );
+                    let _ = error;
                 }
             });
         });
@@ -194,7 +242,17 @@ async fn run_proxy(
                     builder.max_buf_size(64 * 1024).max_headers(128);
                     if let Err(error) = builder.serve_connection(io, service).await {
                         if !error.is_incomplete_message() {
-                            eprintln!("[pentect] Claude HTTP proxy connection failed: {error}");
+                            crate::gateway_diagnostics::record(
+                                "claude",
+                                "connection-failed",
+                                "client-connection",
+                                crate::gateway_diagnostics::RequestContext {
+                                    endpoint: "gateway",
+                                    method: "HTTP",
+                                },
+                                None,
+                                true,
+                            );
                         }
                     }
                 });
@@ -212,7 +270,26 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let context = crate::gateway_diagnostics::RequestContext {
+        endpoint: classify_anthropic_endpoint(
+            request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/"),
+        )
+        .diagnostic_name(),
+        method: crate::gateway_diagnostics::method_name(request.method()),
+    };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
+        crate::gateway_diagnostics::record(
+            "claude",
+            "gateway-busy",
+            "capacity",
+            context,
+            Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            true,
+        );
         return Ok(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Pentect proxy is busy",
@@ -221,14 +298,18 @@ async fn proxy_request(
     match proxy_request_inner(request, &state).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            eprintln!("[pentect] Claude HTTP proxy request failed: {error}");
-            let local_rejection = error.starts_with("image blocked:")
-                || error.starts_with("document blocked:")
-                || error.starts_with("remote ")
-                || error.starts_with("file upload blocked:")
-                || error.starts_with("Files API upload ")
-                || error.starts_with("plugin blocked:")
-                || error.starts_with("unknown format blocked:");
+            let local_rejection = crate::gateway_diagnostics::is_local_rejection(&error);
+            let response_status = if local_rejection {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            crate::gateway_diagnostics::record_request_failure(
+                "claude",
+                context,
+                &error,
+                response_status.as_u16(),
+            );
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -352,7 +433,7 @@ async fn proxy_request_inner(
         reqwest::Body::wrap_stream(stream)
     };
 
-    let mut upstream_request = state.client.request(method, upstream_url);
+    let mut upstream_request = state.client.request(method.clone(), upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
         if state.headers.forward_incoming_header(name.as_str())
@@ -370,6 +451,14 @@ async fn proxy_request_inner(
         .await
         .map_err(|error| reqwest_error_message("could not reach Claude upstream", &error))?;
     let status = upstream_response.status();
+    crate::gateway_diagnostics::record_upstream_status(
+        "claude",
+        crate::gateway_diagnostics::RequestContext {
+            endpoint: endpoint.diagnostic_name(),
+            method: crate::gateway_diagnostics::method_name(&method),
+        },
+        status,
+    );
     let response_headers = upstream_response.headers().clone();
     if response_headers
         .get(hyper::header::CONTENT_ENCODING)
@@ -433,9 +522,7 @@ async fn proxy_request_inner(
                     .await
                     .is_err()
                 {
-                    eprintln!(
-                        "[pentect] file attestation unavailable; uploaded file remains untrusted"
-                    );
+                    diagnostic("file-attestation-unavailable", "storage", "files", true);
                 } else if let Ok(mut files) = state.files.lock() {
                     crate::http_files::remember_scoped_file_coverage(
                         &mut files,
@@ -444,7 +531,7 @@ async fn proxy_request_inner(
                         coverage,
                     );
                 } else {
-                    eprintln!("[pentect] uploaded file registry unavailable; persistent attestation retained");
+                    diagnostic("file-registry-unavailable", "storage", "files", true);
                 }
             }
         }
@@ -453,8 +540,8 @@ async fn proxy_request_inner(
         let response_body = run_response_plugins(response_body, &state.plugins)?;
         match rewrite_anthropic_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
-            Err(error) => {
-                eprintln!("[pentect] Claude response restoration skipped: {error}");
+            Err(_error) => {
+                diagnostic("response-restore-skipped", "protection", "messages", false);
                 response_body
             }
         }
@@ -686,7 +773,7 @@ fn protect_anthropic_request_body(
                     "unknown format blocked: Anthropic request is not valid JSON ({error}); set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
                 ));
             }
-            eprintln!("[pentect] Claude request protection skipped: invalid JSON: {error}");
+            diagnostic("request-invalid-json", "protocol", "messages", false);
             return Ok(ProtectedJsonBody {
                 body: body.clone(),
                 coverage: crate::http_files::Coverage::Partial,
@@ -749,7 +836,12 @@ fn protect_anthropic_request_body(
                 "Anthropic request blocked: content inspection is unavailable ({error})"
             ));
         }
-        eprintln!("[pentect] Claude request protection skipped: {error}");
+        diagnostic(
+            "request-protection-skipped",
+            "protection",
+            "messages",
+            false,
+        );
         return Ok(ProtectedJsonBody {
             body: body.clone(),
             coverage: crate::http_files::Coverage::Partial,
@@ -767,8 +859,8 @@ fn protect_anthropic_request_body(
             },
             local_response: None,
         }),
-        Err(error) => {
-            eprintln!("[pentect] Claude request protection skipped: encode failed: {error}");
+        Err(_error) => {
+            diagnostic("request-encode-skipped", "protocol", "messages", false);
             Ok(ProtectedJsonBody {
                 body: body.clone(),
                 coverage: crate::http_files::Coverage::Partial,
@@ -849,8 +941,11 @@ fn warn_provider_mcp_credentials(value: &Value) {
         })
         && !WARNED_PROVIDER_MCP_CREDENTIALS.swap(true, Ordering::Relaxed)
     {
-        eprintln!(
-            "[pentect] provider-side MCP authorization token is sent to the configured upstream"
+        diagnostic(
+            "provider-mcp-credential-forwarded",
+            "credential-forwarding",
+            "messages",
+            false,
         );
     }
 }
@@ -1013,7 +1108,7 @@ where
             return Ok(vec![Bytes::copy_from_slice(chunk)]);
         }
         if self.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
-            eprintln!("[pentect] Claude SSE restoration disabled: pending event exceeded limit");
+            diagnostic("sse-event-limit", "limit", "messages", false);
             return Ok(self.fail_open_with(chunk));
         }
         self.pending.extend_from_slice(chunk);
@@ -1055,7 +1150,7 @@ where
                 SseControlEvent::Other => {}
             }
             if active.bytes.len().saturating_add(block.len()) > MAX_PENDING_SSE_BYTES {
-                eprintln!("[pentect] Claude SSE restoration disabled: tool input exceeded limit");
+                diagnostic("sse-tool-limit", "limit", "messages", false);
                 let active = self.active_tool.take().expect("active tool exists");
                 output.push(Bytes::from(active.bytes));
                 output.push(Bytes::from(block));
@@ -1081,7 +1176,7 @@ where
                         if error.starts_with("plugin middleware:") {
                             return Err(error);
                         }
-                        eprintln!("[pentect] Claude SSE restoration skipped: {error}");
+                        diagnostic("sse-restore-skipped", "protection", "messages", false);
                         output.push(Bytes::from(active.bytes));
                     }
                 }
@@ -1389,9 +1484,7 @@ fn mask_content(
                     | "fallback" => {}
                     _ => {
                         if !WARNED_UNKNOWN_CONTENT_BLOCK.swap(true, Ordering::Relaxed) {
-                            eprintln!(
-                                "[pentect] unknown Anthropic content block passed through without text inspection"
-                            );
+                            diagnostic("unknown-content-block", "protocol", "messages", false);
                         }
                     }
                 }
@@ -1863,9 +1956,7 @@ where
         } else if shell_safe_secret_token(&resolved) {
             out.push_str(&resolved);
         } else {
-            eprintln!(
-                "[pentect] shell tool secret reference left unresolved: represented value is not shell-safe"
-            );
+            diagnostic("shell-secret-unresolved", "resolution", "tool-input", false);
             out.push_str(reference);
         }
         rest = &rest[end..];
@@ -1941,7 +2032,7 @@ fn inject_shell_environment(
                     if shell_safe_secret_token(&value) {
                         Some(format!("set \"{name}={value}\" && "))
                     } else {
-                        eprintln!("[pentect] cmd binding '{name}' was not injected because its value is not cmd-safe");
+                        diagnostic("cmd-binding-skipped", "resolution", "tool-input", false);
                         None
                     }
                 })
@@ -2012,8 +2103,13 @@ fn resolve_known_text(text: &str) -> Result<String, String> {
     match pentect_agent::resolve_known_text_from_active_memory_store(text) {
         Ok(Some(resolved)) => Ok(resolved),
         Ok(None) => Ok(text.to_string()),
-        Err(error) => {
-            eprintln!("[pentect] Claude tool input restoration skipped: {error}");
+        Err(_error) => {
+            diagnostic(
+                "tool-input-restore-skipped",
+                "resolution",
+                "tool-input",
+                false,
+            );
             Ok(text.to_string())
         }
     }
@@ -2025,13 +2121,23 @@ pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, St
         Ok(resolver) => match resolver.resolve_known_text(text) {
             Ok(Some(resolved)) => Ok(resolved),
             Ok(None) => Ok(text.to_string()),
-            Err(error) => {
-                eprintln!("[pentect] Claude tool input restoration skipped: {error}");
+            Err(_error) => {
+                diagnostic(
+                    "tool-input-restore-skipped",
+                    "resolution",
+                    "tool-input",
+                    false,
+                );
                 Ok(text.to_string())
             }
         },
-        Err(error) => {
-            eprintln!("[pentect] Claude tool input restoration skipped: {error}");
+        Err(_error) => {
+            diagnostic(
+                "tool-input-restore-skipped",
+                "resolution",
+                "tool-input",
+                false,
+            );
             Ok(text.to_string())
         }
     }
@@ -2090,7 +2196,7 @@ fn enforce_known_anthropic_endpoint(
         return Err("unknown format blocked: Anthropic endpoint is not supported; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through".to_string());
     }
     if !WARNED_UNKNOWN_ENDPOINT.swap(true, Ordering::Relaxed) {
-        eprintln!("[pentect] unknown Anthropic endpoint passed through without content inspection");
+        diagnostic("unknown-endpoint", "protocol", "unknown", false);
     }
     Ok(())
 }

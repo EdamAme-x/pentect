@@ -59,6 +59,11 @@ When OCR is enabled, it runs on your computer and Pentect covers detected
 sensitive areas before sending the image. Limits control the number of images,
 file size, image size, download time, and total check time.
 
+Windows uses Windows OCR, macOS uses Vision, and Linux uses Pentect's bundled
+local OCR engine and model files. Linux does not require a separately installed
+Tesseract service. `pentect doctor` reports the selected backend as `windows`,
+`macos`, or `bundled`.
+
 This also applies when a supported browser or MCP tool returns a screenshot as
 part of a tool result. Pentect applies the configured image policy before that
 result enters the next provider request. If the tool also returns page text, HTML, clipboard

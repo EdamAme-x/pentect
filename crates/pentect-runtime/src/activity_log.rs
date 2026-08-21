@@ -3,13 +3,13 @@ use crate::memory_store::MemoryStoreClient;
 use pentect_core::MaskResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_LABELS_PER_EVENT: usize = 64;
 const MAX_SEEN_EVENTS: usize = 4_096;
@@ -20,8 +20,12 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_CHANNEL_CAPACITY: usize = 1_024;
 const LOG_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const LOG_ROTATIONS: usize = 31;
+const DIAGNOSTIC_BATCH_WINDOW: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DIAGNOSTIC_CHANNEL_CAPACITY: usize = 1_024;
 static LOG_SHARE: OnceLock<bool> = OnceLock::new();
 static PERSISTENT_LOG: OnceLock<Option<PersistentLogWriter>> = OnceLock::new();
+static DIAGNOSTIC_WRITER: OnceLock<Option<DiagnosticWriter>> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ActivityEvent {
@@ -35,6 +39,20 @@ pub(crate) struct ActivityEvent {
     target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +91,39 @@ struct LifecycleSource {
 struct PersistentLogWriter {
     sender: SyncSender<LogMessage>,
     dropped: Arc<AtomicU64>,
+}
+
+struct DiagnosticWriter {
+    sender: SyncSender<DiagnosticMessage>,
+    dropped: Arc<AtomicU64>,
+}
+
+enum DiagnosticMessage {
+    Entry(Box<ActivityEvent>),
+    Flush(mpsc::Sender<()>),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DiagnosticKey {
+    action: String,
+    surface: String,
+    event: Option<String>,
+    kind: Option<String>,
+    endpoint: Option<String>,
+    method: Option<String>,
+    status: Option<u16>,
+    retryable: Option<bool>,
+    pid: Option<u32>,
+}
+
+struct PendingDiagnostic {
+    event: ActivityEvent,
+    first_seen: Instant,
+}
+
+#[derive(Default)]
+struct DiagnosticBatch {
+    pending: HashMap<DiagnosticKey, PendingDiagnostic>,
 }
 
 enum LogMessage {
@@ -122,6 +173,13 @@ impl ActivityEvent {
                 .collect(),
             target,
             event: None,
+            kind: None,
+            endpoint: None,
+            method: None,
+            status: None,
+            retryable: None,
+            last_time: None,
+            duration_ms: None,
             pid: None,
             version: None,
             os: None,
@@ -148,6 +206,13 @@ impl ActivityEvent {
             labels: Vec::new(),
             target: None,
             event: Some(safe_identifier(event)),
+            kind: None,
+            endpoint: None,
+            method: None,
+            status: None,
+            retryable: None,
+            last_time: None,
+            duration_ms: None,
             pid: Some(std::process::id()),
             version: Some(version.chars().take(64).collect()),
             os: Some(std::env::consts::OS.to_string()),
@@ -156,6 +221,69 @@ impl ActivityEvent {
             panic_location: panic_location.map(safe_panic_location),
             backtrace: backtrace.map(safe_backtrace),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn diagnostic(
+        surface: &str,
+        event: &str,
+        kind: Option<&str>,
+        endpoint: Option<&str>,
+        method: Option<&str>,
+        status: Option<u16>,
+        retryable: Option<bool>,
+        version: Option<&str>,
+    ) -> Self {
+        Self {
+            time: jiff::Timestamp::now().to_string(),
+            action: "warning".to_string(),
+            surface: diagnostic_surface(surface),
+            count: 1,
+            labels: Vec::new(),
+            target: None,
+            event: Some(diagnostic_event(event)),
+            kind: kind.map(diagnostic_kind),
+            endpoint: endpoint.map(diagnostic_endpoint),
+            method: method.map(diagnostic_method),
+            status,
+            retryable,
+            last_time: None,
+            duration_ms: None,
+            pid: Some(std::process::id()),
+            version: version.and_then(diagnostic_version),
+            os: Some(std::env::consts::OS.to_string()),
+            arch: Some(std::env::consts::ARCH.to_string()),
+            exit_code: None,
+            panic_location: None,
+            backtrace: None,
+        }
+    }
+}
+
+impl ActivityEvent {
+    #[allow(clippy::too_many_arguments)]
+    fn diagnostic_counted(
+        action: &str,
+        surface: &str,
+        event: &str,
+        kind: Option<&str>,
+        endpoint: Option<&str>,
+        method: Option<&str>,
+        status: Option<u16>,
+        retryable: Option<bool>,
+        version: Option<&str>,
+        count: u64,
+    ) -> Self {
+        let mut out = Self::diagnostic(
+            surface, event, kind, endpoint, method, status, retryable, version,
+        );
+        out.action = match action {
+            "warning" => "warning",
+            _ => "diagnostic",
+        }
+        .to_string();
+        out.count = count.max(1);
+        out
     }
 }
 
@@ -178,9 +306,46 @@ pub(crate) fn record_process(
 }
 
 pub(crate) fn flush_persistent() {
+    if let Some(writer) = diagnostic_writer() {
+        writer.flush();
+    }
     if let Some(writer) = persistent_log() {
         writer.flush();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_diagnostic(
+    surface: &str,
+    event: &str,
+    kind: Option<&str>,
+    endpoint: Option<&str>,
+    method: Option<&str>,
+    status: Option<u16>,
+    retryable: Option<bool>,
+    version: Option<&str>,
+) {
+    record(ActivityEvent::diagnostic(
+        surface, event, kind, endpoint, method, status, retryable, version,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_structured(
+    action: &str,
+    surface: &str,
+    event: &str,
+    kind: Option<&str>,
+    endpoint: Option<&str>,
+    method: Option<&str>,
+    status: Option<u16>,
+    retryable: Option<bool>,
+    version: Option<&str>,
+    count: u64,
+) {
+    record(ActivityEvent::diagnostic_counted(
+        action, surface, event, kind, endpoint, method, status, retryable, version, count,
+    ));
 }
 
 pub(crate) fn persistent_log_path() -> PathBuf {
@@ -437,6 +602,16 @@ fn codex_lifecycle_log_path() -> PathBuf {
 }
 
 fn record(event: ActivityEvent) {
+    if matches!(event.action.as_str(), "warning" | "diagnostic") {
+        if let Some(writer) = diagnostic_writer() {
+            writer.enqueue(event);
+            return;
+        }
+    }
+    record_immediate(event);
+}
+
+fn record_immediate(event: ActivityEvent) {
     let Ok(json) = serde_json::to_string(&event) else {
         return;
     };
@@ -445,6 +620,134 @@ fn record(event: ActivityEvent) {
     }
     let share = *LOG_SHARE.get_or_init(|| crate::config::activity_share_enabled().unwrap_or(true));
     let _ = delegated_process_host::send_activity(&json, share);
+}
+
+fn diagnostic_writer() -> Option<&'static DiagnosticWriter> {
+    DIAGNOSTIC_WRITER
+        .get_or_init(|| DiagnosticWriter::spawn().ok())
+        .as_ref()
+}
+
+impl DiagnosticWriter {
+    fn spawn() -> Result<Self, String> {
+        let (sender, receiver) = mpsc::sync_channel(DIAGNOSTIC_CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("pentect-diagnostic-writer".to_string())
+            .spawn(move || diagnostic_writer_loop(receiver, worker_dropped))
+            .map_err(|error| format!("could not start diagnostic writer: {error}"))?;
+        Ok(Self { sender, dropped })
+    }
+
+    fn enqueue(&self, event: ActivityEvent) {
+        match self
+            .sender
+            .try_send(DiagnosticMessage::Entry(Box::new(event)))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn flush(&self) {
+        let (sender, receiver) = mpsc::channel();
+        if self.sender.send(DiagnosticMessage::Flush(sender)).is_ok() {
+            let _ = receiver.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
+impl DiagnosticBatch {
+    fn push(&mut self, event: ActivityEvent, now: Instant) {
+        let key = DiagnosticKey {
+            action: event.action.clone(),
+            surface: event.surface.clone(),
+            event: event.event.clone(),
+            kind: event.kind.clone(),
+            endpoint: event.endpoint.clone(),
+            method: event.method.clone(),
+            status: event.status,
+            retryable: event.retryable,
+            pid: event.pid,
+        };
+        match self.pending.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                pending.event.count = pending.event.count.saturating_add(event.count);
+                pending.event.last_time = Some(event.time);
+                pending.event.duration_ms = Some(
+                    now.saturating_duration_since(pending.first_seen)
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PendingDiagnostic {
+                    event,
+                    first_seen: now,
+                });
+            }
+        }
+    }
+
+    fn drain_expired(&mut self, now: Instant, force: bool) -> Vec<ActivityEvent> {
+        let keys = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                force
+                    || now.saturating_duration_since(pending.first_seen) >= DIAGNOSTIC_BATCH_WINDOW
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| self.pending.remove(&key).map(|pending| pending.event))
+            .collect()
+    }
+}
+
+fn diagnostic_writer_loop(receiver: Receiver<DiagnosticMessage>, dropped: Arc<AtomicU64>) {
+    let mut batch = DiagnosticBatch::default();
+    loop {
+        match receiver.recv_timeout(DIAGNOSTIC_POLL_INTERVAL) {
+            Ok(DiagnosticMessage::Entry(event)) => batch.push(*event, Instant::now()),
+            Ok(DiagnosticMessage::Flush(acknowledge)) => {
+                flush_diagnostic_batch(&mut batch, &dropped, true);
+                let _ = acknowledge.send(());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                flush_diagnostic_batch(&mut batch, &dropped, false);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    flush_diagnostic_batch(&mut batch, &dropped, true);
+}
+
+fn flush_diagnostic_batch(batch: &mut DiagnosticBatch, dropped: &AtomicU64, force: bool) {
+    for event in batch.drain_expired(Instant::now(), force) {
+        record_immediate(event);
+    }
+    let lost = dropped.swap(0, Ordering::Relaxed);
+    if lost > 0 {
+        let mut event = ActivityEvent::diagnostic(
+            "logger",
+            "diagnostic-queue-overflow",
+            Some("capacity"),
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+        );
+        event.count = lost;
+        record_immediate(event);
+    }
 }
 
 fn persistent_log() -> Option<&'static PersistentLogWriter> {
@@ -657,6 +960,49 @@ fn format_event(event: &ActivityEvent) -> String {
             location,
         );
     }
+    if matches!(event.action.as_str(), "warning" | "diagnostic") && event.event.is_some() {
+        let mut details = Vec::new();
+        if let Some(kind) = &event.kind {
+            details.push(format!("kind={kind}"));
+        }
+        if let Some(endpoint) = &event.endpoint {
+            details.push(format!("endpoint={endpoint}"));
+        }
+        if let Some(method) = &event.method {
+            details.push(format!("method={method}"));
+        }
+        if let Some(status) = event.status {
+            details.push(format!("status={status}"));
+        }
+        if let Some(retryable) = event.retryable {
+            details.push(format!("retryable={retryable}"));
+        }
+        if let Some(duration_ms) = event.duration_ms {
+            details.push(format!("span_ms={duration_ms}"));
+        }
+        if let Some(pid) = event.pid {
+            details.push(format!("pid={pid}"));
+        }
+        let count = if event.count == 1 {
+            String::new()
+        } else {
+            format!(" x{}", event.count)
+        };
+        let details = if details.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", details.join("  "))
+        };
+        return format!(
+            "{}  {}/{}  {}{}{}",
+            event.time,
+            event.action,
+            event.surface,
+            event.event.as_deref().unwrap_or("event"),
+            count,
+            details,
+        );
+    }
     let labels = event
         .labels
         .iter()
@@ -702,6 +1048,153 @@ fn safe_identifier(value: &str) -> String {
     } else {
         value
     }
+}
+
+fn allowed_diagnostic_identifier(value: &str, allowed: &[&str]) -> String {
+    if allowed.contains(&value) {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn diagnostic_surface(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &["claude", "cloud-code", "gemini", "logger", "ocr", "openai"],
+    )
+}
+
+fn diagnostic_event(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "cmd-binding-skipped",
+            "connection-failed",
+            "diagnostic-queue-overflow",
+            "file-attestation-unavailable",
+            "file-registry-unavailable",
+            "gateway-busy",
+            "gateway-stopped",
+            "provider-mcp-credential-forwarded",
+            "request-content-encoding-skipped",
+            "request-encode-skipped",
+            "request-failed",
+            "request-invalid-json",
+            "request-protection-skipped",
+            "request-rejected",
+            "response-protection-skipped",
+            "response-restore-skipped",
+            "scan-complete",
+            "scan-failed",
+            "scan-failure-allowed",
+            "scan-failure-blocked",
+            "scan-unavailable-allowed",
+            "scan-unavailable-blocked",
+            "shell-secret-unresolved",
+            "sse-event-limit",
+            "sse-restore-skipped",
+            "sse-tool-limit",
+            "stream-event-protection-skipped",
+            "tool-input-restore-skipped",
+            "unknown-content-block",
+            "unknown-endpoint",
+            "upstream-response",
+        ],
+    )
+}
+
+fn diagnostic_kind(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "authentication",
+            "bundled",
+            "capacity",
+            "client-connection",
+            "conflict",
+            "connect",
+            "credential-forwarding",
+            "decode",
+            "disabled",
+            "initialize",
+            "internal",
+            "limit",
+            "model-load",
+            "policy",
+            "preprocess",
+            "protection",
+            "protocol",
+            "rate-limit",
+            "recognition",
+            "redirect",
+            "resolution",
+            "response-body",
+            "runtime",
+            "source-or-limit",
+            "storage",
+            "stream",
+            "timeout",
+            "unclassified",
+            "unexpected-status",
+            "unsupported",
+            "upstream-client",
+            "upstream-server",
+            "windows",
+            "macos",
+        ],
+    )
+}
+
+fn diagnostic_endpoint(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "bundled",
+            "chat-completions",
+            "control",
+            "count-tokens",
+            "disabled",
+            "files",
+            "files-collection",
+            "gateway",
+            "generate-content",
+            "health",
+            "image",
+            "input-tokens",
+            "macos",
+            "messages",
+            "models",
+            "responses",
+            "responses-resource",
+            "stream-generate-content",
+            "telemetry",
+            "tool-input",
+            "unknown",
+            "unsupported",
+            "windows",
+        ],
+    )
+}
+
+fn diagnostic_method(value: &str) -> String {
+    allowed_diagnostic_identifier(
+        value,
+        &[
+            "DELETE", "GET", "HEAD", "HTTP", "OPTIONS", "OTHER", "PATCH", "POST", "PUT", "SCAN",
+        ],
+    )
+}
+
+fn diagnostic_version(value: &str) -> Option<String> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let mut parts = value.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+    }) && parts.next().is_none();
+    valid.then(|| value.to_string())
 }
 
 fn safe_panic_location(value: &str) -> String {
@@ -929,5 +1422,93 @@ mod tests {
             .unwrap()
             .contains("after-rotation"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diagnostic_batch_aggregates_repeats_and_flushes_from_first_seen() {
+        let start = Instant::now();
+        let mut batch = DiagnosticBatch::default();
+        let event = ActivityEvent::diagnostic_counted(
+            "warning",
+            "openai",
+            "request-failed",
+            Some("connect"),
+            Some("responses"),
+            Some("POST"),
+            Some(502),
+            Some(true),
+            Some("test"),
+            1,
+        );
+        batch.push(event.clone(), start);
+        batch.push(event, start + Duration::from_secs(4));
+
+        let drained = batch.drain_expired(start + DIAGNOSTIC_BATCH_WINDOW, false);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].count, 2);
+        assert_eq!(drained[0].duration_ms, Some(4_000));
+        assert!(batch.pending.is_empty());
+    }
+
+    #[test]
+    fn structured_diagnostics_keep_action_and_classifier_boundaries() {
+        let start = Instant::now();
+        let mut batch = DiagnosticBatch::default();
+        for action in ["diagnostic", "warning"] {
+            batch.push(
+                ActivityEvent::diagnostic_counted(
+                    action,
+                    "ocr",
+                    "scan-complete",
+                    Some("bundled"),
+                    Some("image"),
+                    Some("SCAN"),
+                    None,
+                    Some(false),
+                    None,
+                    3,
+                ),
+                start,
+            );
+        }
+        let drained = batch.drain_expired(start, true);
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|event| event.action == "diagnostic"));
+        assert!(drained.iter().any(|event| event.action == "warning"));
+        assert!(drained.iter().all(|event| !serde_json::to_string(event)
+            .unwrap()
+            .contains("image bytes")));
+    }
+
+    #[test]
+    fn structured_diagnostics_reject_unlisted_identifier_shaped_input() {
+        let event = ActivityEvent::diagnostic(
+            "tenantCredential123",
+            "httpsApiExampleComPrivateRoute",
+            Some("apiKeyMaterial123"),
+            Some("accountIdentifier456"),
+            Some("SECRETVERB"),
+            Some(502),
+            Some(false),
+            Some("12345678901234567890"),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+
+        for rejected in [
+            "tenantCredential123",
+            "httpsApiExampleComPrivateRoute",
+            "apiKeyMaterial123",
+            "accountIdentifier456",
+            "SECRETVERB",
+            "12345678901234567890",
+        ] {
+            assert!(!json.contains(rejected), "persisted rejected field: {json}");
+        }
+        assert_eq!(event.surface, "unknown");
+        assert_eq!(event.event.as_deref(), Some("unknown"));
+        assert_eq!(event.kind.as_deref(), Some("unknown"));
+        assert_eq!(event.endpoint.as_deref(), Some("unknown"));
+        assert_eq!(event.method.as_deref(), Some("unknown"));
+        assert_eq!(event.version, None);
     }
 }
