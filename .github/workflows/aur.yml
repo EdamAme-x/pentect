@@ -89,6 +89,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/packages"
+          # Metadata and source integrity are architecture-independent. Check
+          # both package definitions everywhere, but compile the VCS package
+          # only once; release CI already builds and installs the same source
+          # natively on both Linux architectures.
           for package in pentect-bin pentect-git; do
             directory="$GITHUB_WORKSPACE/packaging/aur/$package"
             cd "$directory"
@@ -108,8 +112,21 @@ jobs:
               fi
               ! grep -Fq "$unexpected" "$verify_log"
             fi
-            sudo -u builder makepkg --cleanbuild --syncdeps --noconfirm
-            find . -maxdepth 1 -type f -name '*.pkg.tar.*' -exec cp {} "$RUNNER_TEMP/packages/" \;
+          done
+
+          packages=(pentect-bin)
+          if [[ '${{ matrix.arch }}' == x86_64 ]]; then
+            packages+=(pentect-git)
+          fi
+          for package in "${packages[@]}"; do
+            cd "$GITHUB_WORKSPACE/packaging/aur/$package"
+            # The repository's required CI test job already runs the Rust
+            # suite. This job still performs a real package build, install,
+            # launch, update guard, conflict check, and uninstall lifecycle.
+            sudo -u builder env CARGO_BUILD_JOBS=4 \
+              makepkg --cleanbuild --syncdeps --noconfirm --nocheck
+            find . -maxdepth 1 \( -type f -o -type l \) -name '*.pkg.tar.*' \
+              -exec cp -L {} "$RUNNER_TEMP/packages/" \;
           done
       - name: Run namcap on built packages
         run: namcap "$RUNNER_TEMP"/packages/*.pkg.tar.* || true
@@ -121,7 +138,6 @@ jobs:
           git_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-git-*.pkg.tar.*' \
             ! -name 'pentect-git-debug-*' -print -quit)
           test -n "$bin_package"
-          test -n "$git_package"
           release_version=$(jq -r .version packaging/release.json)
 
           pacman -U --noconfirm "$bin_package"
@@ -132,14 +148,22 @@ jobs:
           if pentect uninstall 2>"$RUNNER_TEMP/uninstall.err"; then exit 1; fi
           grep -Fq 'managed by aur' "$RUNNER_TEMP/uninstall.err"
           test "$(sha256sum /usr/bin/pentect)" = "$before"
-          if pacman -U --noconfirm "$git_package"; then
-            echo 'pentect-git unexpectedly replaced pentect-bin' >&2
-            exit 1
+          if [[ '${{ matrix.arch }}' == x86_64 ]]; then
+            if pacman -U --noconfirm "$git_package"; then
+              echo 'pentect-git unexpectedly replaced pentect-bin' >&2
+              exit 1
+            fi
           fi
           pacman -Q pentect-bin
           pacman -Rns --noconfirm pentect-bin
           test ! -e /usr/bin/pentect
           test ! -e /usr/bin/.pentect-managed-install.json
+
+          if [[ '${{ matrix.arch }}' != x86_64 ]]; then
+            test -z "$git_package"
+            exit 0
+          fi
+          test -n "$git_package"
 
           pacman -U --noconfirm "$git_package"
           expected_git_version=$(sudo -u builder bash -c 'source packaging/aur/pentect-git/PKGBUILD; cd packaging/aur/pentect-git/src; pkgver')
