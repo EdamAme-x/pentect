@@ -27,6 +27,19 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
                 || can_touch_protected(s))
     });
 
+    // An explicit marker defines the user's exact value boundary. A broader
+    // heuristic overlap must not expand it back over the `pentect(...)` wrapper,
+    // otherwise recovery would include annotation syntax instead of only the
+    // intended value.
+    let explicit = RangeIndex::new(
+        spans
+            .iter()
+            .filter(|span| span.source == DetectorId::Explicit)
+            .map(|span| span.range)
+            .collect(),
+    );
+    spans.retain(|span| span.source == DetectorId::Explicit || !explicit.overlaps(&span.range));
+
     // Every connected overlap describes one underlying byte sequence. Mask its
     // full union so a weaker candidate cannot leave a prefix or suffix visible.
     // Ranges that merely touch at an edge remain independent.
@@ -175,6 +188,28 @@ mod tests {
         );
         assert_eq!(out.len(), 2);
         assert!(out[0].range.start < out[1].range.start);
+    }
+
+    #[test]
+    fn explicit_span_keeps_its_exact_boundary_over_broader_overlap() {
+        let explicit = Span {
+            range: ByteRange::new(8, 11),
+            category: Category::Secret,
+            label: labels::KEYED_SECRET.into(),
+            confidence: Confidence::High,
+            source: DetectorId::Explicit,
+        };
+        let broader = Span {
+            range: ByteRange::new(0, 12),
+            category: Category::Secret,
+            label: labels::KEYED_SECRET.into(),
+            confidence: Confidence::High,
+            source: DetectorId::KeyValue,
+        };
+        let out = merge(vec![broader, explicit], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, DetectorId::Explicit);
+        assert_eq!(out[0].range, ByteRange::new(8, 11));
     }
 
     fn entropy_span(start: usize, end: usize) -> Span {

@@ -11,6 +11,7 @@ mod credsweeper_ml;
 mod decode;
 mod documentation;
 mod entropy;
+mod explicit;
 mod key_value;
 mod pattern;
 mod pem;
@@ -36,6 +37,8 @@ pub use decode::{
     DEFAULT_MAX_INFLATE_BYTES, DEFAULT_MIN_DECODE_BYTES, DEFAULT_MIN_OPAQUE_RUN,
 };
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
+pub use explicit::ExplicitSecretDetector;
+pub(crate) use explicit::EXPLICIT_SECRET_PREFIX;
 pub use key_value::KeyValueDetector;
 pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use pem::PemDetector;

@@ -35,8 +35,8 @@ pub use detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats, DecodeConfig, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, KeyValueDetector, PatternMatchDetector, PatternSpec, PemDetector,
-    RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    EnvValueDetector, ExplicitSecretDetector, KeyValueDetector, PatternMatchDetector, PatternSpec,
+    PemDetector, RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector, UrlDetector,
 };
 pub use model::{
     ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
