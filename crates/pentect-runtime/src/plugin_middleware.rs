@@ -3697,10 +3697,7 @@ mod tests {
         };
         let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
         let mut budget = PluginChainBudget::new();
-        // Keep the chain budget comfortably above process-spawn jitter on
-        // macOS and Windows. The per-invocation timeout below remains 50 ms and
-        // is the behavior this test is exercising.
-        budget.deadline = Instant::now() + Duration::from_secs(1);
+        let deadline_before_start = budget.deadline;
 
         let first = program
             .invoke_with_startup_timeout(
@@ -3714,9 +3711,10 @@ mod tests {
         assert_eq!(serde_json::from_slice::<Value>(&first).unwrap()["id"], 1);
         assert!(
             budget
-                .remaining()
-                .is_ok_and(|remaining| remaining > Duration::from_millis(500)),
-            "cold start consumed chain budget"
+                .deadline
+                .saturating_duration_since(deadline_before_start)
+                > Duration::from_millis(200),
+            "cold start was not excluded from the chain deadline"
         );
 
         let second = program
