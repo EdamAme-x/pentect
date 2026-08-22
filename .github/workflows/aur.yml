@@ -93,16 +93,18 @@ jobs:
             sudo -u builder makepkg --printsrcinfo > "$RUNNER_TEMP/$package.SRCINFO"
             diff -u .SRCINFO "$RUNNER_TEMP/$package.SRCINFO"
             sudo -u builder namcap PKGBUILD || true
-            sudo -u builder makepkg --verifysource
+            verify_log="$RUNNER_TEMP/$package-verifysource.log"
+            sudo -u builder makepkg --verifysource 2>&1 | tee "$verify_log"
             if [[ "$package" == pentect-bin ]]; then
               release_version=$(jq -r .version "$GITHUB_WORKSPACE/packaging/release.json")
               expected="pentect-$release_version-${{ matrix.arch }}"
-              test -f "$directory/$expected"
+              grep -Fq "$expected" "$verify_log"
               if [[ '${{ matrix.arch }}' == x86_64 ]]; then
-                test ! -e "$directory/pentect-$release_version-aarch64"
+                unexpected="pentect-$release_version-aarch64"
               else
-                test ! -e "$directory/pentect-$release_version-x86_64"
+                unexpected="pentect-$release_version-x86_64"
               fi
+              ! grep -Fq "$unexpected" "$verify_log"
             fi
             sudo -u builder makepkg --cleanbuild --syncdeps --noconfirm
             find . -maxdepth 1 -type f -name '*.pkg.tar.zst' -exec cp {} "$RUNNER_TEMP/packages/" \;
