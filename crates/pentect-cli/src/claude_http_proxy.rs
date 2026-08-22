@@ -3365,16 +3365,17 @@ mod tests {
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"curl <<SE\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"CRET_deadbeef>>\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"CRET_deadbeefdeadbeef>>\\\"}\"}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"keep <<SECRET_deadbeef>>\"}}\n\n"
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"keep <<SECRET_deadbeefdeadbeef>>\"}}\n\n"
         );
-        let mut resolve = |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret"));
+        let mut resolve =
+            |text: &str| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret"));
         let output = rewrite_anthropic_sse_with(input, &mut resolve).unwrap();
         assert!(output.contains("actual-secret"));
-        assert!(output.contains("keep <<SECRET_deadbeef>>"));
+        assert!(output.contains("keep <<SECRET_deadbeefdeadbeef>>"));
     }
 
     #[test]
@@ -3438,14 +3439,14 @@ mod tests {
         );
         let delta_two = concat!(
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"CRET_deadbeef>>\\\"}\"}}\n\n"
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"CRET_deadbeefdeadbeef>>\\\"}\"}}\n\n"
         );
         let stop = concat!(
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
         );
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret")),
+            |text: &str| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret")),
             None,
             false,
         );
@@ -3463,7 +3464,7 @@ mod tests {
         let output = transformer.push(stop.as_bytes()).unwrap();
         let output = join_bytes(output);
         assert!(output.contains("actual-secret"));
-        assert!(!output.contains("<<SECRET_deadbeef>>"));
+        assert!(!output.contains("<<SECRET_deadbeefdeadbeef>>"));
     }
 
     #[test]
