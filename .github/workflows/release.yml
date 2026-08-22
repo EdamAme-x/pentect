@@ -43,9 +43,11 @@ jobs:
           }
       - name: Validate POSIX installer
         run: |
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh .github/scripts/publish-aur.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh
+          bash -n .github/scripts/publish-aur.sh
           python tools/test_client_smoke_coverage.py
-          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/verify_client_smoke_log.py
+          python tools/test_release_package_metadata.py
+          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
           cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$RUNNER_TEMP/codex-app-smoke-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           node --check tools/smoke_pi_package.mjs
@@ -737,13 +739,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if git diff --quiet -- packaging/release.json packaging/homebrew/Formula/pentect.rb packaging/aur/pentect-bin/PKGBUILD packaging/aur/pentect-bin/.SRCINFO; then
+          metadata_paths=(
+            packaging/release.json
+            packaging/homebrew/Formula/pentect.rb
+            packaging/aur/pentect-bin/PKGBUILD
+            packaging/aur/pentect-bin/.SRCINFO
+            packaging/aur/pentect-git/PKGBUILD
+            packaging/aur/pentect-git/.SRCINFO
+          )
+          if git diff --quiet -- "${metadata_paths[@]}"; then
             exit 0
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add packaging/release.json packaging/homebrew/Formula/pentect.rb \
-            packaging/aur/pentect-bin/PKGBUILD packaging/aur/pentect-bin/.SRCINFO
+          git add "${metadata_paths[@]}"
           git commit -m "chore: update package metadata for $GITHUB_REF_NAME"
           branch="automation/package-metadata-${GITHUB_REF_NAME}"
           pull=$(sh tools/propose_automation_pr.sh \

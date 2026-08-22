@@ -52,15 +52,19 @@ jobs:
     name: Validate (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
-    container: archlinux:base-devel
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-22.04
             arch: x86_64
+            container: archlinux:base-devel@sha256:aecf5b39bd3139a951090dfb3d940f9317e4c5fca038c65fb49ac03910f7133e
           - runner: ubuntu-22.04-arm
             arch: aarch64
+            # The official Arch image is amd64-only. This pinned Arch Linux ARM
+            # image supplies the native aarch64 userspace for the ARM runner.
+            container: menci/archlinuxarm:base-devel@sha256:90621c79bc2909b5036b3293157c7de49daffb96d3d5010a93a47cc3bc299b1d
     steps:
       - name: Install validation tools
         run: |

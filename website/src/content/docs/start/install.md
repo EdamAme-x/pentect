@@ -77,6 +77,9 @@ workflow. A Nix flake lock file keeps the selected revision.
 
 Use the package manager that installed Pentect:
 
+For AUR installations, select the update command matching the package you
+installed.
+
 ::: code-group
 
 ```sh [Direct installer]
@@ -100,8 +103,12 @@ sudo apt update
 sudo apt install --only-upgrade pentect
 ```
 
-```sh [AUR]
+```sh [AUR — pentect-bin]
 paru -S pentect-bin
+```
+
+```sh [AUR — pentect-git]
+paru -S pentect-git
 ```
 
 ```sh [Nix profile]
