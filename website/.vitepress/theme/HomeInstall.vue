@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   siApple,
+  siArchlinux,
   siDebian,
   siGnubash,
   siHomebrew,
@@ -68,6 +69,25 @@ const nixInstaller: Installer = {
     },
   ],
 };
+const aurInstaller: Installer = {
+  id: 'aur',
+  label: 'AUR',
+  command: 'paru -S pentect-bin',
+  icon: 'archlinux',
+  tone: 'aur',
+  variants: [
+    {
+      id: 'stable',
+      label: 'Release',
+      command: 'paru -S pentect-bin',
+    },
+    {
+      id: 'git',
+      label: 'Development',
+      command: 'paru -S pentect-git',
+    },
+  ],
+};
 
 const installers: Record<OperatingSystem, Installer[]> = {
   windows: [
@@ -113,6 +133,7 @@ const installers: Record<OperatingSystem, Installer[]> = {
       icon: 'debian',
       tone: 'apt',
     },
+    aurInstaller,
     npmInstaller,
     nixInstaller,
   ],
@@ -127,6 +148,7 @@ const copyState = ref<'idle' | 'copied' | 'failed'>('idle');
 const iconSet: Record<string, string> = {
   windows: 'M0 0h11.377v11.372H0Zm12.623 0H24v11.372H12.623ZM0 12.623h11.377V24H0Zm12.623 0H24V24H12.623',
   apple: siApple.path,
+  archlinux: siArchlinux.path,
   linux: siLinux.path,
   powershell: 'M23.181 2.974c.568 0 .923.463.792 1.035l-3.659 15.982c-.13.572-.697 1.035-1.265 1.035H.819c-.568 0-.923-.463-.792-1.035L3.686 4.009c.13-.572.697-1.035 1.265-1.035zm-8.375 9.346c.251-.394.227-.905-.09-1.243L9.122 5.125c-.38-.404-1.037-.407-1.466-.003c-.429.402-.468 1.056-.088 1.46l4.662 4.96v.11l-7.42 5.374c-.45.327-.533.977-.187 1.453s.991.597 1.44.27l8.229-5.91c.28-.196.438-.365.514-.52zm-2.796 4.399a.93.93 0 0 0-.934.923c0 .51.418.923.934.923h4.433a.93.93 0 0 0 .934-.923a.93.93 0 0 0-.934-.923z',
   gnubash: siGnubash.path,
@@ -266,7 +288,7 @@ onMounted(() => {
         v-if="variants.length"
         class="install-choice install-choice--variant"
         role="group"
-        aria-label="Nix installation mode"
+        aria-label="Installation variant"
       >
         <span class="install-choice__label">Mode</span>
         <button

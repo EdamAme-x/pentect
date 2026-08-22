@@ -105,6 +105,9 @@ function rewriteNodes(nodes) {
           codeBlock('nix shell github:EdamAme-x/pentect', 'sh'),
           heading('APT — Debian and Ubuntu', 3),
           codeBlock('curl -fsSL https://pentect.dev/install-apt.sh | sudo sh', 'sh'),
+          heading('AUR — Arch Linux', 3),
+          codeBlock('paru -S pentect-bin', 'sh'),
+          paragraph('For the development package, use `paru -S pentect-git`. `paru` is only an example; other AUR helpers or makepkg work too.'),
         ];
       }
       if (node.name === 'QuickInstall') {

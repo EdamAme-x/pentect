@@ -1,0 +1,20 @@
+pkgbase = pentect-git
+	pkgdesc = Local secret masking boundary for AI agents (development version)
+	pkgver = 0.0.35.r941.g4cee182
+	pkgrel = 1
+	url = https://github.com/EdamAme-x/pentect
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = ca-certificates
+	depends = gcc-libs
+	depends = glibc
+	provides = pentect=0.0.35.r941.g4cee182
+	conflicts = pentect
+	options = !lto
+	source = pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main
+	sha256sums = SKIP
+
+pkgname = pentect-git
