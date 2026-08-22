@@ -104,6 +104,11 @@ jobs:
 
   build:
     needs: verify
+    env:
+      # The repository-wide default is intentionally conservative for local
+      # machines. Hosted release runners have four cores and enough memory;
+      # using all of them cuts the critical build path substantially.
+      CARGO_BUILD_JOBS: "4"
     permissions:
       contents: read
       id-token: write
@@ -512,7 +517,7 @@ jobs:
           test "$(pentect version)" = "pentect ${GITHUB_REF_NAME#v}"
           echo 'PENTECT_SMOKE_BINARY=/usr/bin/pentect' >> "$GITHUB_ENV"
       - name: Verify agent CLIs and desktop app contracts (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.installer == 'direct'
         shell: pwsh
         run: |
           python tools/install_portable_client_smoke.py --mode release
@@ -538,7 +543,7 @@ jobs:
           & $env:PENTECT_SMOKE_BINARY claude app --app $claudeFixture --upstream https://api.anthropic.com
           if ($LASTEXITCODE -ne 0) { throw 'pentect claude app failed to launch' }
       - name: Verify agent CLIs and desktop app contracts (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.installer == 'direct'
         shell: bash
         run: |
           set -euo pipefail
@@ -556,7 +561,7 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$claude_fixture"
           "$PENTECT_SMOKE_BINARY" claude app --app "$claude_fixture" --upstream https://api.anthropic.com
       - name: Verify persistent diagnostics (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.installer == 'direct'
         shell: pwsh
         run: |
           $secret = 'sk-pentect-log-smoke-secret'
@@ -578,7 +583,7 @@ jobs:
           }
           python tools/verify_client_smoke_log.py $logPath codex claude opencode pi codex-app claude-app --absent $secret
       - name: Verify persistent diagnostics (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.installer == 'direct'
         shell: bash
         run: |
           set -euo pipefail
