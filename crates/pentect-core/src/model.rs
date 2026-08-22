@@ -218,6 +218,8 @@ mod tests {
 /// label is kept (e.g. OPAQUE_BLOB over a generic LIKELY_SECRET).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DetectorId {
+    /// A value explicitly wrapped by the user as `pentect(value)`.
+    Explicit,
     /// Span supplied by a plugin adapter outside deterministic core.
     Plugin,
     /// Native Rust port of embedded CredSweeper rule/model assets.
@@ -242,6 +244,7 @@ pub enum DetectorId {
 impl DetectorId {
     pub fn as_str(self) -> &'static str {
         match self {
+            DetectorId::Explicit => "explicit",
             DetectorId::Plugin => "plugin",
             DetectorId::CredSweeper => "credsweeper",
             DetectorId::Rule => "rule",
