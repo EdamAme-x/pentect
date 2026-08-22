@@ -139,8 +139,8 @@ See [Plugins](/plugins/overview/) for the full workflow and
 
 ## Installation and distribution
 
-You can install Pentect with PowerShell, a shell script, Homebrew, apt, Nix,
-or npm. The binary installers check SHA-256 checksums. They support
+You can install Pentect with PowerShell, a shell script, Homebrew, apt, AUR,
+Nix, or npm. The binary installers check SHA-256 checksums. They support
 version choice, updates, and uninstall. They also find installs managed by
 another package manager.
 

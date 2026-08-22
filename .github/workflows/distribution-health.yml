@@ -33,6 +33,15 @@ jobs:
             -H 'Accept: application/vnd.github.raw' \
             > "$RUNNER_TEMP/pentect.rb"
           grep -Fq "version \"$version\"" "$RUNNER_TEMP/pentect.rb"
+      - name: Verify AUR packages
+        run: |
+          version=$(jq -r .version packaging/release.json)
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            'https://aur.archlinux.org/rpc/v5/info?arg[]=pentect-bin&arg[]=pentect-git' \
+            -o "$RUNNER_TEMP/aur.json"
+          test "$(jq -r .resultcount "$RUNNER_TEMP/aur.json")" = 2
+          test "$(jq -r '.results[] | select(.Name == "pentect-bin") | .Version' "$RUNNER_TEMP/aur.json")" = "$version-1"
+          test -n "$(jq -r '.results[] | select(.Name == "pentect-git") | .Version' "$RUNNER_TEMP/aur.json")"
       - name: Verify signed APT repository and key lifetime
         run: |
           base=https://edamame-x.github.io/pentect/apt

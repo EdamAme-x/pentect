@@ -1,0 +1,191 @@
+name: AUR
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish both packages to the AUR after validation
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-22.04
+    outputs:
+      publish: ${{ steps.scope.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect publishable changes
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish=false
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && '${{ inputs.publish }}' == true ]]; then
+            publish=true
+          elif [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            before='${{ github.event.before }}'
+            if [[ "$before" == 0000000000000000000000000000000000000000 ]] ||
+              ! git diff --quiet "$before" "$GITHUB_SHA" -- \
+                packaging/aur packaging/release.json tools/update_package_metadata.py; then
+              publish=true
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            container: archlinux:base-devel@sha256:aecf5b39bd3139a951090dfb3d940f9317e4c5fca038c65fb49ac03910f7133e
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            # The official Arch image is amd64-only. This pinned Arch Linux ARM
+            # image supplies the native aarch64 userspace for the ARM runner.
+            container: menci/archlinuxarm:base-devel@sha256:90621c79bc2909b5036b3293157c7de49daffb96d3d5010a93a47cc3bc299b1d
+    steps:
+      - name: Install validation tools
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          # GitHub job containers cannot apply pacman's nested Landlock sandbox.
+          # Package signature and checksum verification remain enabled.
+          # Install Rust up front so makepkg does not invoke a nested pacman
+          # without --disable-sandbox when resolving pentect-git's cargo dependency.
+          pacman --disable-sandbox -Syu --noconfirm --needed git jq namcap openssh rust sudo
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Create unprivileged package builder
+        shell: bash
+        run: |
+          useradd --create-home --groups wheel builder
+          printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/aur-builder
+          chmod 0440 /etc/sudoers.d/aur-builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+      - name: Validate source metadata and build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/packages"
+          for package in pentect-bin pentect-git; do
+            directory="$GITHUB_WORKSPACE/packaging/aur/$package"
+            cd "$directory"
+            sudo -u builder makepkg --printsrcinfo > "$RUNNER_TEMP/$package.SRCINFO"
+            diff -u .SRCINFO "$RUNNER_TEMP/$package.SRCINFO"
+            sudo -u builder namcap PKGBUILD || true
+            verify_log="$RUNNER_TEMP/$package-verifysource.log"
+            sudo -u builder makepkg --verifysource 2>&1 | tee "$verify_log"
+            if [[ "$package" == pentect-bin ]]; then
+              release_version=$(jq -r .version "$GITHUB_WORKSPACE/packaging/release.json")
+              expected="pentect-$release_version-${{ matrix.arch }}"
+              grep -Fq "$expected" "$verify_log"
+              if [[ '${{ matrix.arch }}' == x86_64 ]]; then
+                unexpected="pentect-$release_version-aarch64"
+              else
+                unexpected="pentect-$release_version-x86_64"
+              fi
+              ! grep -Fq "$unexpected" "$verify_log"
+            fi
+            sudo -u builder makepkg --cleanbuild --syncdeps --noconfirm
+            find . -maxdepth 1 -type f -name '*.pkg.tar.*' -exec cp {} "$RUNNER_TEMP/packages/" \;
+          done
+      - name: Run namcap on built packages
+        run: namcap "$RUNNER_TEMP"/packages/*.pkg.tar.* || true
+      - name: Verify install lifecycle and package conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-bin-*.pkg.tar.*' -print -quit)
+          git_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-git-*.pkg.tar.*' \
+            ! -name 'pentect-git-debug-*' -print -quit)
+          test -n "$bin_package"
+          test -n "$git_package"
+          release_version=$(jq -r .version packaging/release.json)
+
+          pacman -U --noconfirm "$bin_package"
+          test "$(pentect version)" = "pentect $release_version"
+          before=$(sha256sum /usr/bin/pentect)
+          if pentect update 2>"$RUNNER_TEMP/update.err"; then exit 1; fi
+          grep -Fq 'managed by aur' "$RUNNER_TEMP/update.err"
+          if pentect uninstall 2>"$RUNNER_TEMP/uninstall.err"; then exit 1; fi
+          grep -Fq 'managed by aur' "$RUNNER_TEMP/uninstall.err"
+          test "$(sha256sum /usr/bin/pentect)" = "$before"
+          if pacman -U --noconfirm "$git_package"; then
+            echo 'pentect-git unexpectedly replaced pentect-bin' >&2
+            exit 1
+          fi
+          pacman -Q pentect-bin
+          pacman -Rns --noconfirm pentect-bin
+          test ! -e /usr/bin/pentect
+          test ! -e /usr/bin/.pentect-managed-install.json
+
+          pacman -U --noconfirm "$git_package"
+          expected_git_version=$(sudo -u builder bash -c 'source packaging/aur/pentect-git/PKGBUILD; cd packaging/aur/pentect-git/src; pkgver')
+          test "$(pacman -Q pentect-git)" = "pentect-git $expected_git_version-1"
+          manifest_version=$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' \
+            packaging/aur/pentect-git/src/pentect/crates/pentect-cli/Cargo.toml)
+          test "$(pentect version)" = "pentect $manifest_version"
+          if pentect update 2>"$RUNNER_TEMP/git-update.err"; then exit 1; fi
+          grep -Fq 'managed by aur' "$RUNNER_TEMP/git-update.err"
+          if pentect uninstall 2>"$RUNNER_TEMP/git-uninstall.err"; then exit 1; fi
+          grep -Fq 'managed by aur' "$RUNNER_TEMP/git-uninstall.err"
+          if pacman -U --noconfirm "$bin_package"; then
+            echo 'pentect-bin unexpectedly replaced pentect-git' >&2
+            exit 1
+          fi
+          pacman -Q pentect-git
+          pacman -Rns --noconfirm pentect-git
+          test ! -e /usr/bin/pentect
+          test ! -e /usr/bin/.pentect-managed-install.json
+
+  publish-bin:
+    name: Publish pentect-bin
+    needs: [changes, validate]
+    if: needs.changes.outputs.publish == 'true' && github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Synchronize pentect-bin
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: bash .github/scripts/publish-aur.sh pentect-bin
+
+  publish-git:
+    name: Publish pentect-git
+    needs: [changes, validate]
+    if: needs.changes.outputs.publish == 'true' && github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Synchronize pentect-git
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: bash .github/scripts/publish-aur.sh pentect-git

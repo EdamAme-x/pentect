@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate Homebrew and Nix metadata from a verified GitHub Release."""
+"""Generate Homebrew, Nix, and AUR metadata from a verified GitHub Release."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -19,8 +20,15 @@ ASSETS = {
     "x86_64-darwin": "pentect-macos-x86_64",
     "aarch64-darwin": "pentect-macos-aarch64",
 }
+NOTICE_ASSETS = {
+    "license": "LICENSE",
+    "third_party_licenses": "THIRD_PARTY_LICENSES.txt",
+}
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Baseline produced by pkgver() from a full main-branch clone. Release metadata
+# updates must not replace the VCS package version with a bare release version.
+AUR_GIT_PKGVER = "0.0.53.r1062.g21ffa65"
 
 
 def request(url: str, *, authenticated: bool = False) -> bytes:
@@ -60,8 +68,6 @@ def release_metadata(tag: str | None) -> dict[str, object]:
     for system, name in ASSETS.items():
         asset = assets.get(name)
         if asset is None:
-            if system == "aarch64-linux":
-                continue
             raise SystemExit(f"release is missing {name}")
         digest = str(asset.get("digest") or "")
         sha256 = digest.removeprefix("sha256:")
@@ -78,7 +84,26 @@ def release_metadata(tag: str | None) -> dict[str, object]:
             "url": asset["browser_download_url"],
             "sha256": sha256,
         }
-    return {"version": match.group(1), "tag": release["tag_name"], "systems": systems}
+    notices: dict[str, dict[str, str]] = {}
+    for key, name in NOTICE_ASSETS.items():
+        asset = assets.get(name)
+        if asset is None:
+            raise SystemExit(f"release is missing {name}")
+        digest = str(asset.get("digest") or "")
+        sha256 = digest.removeprefix("sha256:")
+        if not SHA256_RE.fullmatch(sha256):
+            sha256 = hashlib.sha256(request(asset["browser_download_url"])).hexdigest()
+        notices[key] = {
+            "asset": name,
+            "url": asset["browser_download_url"],
+            "sha256": sha256,
+        }
+    return {
+        "version": match.group(1),
+        "tag": release["tag_name"],
+        "systems": systems,
+        "notices": notices,
+    }
 
 
 def ruby_platform_block(name: str, entries: dict[str, dict[str, str]]) -> list[str]:
@@ -145,11 +170,181 @@ def homebrew_formula(metadata: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def aur_bin_pkgbuild(metadata: dict[str, object]) -> str:
+    systems = metadata["systems"]
+    notices = metadata["notices"]
+    assert isinstance(systems, dict)
+    assert isinstance(notices, dict)
+    x86_64 = systems["x86_64-linux"]
+    aarch64 = systems["aarch64-linux"]
+    license_asset = notices["license"]
+    third_party = notices["third_party_licenses"]
+    lines = [
+        "# Maintainer: EdamAme-x <edame8080 at gmail dot com>",
+        "pkgname=pentect-bin",
+        f'pkgver={metadata["version"]}',
+        "pkgrel=1",
+        "pkgdesc='Local secret masking boundary for AI agents (prebuilt binary)'",
+        "arch=('x86_64' 'aarch64')",
+        "url='https://github.com/EdamAme-x/pentect'",
+        "license=('MIT')",
+        "depends=('ca-certificates' 'gcc-libs' 'glibc')",
+        "provides=(\"pentect=$pkgver\")",
+        "conflicts=('pentect')",
+        "options=('!strip')",
+        "source=(",
+        f'  \'pentect-LICENSE::{license_asset["url"]}\'',
+        f'  \'pentect-THIRD_PARTY_LICENSES.txt::{third_party["url"]}\'',
+        ")",
+        "sha256sums=(",
+        f'  \'{license_asset["sha256"]}\'',
+        f'  \'{third_party["sha256"]}\'',
+        ")",
+        f'source_x86_64=("pentect-${{pkgver}}-x86_64::{x86_64["url"]}")',
+        f"sha256sums_x86_64=('{x86_64['sha256']}')",
+        f'source_aarch64=("pentect-${{pkgver}}-aarch64::{aarch64["url"]}")',
+        f"sha256sums_aarch64=('{aarch64['sha256']}')",
+        "",
+        "package() {",
+        "  install -Dm755 \"$srcdir/pentect-${pkgver}-${CARCH}\" \"$pkgdir/usr/bin/pentect\"",
+        "  printf '%s\\n' '{\"version\":1,\"manager\":\"aur\",\"uninstall\":\"sudo pacman -Rns pentect-bin\"}' > \"$pkgdir/usr/bin/.pentect-managed-install.json\"",
+        "  install -Dm644 \"$srcdir/pentect-LICENSE\" \"$pkgdir/usr/share/licenses/$pkgname/LICENSE\"",
+        "  install -Dm644 \"$srcdir/pentect-THIRD_PARTY_LICENSES.txt\" \"$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.txt\"",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def aur_bin_srcinfo(metadata: dict[str, object]) -> str:
+    systems = metadata["systems"]
+    notices = metadata["notices"]
+    assert isinstance(systems, dict)
+    assert isinstance(notices, dict)
+    lines = [
+        "pkgbase = pentect-bin",
+        "\tpkgdesc = Local secret masking boundary for AI agents (prebuilt binary)",
+        f'\tpkgver = {metadata["version"]}',
+        "\tpkgrel = 1",
+        "\turl = https://github.com/EdamAme-x/pentect",
+        "\tarch = x86_64",
+        "\tarch = aarch64",
+        "\tlicense = MIT",
+        "\tdepends = ca-certificates",
+        "\tdepends = gcc-libs",
+        "\tdepends = glibc",
+        f'\tprovides = pentect={metadata["version"]}',
+        "\tconflicts = pentect",
+        "\toptions = !strip",
+        f'\tsource = pentect-LICENSE::{notices["license"]["url"]}',
+        f'\tsource = pentect-THIRD_PARTY_LICENSES.txt::{notices["third_party_licenses"]["url"]}',
+        f'\tsha256sums = {notices["license"]["sha256"]}',
+        f'\tsha256sums = {notices["third_party_licenses"]["sha256"]}',
+        f'\tsource_x86_64 = pentect-{metadata["version"]}-x86_64::{systems["x86_64-linux"]["url"]}',
+        f'\tsha256sums_x86_64 = {systems["x86_64-linux"]["sha256"]}',
+        f'\tsource_aarch64 = pentect-{metadata["version"]}-aarch64::{systems["aarch64-linux"]["url"]}',
+        f'\tsha256sums_aarch64 = {systems["aarch64-linux"]["sha256"]}',
+        "",
+        "pkgname = pentect-bin",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def aur_git_pkgbuild(metadata: dict[str, object]) -> str:
+    lines = [
+        "# Maintainer: EdamAme-x <edame8080 at gmail dot com>",
+        "pkgname=pentect-git",
+        f"pkgver={AUR_GIT_PKGVER}",
+        "pkgrel=1",
+        "pkgdesc='Local secret masking boundary for AI agents (development version)'",
+        "arch=('x86_64' 'aarch64')",
+        "url='https://github.com/EdamAme-x/pentect'",
+        "license=('MIT')",
+        "depends=('ca-certificates' 'gcc-libs' 'glibc')",
+        "makedepends=('cargo' 'git')",
+        'provides=("pentect=$pkgver")',
+        "conflicts=('pentect')",
+        "options=('!lto')",
+        "source=('pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main')",
+        "sha256sums=('SKIP')",
+        "",
+        "pkgver() {",
+        "  cd pentect",
+        "  local tag revision hash",
+        "  revision=$(git rev-list --count HEAD)",
+        "  hash=$(git rev-parse --short=7 HEAD)",
+        "  if tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null); then",
+        "    printf '%s.r%s.g%s\\n' \"${tag#v}\" \"$revision\" \"$hash\"",
+        "  else",
+        "    printf 'r%s.%s\\n' \"$revision\" \"$hash\"",
+        "  fi",
+        "}",
+        "",
+        "prepare() {",
+        "  cd pentect",
+        '  cargo fetch --locked --target "${CARCH}-unknown-linux-gnu"',
+        "}",
+        "",
+        "build() {",
+        "  cd pentect",
+        "  export CARGO_TARGET_DIR=target",
+        "  cargo build --frozen --release --all-features -p pentect-cli",
+        "}",
+        "",
+        "check() {",
+        "  cd pentect",
+        "  export CARGO_TARGET_DIR=target",
+        "  cargo test --frozen --workspace --all-features",
+        "}",
+        "",
+        "package() {",
+        '  install -Dm755 "pentect/target/release/pentect" "$pkgdir/usr/bin/pentect"',
+        "  printf '%s\\n' '{\"version\":1,\"manager\":\"aur\",\"uninstall\":\"sudo pacman -Rns pentect-git\"}' > \"$pkgdir/usr/bin/.pentect-managed-install.json\"",
+        '  install -Dm644 "pentect/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"',
+        '  install -Dm644 "pentect/THIRD_PARTY_LICENSES.txt" "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.txt"',
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def aur_git_srcinfo(metadata: dict[str, object]) -> str:
+    lines = [
+        "pkgbase = pentect-git",
+        "\tpkgdesc = Local secret masking boundary for AI agents (development version)",
+        f"\tpkgver = {AUR_GIT_PKGVER}",
+        "\tpkgrel = 1",
+        "\turl = https://github.com/EdamAme-x/pentect",
+        "\tarch = x86_64",
+        "\tarch = aarch64",
+        "\tlicense = MIT",
+        "\tmakedepends = cargo",
+        "\tmakedepends = git",
+        "\tdepends = ca-certificates",
+        "\tdepends = gcc-libs",
+        "\tdepends = glibc",
+        f"\tprovides = pentect={AUR_GIT_PKGVER}",
+        "\tconflicts = pentect",
+        "\toptions = !lto",
+        "\tsource = pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main",
+        "\tsha256sums = SKIP",
+        "",
+        "pkgname = pentect-git",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def serialized(metadata: dict[str, object]) -> dict[Path, str]:
     root = Path(__file__).resolve().parent.parent
     return {
         root / "packaging" / "release.json": json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         root / "packaging" / "homebrew" / "Formula" / "pentect.rb": homebrew_formula(metadata),
+        root / "packaging" / "aur" / "pentect-bin" / "PKGBUILD": aur_bin_pkgbuild(metadata),
+        root / "packaging" / "aur" / "pentect-bin" / ".SRCINFO": aur_bin_srcinfo(metadata),
+        root / "packaging" / "aur" / "pentect-git" / "PKGBUILD": aur_git_pkgbuild(metadata),
+        root / "packaging" / "aur" / "pentect-git" / ".SRCINFO": aur_git_srcinfo(metadata),
     }
 
 

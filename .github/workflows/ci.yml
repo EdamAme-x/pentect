@@ -118,6 +118,7 @@ jobs:
               - 'tools/build_apt_repository.sh'
               - 'tools/propose_automation_pr.sh'
               - 'tools/test_propose_automation_pr.sh'
+              - 'tools/test_release_package_metadata.py'
               - 'tools/update_package_metadata.py'
               - 'tools/client_smoke.py'
               - 'tools/install_client_smoke.sh'
@@ -367,8 +368,10 @@ jobs:
         run: |
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
           python tools/test_client_smoke_coverage.py
-          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/verify_client_smoke_log.py
+          python tools/test_release_package_metadata.py
+          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
           sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh
+          bash -n .github/scripts/publish-aur.sh
           cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$RUNNER_TEMP/codex-app-smoke-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           sh tools/test_propose_automation_pr.sh

@@ -6,7 +6,7 @@ description: Protect a real Codex or Claude session in a few commands.
 ## Install
 
 New to Pentect? [Choose your OS and install method](/start/install/). The
-installation page covers Windows, macOS, Linux, npm, Homebrew, APT, and Nix.
+installation page covers Windows, macOS, Linux, npm, Homebrew, APT, AUR, and Nix.
 
 Already installed? Continue below. You do not need to change the permanent
 settings of Codex or Claude.

@@ -1,0 +1,51 @@
+# Maintainer: EdamAme-x <edame8080 at gmail dot com>
+pkgname=pentect-git
+pkgver=0.0.53.r1062.g21ffa65
+pkgrel=1
+pkgdesc='Local secret masking boundary for AI agents (development version)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/EdamAme-x/pentect'
+license=('MIT')
+depends=('ca-certificates' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+provides=("pentect=$pkgver")
+conflicts=('pentect')
+options=('!lto')
+source=('pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main')
+sha256sums=('SKIP')
+
+pkgver() {
+  cd pentect
+  local tag revision hash
+  revision=$(git rev-list --count HEAD)
+  hash=$(git rev-parse --short=7 HEAD)
+  if tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null); then
+    printf '%s.r%s.g%s\n' "${tag#v}" "$revision" "$hash"
+  else
+    printf 'r%s.%s\n' "$revision" "$hash"
+  fi
+}
+
+prepare() {
+  cd pentect
+  cargo fetch --locked --target "${CARCH}-unknown-linux-gnu"
+}
+
+build() {
+  cd pentect
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features -p pentect-cli
+}
+
+check() {
+  cd pentect
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --workspace --all-features
+}
+
+package() {
+  install -Dm755 "pentect/target/release/pentect" "$pkgdir/usr/bin/pentect"
+  printf '%s\n' '{"version":1,"manager":"aur","uninstall":"sudo pacman -Rns pentect-git"}' > "$pkgdir/usr/bin/.pentect-managed-install.json"
+  install -Dm644 "pentect/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "pentect/THIRD_PARTY_LICENSES.txt" "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.txt"
+}

@@ -4,8 +4,9 @@ description: Install and update Pentect on Windows, macOS, or Linux.
 pageClass: install-page
 ---
 
-Choose your operating system and package manager. Pentect uses a prebuilt
-binary, so the install does not compile the Rust workspace on your machine.
+Choose your operating system and package manager. The normal release options,
+including `pentect-bin`, use a prebuilt binary. The opt-in `pentect-git` AUR
+package builds the Rust workspace on your machine.
 
 <HomeInstall />
 
@@ -69,12 +70,15 @@ npm i -g pentect@X.Y.Z
 
 :::
 
-Homebrew, APT, and Nix choose versions through their normal package-manager
+Homebrew, APT, AUR, and Nix choose versions through their normal package-manager
 workflow. A Nix flake lock file keeps the selected revision.
 
 ## Update
 
 Use the package manager that installed Pentect:
+
+For AUR installations, select the update command matching the package you
+installed.
 
 ::: code-group
 
@@ -99,6 +103,14 @@ sudo apt update
 sudo apt install --only-upgrade pentect
 ```
 
+```sh [AUR — pentect-bin]
+paru -S pentect-bin
+```
+
+```sh [AUR — pentect-git]
+paru -S pentect-git
+```
+
 ```sh [Nix profile]
 nix profile upgrade pentect
 ```
@@ -109,6 +121,13 @@ sudo nixos-rebuild switch --flake .#HOSTNAME
 ```
 
 :::
+
+On Arch Linux, `pentect-bin` is the normal release package. Use
+`paru -S pentect-git` if you intentionally want to build the latest `main`
+branch. `paru` is only an example: `yay` and a manual `makepkg` workflow are
+supported as well. For `pentect-git`, `pentect version` reports the upstream
+manifest version; use `pacman -Q pentect-git` to see the full VCS package
+version.
 
 ## NixOS configuration
 
@@ -157,5 +176,7 @@ For a direct PowerShell or shell install:
 pentect uninstall
 ```
 
-For npm, Homebrew, APT, or Nix, uninstall Pentect with that package manager.
+For npm, Homebrew, APT, AUR, or Nix, uninstall Pentect with that package manager.
+For AUR packages, run `sudo pacman -Rns pentect-bin` or
+`sudo pacman -Rns pentect-git`, matching the installed package.
 Project `.pentect` settings and user data are not removed automatically.

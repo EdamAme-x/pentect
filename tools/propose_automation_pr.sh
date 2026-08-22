@@ -59,6 +59,7 @@ previous_ci=$(latest_run ci.yml)
 previous_nix=$(latest_run nix.yml)
 gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
 gh workflow run nix.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
+gh workflow run aur.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
 
 new_run() {
   workflow=$1
