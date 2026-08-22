@@ -2095,10 +2095,21 @@ where
     R: FnMut(&str) -> Result<String, String>,
 {
     if is_free_form_shell_tool(tool_name) {
+        let allow_direct_posix_secrets = !cfg!(windows)
+            && !tool_name.is_some_and(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "powershell" | "pwsh" | "cmd"
+                )
+            });
         if let Some(object) = value.as_object_mut() {
             for key in ["command", "script", "code"] {
                 if let Some(Value::String(text)) = object.get_mut(key) {
-                    *text = resolve_shell_text_safely(text, resolve)?;
+                    *text = resolve_shell_text_safely_with_context(
+                        text,
+                        allow_direct_posix_secrets,
+                        resolve,
+                    )?;
                 }
             }
             // Non-command metadata is structured data and remains safe to
@@ -2127,6 +2138,17 @@ pub(crate) fn resolve_shell_text_safely<R>(text: &str, resolve: &mut R) -> Resul
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    resolve_shell_text_safely_with_context(text, !cfg!(windows), resolve)
+}
+
+fn resolve_shell_text_safely_with_context<R>(
+    text: &str,
+    allow_direct_posix_secrets: bool,
+    resolve: &mut R,
+) -> Result<String, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut environment = Vec::new();
@@ -2142,12 +2164,9 @@ where
             out.push_str(reference);
         } else if shell_safe_secret_token(&resolved) {
             out.push_str(&resolved);
-        } else if direct_secret_is_safe_in_shell_context(
-            text,
-            absolute_start,
-            end - start,
-            &resolved,
-        ) {
+        } else if allow_direct_posix_secrets
+            && direct_secret_is_safe_in_shell_context(text, absolute_start, end - start, &resolved)
+        {
             if text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'\'')
                 && text.as_bytes().get(absolute_start + end - start) == Some(&b'\'')
             {
@@ -2309,14 +2328,7 @@ fn next_shell_secret_reference(text: &str) -> Option<(usize, usize)> {
         if bytes[start..].starts_with(b"<<") {
             if let Some(close) = text[start + 2..].find(">>") {
                 let end = start + 2 + close + 2;
-                let inner = &text[start + 2..end - 2];
-                if !inner.is_empty()
-                    && inner.len() <= 128
-                    && inner.contains('_')
-                    && inner
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                {
+                if pentect_core::parse_placeholder(&text[start..end]).is_ok() {
                     return Some((start, end));
                 }
             }
@@ -3529,9 +3541,10 @@ mod tests {
 
     #[test]
     fn shell_tool_only_resolves_conservative_token_values() {
-        let mut safe = |text: &str| Ok(text.replace("<<SECRET_safe>>", "abc_DEF-123+/="));
+        let mut safe =
+            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "abc_DEF-123+/="));
         let restored = resolve_tool_input_json(
-            r#"{"command":"curl <<SECRET_safe>>"}"#,
+            r#"{"command":"curl <<SECRET_0123456789abcdef>>"}"#,
             Some("Bash"),
             &mut safe,
         )
@@ -3539,20 +3552,22 @@ mod tests {
         assert!(restored.contains("abc_DEF-123+/="));
 
         let dangerous_value = "quoted \"; Remove-Item x\nnext";
-        let mut dangerous = |text: &str| Ok(text.replace("<<SECRET_danger>>", dangerous_value));
+        let mut dangerous =
+            |text: &str| Ok(text.replace("<<SECRET_fedcba9876543210>>", dangerous_value));
         let restored = resolve_tool_input_json(
-            r#"{"command":"echo <<SECRET_danger>>"}"#,
+            r#"{"command":"echo <<SECRET_fedcba9876543210>>"}"#,
             Some("PowerShell"),
             &mut dangerous,
         )
         .unwrap();
-        assert!(restored.contains("<<SECRET_danger>>"));
+        assert!(restored.contains("<<SECRET_fedcba9876543210>>"));
         assert!(!restored.contains(dangerous_value));
 
         let sudo_password = "fixture@password!";
-        let mut sudo = |text: &str| Ok(text.replace("<<KEYED_SECRET_fixture>>", sudo_password));
+        let mut sudo =
+            |text: &str| Ok(text.replace("<<KEYED_SECRET_a2c25e122d2e002f>>", sudo_password));
         let heredoc = resolve_shell_text_safely(
-            "sudo -S cat ./ROOT_ONLY.txt <<'EOF'\n<<KEYED_SECRET_fixture>>\nEOF",
+            "sudo -S cat ./ROOT_ONLY.txt <<'EOF'\n<<KEYED_SECRET_a2c25e122d2e002f>>\nEOF",
             &mut sudo,
         )
         .unwrap();
@@ -3560,10 +3575,10 @@ mod tests {
             heredoc.contains(&format!("\n{sudo_password}\nEOF")),
             "{heredoc}"
         );
-        assert!(!heredoc.contains("<<KEYED_SECRET_fixture>>"));
+        assert!(!heredoc.contains("<<KEYED_SECRET_a2c25e122d2e002f>>"));
 
         let single_quoted = resolve_shell_text_safely(
-            "sudo -S cat ./ROOT_ONLY.txt <<< '<<KEYED_SECRET_fixture>>'",
+            "sudo -S cat ./ROOT_ONLY.txt <<< '<<KEYED_SECRET_a2c25e122d2e002f>>'",
             &mut sudo,
         )
         .unwrap();
