@@ -29,11 +29,12 @@ def _use_managed_python() -> None:
     if not candidate.is_file():
         return
     try:
-        current = Path(sys.executable).resolve()
-        managed = candidate.resolve()
+        current_environment = Path(sys.prefix).resolve()
+        managed_environment = root.resolve()
     except OSError:
-        return
-    if current != managed:
+        current_environment = Path(sys.prefix)
+        managed_environment = root
+    if current_environment != managed_environment:
         # Execute through the venv path rather than its resolved interpreter.
         # Python discovers pyvenv.cfg from the executable path; bypassing the
         # symlink starts the base interpreter without the venv's packages.

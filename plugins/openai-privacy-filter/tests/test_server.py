@@ -42,6 +42,7 @@ class ServerTests(unittest.TestCase):
             with (
                 mock.patch.object(SERVER.Path, "home", return_value=home),
                 mock.patch.object(SERVER.sys, "executable", "/usr/bin/python3"),
+                mock.patch.object(SERVER.sys, "prefix", "/usr"),
                 mock.patch.object(SERVER.os, "execv") as execv,
             ):
                 SERVER._use_managed_python()
@@ -49,6 +50,20 @@ class ServerTests(unittest.TestCase):
             executable, arguments = execv.call_args.args
             self.assertEqual(executable, str(candidate))
             self.assertEqual(arguments[0], str(candidate))
+
+    def test_managed_python_does_not_reexec_inside_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / ".pentect" / "openai-privacy-filter" / "venv"
+            candidate = root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            candidate.parent.mkdir(parents=True)
+            candidate.touch()
+            with (
+                mock.patch.object(SERVER.Path, "home", return_value=Path(directory)),
+                mock.patch.object(SERVER.sys, "prefix", str(root)),
+                mock.patch.object(SERVER.os, "execv") as execv,
+            ):
+                SERVER._use_managed_python()
+            execv.assert_not_called()
 
     def test_offsets_are_utf8_bytes(self) -> None:
         result = SERVER.inspect_text(Redactor(), "AéZ")

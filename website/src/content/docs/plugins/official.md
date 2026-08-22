@@ -73,7 +73,8 @@ therefore replaces PyTorch and the managed virtual environment, not the model.
 Review the exact runtime and environment setup commands, downloaded file
 hashes, `inspect` hook, and required status. Pentect prepares the model before
 enabling the plugin, so the first protected request does not unexpectedly start
-a multi-gigabyte download.
+a multi-gigabyte download. The first process start has a five-minute model-load
+budget; later requests retain the normal 60-second inference limit.
 
 Test with fake data:
 
