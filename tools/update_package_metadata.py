@@ -26,6 +26,9 @@ NOTICE_ASSETS = {
 }
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Baseline produced by pkgver() from a full main-branch clone. Release metadata
+# updates must not replace the VCS package version with a bare release version.
+AUR_GIT_PKGVER = "0.0.53.r1062.g21ffa65"
 
 
 def request(url: str, *, authenticated: bool = False) -> bytes:
@@ -252,7 +255,7 @@ def aur_git_pkgbuild(metadata: dict[str, object]) -> str:
     lines = [
         "# Maintainer: EdamAme-x <edame8080 at gmail dot com>",
         "pkgname=pentect-git",
-        f'pkgver={metadata["version"]}',
+        f"pkgver={AUR_GIT_PKGVER}",
         "pkgrel=1",
         "pkgdesc='Local secret masking boundary for AI agents (development version)'",
         "arch=('x86_64' 'aarch64')",
@@ -307,11 +310,10 @@ def aur_git_pkgbuild(metadata: dict[str, object]) -> str:
 
 
 def aur_git_srcinfo(metadata: dict[str, object]) -> str:
-    version = metadata["version"]
     lines = [
         "pkgbase = pentect-git",
         "\tpkgdesc = Local secret masking boundary for AI agents (development version)",
-        f"\tpkgver = {version}",
+        f"\tpkgver = {AUR_GIT_PKGVER}",
         "\tpkgrel = 1",
         "\turl = https://github.com/EdamAme-x/pentect",
         "\tarch = x86_64",
@@ -322,7 +324,7 @@ def aur_git_srcinfo(metadata: dict[str, object]) -> str:
         "\tdepends = ca-certificates",
         "\tdepends = gcc-libs",
         "\tdepends = glibc",
-        f"\tprovides = pentect={version}",
+        f"\tprovides = pentect={AUR_GIT_PKGVER}",
         "\tconflicts = pentect",
         "\toptions = !lto",
         "\tsource = pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main",

@@ -1,6 +1,6 @@
 pkgbase = pentect-git
 	pkgdesc = Local secret masking boundary for AI agents (development version)
-	pkgver = 0.0.52
+	pkgver = 0.0.53.r1062.g21ffa65
 	pkgrel = 1
 	url = https://github.com/EdamAme-x/pentect
 	arch = x86_64
@@ -11,7 +11,7 @@ pkgbase = pentect-git
 	depends = ca-certificates
 	depends = gcc-libs
 	depends = glibc
-	provides = pentect=0.0.52
+	provides = pentect=0.0.53.r1062.g21ffa65
 	conflicts = pentect
 	options = !lto
 	source = pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main

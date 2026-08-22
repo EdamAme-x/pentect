@@ -109,16 +109,17 @@ jobs:
               ! grep -Fq "$unexpected" "$verify_log"
             fi
             sudo -u builder makepkg --cleanbuild --syncdeps --noconfirm
-            find . -maxdepth 1 -type f -name '*.pkg.tar.zst' -exec cp {} "$RUNNER_TEMP/packages/" \;
+            find . -maxdepth 1 -type f -name '*.pkg.tar.*' -exec cp {} "$RUNNER_TEMP/packages/" \;
           done
       - name: Run namcap on built packages
-        run: namcap "$RUNNER_TEMP"/packages/*.pkg.tar.zst || true
+        run: namcap "$RUNNER_TEMP"/packages/*.pkg.tar.* || true
       - name: Verify install lifecycle and package conflict
         shell: bash
         run: |
           set -euo pipefail
-          bin_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-bin-*.pkg.tar.zst' -print -quit)
-          git_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-git-*.pkg.tar.zst' -print -quit)
+          bin_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-bin-*.pkg.tar.*' -print -quit)
+          git_package=$(find "$RUNNER_TEMP/packages" -name 'pentect-git-*.pkg.tar.*' \
+            ! -name 'pentect-git-debug-*' -print -quit)
           test -n "$bin_package"
           test -n "$git_package"
           release_version=$(jq -r .version packaging/release.json)

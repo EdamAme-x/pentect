@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -40,16 +41,36 @@ def main() -> None:
             text=True,
         )
 
+        bin_pkgbuild = test_root / "packaging/aur/pentect-bin/PKGBUILD"
+        bin_srcinfo = test_root / "packaging/aur/pentect-bin/.SRCINFO"
+        bin_pkgbuild_text = bin_pkgbuild.read_text(encoding="utf-8")
+        bin_srcinfo_text = bin_srcinfo.read_text(encoding="utf-8")
+        assert "pkgver=9.8.7\n" in bin_pkgbuild_text
+        assert 'provides=("pentect=$pkgver")\n' in bin_pkgbuild_text
+        assert "\tpkgver = 9.8.7\n" in bin_srcinfo_text
+        assert "\tprovides = pentect=9.8.7\n" in bin_srcinfo_text
+
         git_pkgbuild = test_root / "packaging/aur/pentect-git/PKGBUILD"
         git_srcinfo = test_root / "packaging/aur/pentect-git/.SRCINFO"
-        assert "pkgver=9.8.7\n" in git_pkgbuild.read_text(encoding="utf-8")
-        assert "\tpkgver = 9.8.7\n" in git_srcinfo.read_text(encoding="utf-8")
-        assert "\tprovides = pentect=9.8.7\n" in git_srcinfo.read_text(encoding="utf-8")
+        git_pkgbuild_text = git_pkgbuild.read_text(encoding="utf-8")
+        git_srcinfo_text = git_srcinfo.read_text(encoding="utf-8")
+        match = re.search(r"^pkgver=(.+)$", git_pkgbuild_text, re.MULTILINE)
+        assert match is not None
+        vcs_version = match.group(1)
+        assert vcs_version != "9.8.7"
+        assert re.fullmatch(
+            r"(?:\d+\.\d+\.\d+\.r\d+\.g[0-9a-f]{7}|r\d+\.[0-9a-f]{7})",
+            vcs_version,
+        )
+        assert f"\tpkgver = {vcs_version}\n" in git_srcinfo_text
+        assert f"\tprovides = pentect={vcs_version}\n" in git_srcinfo_text
 
     release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
         encoding="utf-8"
     )
     for path in (
+        "packaging/aur/pentect-bin/PKGBUILD",
+        "packaging/aur/pentect-bin/.SRCINFO",
         "packaging/aur/pentect-git/PKGBUILD",
         "packaging/aur/pentect-git/.SRCINFO",
     ):
