@@ -35,16 +35,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          publish=false
+          requested=false
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && '${{ inputs.publish }}' == true ]]; then
-            publish=true
+            requested=true
           elif [[ "$GITHUB_EVENT_NAME" == push ]]; then
             before='${{ github.event.before }}'
             if [[ "$before" == 0000000000000000000000000000000000000000 ]] ||
               ! git diff --quiet "$before" "$GITHUB_SHA" -- \
                 packaging/aur packaging/release.json tools/update_package_metadata.py; then
-              publish=true
+              requested=true
             fi
+          fi
+          publish=false
+          if [[ "$requested" == true && '${{ vars.AUR_PUBLISH_ENABLED }}' == true ]]; then
+            publish=true
+          elif [[ "$requested" == true ]]; then
+            echo "::warning title=AUR publishing disabled::Set the repository variable AUR_PUBLISH_ENABLED=true after registering the CI public key with an AUR account."
+            {
+              echo '### AUR publishing skipped'
+              echo
+              echo 'AUR package validation passed, but publishing is disabled.'
+              echo 'After AUR account registration is available, register the CI public key and set `AUR_PUBLISH_ENABLED` to `true`.'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
