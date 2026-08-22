@@ -100,14 +100,18 @@ use the same name in both places.
 ```toml
 [execution]
 timeout_ms = 10000
+startup_timeout_ms = 120000
 max_input_bytes = 262144
 max_output_bytes = 1048576
 max_spans = 512
 ```
 
-The largest allowed values are 60 seconds, 4 MiB input, 4 MiB output, and 4,096
-findings. The Wasm file itself must be 32 MiB or smaller. Pentect infers the
-form, so new manifests do not set a runtime or mode.
+The largest allowed values are 60 seconds per invocation, 10 minutes for
+`startup_timeout_ms`, 4 MiB input, 4 MiB output, and 4,096 findings. The startup
+limit applies only to the first response from a native Command process; later
+responses use `timeout_ms`. If omitted, it equals `timeout_ms`. The Wasm file
+itself must be 32 MiB or smaller. Pentect infers the form, so new manifests do
+not set a runtime or mode.
 
 Use small limits. They protect the user from a slow or broken plugin.
 

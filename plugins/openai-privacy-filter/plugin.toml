@@ -22,6 +22,7 @@ linux = ["python3", "{plugin}/setup.py"]
 
 [execution]
 timeout_ms = 60000
+startup_timeout_ms = 300000
 max_input_bytes = 1048576
 max_output_bytes = 1048576
 max_spans = 4096

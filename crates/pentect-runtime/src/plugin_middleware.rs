@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
@@ -33,6 +33,7 @@ const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_SPANS: usize = 512;
 const MAX_TIMEOUT_MS: u64 = 60_000;
+const MAX_STARTUP_TIMEOUT_MS: u64 = 600_000;
 const MAX_PLUGIN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_SPANS: usize = 4096;
@@ -143,6 +144,7 @@ pub fn test_local_wasm_plugin(bytes: &[u8], name: &str) -> Result<usize, String>
             required: true,
             command_config: None,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_spans: DEFAULT_MAX_SPANS,
@@ -254,6 +256,13 @@ impl PluginChainBudget {
         } else {
             Ok(remaining)
         }
+    }
+
+    fn exclude_startup(&mut self, elapsed: Duration) {
+        // An approved native command may need to load a large local model before
+        // its first response. That separately bounded initialization must not
+        // consume the request-wide budget of the remaining plugin chain.
+        self.deadline = self.deadline.checked_add(elapsed).unwrap_or(self.deadline);
     }
 
     fn charge_input(&mut self, bytes: usize) -> Result<(), String> {
@@ -627,6 +636,7 @@ struct PluginBinary {
     required: bool,
     command_config: Option<Value>,
     timeout: Duration,
+    startup_timeout: Duration,
     max_input_bytes: usize,
     max_output_bytes: usize,
     max_spans: usize,
@@ -752,6 +762,7 @@ impl PluginBinary {
             ));
         }
         let timeout_ms = execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let startup_timeout_ms = execution.startup_timeout_ms.unwrap_or(timeout_ms);
         let max_input_bytes = execution.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES);
         let max_output_bytes = execution
             .max_output_bytes
@@ -759,6 +770,8 @@ impl PluginBinary {
         let max_spans = execution.max_spans.unwrap_or(DEFAULT_MAX_SPANS);
         if timeout_ms == 0
             || timeout_ms > MAX_TIMEOUT_MS
+            || startup_timeout_ms == 0
+            || startup_timeout_ms > MAX_STARTUP_TIMEOUT_MS
             || max_input_bytes == 0
             || max_input_bytes > MAX_PLUGIN_INPUT_BYTES
             || max_output_bytes == 0
@@ -850,6 +863,7 @@ impl PluginBinary {
             required: file.required,
             command_config,
             timeout: Duration::from_millis(timeout_ms),
+            startup_timeout: Duration::from_millis(startup_timeout_ms),
             max_input_bytes,
             max_output_bytes,
             max_spans,
@@ -895,7 +909,13 @@ impl PluginBinary {
                 budget.deadline,
                 Arc::clone(&budget.network_requests),
             )?,
-            PluginProgram::Command(command) => command.invoke(&encoded, timeout, &self.name)?,
+            PluginProgram::Command(command) => command.invoke_with_startup_timeout(
+                &encoded,
+                timeout,
+                self.startup_timeout,
+                &self.name,
+                budget,
+            )?,
         };
         budget
             .charge_output(output.len())
@@ -1043,13 +1063,39 @@ impl CommandProgram {
         })
     }
 
+    #[cfg(test)]
     fn invoke(&self, request: &[u8], timeout: Duration, name: &str) -> Result<Vec<u8>, String> {
+        let mut budget = PluginChainBudget::new();
+        self.invoke_with_startup_timeout(request, timeout, timeout, name, &mut budget)
+    }
+
+    fn invoke_with_startup_timeout(
+        &self,
+        request: &[u8],
+        timeout: Duration,
+        startup_timeout: Duration,
+        name: &str,
+        budget: &mut PluginChainBudget,
+    ) -> Result<Vec<u8>, String> {
         record_plugin_access(name, "command");
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| format!("plugin '{name}' command state is unavailable"))?;
-        if state.is_none() {
+        let mut state = loop {
+            match self.state.try_lock() {
+                Ok(state) => break state,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(format!("plugin '{name}' command state is unavailable"));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = budget.deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(format!("plugin '{name}' command state is unavailable"));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
+            }
+        };
+        let starting = state.is_none();
+        let started = Instant::now();
+        if starting {
             *state = Some(CommandSession::start(
                 &self.argv,
                 &self.cwd,
@@ -1057,10 +1103,22 @@ impl CommandProgram {
                 name,
             )?);
         }
+        let exchange_timeout = if starting {
+            startup_timeout
+        } else {
+            timeout.min(
+                budget
+                    .remaining()
+                    .map_err(|_| format!("plugin '{name}' command state is unavailable"))?,
+            )
+        };
         let result = state
             .as_mut()
             .expect("command session initialized")
-            .exchange(request, timeout, name);
+            .exchange(request, exchange_timeout, name);
+        if starting {
+            budget.exclude_startup(started.elapsed());
+        }
         if result.is_err() {
             if let Some(mut session) = state.take() {
                 session.stop();
@@ -1432,10 +1490,10 @@ fn verify_command_files(
         .iter()
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
-    if !expected.is_subset(&locked)
-        || (!lock.managed && expected != locked)
-        || locked.len() != lock.file.len()
-    {
+    // The setup command may reference additional reviewed files that are also
+    // hashed into the approval lock. Runtime argv must be covered by that lock,
+    // but it need not be the entire locked set.
+    if !expected.is_subset(&locked) || locked.len() != lock.file.len() {
         return Err(format!(
             "plugin '{name}' command file set changed after setup"
         ));
@@ -2893,6 +2951,7 @@ struct ExecutionFile {
     runtime: Option<String>,
     mode: Option<String>,
     timeout_ms: Option<u64>,
+    startup_timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
     max_output_bytes: Option<usize>,
     max_spans: Option<usize>,
@@ -3646,6 +3705,116 @@ mod tests {
     }
 
     #[test]
+    fn command_program_uses_longer_timeout_only_for_cold_start() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys,time; time.sleep(0.15);\nfor line in sys.stdin:\n r=json.loads(line); time.sleep(0.10); print(json.dumps({'id':r['id']}), flush=True)",
+        ) else {
+            return;
+        };
+        let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
+        let mut budget = PluginChainBudget::new();
+        let deadline_before_start = budget.deadline;
+
+        let first = program
+            .invoke_with_startup_timeout(
+                br#"{"id":1}"#,
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+                "fixture",
+                &mut budget,
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&first).unwrap()["id"], 1);
+        assert!(
+            budget
+                .deadline
+                .saturating_duration_since(deadline_before_start)
+                > Duration::from_millis(200),
+            "cold start was not excluded from the chain deadline"
+        );
+
+        let second = program
+            .invoke_with_startup_timeout(
+                br#"{"id":2}"#,
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+                "fixture",
+                &mut budget,
+            )
+            .unwrap_err();
+        assert!(second.contains("timed out"), "{second}");
+    }
+
+    #[test]
+    fn command_program_state_wait_is_bounded_by_chain_deadline() {
+        let Some(command) = python_protocol_fixture("pass") else {
+            return;
+        };
+        let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
+        let held_state = program.state.lock().unwrap();
+        let waiting_program = program.clone();
+        let waiting = std::thread::spawn(move || {
+            let mut budget = PluginChainBudget::new();
+            budget.deadline = Instant::now() + Duration::from_millis(50);
+            waiting_program
+                .invoke_with_startup_timeout(
+                    br#"{"id":1}"#,
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    "fixture",
+                    &mut budget,
+                )
+                .unwrap_err()
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(waiting.is_finished(), "state wait exceeded chain deadline");
+        drop(held_state);
+        assert!(waiting.join().unwrap().contains("state is unavailable"));
+    }
+
+    #[test]
+    fn local_command_lock_may_include_reviewed_setup_file() {
+        use sha2::{Digest, Sha256};
+
+        let Some(command) = python_protocol_fixture("pass") else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "pentect-command-setup-lock-{}-{}",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = directory.join("plugin");
+        let data = directory.join("runtime");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(root.join("server.py"), "print('server')\n").unwrap();
+        std::fs::write(root.join("setup.py"), "print('setup')\n").unwrap();
+        let digest = |name: &str| {
+            data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(root.join(name)).unwrap()))
+        };
+        let executable = resolve_command_executable(&command[0]).unwrap();
+        std::fs::write(
+            data.join(PLUGIN_COMMAND_LOCK_FILE),
+            format!(
+                "schema = \"pentect.plugin-command-lock.v1\"\nexecutable = {:?}\nmanaged = false\n\n[[file]]\npath = \"server.py\"\nsha256 = \"{}\"\n\n[[file]]\npath = \"setup.py\"\nsha256 = \"{}\"\n",
+                executable.to_string_lossy(),
+                digest("server.py"),
+                digest("setup.py"),
+            ),
+        )
+        .unwrap();
+        let dirs = PluginRuntimeDirs {
+            data_dir: data,
+            cache_dir: directory.join("cache"),
+            config_file: directory.join("config.toml"),
+        };
+        let argv = vec![command[0].clone(), "{plugin}/server.py".to_string()];
+        verify_command_files("fixture", &argv, &root, &dirs).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn command_program_enforces_deadline_and_output_limit() {
         let timeout = CommandProgram::new(
             sleeping_command_fixture(),
@@ -3720,6 +3889,7 @@ mod tests {
             required: true,
             command_config: Some(json!({})),
             timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(5),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: 4096,
             max_spans: DEFAULT_MAX_SPANS,
@@ -3750,6 +3920,7 @@ mod tests {
             required,
             command_config: Some(json!({})),
             timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(5),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: 4096,
             max_spans: DEFAULT_MAX_SPANS,

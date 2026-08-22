@@ -1350,6 +1350,7 @@ struct ExecutionConfig {
     runtime: Option<String>,
     mode: Option<String>,
     timeout_ms: Option<u64>,
+    startup_timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
     max_output_bytes: Option<usize>,
     max_spans: Option<usize>,
@@ -1907,6 +1908,9 @@ fn validate_execution(manifest: &PluginManifest) -> Result<(), String> {
     if execution
         .timeout_ms
         .is_some_and(|value| value == 0 || value > 60_000)
+        || execution
+            .startup_timeout_ms
+            .is_some_and(|value| value == 0 || value > 600_000)
         || execution
             .max_input_bytes
             .is_some_and(|value| value == 0 || value > 4 * 1024 * 1024)
