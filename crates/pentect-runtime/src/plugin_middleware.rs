@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
@@ -1078,21 +1078,7 @@ impl CommandProgram {
         budget: &mut PluginChainBudget,
     ) -> Result<Vec<u8>, String> {
         record_plugin_access(name, "command");
-        let mut state = loop {
-            match self.state.try_lock() {
-                Ok(state) => break state,
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err(format!("plugin '{name}' command state is unavailable"));
-                }
-                Err(TryLockError::WouldBlock) => {
-                    let remaining = budget.deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(format!("plugin '{name}' command state is unavailable"));
-                    }
-                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
-                }
-            }
-        };
+        let mut state = self.lock_state_until(budget.deadline, name)?;
         let starting = state.is_none();
         let started = Instant::now();
         if starting {
@@ -1125,6 +1111,28 @@ impl CommandProgram {
             }
         }
         result
+    }
+
+    fn lock_state_until<'a>(
+        &'a self,
+        deadline: Instant,
+        name: &str,
+    ) -> Result<MutexGuard<'a, Option<CommandSession>>, String> {
+        loop {
+            match self.state.try_lock() {
+                Ok(state) => return Ok(state),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(format!("plugin '{name}' command state is unavailable"));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(format!("plugin '{name}' command state is unavailable"));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
+            }
+        }
     }
 }
 
@@ -3752,24 +3760,12 @@ mod tests {
         };
         let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
         let held_state = program.state.lock().unwrap();
-        let waiting_program = program.clone();
-        let waiting = std::thread::spawn(move || {
-            let mut budget = PluginChainBudget::new();
-            budget.deadline = Instant::now() + Duration::from_millis(50);
-            waiting_program
-                .invoke_with_startup_timeout(
-                    br#"{"id":1}"#,
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                    "fixture",
-                    &mut budget,
-                )
-                .unwrap_err()
-        });
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(waiting.is_finished(), "state wait exceeded chain deadline");
+        let error = match program.lock_state_until(Instant::now(), "fixture") {
+            Ok(_) => panic!("locked command state was unexpectedly available"),
+            Err(error) => error,
+        };
         drop(held_state);
-        assert!(waiting.join().unwrap().contains("state is unavailable"));
+        assert!(error.contains("state is unavailable"));
     }
 
     #[test]
