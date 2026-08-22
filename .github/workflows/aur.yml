@@ -71,7 +71,9 @@ jobs:
           test "$(uname -m)" = '${{ matrix.arch }}'
           # GitHub job containers cannot apply pacman's nested Landlock sandbox.
           # Package signature and checksum verification remain enabled.
-          pacman --disable-sandbox -Syu --noconfirm --needed git jq namcap openssh sudo
+          # Install Rust up front so makepkg does not invoke a nested pacman
+          # without --disable-sandbox when resolving pentect-git's cargo dependency.
+          pacman --disable-sandbox -Syu --noconfirm --needed git jq namcap openssh rust sudo
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
