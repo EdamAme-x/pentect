@@ -40,6 +40,7 @@ class ServerTests(unittest.TestCase):
             candidate.symlink_to(runtime)
 
             with (
+                mock.patch.dict(SERVER.os.environ, {"PENTECT_OPF_ROOT": ""}),
                 mock.patch.object(SERVER.Path, "home", return_value=home),
                 mock.patch.object(SERVER.sys, "executable", "/usr/bin/python3"),
                 mock.patch.object(SERVER.sys, "prefix", "/usr"),
@@ -58,6 +59,7 @@ class ServerTests(unittest.TestCase):
             candidate.parent.mkdir(parents=True)
             candidate.touch()
             with (
+                mock.patch.dict(SERVER.os.environ, {"PENTECT_OPF_ROOT": ""}),
                 mock.patch.object(SERVER.Path, "home", return_value=Path(directory)),
                 mock.patch.object(SERVER.sys, "prefix", str(root)),
                 mock.patch.object(SERVER.os, "execv") as execv,
