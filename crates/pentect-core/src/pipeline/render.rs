@@ -1,3 +1,4 @@
+use crate::detect::EXPLICIT_SECRET_PREFIX;
 use crate::model::*;
 use crate::normalize::n_id_cow;
 use crate::placeholder::{render_placeholder, IdentityHasher};
@@ -83,7 +84,11 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         if s.range.start < cursor {
             continue;
         }
-        push_literal(&mut segments, &mut masked, &raw[cursor..s.range.start]);
+        let explicit_wrapper = explicit_wrapper_bounds(raw, s);
+        let literal_end = explicit_wrapper
+            .map(|(start, _)| start)
+            .unwrap_or(s.range.start);
+        push_literal(&mut segments, &mut masked, &raw[cursor..literal_end]);
         let val = &raw[s.range.start..s.range.end];
 
         match should_split_email(s).then(|| split_email(val)).flatten() {
@@ -135,7 +140,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 );
             }
         }
-        cursor = s.range.end;
+        cursor = explicit_wrapper.map(|(_, end)| end).unwrap_or(s.range.end);
     }
     push_literal(&mut segments, &mut masked, &raw[cursor..]);
 
@@ -145,6 +150,16 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         map,
         collisions,
     }
+}
+
+fn explicit_wrapper_bounds(raw: &str, span: &Span) -> Option<(usize, usize)> {
+    if span.source != DetectorId::Explicit || span.range.start < EXPLICIT_SECRET_PREFIX.len() {
+        return None;
+    }
+    let wrapper_start = span.range.start - EXPLICIT_SECRET_PREFIX.len();
+    (raw.get(wrapper_start..span.range.start) == Some(EXPLICIT_SECRET_PREFIX)
+        && raw.as_bytes().get(span.range.end) == Some(&b')'))
+    .then_some((wrapper_start, span.range.end + 1))
 }
 
 fn should_split_email(span: &Span) -> bool {

@@ -6,9 +6,9 @@ use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
     load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
-    EntropyDetector, EnvParser, EnvValueDetector, Input, JsonParser, KeyValueDetector, Kind,
-    MaskResult, NdjsonParser, PemDetector, Profile, ProfilePolicy, Recovery, Region, RegionKind,
-    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    EntropyDetector, EnvParser, EnvValueDetector, ExplicitSecretDetector, Input, JsonParser,
+    KeyValueDetector, Kind, MaskResult, NdjsonParser, PemDetector, Profile, ProfilePolicy,
+    Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -938,7 +938,8 @@ fn build_pentect_engine_with_prompt_detectors(prompt: bool) -> Result<Engine, St
         .structured_parsers()
         .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
-        .detector(Box::new(CredSweeperNativeDetector::builtin()));
+        .detector(Box::new(CredSweeperNativeDetector::builtin()))
+        .detector(Box::new(ExplicitSecretDetector));
     if prompt {
         builder = builder.detector(Box::new(KeyValueDetector));
     }

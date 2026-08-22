@@ -30,6 +30,21 @@ a general `SECRET` or `PII` label.
 The ID is a keyed hash. It is not a plain checksum of the value. The private
 identity key stays on the local device.
 
+## Force a value to become a handle
+
+Wrap a value in `pentect(...)` when it must be protected even if it is short,
+low-entropy, or unknown to the built-in detectors:
+
+```text
+sudo password is pentect(passsword123)
+```
+
+Pentect removes the wrapper before the request leaves the device and sends a
+`KEYED_SECRET` handle in its place. If that handle is later used by a local tool,
+Pentect restores only `passsword123`; the `pentect(...)` annotation is not part
+of the value. The marker is case-sensitive, must be balanced, and an empty
+`pentect()` marker is ignored.
+
 ## How a tool uses a handle
 
 Protected launches provide an environment binding for each handle. Remove the

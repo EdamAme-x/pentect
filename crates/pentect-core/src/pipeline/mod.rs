@@ -6,8 +6,9 @@ mod sweep;
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
     CredSweeperNativeDetector, DecodeConfig, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
-    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector, SECRET_VALUE_HINT,
+    EnvValueDetector, ExplicitSecretDetector, KeyValueDetector, PemDetector, PhoneDetector,
+    RuleDetector, SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
+    SECRET_VALUE_HINT,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -705,6 +706,7 @@ impl EngineBuilder {
             .parser(Kind::Env, Box::new(EnvParser))
             .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
+            .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
             .detector(Box::new(RuleDetector::builtin()))
@@ -735,6 +737,7 @@ impl EngineBuilder {
             .parser(Kind::Env, Box::new(EnvParser))
             .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
+            .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
             .detector(Box::new(KeyValueDetector))
             .detector(Box::new(PemDetector::default()))
@@ -1399,6 +1402,34 @@ mod tests {
         assert!(r.masked.contains("<<KEYED_SECRET_"), "{}", r.masked);
         assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn explicit_secret_marker_forces_masking_and_is_not_restored_as_syntax() {
+        let input = "fixture value: pentect(abc)";
+        let result = Engine::with_profile(Profile::Dev).mask(
+            Input {
+                kind: Kind::Text,
+                data: input.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert_eq!(result.masked.matches("<<KEYED_SECRET_").count(), 1);
+        assert!(!result.masked.contains("pentect("), "{}", result.masked);
+        assert!(!result.masked.contains("abc"), "{}", result.masked);
+        assert_eq!(
+            restore(&result.masked, &result.recovery).unwrap(),
+            "fixture value: abc"
+        );
+
+        let remasked = Engine::with_profile(Profile::Dev).mask(
+            Input {
+                kind: Kind::Text,
+                data: result.masked.clone(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert_eq!(remasked.masked, result.masked);
     }
 
     #[test]
