@@ -1,6 +1,6 @@
 # Maintainer: EdamAme-x <edame8080 at gmail dot com>
 pkgname=pentect-bin
-pkgver=0.0.52
+pkgver=0.0.53
 pkgrel=1
 pkgdesc='Local secret masking boundary for AI agents (prebuilt binary)'
 arch=('x86_64' 'aarch64')
@@ -11,17 +11,17 @@ provides=("pentect=$pkgver")
 conflicts=('pentect')
 options=('!strip')
 source=(
-  'pentect-LICENSE::https://github.com/EdamAme-x/pentect/releases/download/v0.0.52/LICENSE'
-  'pentect-THIRD_PARTY_LICENSES.txt::https://github.com/EdamAme-x/pentect/releases/download/v0.0.52/THIRD_PARTY_LICENSES.txt'
+  'pentect-LICENSE::https://github.com/EdamAme-x/pentect/releases/download/v0.0.53/LICENSE'
+  'pentect-THIRD_PARTY_LICENSES.txt::https://github.com/EdamAme-x/pentect/releases/download/v0.0.53/THIRD_PARTY_LICENSES.txt'
 )
 sha256sums=(
   'c87936a4168b4cb93850c94a7f98e03e372145df0ecb3c90f7f02cd1a1fed248'
   'e93c96d3083c856d5851af35c2958773325069df1630208b75656de412867604'
 )
-source_x86_64=("pentect-${pkgver}-x86_64::https://github.com/EdamAme-x/pentect/releases/download/v0.0.52/pentect-linux-x86_64")
-sha256sums_x86_64=('6fbb50e08f1bc55a97bd29d5561be4c15f4beafd46a8efa1c6b334c5baf25699')
-source_aarch64=("pentect-${pkgver}-aarch64::https://github.com/EdamAme-x/pentect/releases/download/v0.0.52/pentect-linux-aarch64")
-sha256sums_aarch64=('74e74484fe5a6f495e620397b972eff6e47100b4e036c114edf1845cbf8a604e')
+source_x86_64=("pentect-${pkgver}-x86_64::https://github.com/EdamAme-x/pentect/releases/download/v0.0.53/pentect-linux-x86_64")
+sha256sums_x86_64=('ec07cff817cc99f9052b8ab2f59c7eb00f5acd9c8a08419d2c5f6c7dd5bf14a6')
+source_aarch64=("pentect-${pkgver}-aarch64::https://github.com/EdamAme-x/pentect/releases/download/v0.0.53/pentect-linux-aarch64")
+sha256sums_aarch64=('ee461670d5ad5091fee201239cd26770a8f58fc8a425814bbabf6fa0c81f5e85')
 
 package() {
   install -Dm755 "$srcdir/pentect-${pkgver}-${CARCH}" "$pkgdir/usr/bin/pentect"
