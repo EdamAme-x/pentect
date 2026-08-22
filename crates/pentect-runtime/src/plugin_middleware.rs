@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
@@ -1078,10 +1078,21 @@ impl CommandProgram {
         budget: &mut PluginChainBudget,
     ) -> Result<Vec<u8>, String> {
         record_plugin_access(name, "command");
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| format!("plugin '{name}' command state is unavailable"))?;
+        let mut state = loop {
+            match self.state.try_lock() {
+                Ok(state) => break state,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(format!("plugin '{name}' command state is unavailable"));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = budget.deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(format!("plugin '{name}' command state is unavailable"));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
+            }
+        };
         let starting = state.is_none();
         let started = Instant::now();
         if starting {
@@ -1092,14 +1103,19 @@ impl CommandProgram {
                 name,
             )?);
         }
+        let exchange_timeout = if starting {
+            startup_timeout
+        } else {
+            timeout.min(
+                budget
+                    .remaining()
+                    .map_err(|_| format!("plugin '{name}' command state is unavailable"))?,
+            )
+        };
         let result = state
             .as_mut()
             .expect("command session initialized")
-            .exchange(
-                request,
-                if starting { startup_timeout } else { timeout },
-                name,
-            );
+            .exchange(request, exchange_timeout, name);
         if starting {
             budget.exclude_startup(started.elapsed());
         }
@@ -3727,6 +3743,33 @@ mod tests {
             )
             .unwrap_err();
         assert!(second.contains("timed out"), "{second}");
+    }
+
+    #[test]
+    fn command_program_state_wait_is_bounded_by_chain_deadline() {
+        let Some(command) = python_protocol_fixture("pass") else {
+            return;
+        };
+        let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
+        let held_state = program.state.lock().unwrap();
+        let waiting_program = program.clone();
+        let waiting = std::thread::spawn(move || {
+            let mut budget = PluginChainBudget::new();
+            budget.deadline = Instant::now() + Duration::from_millis(50);
+            waiting_program
+                .invoke_with_startup_timeout(
+                    br#"{"id":1}"#,
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    "fixture",
+                    &mut budget,
+                )
+                .unwrap_err()
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(waiting.is_finished(), "state wait exceeded chain deadline");
+        drop(held_state);
+        assert!(waiting.join().unwrap().contains("state is unavailable"));
     }
 
     #[test]
