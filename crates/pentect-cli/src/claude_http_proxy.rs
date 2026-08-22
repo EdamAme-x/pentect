@@ -2131,6 +2131,7 @@ where
     let mut rest = text;
     let mut environment = Vec::new();
     while let Some((start, end)) = next_shell_secret_reference(rest) {
+        let absolute_start = text.len().saturating_sub(rest.len()).saturating_add(start);
         out.push_str(&rest[..start]);
         let reference = &rest[start..end];
         let resolved = resolve(reference)?;
@@ -2141,6 +2142,19 @@ where
             out.push_str(reference);
         } else if shell_safe_secret_token(&resolved) {
             out.push_str(&resolved);
+        } else if direct_secret_is_safe_in_shell_context(
+            text,
+            absolute_start,
+            end - start,
+            &resolved,
+        ) {
+            if text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'\'')
+                && text.as_bytes().get(absolute_start + end - start) == Some(&b'\'')
+            {
+                out.push_str(&resolved.replace('\'', "'\\''"));
+            } else {
+                out.push_str(&resolved);
+            }
         } else {
             diagnostic("shell-secret-unresolved", "resolution", "tool-input", false);
             out.push_str(reference);
@@ -2149,6 +2163,67 @@ where
     }
     out.push_str(rest);
     Ok(inject_shell_environment(out, environment))
+}
+
+fn direct_secret_is_safe_in_shell_context(
+    command: &str,
+    start: usize,
+    length: usize,
+    value: &str,
+) -> bool {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\0' | '\r' | '\n'))
+    {
+        return false;
+    }
+    let bytes = command.as_bytes();
+    if start > 0
+        && bytes.get(start - 1) == Some(&b'\'')
+        && bytes.get(start + length) == Some(&b'\'')
+    {
+        return true;
+    }
+    inside_quoted_here_document(command, start)
+}
+
+fn inside_quoted_here_document(command: &str, position: usize) -> bool {
+    for (marker, quote) in [("<<'", '\''), ("<<\"", '"')] {
+        let mut search_from = 0usize;
+        while let Some(relative) = command[search_from..position].find(marker) {
+            let marker_start = search_from + relative;
+            let delimiter_start = marker_start + marker.len();
+            let Some(delimiter_end_relative) = command[delimiter_start..position].find(quote)
+            else {
+                break;
+            };
+            let delimiter_end = delimiter_start + delimiter_end_relative;
+            let delimiter = &command[delimiter_start..delimiter_end];
+            if delimiter.is_empty()
+                || delimiter.len() > 64
+                || !delimiter
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                search_from = delimiter_end.saturating_add(1);
+                continue;
+            }
+            let Some(content_start_relative) = command[delimiter_end + 1..].find('\n') else {
+                break;
+            };
+            let content_start = delimiter_end + 1 + content_start_relative + 1;
+            let closing = format!("\n{delimiter}");
+            let Some(content_end_relative) = command[content_start..].find(&closing) else {
+                break;
+            };
+            let content_end = content_start + content_end_relative;
+            if position >= content_start && position < content_end {
+                return true;
+            }
+            search_from = delimiter_end.saturating_add(1);
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2232,8 +2307,19 @@ fn next_shell_secret_reference(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     for start in 0..bytes.len() {
         if bytes[start..].starts_with(b"<<") {
-            let close = text[start + 2..].find(">>")?;
-            return Some((start, start + 2 + close + 2));
+            if let Some(close) = text[start + 2..].find(">>") {
+                let end = start + 2 + close + 2;
+                let inner = &text[start + 2..end - 2];
+                if !inner.is_empty()
+                    && inner.len() <= 128
+                    && inner.contains('_')
+                    && inner
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return Some((start, end));
+                }
+            }
         }
         if bytes[start] == b'$' {
             if bytes
@@ -3462,6 +3548,26 @@ mod tests {
         .unwrap();
         assert!(restored.contains("<<SECRET_danger>>"));
         assert!(!restored.contains(dangerous_value));
+
+        let sudo_password = "fixture@password!";
+        let mut sudo = |text: &str| Ok(text.replace("<<KEYED_SECRET_fixture>>", sudo_password));
+        let heredoc = resolve_shell_text_safely(
+            "sudo -S cat ./ROOT_ONLY.txt <<'EOF'\n<<KEYED_SECRET_fixture>>\nEOF",
+            &mut sudo,
+        )
+        .unwrap();
+        assert!(
+            heredoc.contains(&format!("\n{sudo_password}\nEOF")),
+            "{heredoc}"
+        );
+        assert!(!heredoc.contains("<<KEYED_SECRET_fixture>>"));
+
+        let single_quoted = resolve_shell_text_safely(
+            "sudo -S cat ./ROOT_ONLY.txt <<< '<<KEYED_SECRET_fixture>>'",
+            &mut sudo,
+        )
+        .unwrap();
+        assert!(single_quoted.contains("<<< 'fixture@password!'"));
 
         let env_name = "PENTECT_STRIPE_SECRET_KEY_a81f42c7d933";
         let secret = ["sk", "live", "51Qx7K9mN2vR4aBcD8eF"].join("_");
