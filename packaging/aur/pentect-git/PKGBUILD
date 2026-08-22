@@ -1,6 +1,6 @@
 # Maintainer: EdamAme-x <edame8080 at gmail dot com>
 pkgname=pentect-git
-pkgver=0.0.51
+pkgver=0.0.52
 pkgrel=1
 pkgdesc='Local secret masking boundary for AI agents (development version)'
 arch=('x86_64' 'aarch64')

@@ -3,12 +3,12 @@
     "license": {
       "asset": "LICENSE",
       "sha256": "c87936a4168b4cb93850c94a7f98e03e372145df0ecb3c90f7f02cd1a1fed248",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.51/LICENSE"
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.52/LICENSE"
     },
     "third_party_licenses": {
       "asset": "THIRD_PARTY_LICENSES.txt",
       "sha256": "e93c96d3083c856d5851af35c2958773325069df1630208b75656de412867604",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.51/THIRD_PARTY_LICENSES.txt"
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.52/THIRD_PARTY_LICENSES.txt"
     }
   },
   "systems": {
