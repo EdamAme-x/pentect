@@ -55,7 +55,8 @@ pub(crate) struct ImageRedaction {
     pub(crate) secret_images: usize,
     pub(crate) notes: Vec<String>,
     pub(crate) recovery: Recovery,
-    pub(crate) pixel_redactions: usize,
+    pub(crate) visual_notes: Vec<String>,
+    pub(crate) metadata_notes: Vec<String>,
 }
 
 struct ImageRedactionState {
@@ -68,7 +69,8 @@ struct ImageRedactionState {
     started_at: std::time::Instant,
     notes: Vec<String>,
     recovery: HashMap<String, String>,
-    pixel_redactions: usize,
+    visual_notes: Vec<String>,
+    metadata_notes: Vec<String>,
 }
 
 struct RedactedImagePayload {
@@ -232,7 +234,8 @@ pub(crate) fn redact_tool_images_for_secrets(
         started_at: std::time::Instant::now(),
         notes: Vec::new(),
         recovery: HashMap::new(),
-        pixel_redactions: 0,
+        visual_notes: Vec::new(),
+        metadata_notes: Vec::new(),
     };
     let updated = redact_image_value(value, identity_key, cfg, &mut state)?;
     record_ocr_outcomes(
@@ -249,7 +252,8 @@ pub(crate) fn redact_tool_images_for_secrets(
         secret_images: state.secret_images,
         notes: state.notes,
         recovery: Recovery::seal(state.recovery, key),
-        pixel_redactions: state.pixel_redactions,
+        visual_notes: state.visual_notes,
+        metadata_notes: state.metadata_notes,
     })
 }
 
@@ -630,16 +634,19 @@ fn redact_image_bytes(
         }
     }
     state.secret_images += 1;
-    if findings_redact_pixels(&findings) {
-        state.pixel_redactions += 1;
-    }
     let index = state.notes.len() + 1;
     let summary = if handles.is_empty() {
         labels.join(", ")
     } else {
         handles.join(", ")
     };
-    state.notes.push(format!("[{index}] {summary}"));
+    let note = format!("[{index}] {summary}");
+    state.notes.push(note.clone());
+    if findings_redact_pixels(&findings) {
+        state.visual_notes.push(note);
+    } else {
+        state.metadata_notes.push(note);
+    }
     let payload = redacted_image_payload(bytes, index, cfg, &findings)?;
     Ok(ImageRedactionDecision::Redacted(payload))
 }

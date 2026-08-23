@@ -299,9 +299,9 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
     }
     Ok(Some(append_image_mask_notes(
         redaction.updated,
-        &redaction.notes,
+        &redaction.visual_notes,
+        &redaction.metadata_notes,
         cfg.redaction,
-        redaction.pixel_redactions > 0,
     )))
 }
 
@@ -3941,9 +3941,9 @@ fn claude_image_tool_output(
         }
         let updated = append_image_mask_notes(
             redaction.updated,
-            &redaction.notes,
+            &redaction.visual_notes,
+            &redaction.metadata_notes,
             cfg.redaction,
-            redaction.pixel_redactions > 0,
         );
         return Ok(Some(ToolTextOutput::Updated(updated)));
     }
@@ -3955,28 +3955,35 @@ fn claude_image_tool_output(
 
 fn append_image_mask_notes(
     mut value: Value,
-    notes: &[String],
+    visual_notes: &[String],
+    metadata_notes: &[String],
     style: config::ImageRedactionStyle,
-    pixels_changed: bool,
 ) -> Value {
-    if notes.is_empty() {
+    if visual_notes.is_empty() && metadata_notes.is_empty() {
         return value;
     }
-    let (explanation, heading) = match (pixels_changed, style) {
-        (true, config::ImageRedactionStyle::Black) => (
-            "Pentect masked sensitive information in this image with black boxes.",
-            "Masked regions:",
-        ),
-        (true, config::ImageRedactionStyle::Blur) => (
-            "Pentect masked sensitive information in this image by blurring those regions.",
-            "Masked regions:",
-        ),
-        (false, _) => (
-            "Pentect removed sensitive metadata from this image.",
-            "Protected values:",
-        ),
-    };
-    let text = format!("{explanation}\n{heading}\n{}", notes.join("\n"));
+    let mut sections = Vec::new();
+    if !visual_notes.is_empty() {
+        let explanation = match style {
+            config::ImageRedactionStyle::Black => {
+                "Pentect masked sensitive information in this image with black boxes."
+            }
+            config::ImageRedactionStyle::Blur => {
+                "Pentect masked sensitive information in this image by blurring those regions."
+            }
+        };
+        sections.push(format!(
+            "{explanation}\nMasked regions:\n{}",
+            visual_notes.join("\n")
+        ));
+    }
+    if !metadata_notes.is_empty() {
+        sections.push(format!(
+            "Pentect removed sensitive metadata from this image.\nProtected values:\n{}",
+            metadata_notes.join("\n")
+        ));
+    }
+    let text = sections.join("\n");
     if append_text_block_to_content(&mut value, &text) {
         return value;
     }
