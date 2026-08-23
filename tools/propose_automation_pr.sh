@@ -59,7 +59,12 @@ previous_ci=$(latest_run ci.yml)
 previous_nix=$(latest_run nix.yml)
 gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
 gh workflow run nix.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
-gh workflow run aur.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
+aur_state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/aur.yml" --jq .state)
+if [ "$aur_state" = active ]; then
+  gh workflow run aur.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
+else
+  echo "AUR workflow is $aur_state; skipping automation PR validation" >&2
+fi
 
 new_run() {
   workflow=$1

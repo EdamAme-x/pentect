@@ -21,6 +21,7 @@ case "$1 $2" in
     case "$*" in
       *ci.yml*) touch "$MOCK_STATE/ci" ;;
       *nix.yml*) touch "$MOCK_STATE/nix" ;;
+      *aur.yml*) touch "$MOCK_STATE/aur" ;;
     esac
     ;;
   "run list")
@@ -30,6 +31,9 @@ case "$1 $2" in
     esac
     ;;
   "run watch") printf '%s\n' "$*" >> "$MOCK_STATE/watch" ;;
+  "api repos/example/project/actions/workflows/aur.yml")
+    printf '%s\n' "${MOCK_AUR_STATE:-disabled_manually}"
+    ;;
   "api --method") printf '%s\n' "$*" >> "$MOCK_STATE/api" ;;
   *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
 esac
@@ -46,6 +50,7 @@ output=$(
       automation/test "test automation" "test body" 2>/dev/null
 )
 test "$output" = https://github.com/example/project/pull/1
+test ! -e "$tmp/state/aur"
 test "$(wc -l < "$tmp/state/watch")" -eq 2
 grep -Fx 'run watch 101 --repo example/project --exit-status' "$tmp/state/watch"
 grep -Fx 'run watch 102 --repo example/project --exit-status' "$tmp/state/watch"
