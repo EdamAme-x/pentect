@@ -5,6 +5,7 @@ use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
 use crate::config::{ImageOcrConfig, UnscannedImagePolicy};
 #[cfg(any(feature = "ocr", test))]
 use pentect_core::model::labels;
+#[cfg(any(feature = "ocr", test))]
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 #[cfg(any(feature = "ocr", test))]
 use pentect_core::ByteRange;
