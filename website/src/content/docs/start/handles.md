@@ -32,8 +32,8 @@ identity key stays on the local device.
 
 ## Force a value to become a handle
 
-Wrap a value in `pentect(...)` when it must be protected even if it is short,
-low-entropy, or unknown to the built-in detectors:
+Wrap a value in `pentect(...)` or its shorter alias `mask(...)` when it must be
+protected even if it is short, low-entropy, or unknown to the built-in detectors:
 
 ```text
 sudo password is pentect(passsword123)
@@ -41,9 +41,23 @@ sudo password is pentect(passsword123)
 
 Pentect removes the wrapper before the request leaves the device and sends a
 `KEYED_SECRET` handle in its place. If that handle is later used by a local tool,
-Pentect restores only `passsword123`; the `pentect(...)` annotation is not part
-of the value. The marker is case-sensitive, must be balanced, and an empty
-`pentect()` marker is ignored.
+Pentect restores only `passsword123`; the annotation is not part of the value.
+Both markers are case-sensitive, must be balanced, and are ignored when empty.
+
+## Intentionally leave a prompt value visible
+
+Use `unpentect(...)` or `unmask(...)` when a value in your own prompt must be
+sent without masking:
+
+```text
+public fixture is unmask(sk-example-not-a-real-key)
+```
+
+Pentect removes the wrapper and leaves only its contents. Unmask markers are
+recognized only in user prompt text. They are deliberately ignored in tool
+results, browser output, files, and other external content so an external source
+cannot disable protection. All four marker names are case-sensitive and require
+balanced parentheses.
 
 ## How a tool uses a handle
 

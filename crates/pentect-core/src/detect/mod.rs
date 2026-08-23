@@ -38,7 +38,7 @@ pub use decode::{
 };
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 pub use explicit::ExplicitSecretDetector;
-pub(crate) use explicit::EXPLICIT_SECRET_PREFIX;
+pub(crate) use explicit::EXPLICIT_SECRET_PREFIXES;
 pub use key_value::KeyValueDetector;
 pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use pem::PemDetector;

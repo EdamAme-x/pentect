@@ -2,9 +2,9 @@ use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
 
-pub(crate) const EXPLICIT_SECRET_PREFIX: &str = "pentect(";
+pub(crate) const EXPLICIT_SECRET_PREFIXES: [&str; 2] = ["pentect(", "mask("];
 
-/// Masks values deliberately wrapped as `pentect(value)`, regardless of their
+/// Masks values deliberately wrapped as `pentect(value)` or `mask(value)`, regardless of their
 /// entropy or shape. The renderer removes the opt-in wrapper while preserving
 /// only `value` in recovery, so a restored tool argument receives the intended
 /// value rather than the annotation syntax.
@@ -14,15 +14,13 @@ impl Detector for ExplicitSecretDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
         let bytes = text.as_bytes();
-        let prefix = EXPLICIT_SECRET_PREFIX.as_bytes();
         let mut spans = Vec::new();
         let mut cursor = 0usize;
 
-        while cursor + prefix.len() < bytes.len() {
-            let Some(relative) = text[cursor..].find(EXPLICIT_SECRET_PREFIX) else {
+        while cursor < bytes.len() {
+            let Some((marker_start, prefix)) = next_explicit_marker(text, cursor) else {
                 break;
             };
-            let marker_start = cursor + relative;
             let value_start = marker_start + prefix.len();
             let mut depth = 1usize;
             let mut close = value_start;
@@ -64,6 +62,23 @@ impl Detector for ExplicitSecretDetector {
     }
 }
 
+fn next_explicit_marker(text: &str, cursor: usize) -> Option<(usize, &'static str)> {
+    EXPLICIT_SECRET_PREFIXES
+        .iter()
+        .filter_map(|prefix| {
+            text[cursor..]
+                .match_indices(prefix)
+                .map(|(relative, _)| cursor + relative)
+                .find(|&start| {
+                    start == 0
+                        || !text.as_bytes()[start - 1].is_ascii_alphanumeric()
+                            && text.as_bytes()[start - 1] != b'_'
+                })
+                .map(|start| (start, *prefix))
+        })
+        .min_by_key(|(start, _)| *start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,7 +100,7 @@ mod tests {
 
     #[test]
     fn finds_low_entropy_and_balanced_values() {
-        let text = "a pentect(abc) b pentect(pa(ss)word)";
+        let text = "a pentect(abc) b mask(pa(ss)word)";
         let spans = detect(text);
         assert_eq!(spans.len(), 2);
         assert_eq!(&text[spans[0].range.start..spans[0].range.end], "abc");
@@ -97,7 +112,8 @@ mod tests {
 
     #[test]
     fn ignores_empty_unclosed_and_lookalike_markers() {
-        assert!(detect("pentect() pentect(unclosed").is_empty());
+        assert!(detect("pentect() mask() pentect(unclosed mask(unclosed").is_empty());
         assert!(detect("ｐｅｎｔｅｃｔ(value)").is_empty());
+        assert!(detect("unpentect(value) unmask(value)").is_empty());
     }
 }
