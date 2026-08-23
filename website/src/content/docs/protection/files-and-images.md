@@ -59,6 +59,11 @@ When OCR is enabled, it runs on your computer and Pentect covers detected
 sensitive areas before sending the image. Limits control the number of images,
 file size, image size, download time, and total check time.
 
+When pixels are covered, Pentect appends a short note for the agent explaining
+that the image was protected. Each region lists the same recoverable handle used
+for text, for example `[1] <<AWS_AKID_hash>>`; the original value is not included
+in the provider-visible note.
+
 Windows uses Windows OCR, macOS uses Vision, and Linux uses Pentect's bundled
 local OCR engine and model files. Linux does not require a separately installed
 Tesseract service. `pentect doctor` reports the selected backend as `windows`,

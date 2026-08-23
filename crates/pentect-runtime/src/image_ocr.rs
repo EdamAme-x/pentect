@@ -5,9 +5,12 @@ use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
 use crate::config::{ImageOcrConfig, UnscannedImagePolicy};
 #[cfg(any(feature = "ocr", test))]
 use pentect_core::model::labels;
+use pentect_core::placeholder::{identity_hash, render_placeholder};
 #[cfg(any(feature = "ocr", test))]
 use pentect_core::ByteRange;
+use pentect_core::Recovery;
 use serde_json::Value;
+use std::collections::HashMap;
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
 
@@ -50,6 +53,7 @@ pub(crate) struct ImageRedaction {
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
     pub(crate) notes: Vec<String>,
+    pub(crate) recovery: Recovery,
 }
 
 struct ImageRedactionState {
@@ -61,6 +65,7 @@ struct ImageRedactionState {
     total_image_bytes: u64,
     started_at: std::time::Instant,
     notes: Vec<String>,
+    recovery: HashMap<String, String>,
 }
 
 struct RedactedImagePayload {
@@ -88,6 +93,7 @@ struct ImageTextRegion {
 #[derive(Clone, Debug)]
 struct ImageSecretFinding {
     labels: Vec<String>,
+    secrets: Vec<(String, String)>,
     #[cfg(feature = "ocr")]
     rect: Option<NormalizedImageRect>,
     #[cfg(feature = "ocr")]
@@ -210,6 +216,7 @@ pub(crate) fn inspect_tool_images_for_secrets(
 pub(crate) fn redact_tool_images_for_secrets(
     value: &Value,
     key: &[u8; 32],
+    identity_key: &[u8; 32],
     cfg: &ImageOcrConfig,
 ) -> Result<ImageRedaction, String> {
     let mut state = ImageRedactionState {
@@ -221,8 +228,9 @@ pub(crate) fn redact_tool_images_for_secrets(
         total_image_bytes: 0,
         started_at: std::time::Instant::now(),
         notes: Vec::new(),
+        recovery: HashMap::new(),
     };
-    let updated = redact_image_value(value, key, cfg, &mut state)?;
+    let updated = redact_image_value(value, identity_key, cfg, &mut state)?;
     record_ocr_outcomes(
         state.scanned_images,
         state.unscanned_images,
@@ -236,6 +244,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         ocr_failures: state.ocr_failures,
         secret_images: state.secret_images,
         notes: state.notes,
+        recovery: Recovery::seal(state.recovery, key),
     })
 }
 
@@ -602,12 +611,27 @@ fn redact_image_bytes(
     }
 
     let mut labels = Vec::new();
+    let mut handles = Vec::new();
     for finding in &findings {
         push_secret_labels(&mut labels, &finding.labels);
+        for (handle, value) in &finding.secrets {
+            if !handles.iter().any(|seen| seen == handle) {
+                handles.push(handle.clone());
+            }
+            state
+                .recovery
+                .entry(handle.clone())
+                .or_insert_with(|| value.clone());
+        }
     }
     state.secret_images += 1;
     let index = state.notes.len() + 1;
-    state.notes.push(format!("[{index}] {}", labels.join(", ")));
+    let summary = if handles.is_empty() {
+        labels.join(", ")
+    } else {
+        handles.join(", ")
+    };
+    state.notes.push(format!("[{index}] {summary}"));
     let payload = redacted_image_payload(bytes, index, cfg, &findings)?;
     Ok(ImageRedactionDecision::Redacted(payload))
 }
@@ -623,6 +647,7 @@ fn image_secret_findings(
         for hit in image_text_secret_hits(&region.text, key)? {
             findings.push(ImageSecretFinding {
                 labels: vec![hit.label.clone()],
+                secrets: secret_entries(&region.text, std::slice::from_ref(&hit), key),
                 rect: None,
                 force_black: false,
                 pad_left: false,
@@ -633,6 +658,7 @@ fn image_secret_findings(
     if image_exif_has_gps(bytes) {
         findings.push(ImageSecretFinding {
             labels: vec![labels::IMAGE_GPS_METADATA.to_string()],
+            secrets: Vec::new(),
             rect: None,
             force_black: false,
             pad_left: false,
@@ -641,12 +667,14 @@ fn image_secret_findings(
     }
 
     for region in image_barcode_regions(bytes, cfg) {
-        let labels = labels_from_text_hits(&image_text_secret_hits(&region.text, key)?);
+        let hits = image_text_secret_hits(&region.text, key)?;
+        let labels = labels_from_text_hits(&hits);
         if labels.is_empty() {
             continue;
         }
         findings.push(ImageSecretFinding {
             labels,
+            secrets: secret_entries(&region.text, &hits, key),
             rect: region.rect,
             force_black: true,
             pad_left: true,
@@ -668,6 +696,7 @@ fn image_secret_findings(
             let redaction = rect_for_text_secret_hit(region, &hit);
             findings.push(ImageSecretFinding {
                 labels: vec![hit.label.clone()],
+                secrets: secret_entries(&region.text, std::slice::from_ref(&hit), key),
                 rect: redaction.rect,
                 force_black: false,
                 pad_left: redaction.pad_left,
@@ -675,10 +704,9 @@ fn image_secret_findings(
             });
         }
     }
-    let joined_labels = labels_from_text_hits(&image_text_secret_hits(
-        &image_regions_text(&ocr_regions),
-        key,
-    )?);
+    let joined_text = image_regions_text(&ocr_regions);
+    let joined_hits = image_text_secret_hits(&joined_text, key)?;
+    let joined_labels = labels_from_text_hits(&joined_hits);
     let missing_joined_labels = joined_labels
         .into_iter()
         .filter(|label| {
@@ -688,8 +716,14 @@ fn image_secret_findings(
         })
         .collect::<Vec<_>>();
     if !missing_joined_labels.is_empty() {
+        let missing_hits = joined_hits
+            .iter()
+            .filter(|hit| missing_joined_labels.contains(&hit.label))
+            .cloned()
+            .collect::<Vec<_>>();
         findings.push(ImageSecretFinding {
             labels: missing_joined_labels,
+            secrets: secret_entries(&joined_text, &missing_hits, key),
             rect: union_region_rects(&ocr_regions),
             force_black: true,
             pad_left: true,
@@ -700,6 +734,32 @@ fn image_secret_findings(
         findings,
         scan_failure: None,
     })
+}
+
+#[cfg(any(feature = "ocr", test))]
+fn secret_entries(
+    text: &str,
+    hits: &[ImageTextSecretHit],
+    identity_key: &[u8; 32],
+) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for hit in hits {
+        let Some(range) = hit.range else {
+            continue;
+        };
+        let Some(value) = text.get(range.start..range.end) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let handle = render_placeholder(&hit.label, &identity_hash(identity_key, value), None);
+        if !entries.iter().any(|(seen, _)| seen == &handle) {
+            entries.push((handle, value.to_string()));
+        }
+    }
+    entries
 }
 
 #[cfg(feature = "ocr")]
@@ -3197,6 +3257,7 @@ mod tests {
     fn test_finding(force_black: bool) -> ImageSecretFinding {
         ImageSecretFinding {
             labels: vec![labels::KEYED_SECRET.to_string()],
+            secrets: Vec::new(),
             rect: NormalizedImageRect::new(0.12, 0.16, 0.42, 0.46),
             force_black,
             pad_left: true,
@@ -3215,6 +3276,23 @@ mod tests {
             labels.contains(&"KAGGLE_API_TOKEN".to_string()),
             "{labels:?}"
         );
+    }
+
+    #[test]
+    fn ocr_secret_entries_are_recoverable_placeholders() {
+        let key = [7; 32];
+        let text = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let hits = image_text_secret_hits(text, &key).unwrap();
+        let entries = secret_entries(text, &hits, &key);
+        let (handle, value) = entries
+            .iter()
+            .find(|(handle, _)| handle.starts_with("<<OPENAI_API_KEY_"))
+            .expect("missing OpenAI API key placeholder");
+        let handle = handle.clone();
+        let value = value.clone();
+        assert_eq!(value, "sk-ABCDEFGHIJKLMNOPQRSTUVWX");
+        let recovery = Recovery::seal(entries.into_iter().collect(), &key);
+        assert_eq!(recovery.resolve(&handle), value);
     }
 
     #[test]
@@ -3337,6 +3415,7 @@ mod tests {
         let jpeg = solid_jpeg_with_app1(&app1);
         let findings = vec![ImageSecretFinding {
             labels: vec!["OPENAI_API_KEY".to_string()],
+            secrets: Vec::new(),
             rect: None,
             force_black: false,
             pad_left: false,

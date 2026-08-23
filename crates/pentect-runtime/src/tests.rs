@@ -2198,8 +2198,12 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
     assert!(output.get("decision").is_none(), "{output}");
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("Masked regions"), "{rendered}");
-    assert!(rendered.contains("[1] OPENAI_API_KEY"), "{rendered}");
+    assert!(
+        rendered.contains("Pentect masked sensitive information in this image with black boxes."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Masked regions:"), "{rendered}");
+    assert!(rendered.contains("[1] <<OPENAI_API_KEY_"), "{rendered}");
     assert!(
         rendered.contains("\"mimeType\":\"image/png\""),
         "{rendered}"

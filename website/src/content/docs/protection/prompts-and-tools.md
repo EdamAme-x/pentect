@@ -88,6 +88,8 @@ side effect happens outside Pentect's provider boundary.
 A screenshot may contain a token even when the tool result has no useful text.
 With OCR enabled, Pentect scans supported image payloads locally and covers
 detected sensitive regions before the image is sent to the provider.
+The protected result also tells the agent whether Pentect added black boxes or
+blurred the regions, and lists a recoverable handle without repeating the secret.
 
 Pentect also checks text found in supported QR codes and barcodes. When an
 image must be rewritten, it removes supported metadata and sends protected
