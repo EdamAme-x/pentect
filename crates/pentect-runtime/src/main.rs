@@ -273,7 +273,15 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
         return Ok(None);
     }
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
-    let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    let redaction = image_ocr::redact_tool_images_for_secrets(
+        value,
+        &session.key,
+        &session.identity_key,
+        &cfg,
+    )?;
+    session
+        .sync_recovery(&redaction.recovery)
+        .map_err(|error| error.to_string())?;
     activity_log::record_image(redaction.secret_images, &redaction.notes);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
@@ -291,7 +299,9 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
     }
     Ok(Some(append_image_mask_notes(
         redaction.updated,
-        &redaction.notes,
+        &redaction.visual_notes,
+        &redaction.metadata_notes,
+        cfg.redaction,
     )))
 }
 
@@ -3901,7 +3911,15 @@ fn claude_image_tool_output(
             ),
         );
     }
-    let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    let redaction = image_ocr::redact_tool_images_for_secrets(
+        value,
+        &session.key,
+        &session.identity_key,
+        &cfg,
+    )?;
+    session
+        .sync_recovery(&redaction.recovery)
+        .map_err(|error| error.to_string())?;
     activity_log::record_image(redaction.secret_images, &redaction.notes);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
@@ -3921,7 +3939,12 @@ fn claude_image_tool_output(
                 "image blocked: secret text detected.".to_string(),
             )));
         }
-        let updated = append_image_mask_notes(redaction.updated, &redaction.notes);
+        let updated = append_image_mask_notes(
+            redaction.updated,
+            &redaction.visual_notes,
+            &redaction.metadata_notes,
+            cfg.redaction,
+        );
         return Ok(Some(ToolTextOutput::Updated(updated)));
     }
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {
@@ -3930,11 +3953,37 @@ fn claude_image_tool_output(
     Ok(None)
 }
 
-fn append_image_mask_notes(mut value: Value, notes: &[String]) -> Value {
-    if notes.is_empty() {
+fn append_image_mask_notes(
+    mut value: Value,
+    visual_notes: &[String],
+    metadata_notes: &[String],
+    style: config::ImageRedactionStyle,
+) -> Value {
+    if visual_notes.is_empty() && metadata_notes.is_empty() {
         return value;
     }
-    let text = format!("Masked regions\n{}", notes.join("\n"));
+    let mut sections = Vec::new();
+    if !visual_notes.is_empty() {
+        let explanation = match style {
+            config::ImageRedactionStyle::Black => {
+                "Pentect masked sensitive information in this image with black boxes."
+            }
+            config::ImageRedactionStyle::Blur => {
+                "Pentect masked sensitive information in this image by blurring those regions."
+            }
+        };
+        sections.push(format!(
+            "{explanation}\nMasked regions:\n{}",
+            visual_notes.join("\n")
+        ));
+    }
+    if !metadata_notes.is_empty() {
+        sections.push(format!(
+            "Pentect removed sensitive metadata from this image.\nProtected values:\n{}",
+            metadata_notes.join("\n")
+        ));
+    }
+    let text = sections.join("\n");
     if append_text_block_to_content(&mut value, &text) {
         return value;
     }

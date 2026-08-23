@@ -2198,8 +2198,12 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
     assert!(output.get("decision").is_none(), "{output}");
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("Masked regions"), "{rendered}");
-    assert!(rendered.contains("[1] OPENAI_API_KEY"), "{rendered}");
+    assert!(
+        rendered.contains("Pentect masked sensitive information in this image with black boxes."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Masked regions:"), "{rendered}");
+    assert!(rendered.contains("[1] <<OPENAI_API_KEY_"), "{rendered}");
     assert!(
         rendered.contains("\"mimeType\":\"image/png\""),
         "{rendered}"
@@ -2207,6 +2211,41 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
     assert!(!rendered.contains(&original), "{rendered}");
     assert!(!rendered.contains(raw), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn image_mask_note_describes_metadata_only_protection_accurately() {
+    let updated = append_image_mask_notes(
+        json!({"content": []}),
+        &[],
+        &["[1] <<OPENAI_API_KEY_0011223344556677>>".to_string()],
+        config::ImageRedactionStyle::Black,
+    );
+    let rendered = serde_json::to_string(&updated).unwrap();
+    assert!(
+        rendered.contains("Pentect removed sensitive metadata from this image."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Protected values:"), "{rendered}");
+    assert!(!rendered.contains("black boxes"), "{rendered}");
+}
+
+#[test]
+fn image_mask_note_separates_visual_and_metadata_protection() {
+    let updated = append_image_mask_notes(
+        json!({"content": []}),
+        &["[1] <<AWS_AKID_0011223344556677>>".to_string()],
+        &["[2] <<OPENAI_API_KEY_0011223344556677>>".to_string()],
+        config::ImageRedactionStyle::Black,
+    );
+    let rendered = serde_json::to_string(&updated).unwrap();
+    assert!(rendered.contains("black boxes"), "{rendered}");
+    assert!(rendered.contains("Masked regions:"), "{rendered}");
+    assert!(
+        rendered.contains("removed sensitive metadata"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Protected values:"), "{rendered}");
 }
 
 #[cfg(feature = "ocr")]
