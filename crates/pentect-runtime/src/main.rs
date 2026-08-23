@@ -301,6 +301,7 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
         redaction.updated,
         &redaction.notes,
         cfg.redaction,
+        redaction.pixel_redactions > 0,
     )))
 }
 
@@ -3938,7 +3939,12 @@ fn claude_image_tool_output(
                 "image blocked: secret text detected.".to_string(),
             )));
         }
-        let updated = append_image_mask_notes(redaction.updated, &redaction.notes, cfg.redaction);
+        let updated = append_image_mask_notes(
+            redaction.updated,
+            &redaction.notes,
+            cfg.redaction,
+            redaction.pixel_redactions > 0,
+        );
         return Ok(Some(ToolTextOutput::Updated(updated)));
     }
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {
@@ -3951,18 +3957,26 @@ fn append_image_mask_notes(
     mut value: Value,
     notes: &[String],
     style: config::ImageRedactionStyle,
+    pixels_changed: bool,
 ) -> Value {
     if notes.is_empty() {
         return value;
     }
-    let protection = match style {
-        config::ImageRedactionStyle::Black => "with black boxes",
-        config::ImageRedactionStyle::Blur => "by blurring those regions",
+    let (explanation, heading) = match (pixels_changed, style) {
+        (true, config::ImageRedactionStyle::Black) => (
+            "Pentect masked sensitive information in this image with black boxes.",
+            "Masked regions:",
+        ),
+        (true, config::ImageRedactionStyle::Blur) => (
+            "Pentect masked sensitive information in this image by blurring those regions.",
+            "Masked regions:",
+        ),
+        (false, _) => (
+            "Pentect removed sensitive metadata from this image.",
+            "Protected values:",
+        ),
     };
-    let text = format!(
-        "Pentect masked sensitive information in this image {protection}.\nMasked regions:\n{}",
-        notes.join("\n")
-    );
+    let text = format!("{explanation}\n{heading}\n{}", notes.join("\n"));
     if append_text_block_to_content(&mut value, &text) {
         return value;
     }

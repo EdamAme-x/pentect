@@ -55,6 +55,7 @@ pub(crate) struct ImageRedaction {
     pub(crate) secret_images: usize,
     pub(crate) notes: Vec<String>,
     pub(crate) recovery: Recovery,
+    pub(crate) pixel_redactions: usize,
 }
 
 struct ImageRedactionState {
@@ -67,6 +68,7 @@ struct ImageRedactionState {
     started_at: std::time::Instant,
     notes: Vec<String>,
     recovery: HashMap<String, String>,
+    pixel_redactions: usize,
 }
 
 struct RedactedImagePayload {
@@ -230,6 +232,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         started_at: std::time::Instant::now(),
         notes: Vec::new(),
         recovery: HashMap::new(),
+        pixel_redactions: 0,
     };
     let updated = redact_image_value(value, identity_key, cfg, &mut state)?;
     record_ocr_outcomes(
@@ -246,6 +249,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         secret_images: state.secret_images,
         notes: state.notes,
         recovery: Recovery::seal(state.recovery, key),
+        pixel_redactions: state.pixel_redactions,
     })
 }
 
@@ -626,6 +630,9 @@ fn redact_image_bytes(
         }
     }
     state.secret_images += 1;
+    if findings_redact_pixels(&findings) {
+        state.pixel_redactions += 1;
+    }
     let index = state.notes.len() + 1;
     let summary = if handles.is_empty() {
         labels.join(", ")
@@ -635,6 +642,16 @@ fn redact_image_bytes(
     state.notes.push(format!("[{index}] {summary}"));
     let payload = redacted_image_payload(bytes, index, cfg, &findings)?;
     Ok(ImageRedactionDecision::Redacted(payload))
+}
+
+#[cfg(feature = "ocr")]
+fn findings_redact_pixels(findings: &[ImageSecretFinding]) -> bool {
+    findings.iter().any(|finding| finding.redact_pixels)
+}
+
+#[cfg(not(feature = "ocr"))]
+fn findings_redact_pixels(_findings: &[ImageSecretFinding]) -> bool {
+    false
 }
 
 #[cfg(feature = "ocr")]

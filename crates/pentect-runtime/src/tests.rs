@@ -2213,6 +2213,23 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn image_mask_note_describes_metadata_only_protection_accurately() {
+    let updated = append_image_mask_notes(
+        json!({"content": []}),
+        &["[1] <<OPENAI_API_KEY_0011223344556677>>".to_string()],
+        config::ImageRedactionStyle::Black,
+        false,
+    );
+    let rendered = serde_json::to_string(&updated).unwrap();
+    assert!(
+        rendered.contains("Pentect removed sensitive metadata from this image."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Protected values:"), "{rendered}");
+    assert!(!rendered.contains("black boxes"), "{rendered}");
+}
+
 #[cfg(feature = "ocr")]
 #[test]
 fn codex_posttool_still_blocks_secret_qr_image() {
