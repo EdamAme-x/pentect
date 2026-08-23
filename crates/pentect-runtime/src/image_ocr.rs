@@ -619,10 +619,17 @@ fn redact_image_bytes(
         return Ok(ImageRedactionDecision::Clean);
     }
 
-    let mut labels = Vec::new();
-    let mut handles = Vec::new();
+    let mut visual_labels = Vec::new();
+    let mut visual_handles = Vec::new();
+    let mut metadata_labels = Vec::new();
+    let mut metadata_handles = Vec::new();
     for finding in &findings {
-        push_secret_labels(&mut labels, &finding.labels);
+        let (labels, handles) = if finding_redacts_pixels(finding) {
+            (&mut visual_labels, &mut visual_handles)
+        } else {
+            (&mut metadata_labels, &mut metadata_handles)
+        };
+        push_secret_labels(labels, &finding.labels);
         for (handle, value) in &finding.secrets {
             if !handles.iter().any(|seen| seen == handle) {
                 handles.push(handle.clone());
@@ -634,30 +641,38 @@ fn redact_image_bytes(
         }
     }
     state.secret_images += 1;
-    let index = state.notes.len() + 1;
-    let summary = if handles.is_empty() {
-        labels.join(", ")
-    } else {
-        handles.join(", ")
-    };
-    let note = format!("[{index}] {summary}");
-    state.notes.push(note.clone());
-    if findings_redact_pixels(&findings) {
+    let index = state.secret_images;
+    if let Some(summary) = image_note_summary(&visual_labels, &visual_handles) {
+        let note = format!("[{index}] {summary}");
+        state.notes.push(note.clone());
         state.visual_notes.push(note);
-    } else {
+    }
+    if let Some(summary) = image_note_summary(&metadata_labels, &metadata_handles) {
+        let note = format!("[{index}] {summary}");
+        state.notes.push(note.clone());
         state.metadata_notes.push(note);
     }
     let payload = redacted_image_payload(bytes, index, cfg, &findings)?;
     Ok(ImageRedactionDecision::Redacted(payload))
 }
 
+fn image_note_summary(labels: &[String], handles: &[String]) -> Option<String> {
+    if !handles.is_empty() {
+        Some(handles.join(", "))
+    } else if !labels.is_empty() {
+        Some(labels.join(", "))
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "ocr")]
-fn findings_redact_pixels(findings: &[ImageSecretFinding]) -> bool {
-    findings.iter().any(|finding| finding.redact_pixels)
+fn finding_redacts_pixels(finding: &ImageSecretFinding) -> bool {
+    finding.redact_pixels
 }
 
 #[cfg(not(feature = "ocr"))]
-fn findings_redact_pixels(_findings: &[ImageSecretFinding]) -> bool {
+fn finding_redacts_pixels(_finding: &ImageSecretFinding) -> bool {
     false
 }
 
@@ -3232,7 +3247,11 @@ mod tests {
 
     #[cfg(feature = "ocr")]
     fn png_with_raw_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut png = color_grid_png();
+        insert_png_raw_chunk(color_grid_png(), kind, data)
+    }
+
+    #[cfg(feature = "ocr")]
+    fn insert_png_raw_chunk(mut png: Vec<u8>, kind: [u8; 4], data: &[u8]) -> Vec<u8> {
         let iend = png
             .windows(8)
             .position(|window| window == b"\0\0\0\0IEND")
@@ -3354,6 +3373,42 @@ mod tests {
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn one_image_separates_visual_and_metadata_handles() {
+        let visual_secret = "AKIAIOSFODNN7EXAMPLE";
+        let metadata_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let mut metadata = b"Description\0OPENAI_API_KEY=".to_vec();
+        metadata.extend_from_slice(metadata_secret.as_bytes());
+        let png = insert_png_raw_chunk(qr_png(visual_secret), *b"tEXt", &metadata);
+        let value = serde_json::json!({
+            "content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": data_encoding::BASE64.encode(&png)
+            }]
+        });
+        let key = [7; 32];
+        let redaction = redact_tool_images_for_secrets(&value, &key, &key, &test_config()).unwrap();
+        let visual = redaction.visual_notes.join("\n");
+        let metadata = redaction.metadata_notes.join("\n");
+        assert!(visual.contains("<<AWS_AKID_"), "{visual}");
+        assert!(!visual.contains("<<OPENAI_API_KEY_"), "{visual}");
+        assert!(metadata.contains("<<OPENAI_API_KEY_"), "{metadata}");
+        assert!(!metadata.contains("<<AWS_AKID_"), "{metadata}");
+        assert!(
+            redaction.recovery.resolve(&visual).contains(visual_secret),
+            "{visual}"
+        );
+        assert!(
+            redaction
+                .recovery
+                .resolve(&metadata)
+                .contains(metadata_secret),
+            "{metadata}"
+        );
     }
 
     #[cfg(feature = "ocr")]
