@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
+const EXPLICIT_UNMASK_PREFIXES: [&str; 2] = ["unpentect(", "unmask("];
 static PENTECT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 static PENTECT_PROMPT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 const BATCH_DELIMITERS: [&str; 4] = [
@@ -127,6 +128,8 @@ impl OutputMasker {
             remasked,
             &Kind::Text,
         )?;
+        let (remasked, unmasked_values) =
+            protect_prompt_unmask_markers(&remasked, &self.store.session.identity_key);
         // Prompt scalars are structurally text, but dotenv assignments can be
         // embedded in prose. Run the Env parser first so assignment labels are
         // preserved, then feed the result through the same cached text engine.
@@ -177,7 +180,10 @@ impl OutputMasker {
             .saturating_add(env_result.summary.masked_count);
         self.track_mask_result("prompt", &result);
         self.add_masked_count(masked_count);
-        let masked = compact_local_home_paths(&result.masked);
+        let masked = restore_prompt_unmask_markers(
+            &compact_local_home_paths(&result.masked),
+            &unmasked_values,
+        );
         let mut recovery = result.recovery;
         recovery.extend_same_key(env_alias_recovery(
             &masked,
@@ -547,6 +553,84 @@ impl OutputMasker {
             }
         }
     }
+}
+
+fn protect_prompt_unmask_markers(
+    text: &str,
+    identity_key: &[u8; 32],
+) -> (String, Vec<(String, String)>) {
+    let mut output = String::with_capacity(text.len());
+    let mut bindings = Vec::new();
+    let mut emit_cursor = 0usize;
+    let mut search_cursor = 0usize;
+    let mut token_index = 0usize;
+
+    while let Some((marker_start, prefix)) = next_unmask_marker(text, search_cursor) {
+        let value_start = marker_start + prefix.len();
+        let Some(close) = balanced_marker_close(text, value_start) else {
+            search_cursor = value_start;
+            continue;
+        };
+        let value = &text[value_start..close];
+        let token = loop {
+            let identity = format!("{token_index}\0{value}");
+            token_index += 1;
+            let candidate =
+                render_placeholder("UNMASKED", &identity_hash(identity_key, &identity), None);
+            if !text.contains(&candidate) && !bindings.iter().any(|(seen, _)| seen == &candidate) {
+                break candidate;
+            }
+        };
+        output.push_str(&text[emit_cursor..marker_start]);
+        output.push_str(&token);
+        bindings.push((token, value.to_string()));
+        emit_cursor = close + 1;
+        search_cursor = emit_cursor;
+    }
+    output.push_str(&text[emit_cursor..]);
+    (output, bindings)
+}
+
+fn restore_prompt_unmask_markers(text: &str, bindings: &[(String, String)]) -> String {
+    bindings
+        .iter()
+        .fold(text.to_string(), |output, (token, value)| {
+            output.replace(token, value)
+        })
+}
+
+fn next_unmask_marker(text: &str, cursor: usize) -> Option<(usize, &'static str)> {
+    EXPLICIT_UNMASK_PREFIXES
+        .iter()
+        .filter_map(|prefix| {
+            text[cursor..]
+                .match_indices(prefix)
+                .map(|(relative, _)| cursor + relative)
+                .find(|&start| {
+                    start == 0
+                        || !text.as_bytes()[start - 1].is_ascii_alphanumeric()
+                            && text.as_bytes()[start - 1] != b'_'
+                })
+                .map(|start| (start, *prefix))
+        })
+        .min_by_key(|(start, _)| *start)
+}
+
+fn balanced_marker_close(text: &str, value_start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    for (relative, byte) in text.as_bytes()[value_start..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(value_start + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn scalar_is_env_assignment(text: &str) -> bool {

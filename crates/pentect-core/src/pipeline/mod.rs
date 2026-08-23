@@ -1406,16 +1406,26 @@ mod tests {
 
     #[test]
     fn explicit_secret_marker_forces_masking_and_is_not_restored_as_syntax() {
-        let input = "fixture value: pentect(abc)";
+        for marker in ["pentect", "mask"] {
+            assert_explicit_secret_marker(marker);
+        }
+    }
+
+    fn assert_explicit_secret_marker(marker: &str) {
+        let input = format!("fixture value: {marker}(abc)");
         let result = Engine::with_profile(Profile::Dev).mask(
             Input {
                 kind: Kind::Text,
-                data: input.to_string(),
+                data: input,
             },
             &Config::insecure_testing(),
         );
         assert_eq!(result.masked.matches("<<KEYED_SECRET_").count(), 1);
-        assert!(!result.masked.contains("pentect("), "{}", result.masked);
+        assert!(
+            !result.masked.contains(&format!("{marker}(")),
+            "{}",
+            result.masked
+        );
         assert!(!result.masked.contains("abc"), "{}", result.masked);
         assert_eq!(
             restore(&result.masked, &result.recovery).unwrap(),

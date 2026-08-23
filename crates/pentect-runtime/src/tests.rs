@@ -623,6 +623,36 @@ fn active_prompt_explicit_marker_masks_low_entropy_value_and_removes_wrapper() {
 }
 
 #[test]
+fn active_prompt_supports_mask_and_prompt_only_unmask_aliases() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-marker-aliases");
+
+    let openai = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let aws = "AKIA7K9Q2M4N6P8R1T3V";
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let masked = masker
+        .mask_prompt_text(&format!(
+            "pentect(abc) mask(def) unpentect({openai}) unmask({aws})"
+        ))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(masked.matches("<<KEYED_SECRET_").count(), 2, "{masked}");
+    assert!(masked.contains(openai), "{masked}");
+    assert!(masked.contains(aws), "{masked}");
+    for wrapper in ["pentect(", "mask(", "unpentect(", "unmask("] {
+        assert!(!masked.contains(wrapper), "{masked}");
+    }
+
+    let output = masker
+        .mask_tool_output(&format!("unmask({aws})"))
+        .unwrap()
+        .unwrap();
+    assert!(!output.contains(aws), "{output}");
+    assert!(output.contains("<<"), "{output}");
+}
+
+#[test]
 fn bridge_masks_prompt_wraps_shell_and_masks_result() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("bridge-mask");
