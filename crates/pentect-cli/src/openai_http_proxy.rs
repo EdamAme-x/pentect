@@ -3465,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_boundary_masks_chat_requests_and_restores_only_tool_arguments() {
+    fn provider_boundary_masks_chat_requests_and_restores_local_assistant_output() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let mut env = ProviderBoundaryTestEnv::install(&store);
@@ -3537,7 +3537,7 @@ mod tests {
         assert!(request.matches(&handle).count() >= 3);
         let protected_request: Value = serde_json::from_str(&request).unwrap();
         assert_eq!(protected_request["messages"][0]["content"], HANDLE_CONTRACT);
-        assert_eq!(response["choices"][0]["message"]["content"], handle);
+        assert_eq!(response["choices"][0]["message"]["content"], secret);
         let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
