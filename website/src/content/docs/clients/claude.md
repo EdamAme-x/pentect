@@ -62,9 +62,10 @@ pentect claude --permission-mode plan
 
 ## Protected flow
 
-Pentect checks supported Chat, attachment, and Claude Code requests before they
-reach the selected provider. Local tool calls can use handles without showing
-the real values to the model.
+`pentect claude` checks supported Claude Code requests before they reach the
+selected provider. On an explicitly compatible Desktop build,
+`pentect claude app` checks the supported Chat and attachment routes. Local tool
+calls can use handles without showing the real values to the model.
 
 Pentect adds short session instructions that explain handle use and local
 environment bindings. The instructions contain labels and syntax, not real
@@ -89,6 +90,16 @@ See [Custom upstreams](/clients/upstreams/) for compatible gateway setup,
 credentials, and troubleshooting.
 
 ## Claude Desktop
+
+::: danger
+Claude Desktop `1.34493.1` on Windows rejects the certificate-pin switch that
+Pentect requires for its ephemeral local CA, so that build cannot be protected
+with `pentect claude app`. Pentect will not bypass certificate verification or
+install a system CA. Version `1.24012.9` is an older observed-compatible point,
+not a guaranteed version ceiling. Use `pentect claude` for Claude Code and see
+the [compatibility matrix](/reference/compatibility/#desktop-testing) before
+using Desktop mode.
+:::
 
 Desktop protection affects only the launch started by Pentect. Test app
 discovery first. If Pentect cannot find the app, pass its path:

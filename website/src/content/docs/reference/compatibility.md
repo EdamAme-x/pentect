@@ -15,7 +15,7 @@ drift is visible before the next release.
 | OpenCode `1.18.20` | Real launch on Linux and all installer platforms | `pentect opencode` |
 | Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
 | ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests | `pentect codex app` |
-| Claude Desktop, supported Chat, attachment, and Code routes | Executable launch contract and protocol tests | `pentect claude app` |
+| Claude Desktop | Protocol tests; `1.24012.9` was manually launch-tested, while `1.34493.1` is known incompatible | `pentect claude app` only on an explicitly compatible build |
 
 ## Not implemented
 
@@ -46,7 +46,7 @@ links, broken data, custom gateway paths, and Codex zstd-compressed requests.
 | `pentect codex` | OpenAI Responses | Includes streaming events and completed tool calls |
 | `pentect claude` | Anthropic Messages | Includes streaming content blocks and tool use |
 | `pentect codex app` | Responses routes used by supported Codex mode | Other ChatGPT modes are outside this claim |
-| `pentect claude app` | Supported Claude Chat, attachment, and Code routes | Cowork and Voice are outside this claim |
+| `pentect claude app` | Supported Claude Chat and attachment routes on a compatible app build | Claude Code should use `pentect claude`; Cowork and Voice are outside this claim |
 
 “Supported” means Pentect recognizes and checks the route and content shapes
 documented here. “Tested” means the release suite exercised them with fake
@@ -87,8 +87,17 @@ that local handles are not printed.
 | Desktop surface | Current scope |
 | --- | --- |
 | Codex App | Supported Codex mode using the Responses protocol |
-| Claude Desktop | Supported Chat, attachment, and Code routes |
+| Claude Desktop | Protocol support exists, but current build compatibility is restricted as described below |
 | Other app modes | Not claimed unless listed here |
+
+Claude Desktop `1.34493.1` on Windows deliberately rejects the Chromium
+certificate-pin switch required by Pentect's ephemeral local CA. Pentect does
+not weaken certificate verification or install that CA into the system trust
+store, so this build cannot use `pentect claude app`. Claude Desktop
+`1.24012.9` is an observed compatible point from a manual smoke test, not a
+guaranteed version range. Do not update or downgrade solely from an inferred
+range; check this page for an explicitly tested build. Use `pentect claude` for
+Claude Code.
 
 ## Not covered
 
