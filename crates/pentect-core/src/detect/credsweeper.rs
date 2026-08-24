@@ -395,6 +395,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueSealedSecretCheck"
             | "ValueSimilarityCheck"
             | "ValueStringTypeCheck"
+            | "ValueSplitKeywordCheck"
             | "ValueTokenCheck"
     )
 }
@@ -2180,6 +2181,9 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueSplitKeywordCheck" && value_split_keyword_filtered(value) {
+            return false;
+        }
         if filter == "ValueTokenCheck" && value_token_filtered(value, candidate) {
             return false;
         }
@@ -2545,6 +2549,13 @@ fn value_string_type_filtered(
         return false;
     }
     true
+}
+
+fn value_split_keyword_filtered(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower
+        .split_whitespace()
+        .any(|word| keyword_checklist_by_length().contains(&word))
 }
 
 fn source_file_requires_quotes(file_type: &str) -> bool {
@@ -3234,7 +3245,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 19, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 18, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3849,6 +3860,17 @@ mod tests {
             &candidate,
             &source
         ));
+    }
+
+    #[test]
+    fn value_split_keyword_check_matches_upstream_whitespace_rules() {
+        for value in ["abstract and so on", "Any dummy lines", "unique string"] {
+            assert!(value_split_keyword_filtered(value), "{value:?}");
+        }
+        for value in ["abstract,and_so_on", "ani dammi lwnes", "unique#string"] {
+            assert!(!value_split_keyword_filtered(value), "{value:?}");
+        }
+        assert!(value_split_keyword_filtered("prefix\tabstract\nsuffix"));
     }
 
     #[test]
