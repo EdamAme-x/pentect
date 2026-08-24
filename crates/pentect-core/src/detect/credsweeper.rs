@@ -497,6 +497,10 @@ fn filter_has_native_handler(filter: &str) -> bool {
 
 impl CredSweeperNativeDetector {
     pub fn detect_findings(&self, view: &NormalizedView) -> Vec<CredSweeperNativeFinding> {
+        if !view.is_identity() {
+            let raw_view = view.raw_detection_view();
+            return self.detect_findings(&raw_view);
+        }
         let text = view.text();
         let mut out = Vec::new();
         let mut ml_pending = Vec::new();
@@ -654,9 +658,89 @@ impl DeferredRegex {
                 .captures_iter(text)
                 .filter_map(Result::ok)
                 .filter_map(|captures| fancy_candidate(&captures, text, value_capture))
+                .map(|candidate| keyword_get_default_candidate(text, candidate))
                 .collect(),
             None => Vec::new(),
         }
+    }
+}
+
+fn keyword_get_default_candidate<'a>(text: &'a str, candidate: Candidate<'a>) -> Candidate<'a> {
+    let wrap = candidate.wrap.unwrap_or_default().to_ascii_lowercase();
+    if !(wrap.contains(".get") || wrap.contains("getenv")) {
+        return candidate;
+    }
+    let Some(key_quote) = candidate.value_leftquote else {
+        return candidate;
+    };
+    if key_quote.len() != 1 || candidate.value_rightquote != Some(key_quote) {
+        return candidate;
+    }
+    let Some(mut tail) = text.get(candidate.end..) else {
+        return candidate;
+    };
+    let Some(after_key_quote) = tail.strip_prefix(key_quote) else {
+        return candidate;
+    };
+    tail = after_key_quote.trim_start();
+    if let Some(after_comma) = tail.strip_prefix(',') {
+        tail = after_comma.trim_start();
+        if tail.to_ascii_lowercase().starts_with("default") {
+            tail = &tail["default".len()..];
+            tail = tail.trim_start();
+            let Some(after_equals) = tail.strip_prefix('=') else {
+                return candidate;
+            };
+            tail = after_equals.trim_start();
+        }
+    } else if let Some(after_paren) = tail.strip_prefix(')') {
+        tail = after_paren.trim_start();
+        if tail.len() < 2 || !tail[..2].eq_ignore_ascii_case("or") {
+            return candidate;
+        }
+        tail = tail[2..].trim_start();
+    } else {
+        return candidate;
+    }
+
+    let prefix_len = text.len() - tail.len();
+    let mut chars = tail.char_indices();
+    let Some((_, quote)) = chars.next() else {
+        return candidate;
+    };
+    if !matches!(quote, '\'' | '"' | '`') {
+        return candidate;
+    }
+    let value_start_local = quote.len_utf8();
+    let mut escaped = false;
+    let mut value_end_local = None;
+    for (index, ch) in tail[value_start_local..].char_indices() {
+        if ch == quote && !escaped {
+            value_end_local = Some(value_start_local + index);
+            break;
+        }
+        escaped = ch == '\\' && !escaped;
+        if ch != '\\' {
+            escaped = false;
+        }
+    }
+    let Some(value_end_local) = value_end_local else {
+        return candidate;
+    };
+    let value_start = prefix_len + value_start_local;
+    let value_end = prefix_len + value_end_local;
+    Candidate {
+        start: value_start,
+        end: value_end,
+        value: &text[value_start..value_end],
+        variable_start: candidate.variable_start,
+        variable_end: candidate.variable_end,
+        variable: candidate.variable,
+        separator: candidate.separator,
+        wrap: candidate.wrap,
+        value_leftquote: Some(&text[prefix_len..prefix_len + quote.len_utf8()]),
+        value_rightquote: Some(&text[value_end..value_end + quote.len_utf8()]),
+        line_data: candidate.line_data,
     }
 }
 
@@ -5091,6 +5175,12 @@ mod tests {
     #[test]
     fn keyword_rules_match_official_nested_fixture_literals() {
         for (path, raw, rule_name, expected) in [
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ['PASSWORD = os.environ.get("PASSWORD") or "at5G6zi!m"', "at5G6zi!m"],"#,
+                "Password",
+                "at5G6zi!m",
+            ),
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/rules/test_password.py",
                 r#"    @pytest.fixture(params=[["password = cackle!"], ["gi_reo_gi_passwd = cackle!"], ["pwd = cackle!"]])"#,
