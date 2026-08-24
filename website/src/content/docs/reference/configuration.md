@@ -39,6 +39,19 @@ ignored.
 | `activity.share` | `true` | Share events with compatible local Pentect processes |
 | `agent.required` | `false` | Require supported agents to start through Pentect |
 | `output.restore` | `false` | Restore known handles in assistant text shown by supported clients |
+| `update.check` | `true` | Check in the background for a newer Pentect release |
+
+## Update notification
+
+```toml
+[update]
+check = true
+```
+
+Pentect checks GitHub Releases at most once every 24 hours and caches the latest
+known version in the local Pentect state directory. The check runs in the
+background and never blocks protected client startup. Set `check = false` to
+disable it. Installing an update remains explicit through `pentect update`.
 
 ## Handle identity
 

@@ -1,5 +1,5 @@
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,23 @@ const USER_AGENT: &str = "pentect-updater";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 4 * 1024;
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+const UPDATE_CHECK_CACHE: &str = "update-check.json";
+const MAX_UPDATE_CACHE_BYTES: u64 = 4 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct UpdateCheckRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct UpdateCheckCache {
+    checked_at: u64,
+    latest: String,
+}
 
 pub(crate) struct DownloadedReleaseAsset {
     pub(crate) version: Version,
@@ -42,6 +59,139 @@ struct UpdateOptions {
 
 pub(crate) fn cmd_version() {
     println!("pentect {}", env!("CARGO_PKG_VERSION"));
+}
+
+pub(crate) fn start_update_notification(args: &[String]) {
+    if !should_check_on_startup(args) || !pentect_agent::update_check_enabled().unwrap_or(true) {
+        return;
+    }
+    let Ok(cache_path) = update_check_cache_path() else {
+        return;
+    };
+    let now = unix_seconds();
+    if let Some(cache) = read_update_check_cache(&cache_path) {
+        if now.saturating_sub(cache.checked_at) < UPDATE_CHECK_INTERVAL.as_secs() {
+            print_update_notice(&cache.latest);
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        if refresh_update_check(&cache_path, now).is_err() {
+            pentect_agent::record_diagnostic_activity("update-check", "request-failed");
+            pentect_agent::flush_activity_log();
+        }
+    });
+}
+
+fn should_check_on_startup(args: &[String]) -> bool {
+    !matches!(
+        args.get(1).map(String::as_str),
+        None | Some("help" | "--help" | "-h" | "version" | "--version" | "-V" | "update")
+            | Some(
+                "__apply-update"
+                    | "memory-store"
+                    | "hook"
+                    | "bridge"
+                    | "__agent-script"
+                    | "__agent-stream"
+            )
+    )
+}
+
+fn refresh_update_check(path: &Path, now: u64) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|error| format!("could not create update-check client: {error}"))?;
+    let release: UpdateCheckRelease = get_response(&client, RELEASE_API, MAX_CHECKSUM_BYTES * 4)?;
+    if release.draft || release.prerelease {
+        return Ok(());
+    }
+    let latest = release_version(&release.tag_name)?.to_string();
+    write_update_check_cache(
+        path,
+        &UpdateCheckCache {
+            checked_at: now,
+            latest: latest.clone(),
+        },
+    )?;
+    print_update_notice(&latest);
+    Ok(())
+}
+
+fn print_update_notice(latest: &str) {
+    let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return;
+    };
+    let Ok(latest) = Version::parse(latest) else {
+        return;
+    };
+    if latest > current {
+        eprintln!("[pentect] update available: {current} -> {latest}; run `pentect update`");
+    }
+}
+
+fn update_check_cache_path() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = home_dir().map(|home| home.join("Library").join("Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".local").join("state")));
+    base.map(|base| base.join("pentect").join(UPDATE_CHECK_CACHE))
+        .ok_or_else(|| "could not find a local state directory for update checks".to_string())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+
+fn read_update_check_cache(path: &Path) -> Option<UpdateCheckCache> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_UPDATE_CACHE_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn write_update_check_cache(path: &Path, cache: &UpdateCheckCache) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "update-check cache path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create update-check cache directory: {error}"))?;
+    let bytes = serde_json::to_vec(cache)
+        .map_err(|error| format!("could not encode update-check cache: {error}"))?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("could not create update-check cache: {error}"))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_data())
+        .map_err(|error| format!("could not write update-check cache: {error}"))?;
+    drop(file);
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("could not publish update-check cache: {error}"))
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 pub(crate) fn cmd_update(args: &[String]) {
@@ -714,5 +864,45 @@ mod tests {
             ["install", "pentect@1.2.3"]
         );
         assert_eq!(command.get_current_dir(), Some(Path::new("/project")));
+    }
+
+    #[test]
+    fn startup_checks_skip_management_and_internal_commands() {
+        assert!(should_check_on_startup(&["pentect".into(), "codex".into()]));
+        for command in [
+            "help",
+            "version",
+            "update",
+            "memory-store",
+            "__apply-update",
+        ] {
+            assert!(!should_check_on_startup(&[
+                "pentect".into(),
+                command.into()
+            ]));
+        }
+    }
+
+    #[test]
+    fn update_check_cache_is_bounded_and_round_trips() {
+        let directory = std::env::temp_dir().join(format!(
+            "pentect-update-cache-test-{}-{}",
+            std::process::id(),
+            unix_seconds()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(UPDATE_CHECK_CACHE);
+        let cache = UpdateCheckCache {
+            checked_at: 123,
+            latest: "1.2.3".to_string(),
+        };
+        write_update_check_cache(&path, &cache).unwrap();
+        let loaded = read_update_check_cache(&path).unwrap();
+        assert_eq!(loaded.checked_at, 123);
+        assert_eq!(loaded.latest, "1.2.3");
+
+        std::fs::write(&path, vec![b'x'; MAX_UPDATE_CACHE_BYTES as usize + 1]).unwrap();
+        assert!(read_update_check_cache(&path).is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

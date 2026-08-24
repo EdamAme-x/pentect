@@ -420,6 +420,12 @@ pub(crate) fn activity_share_enabled() -> Result<bool, String> {
     Ok(project.or(global).unwrap_or(true))
 }
 
+pub(crate) fn update_check_enabled() -> Result<bool, String> {
+    let project = read_update_check(project_config_path())?;
+    let global = read_update_check(global_config_path()?)?;
+    Ok(project.or(global).unwrap_or(true))
+}
+
 pub(crate) fn output_restore_enabled() -> Result<bool, String> {
     let project = read_output_restore(project_config_path())?;
     let global = read_output_restore(global_config_path()?)?;
@@ -600,6 +606,23 @@ fn decode_config_value(value: &toml::Value) -> Result<DecodeConfigPartial, Strin
 
 fn read_files_remember(path: PathBuf) -> Result<Option<bool>, String> {
     parse_config_file(&path)?.map_or(Ok(None), |value| files_remember_value(&value))
+}
+
+fn read_update_check(path: PathBuf) -> Result<Option<bool>, String> {
+    parse_config_file(&path)?.map_or(Ok(None), |value| update_check_value(&value))
+}
+
+fn update_check_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("update") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("update config must be a table".to_string());
+    };
+    table
+        .get("check")
+        .map(|raw| config_bool(raw, "update.check"))
+        .transpose()
 }
 
 fn read_output_restore(path: PathBuf) -> Result<Option<bool>, String> {
@@ -1304,5 +1327,17 @@ unknown_min_bytes = 32
             .parse::<toml::Value>()
             .unwrap();
         assert!(output_restore_value(&value).is_err());
+    }
+
+    #[test]
+    fn update_checks_default_on_and_accept_only_booleans() {
+        let enabled = "[update]\ncheck = true".parse::<toml::Value>().unwrap();
+        let disabled = "[update]\ncheck = false".parse::<toml::Value>().unwrap();
+        let invalid = "[update]\ncheck = \"maybe\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(update_check_value(&enabled).unwrap(), Some(true));
+        assert_eq!(update_check_value(&disabled).unwrap(), Some(false));
+        assert!(update_check_value(&invalid).is_err());
     }
 }
