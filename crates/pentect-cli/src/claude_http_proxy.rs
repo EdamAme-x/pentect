@@ -3170,11 +3170,12 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
-        let (_, media_type, filename) = first_openai_file(&provider_body)
+        let (handle, media_type, filename) = first_openai_file(&provider_body)
             .expect("provider should receive the sanitized file and metadata");
         assert_eq!(media_type, "text/plain");
         assert_eq!(filename, "notes.txt");
         assert!(!file_response.contains(secret.as_str()), "{file_response}");
+        assert!(!file_response.contains(&handle), "{file_response}");
         assert!(file_response.contains("script-b64"), "{file_response}");
         drop(file_proxy);
         file_thread.join().unwrap();

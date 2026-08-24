@@ -1521,7 +1521,7 @@ fn resolve_command_args(
         if resolved != *arg && !allow_secret_argv {
             resolved.zeroize();
             return Err(
-                "refusing to place a restored secret in process arguments; use a shell/stdin/environment binding, or pass --allow-secret-argv after reviewing same-user process visibility"
+                "refusing to place a restored secret in process arguments; prefer target-specific stdin, file-descriptor, or configuration support, or pass --allow-secret-argv after reviewing same-user process visibility (a shell protects the model-facing command only, not child-process arguments)"
                     .to_string(),
             );
         }

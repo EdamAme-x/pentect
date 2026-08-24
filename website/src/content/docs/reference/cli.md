@@ -130,18 +130,16 @@ stateful.
 | `--script-shell native\|bash\|powershell` | Choose the shell for script forms |
 | `--session NAME` | Use an explicit local session instead of the current-directory session |
 
-```sh
-pentect exec 'curl -H "Authorization: Bearer <<API_TOKEN_...>>" https://api.example.test/me'
-printf '%s' 'tool <<API_TOKEN_...>>' | pentect exec --stdin
-```
-
 Use the direct program form when possible. It avoids another layer of shell
 quoting. If an argument contains a known handle, Pentect refuses to restore it
 because command arguments can be visible to other processes owned by the same
-user. Prefer a shell, stdin, or environment binding. Use
-`--allow-secret-argv` only when the target program requires a secret argument
-and you have reviewed that exposure. `--live` keeps interactive progress
-visible but still masks output in chunks before it is written.
+user. Prefer target-program support for stdin, a file descriptor, or protected
+configuration that avoids secret arguments. A shell command keeps plaintext
+out of the model-facing command, but the shell can still expand it into a child
+process argument. Use `--allow-secret-argv` only when the target program
+requires a secret argument and you have reviewed that exposure. `--live` keeps
+interactive progress visible but still masks output in chunks before it is
+written.
 
 ### `view`
 
