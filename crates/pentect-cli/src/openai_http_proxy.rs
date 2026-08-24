@@ -4108,7 +4108,7 @@ mod tests {
             "{headers}"
         );
         assert!(!request.contains(&secret), "{request}");
-        assert!(request.contains("<<KEYED_SECRET_"), "{request}");
+        assert!(request.contains("<<OPENAI_API_KEY_"), "{request}");
     }
 
     #[test]
