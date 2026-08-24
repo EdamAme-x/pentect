@@ -394,6 +394,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValuePatternCheck"
             | "ValueSealedSecretCheck"
             | "ValueSimilarityCheck"
+            | "ValueStringTypeCheck"
             | "ValueTokenCheck"
     )
 }
@@ -417,6 +418,7 @@ impl CredSweeperNativeDetector {
             line: text,
             previous: None,
             next: None,
+            file_type: &ml_file_type,
         };
         for rule in &self.rules {
             if !rule_available_for_code_scan(rule) {
@@ -458,6 +460,7 @@ impl CredSweeperNativeDetector {
                 line: line_body,
                 previous: previous_line,
                 next: next_line,
+                file_type: &ml_file_type,
             };
             let line_lower = LazyLower::new(line_body);
             self.line_prefilter
@@ -1518,6 +1521,7 @@ struct CandidateLineContext<'a> {
     line: &'a str,
     previous: Option<&'a str>,
     next: Option<&'a str>,
+    file_type: &'a str,
 }
 
 fn sanitize_variable_capture(
@@ -2171,6 +2175,11 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueStringTypeCheck"
+            && value_string_type_filtered(value, candidate, line_ctx)
+        {
+            return false;
+        }
         if filter == "ValueTokenCheck" && value_token_filtered(value, candidate) {
             return false;
         }
@@ -2508,6 +2517,124 @@ fn value_token_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
         None
     });
     split.is_some_and(|token_len| token_len < 5)
+}
+
+fn value_string_type_filtered(
+    value: &str,
+    candidate: &Candidate<'_>,
+    line_ctx: &CandidateLineContext<'_>,
+) -> bool {
+    if candidate_url_part(candidate, line_ctx.line) || multibyte_literal(value) {
+        return false;
+    }
+    if !source_file_requires_quotes(line_ctx.file_type)
+        || line_is_comment(line_ctx.line)
+        || is_well_quoted_value(
+            candidate.value_leftquote,
+            candidate.value_rightquote,
+            candidate.value,
+            line_ctx.line,
+            line_ctx.file_type,
+        )
+        || candidate_has_outer_quotes(candidate, line_ctx.line)
+        || value.starts_with(|ch: char| ch.is_ascii_digit())
+        || !candidate
+            .separator
+            .is_some_and(|separator| separator.contains('='))
+    {
+        return false;
+    }
+    true
+}
+
+fn source_file_requires_quotes(file_type: &str) -> bool {
+    matches!(
+        file_type,
+        ".cs"
+            | ".cc"
+            | ".php"
+            | ".tf"
+            | ".kt"
+            | ".go"
+            | ".ipynb"
+            | ".ts"
+            | ".java"
+            | ".js"
+            | ".py"
+            | ".cpp"
+            | ".c"
+            | ".h"
+            | ".hpp"
+    )
+}
+
+fn line_is_comment(line: &str) -> bool {
+    const COMMENT_STARTS: &[&str] = &[
+        "//", "* ", "# ", "/*", "<!––", "%{", "%", "...", "(*", "--", "--[[", "#=",
+    ];
+    let line = line.trim();
+    COMMENT_STARTS.iter().any(|start| line.starts_with(start))
+}
+
+fn candidate_has_outer_quotes(candidate: &Candidate<'_>, line: &str) -> bool {
+    let left = candidate
+        .variable_start
+        .filter(|start| *start > 0)
+        .and_then(|start| line.get(..start))
+        .and_then(|prefix| prefix.chars().find(|ch| matches!(ch, '"' | '\'' | '`')));
+    let right = line
+        .get(candidate.end..)
+        .and_then(|suffix| suffix.chars().find(|ch| matches!(ch, '"' | '\'' | '`')));
+    left.is_some() && left == right
+}
+
+fn multibyte_literal(value: &str) -> bool {
+    static MULTIBYTE: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"(?i)((0x)?[0-9a-f]{1,16}[UL]*)(\s*,\s*((0x)?[0-9a-f]{1,16}[UL]*)){3}")
+            .expect("CredSweeper multibyte literal regex")
+    });
+    MULTIBYTE.is_match(value)
+}
+
+fn candidate_url_part(candidate: &Candidate<'_>, line: &str) -> bool {
+    let line_before_value = line.get(..candidate.start).unwrap_or_default();
+    let scheme = line_before_value.rfind("://").is_some_and(|position| {
+        let prefix = &line_before_value[..position];
+        let scheme_part = prefix.chars().rev().take(3).collect::<Vec<_>>();
+        scheme_part.len() == 3
+            && scheme_part
+                .iter()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+            && !line_before_value[position + 3..]
+                .chars()
+                .any(url_forbidden_char)
+    });
+    let query_variable = candidate
+        .variable_start
+        .filter(|start| *start > 0)
+        .and_then(|start| line.get(..start))
+        .and_then(|prefix| prefix.chars().last())
+        .is_some_and(|ch| matches!(ch, '?' | '&'));
+    static URL_VALUE: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r#"^[^\s&;"<>\[\]^~`{|}]+[&;][^\s=;"<>\[\]^~`{|}]{3,80}=[^\s;&="<>\[\]^~`{|}]{1,80}"#,
+        )
+        .expect("CredSweeper URL value regex")
+    });
+    scheme
+        || query_variable
+        || URL_VALUE.is_match(candidate.value)
+        || candidate
+            .separator
+            .is_some_and(|separator| separator.eq_ignore_ascii_case("%3D"))
+}
+
+fn url_forbidden_char(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '"' | '<' | '>' | '[' | ']' | '^' | '~' | '`' | '{' | '|' | '}'
+        )
 }
 
 fn python_word_char(ch: char) -> bool {
@@ -3107,7 +3234,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 20, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 19, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3673,6 +3800,58 @@ mod tests {
     }
 
     #[test]
+    fn value_string_type_check_matches_upstream_source_literal_rules() {
+        let mut plain = test_candidate("DEAD314BEEF0CAFE", None, None, None);
+        plain.variable_start = Some(0);
+        plain.variable_end = Some(4);
+        plain.variable = Some("pass");
+        plain.separator = Some(" = ");
+        let source = test_line_context("pass = DEAD314BEEF0CAFE", ".py");
+        assert!(value_string_type_filtered(plain.value, &plain, &source));
+
+        let mut numeric = test_candidate("314DEADBEEF0CAFE", None, None, None);
+        numeric.separator = Some(" = ");
+        assert!(!value_string_type_filtered(
+            numeric.value,
+            &numeric,
+            &source
+        ));
+
+        let text = test_line_context("pass = DEAD314BEEF0CAFE", ".txt");
+        assert!(!value_string_type_filtered(plain.value, &plain, &text));
+        let comment = test_line_context("// pass = DEAD314BEEF0CAFE", ".cpp");
+        assert!(!value_string_type_filtered(plain.value, &plain, &comment));
+
+        let mut quoted = test_candidate("DEAD314BEEF0CAFE", None, Some("\""), Some("\""));
+        quoted.separator = Some(" = ");
+        assert!(!value_string_type_filtered(quoted.value, &quoted, &source));
+
+        let mut bytes = test_candidate("0xae, 0x54, 0x55, 0xff", None, None, None);
+        bytes.separator = Some(" = ");
+        assert!(!value_string_type_filtered(bytes.value, &bytes, &source));
+    }
+
+    #[test]
+    fn value_string_type_check_preserves_url_values() {
+        let line = "url = https://example.invalid?password=DEAD314BEEF0CAFE";
+        let value_start = line.find("DEAD").unwrap();
+        let mut candidate = test_candidate(&line[value_start..], None, None, None);
+        candidate.start = value_start;
+        candidate.end = line.len();
+        candidate.variable_start = Some(line.find("password").unwrap());
+        candidate.variable_end = Some(line.find("password").unwrap() + "password".len());
+        candidate.variable = Some("password");
+        candidate.separator = Some("=");
+        let source = test_line_context(line, ".py");
+        assert!(candidate_url_part(&candidate, line));
+        assert!(!value_string_type_filtered(
+            candidate.value,
+            &candidate,
+            &source
+        ));
+    }
+
+    #[test]
     fn line_git_binary_check_matches_upstream_examples() {
         for line in [
             "zxNdj)EYlS}b8JGyg7Pw=wujtWvwg9)mv+;vvr}dADtX-(^(6N+C(YT)lWLG7tdu$7",
@@ -3731,6 +3910,16 @@ mod tests {
             value_leftquote: left,
             value_rightquote: right,
             line_data: Vec::new(),
+        }
+    }
+
+    fn test_line_context<'a>(line: &'a str, file_type: &'a str) -> CandidateLineContext<'a> {
+        CandidateLineContext {
+            start: 0,
+            line,
+            previous: None,
+            next: None,
+            file_type,
         }
     }
 
