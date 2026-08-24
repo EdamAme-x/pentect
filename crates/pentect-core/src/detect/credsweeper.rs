@@ -349,6 +349,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueLastWordCheck"
             | "ValueLengthCheck"
             | "ValueMethodCheck"
+            | "ValueNotAllowedPatternCheck"
             | "ValueMorphemesCheck"
             | "ValueNumberCheck"
             | "ValuePatternCheck"
@@ -2086,6 +2087,11 @@ fn accept_value(
         if filter == "ValueMethodCheck" && value_method_filtered(value, candidate) {
             return false;
         }
+        if filter == "ValueNotAllowedPatternCheck"
+            && value_not_allowed_pattern_filtered(value, candidate)
+        {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2272,6 +2278,19 @@ fn value_method_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
         RustRegex::new(r"^[~.\->:0-9A-Za-z_]+\(.*\)").expect("CredSweeper method-call regex")
     });
     value.contains("function") || METHOD.is_match(value)
+}
+
+fn value_not_allowed_pattern_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
+    if candidate_is_well_quoted(candidate) {
+        return false;
+    }
+    static NOT_ALLOWED: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?i)(?:[<>\[\]{}]\s+|\\u00(?:26|3c)gt;?(?:\s|\\+[nrt])?|^\s*\\|^\s*\\n\s*)$",
+        )
+        .expect("CredSweeper not-allowed value regex")
+    });
+    NOT_ALLOWED.is_match(value)
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -2867,7 +2886,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 25, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 24, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3356,6 +3375,26 @@ mod tests {
         }
         let quoted = test_candidate("Crac.method()", None, Some("\""), Some("\""));
         assert!(!value_method_filtered(quoted.value, &quoted));
+    }
+
+    #[test]
+    fn value_not_allowed_pattern_check_matches_upstream_examples() {
+        for value in ["[{ ", "\\n", "\t\t\t\\", "\t \\n\t \t", "\\u003cgt;"] {
+            let item = test_candidate(value, None, None, None);
+            assert!(
+                value_not_allowed_pattern_filtered(value, &item),
+                "{value:?}"
+            );
+        }
+        for value in ["secret", "[{x", "line\n"] {
+            let item = test_candidate(value, None, None, None);
+            assert!(
+                !value_not_allowed_pattern_filtered(value, &item),
+                "{value:?}"
+            );
+        }
+        let quoted = test_candidate("\\n", None, Some("\""), Some("\""));
+        assert!(!value_not_allowed_pattern_filtered(quoted.value, &quoted));
     }
 
     fn test_candidate<'a>(
