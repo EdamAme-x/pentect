@@ -202,7 +202,9 @@ enum PatternMatcher {
 
 struct DeferredRegex {
     source: String,
+    keyword_source: Option<String>,
     compiled: OnceLock<Option<CompiledRegex>>,
+    compiled_keyword: OnceLock<Option<FancyRegex>>,
 }
 
 enum CompiledRegex {
@@ -260,7 +262,7 @@ impl CredSweeperNativeDetector {
             } else if raw.kind.as_deref() == Some("keyword") {
                 for value in values {
                     patterns.push(NativePattern {
-                        matcher: PatternMatcher::deferred(keyword_pattern(value)),
+                        matcher: PatternMatcher::deferred_keyword(keyword_pattern(value), value),
                         value_capture: true,
                     });
                 }
@@ -631,7 +633,18 @@ impl PatternMatcher {
     fn deferred(source: impl Into<String>) -> Self {
         Self::Deferred(Arc::new(DeferredRegex {
             source: source.into(),
+            keyword_source: None,
             compiled: OnceLock::new(),
+            compiled_keyword: OnceLock::new(),
+        }))
+    }
+
+    fn deferred_keyword(source: impl Into<String>, keyword: impl Into<String>) -> Self {
+        Self::Deferred(Arc::new(DeferredRegex {
+            source: source.into(),
+            keyword_source: Some(keyword.into()),
+            compiled: OnceLock::new(),
+            compiled_keyword: OnceLock::new(),
         }))
     }
 }
@@ -649,7 +662,7 @@ impl DeferredRegex {
     }
 
     fn find<'a>(&self, text: &'a str, value_capture: bool) -> Vec<Candidate<'a>> {
-        match self.compiled() {
+        let mut out = match self.compiled() {
             Some(CompiledRegex::Rust(regex)) => regex
                 .captures_iter(text)
                 .filter_map(|captures| rust_candidate(&captures, value_capture))
@@ -661,7 +674,18 @@ impl DeferredRegex {
                 .map(|candidate| keyword_get_default_candidate(text, candidate))
                 .collect(),
             None => Vec::new(),
+        };
+        if let Some(keyword) = self.compiled_keyword() {
+            out.extend(keyword_set_call_candidates(text, keyword));
         }
+        out
+    }
+
+    fn compiled_keyword(&self) -> Option<&FancyRegex> {
+        let source = self.keyword_source.as_ref()?;
+        self.compiled_keyword
+            .get_or_init(|| FancyRegex::new(&format!("(?is:{source})")).ok())
+            .as_ref()
     }
 }
 
@@ -742,6 +766,81 @@ fn keyword_get_default_candidate<'a>(text: &'a str, candidate: Candidate<'a>) ->
         value_rightquote: Some(&text[value_end..value_end + quote.len_utf8()]),
         line_data: candidate.line_data,
     }
+}
+
+fn keyword_set_call_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let prefix = &text[..matched.start()];
+        let directive_start = prefix
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(prefix.len());
+        let directive = &prefix[directive_start..];
+        if !directive.to_ascii_lowercase().ends_with("set") {
+            continue;
+        }
+        let mut cursor = matched.end();
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            cursor += 1;
+        }
+        let variable_end = cursor;
+        cursor += text[cursor..]
+            .len()
+            .saturating_sub(text[cursor..].trim_start().len());
+        if text.as_bytes().get(cursor) != Some(&b'(') {
+            continue;
+        }
+        let separator_start = cursor;
+        cursor += 1;
+        cursor += text[cursor..]
+            .len()
+            .saturating_sub(text[cursor..].trim_start().len());
+        let Some(&quote) = text.as_bytes().get(cursor) else {
+            continue;
+        };
+        if !matches!(quote, b'\'' | b'"' | b'`') {
+            continue;
+        }
+        let quote_start = cursor;
+        cursor += 1;
+        let value_start = cursor;
+        let mut escaped = false;
+        while let Some(&byte) = text.as_bytes().get(cursor) {
+            if byte == quote && !escaped {
+                break;
+            }
+            escaped = byte == b'\\' && !escaped;
+            if byte != b'\\' {
+                escaped = false;
+            }
+            cursor += 1;
+        }
+        if text.as_bytes().get(cursor) != Some(&quote) || cursor - value_start < 4 {
+            continue;
+        }
+        out.push(Candidate {
+            start: value_start,
+            end: cursor,
+            value: &text[value_start..cursor],
+            variable_start: Some(matched.start()),
+            variable_end: Some(variable_end),
+            variable: Some(&text[matched.start()..variable_end]),
+            separator: Some(&text[separator_start..separator_start + 1]),
+            wrap: None,
+            value_leftquote: Some(&text[quote_start..quote_start + 1]),
+            value_rightquote: Some(&text[cursor..cursor + 1]),
+            line_data: Vec::new(),
+        });
+    }
+    out
 }
 
 fn rust_candidate<'a>(
@@ -1035,13 +1134,17 @@ fn compile_pattern(pattern: &str) -> Result<PatternMatcher, ()> {
     match RustRegex::new(pattern) {
         Ok(regex) => Ok(PatternMatcher::Deferred(Arc::new(DeferredRegex {
             source: pattern.to_string(),
+            keyword_source: None,
             compiled: OnceLock::from(Some(CompiledRegex::Rust(regex))),
+            compiled_keyword: OnceLock::new(),
         }))),
         Err(_) => FancyRegex::new(pattern)
             .map(|regex| {
                 PatternMatcher::Deferred(Arc::new(DeferredRegex {
                     source: pattern.to_string(),
+                    keyword_source: None,
                     compiled: OnceLock::from(Some(CompiledRegex::Fancy(regex))),
+                    compiled_keyword: OnceLock::new(),
                 }))
             })
             .map_err(|_| ()),
@@ -5175,6 +5278,12 @@ mod tests {
     #[test]
     fn keyword_rules_match_official_nested_fixture_literals() {
         for (path, raw, rule_name, expected) in [
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ['self.setPassword("0bead47f3c5bc275ec7b5eda8a333f")', "0bead47f3c5bc275ec7b5eda8a333f"],"#,
+                "Password",
+                "0bead47f3c5bc275ec7b5eda8a333f",
+            ),
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
                 r#"            ['PASSWORD = os.environ.get("PASSWORD") or "at5G6zi!m"', "at5G6zi!m"],"#,
