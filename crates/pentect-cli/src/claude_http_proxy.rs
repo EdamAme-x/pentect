@@ -3300,7 +3300,7 @@ mod tests {
         let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
         let original: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(allowed["messages"], original["messages"]);
-        assert_eq!(allowed["system"][0]["text"], HANDLE_CONTRACT);
+        assert!(allowed.get("system").is_none());
     }
 
     #[test]
