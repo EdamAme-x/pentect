@@ -2556,7 +2556,7 @@ fn accept_filter_list(
     if filters
         .iter()
         .any(|filter| filter.contains("ValueFilePathCheck"))
-        && looks_like_file_path(value)
+        && value_file_path_filtered(value, candidate.separator)
     {
         return false;
     }
@@ -4275,16 +4275,51 @@ fn is_repeated_symbol(value: &str) -> bool {
     chars.all(|ch| ch == first)
 }
 
-fn looks_like_file_path(value: &str) -> bool {
-    if value.contains("://") {
+fn value_file_path_filtered(value: &str, separator: Option<&str>) -> bool {
+    let bit_length = value
+        .chars()
+        .count()
+        .checked_ilog2()
+        .map_or(0, |value| value + 1);
+    let threshold = if bit_length < 6 {
+        1
+    } else {
+        bit_length as usize - 4
+    };
+    let mut unix = value.contains('/');
+    if unix
+        && (value.contains("://")
+            || value.starts_with("~/")
+            || value.starts_with("./")
+            || value.contains("../")
+            || value.contains("/..")
+            || (value.starts_with("//") && separator == Some(":")))
+    {
+        return morphemes_filtered_with_threshold(&value.to_lowercase(), threshold);
+    }
+    if unix
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        let minimum = minimum_base64_entropy(value.chars().count());
+        let entropy = shannon_entropy(value);
+        unix = if minimum == 0.0 || minimum > entropy {
+            value.matches('/').count() > 1
+        } else {
+            false
+        };
+    }
+    let windows = value.contains(":\\");
+    if !(unix || windows) {
         return false;
     }
-    let slash_count = value.matches('/').count() + value.matches('\\').count();
-    slash_count >= 2
-        || value.starts_with("./")
-        || value.starts_with("../")
-        || value.starts_with("~/")
-        || value.contains(":\\")
+    const UNIX_UNUSUAL: &str = "\t\n\r!@`&*<>+=;,~^:\\";
+    const WINDOWS_UNUSUAL: &str = "\t\n\r!$@`&*(){}<>+=;,~^";
+    let unusual = if unix { UNIX_UNUSUAL } else { WINDOWS_UNUSUAL };
+    !value.chars().any(|ch| unusual.contains(ch))
+        && unix != windows
+        && morphemes_filtered_with_threshold(&value.to_lowercase(), threshold)
 }
 
 fn map_confidence(confidence: Option<&str>) -> Confidence {
@@ -4615,6 +4650,37 @@ mod tests {
             .join("\\n");
         assert!(!value_base64_key_filtered(&format!("'''{wrapped}'''")));
         assert!(value_base64_key_filtered("MIIXXXXX"));
+    }
+
+    #[test]
+    fn value_file_path_matches_official_fixtures() {
+        for value in [
+            "/u5r/d3v/f1le",
+            "5//0KCPafDhZvtCwqrsyiKFeDGT_0ZGHiI-E0ClIWrLC7tZ1WE5vHc4-Y2qi1IhPy3Pz5fmCe9OPIxEZUONUg7SWJF9nwQ_j2lIdXU0",
+            "SDF;4s]dDe",
+        ] {
+            assert!(!value_file_path_filtered(value, None), "{value}");
+        }
+        for value in [
+            "[DEPOT]/${path}/$(date)/config/credentials",
+            "/mnt/x",
+            "/srv/x",
+            "/var/lib/",
+            "~/.ssh/id_rsa",
+            "../key",
+            "../../log",
+            "/home/user/.ssh/id_rsa",
+            "../.ssh/id_rsa",
+            "crackle/filepath.txt",
+            "/home/user/tmp",
+            "file:///Crackle/filepath/",
+            "~/.custompass",
+            "./sshpass.sh",
+            "crackle/file.path",
+            "C:\\Crackle\\filepath",
+        ] {
+            assert!(value_file_path_filtered(value, None), "{value}");
+        }
     }
 
     #[test]
