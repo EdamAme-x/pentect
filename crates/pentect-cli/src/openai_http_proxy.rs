@@ -3155,6 +3155,61 @@ fn random_auth_token() -> Result<String, String> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn powershell_direct_handle_reaches_local_authorization_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = "<<KEYED_SECRET_a2c25e122d2e002f>>";
+        let secret = "fixture key with @ and 'quote'";
+        let input = serde_json::json!({
+            "command": format!(
+                "Invoke-WebRequest -UseBasicParsing http://{address}/check -Headers @{{ Authorization = \"Bearer {handle}\" }} | Out-Null"
+            )
+        })
+        .to_string();
+        let mut resolve = |text: &str| Ok(text.replace(handle, secret));
+        let restored = crate::claude_http_proxy::resolve_tool_input_json(
+            &input,
+            Some("PowerShell"),
+            &mut resolve,
+        )
+        .unwrap();
+        let command = serde_json::from_str::<Value>(&restored).unwrap()["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let child = std::thread::spawn(move || {
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .status()
+                .unwrap()
+        });
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).unwrap();
+            assert!(read > 0);
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        let request = String::from_utf8(bytes).unwrap();
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        assert!(child.join().unwrap().success());
+        assert!(
+            request.contains(&format!("Authorization: Bearer {secret}")),
+            "{request}"
+        );
+        assert!(!request.contains(handle), "{request}");
+    }
+
     struct ProviderBoundaryTestEnv {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
         home: std::path::PathBuf,
