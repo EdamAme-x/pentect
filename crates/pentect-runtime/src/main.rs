@@ -131,6 +131,10 @@ pub fn output_restore_enabled() -> Result<bool, String> {
     config::output_restore_enabled()
 }
 
+pub fn update_check_enabled() -> Result<bool, String> {
+    config::update_check_enabled()
+}
+
 pub fn load_environment_variable_prefix() -> Result<String, String> {
     config::environment_variable_prefix()
 }

@@ -305,6 +305,7 @@ fn run(args: Vec<String>) -> Option<i32> {
         panic!("forced test panic with payload that must not be persisted");
     }
     let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
+    update::start_update_notification(&args);
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
     }
