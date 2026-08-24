@@ -105,6 +105,38 @@ impl Codec for HexCodec {
     }
 }
 
+/// A dense RFC 3986 percent-encoded byte sequence. Plain URL characters are
+/// intentionally excluded so normal URLs do not become decode candidates.
+pub struct PercentCodec;
+
+impl Codec for PercentCodec {
+    fn decode(&self, run: &str) -> Option<Vec<u8>> {
+        let bytes = run.as_bytes();
+        if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() / 3);
+        for chunk in bytes.chunks_exact(3) {
+            if chunk[0] != b'%' {
+                return None;
+            }
+            let high = hex_nibble(chunk[1])?;
+            let low = hex_nibble(chunk[2])?;
+            out.push((high << 4) | low);
+        }
+        Some(out)
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Byte-oriented binary representation: one eight-bit group per decoded byte.
 pub struct BinaryCodec;
 

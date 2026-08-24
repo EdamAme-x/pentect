@@ -903,7 +903,21 @@ fn merge_decode_config(
             .unwrap_or(defaults.max_inflate_bytes),
         mask_unknown,
         unknown_min_bytes,
+        limit_reporter: Some(record_decode_limit),
     }
+}
+
+fn record_decode_limit(reason: pentect_core::DecodeLimitReason) {
+    crate::activity_log::record_diagnostic(
+        "decode",
+        reason.as_str(),
+        Some("limit"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 }
 
 fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {

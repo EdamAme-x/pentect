@@ -124,6 +124,22 @@ when another limit controls the input. `mask_unknown = true` also masks long
 opaque encoded values that Pentect cannot identify. It can create false
 positives, so it is off by default.
 
+Detection scans both the original text and bounded decoded representations.
+Supported text layers include standard and URL-safe Base64, dense `%XX`
+percent encoding, hexadecimal text, Base32, Base58, and the documented Base85
+forms. Mixed layers are allowed up to `max_depth`. A detected encoded value is
+masked as one outer handle, so Pentect keeps the exact encoded source for local
+recovery and never writes decoded plaintext to the activity log.
+
+Hard safety budgets apply even when a configurable limit is `"unlimited"`: at
+most 256 successful decode candidates, 1 MiB of aggregate decoded bytes, a 32x
+per-transform expansion ratio, and 100 ms of decode work per detector pass.
+When one is reached, the persistent log records only `candidate-limit`,
+`decoded-byte-limit`, `expansion-limit`, or `elapsed-limit`. It does not record
+the candidate or decoded value. Dense percent encoding is required; ordinary
+URL paths are not decode candidates. Encoding can make benign text resemble a
+credential, so review false positives before enabling `mask_unknown`.
+
 ## Files and activity
 
 ```toml

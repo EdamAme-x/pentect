@@ -1061,7 +1061,15 @@ fn allowed_diagnostic_identifier(value: &str, allowed: &[&str]) -> String {
 fn diagnostic_surface(value: &str) -> String {
     allowed_diagnostic_identifier(
         value,
-        &["claude", "cloud-code", "gemini", "logger", "ocr", "openai"],
+        &[
+            "claude",
+            "cloud-code",
+            "decode",
+            "gemini",
+            "logger",
+            "ocr",
+            "openai",
+        ],
     )
 }
 
@@ -1071,7 +1079,11 @@ fn diagnostic_event(value: &str) -> String {
         &[
             "cmd-binding-skipped",
             "connection-failed",
+            "candidate-limit",
+            "decoded-byte-limit",
             "diagnostic-queue-overflow",
+            "elapsed-limit",
+            "expansion-limit",
             "file-attestation-unavailable",
             "file-registry-unavailable",
             "gateway-busy",
@@ -1478,6 +1490,25 @@ mod tests {
         assert!(drained.iter().all(|event| !serde_json::to_string(event)
             .unwrap()
             .contains("image bytes")));
+    }
+
+    #[test]
+    fn decode_limit_diagnostic_keeps_only_fixed_classifiers() {
+        let event = ActivityEvent::diagnostic(
+            "decode",
+            "candidate-limit",
+            Some("limit"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(event.surface, "decode");
+        assert_eq!(event.event.as_deref(), Some("candidate-limit"));
+        assert_eq!(event.kind.as_deref(), Some("limit"));
+        let rendered = serde_json::to_string(&event).unwrap();
+        assert!(!rendered.contains("candidate text"));
     }
 
     #[test]
