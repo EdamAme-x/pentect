@@ -2,8 +2,8 @@
 //!
 //! Model-bound prompts and local function outputs are masked on requests.
 //! Completed client function-call arguments are resolved on responses. Local
-//! Provider-generated text remains masked unless the user opts into local
-//! output restoration.
+//! Provider-generated text restores known handles for the local user unless
+//! user or project policy opts out.
 
 use futures_util::{stream, Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -4246,7 +4246,7 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_response_text_restores_known_handles_only() {
+    fn enabled_response_text_restores_known_handles_only() {
         let mut value = serde_json::json!({
             "output": [{
                 "type": "message",
@@ -4266,7 +4266,7 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_openai_stream_restores_a_handle_split_across_events() {
+    fn enabled_openai_stream_restores_a_handle_split_across_events() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut streams = HashMap::new();
         let mut resolve: HandleResolver =

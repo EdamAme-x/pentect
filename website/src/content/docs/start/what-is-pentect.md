@@ -41,16 +41,17 @@ provider can see. Local tools still use the permissions of the current user.
 | --- | --- |
 | Local input | Finds supported sensitive values and creates handles |
 | Request to the provider | Sends handles instead of known real values |
-| Model response | Keeps handles in text by default and in tool arguments |
+| Model response | Restores known handles in local assistant text; keeps tool arguments protected until local execution |
 | Before a local tool runs | Restores handles that the current session knows |
 | Tool result | Checks and masks output before the next request |
 
 The client UI stays the same. Pentect starts the client with a local gateway for
 that process only.
 
-Assistant prose remains masked by default. Users who explicitly prefer local
-readability can enable [`output.restore`](/reference/configuration/#assistant-output-restoration).
-That opt-in restores only handles known to the active session and can expose the
+Assistant prose restores known handles locally by default. Environments that
+need opaque output can set
+[`output.restore = false`](/reference/configuration/#assistant-output-restoration).
+Restoration applies only to handles known to the active session and can expose the
 value to terminal scrollback or client logs.
 
 ## Supported surfaces

@@ -3481,7 +3481,7 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_streaming_text_restores_handles_split_across_events() {
+    fn enabled_streaming_text_restores_handles_split_across_events() {
         let start = concat!(
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"

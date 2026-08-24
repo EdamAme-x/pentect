@@ -433,10 +433,10 @@ pub(crate) fn output_restore_enabled() -> Result<bool, String> {
 }
 
 fn output_restore_effective(project: Option<bool>, global: Option<bool>) -> bool {
-    // Restoring assistant prose reveals protected values to terminals and local
-    // client logs. A repository may opt out, but cannot opt a user into that
-    // wider boundary without the same setting in the user config.
-    global.unwrap_or(false) && project.unwrap_or(true)
+    // User-facing assistant output is local and restores known handles by
+    // default. Either the user policy or a project policy may narrow that
+    // boundary; a project cannot override a user-level opt-out.
+    global.unwrap_or(true) && project.unwrap_or(true)
 }
 
 pub(crate) fn unknown_formats_should_block() -> Result<bool, String> {
@@ -1324,15 +1324,17 @@ unknown_min_bytes = 32
     }
 
     #[test]
-    fn output_restore_is_opt_in_and_project_cannot_enable_it() {
+    fn output_restore_defaults_on_and_either_scope_can_disable_it() {
         let enabled = "[output]\nrestore = true".parse::<toml::Value>().unwrap();
         let disabled = "[output]\nrestore = false".parse::<toml::Value>().unwrap();
         assert_eq!(output_restore_value(&enabled).unwrap(), Some(true));
         assert_eq!(output_restore_value(&disabled).unwrap(), Some(false));
-        assert!(!output_restore_effective(None, None));
-        assert!(!output_restore_effective(Some(true), None));
+        assert!(output_restore_effective(None, None));
+        assert!(output_restore_effective(Some(true), None));
         assert!(output_restore_effective(None, Some(true)));
         assert!(!output_restore_effective(Some(false), Some(true)));
+        assert!(!output_restore_effective(None, Some(false)));
+        assert!(!output_restore_effective(Some(true), Some(false)));
     }
 
     #[test]
