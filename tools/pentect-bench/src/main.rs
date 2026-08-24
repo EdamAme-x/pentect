@@ -34,7 +34,9 @@ fn cmd_bench(args: &[String]) {
             let path = Path::new(value);
             let raw = std::fs::read_to_string(path)
                 .map(normalize_newlines)
-                .unwrap_or_else(|error| die(format!("could not read '{}': {error}", path.display())));
+                .unwrap_or_else(|error| {
+                    die(format!("could not read '{}': {error}", path.display()))
+                });
             let line_index = LineIndex::new(&raw);
             credentials.extend(detect_credsweeper_json(path, &raw, &line_index));
         }
@@ -1128,7 +1130,11 @@ impl<'a> LineIndex<'a> {
         variable_end: Option<usize>,
     ) -> Option<Vec<CredSweeperJsonLineData>> {
         let start_line = self.line_for_offset(range.start)?;
-        let end_line = self.line_for_offset(range.end.saturating_sub(1))?;
+        let end_line = if range.is_empty() {
+            start_line
+        } else {
+            self.line_for_offset(range.end - 1)?
+        };
         let mut out = Vec::new();
         for line_num in start_line..=end_line {
             let line_start = *self.starts.get(line_num.checked_sub(1)?)?;
@@ -1852,6 +1858,20 @@ mod tests {
         let text = "abc=secret\nnext";
         let lines = LineIndex::new(text);
         assert_eq!(lines.value_range(1, 4, 10), Some(ByteRange::new(4, 10)));
+    }
+
+    #[test]
+    fn credsweeper_line_data_keeps_zero_width_empty_lines() {
+        let text = "header\n\nbody";
+        let lines = LineIndex::new(text);
+        let data = lines
+            .credsweeper_line_data_part("fixture", ByteRange::new(7, 7), None, None, None)
+            .unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].line_num, 2);
+        assert_eq!(data[0].value_start, 0);
+        assert_eq!(data[0].value_end, 0);
+        assert!(data[0].value.is_empty());
     }
 
     fn sample_credsweeper_credential(

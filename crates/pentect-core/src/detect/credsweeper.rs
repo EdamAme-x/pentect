@@ -1169,7 +1169,7 @@ fn keyword_structured_candidates<'a>(
             prefix.to_ascii_lowercase().as_str(),
             "" | "b" | "r" | "br" | "rb" | "u" | "t" | "f" | "rf" | "fr" | "l"
         );
-        if valid_prefix && !has_existing && (!prefix.is_empty() || typed_annotation) {
+        if valid_prefix && !has_existing {
             if let Some(&quote) = text
                 .as_bytes()
                 .get(cursor)
@@ -1189,7 +1189,22 @@ fn keyword_structured_candidates<'a>(
                     }
                     cursor += 1;
                 }
-                if text.as_bytes().get(cursor) == Some(&quote) && cursor > value_start {
+                let plain_quote_has_safe_tail = if prefix.is_empty() && !typed_annotation {
+                    let tail = text
+                        .get(cursor.saturating_add(1)..)
+                        .unwrap_or_default()
+                        .trim_start();
+                    tail.is_empty()
+                        || tail.starts_with([';', ',', ')', ']', '}'])
+                        || tail.starts_with("//")
+                        || tail.starts_with('#')
+                } else {
+                    true
+                };
+                if text.as_bytes().get(cursor) == Some(&quote)
+                    && cursor > value_start
+                    && plain_quote_has_safe_tail
+                {
                     out.push(Candidate {
                         start: value_start,
                         end: cursor,
@@ -2164,6 +2179,17 @@ fn pem_private_key_line_data(
             continue;
         }
         if out.is_empty() {
+            if end <= line_end {
+                out.push(CandidateLineData {
+                    start: begin,
+                    end,
+                    value: &text[begin..end],
+                    variable_start: None,
+                    variable_end: None,
+                    variable: None,
+                });
+                break;
+            }
             out.push(CandidateLineData {
                 start: begin,
                 end: header_end,
@@ -2478,53 +2504,70 @@ fn is_pem_base64_byte(byte: u8) -> bool {
 }
 
 fn base64_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
-    token_runs(line)
-        .filter(|run| {
-            run.value.len() >= 160
-                && run.value.starts_with("MII")
-                && is_base64ish(run.value)
-                && run.value.chars().all(|ch| {
-                    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_')
-                })
-        })
-        .collect()
-}
-
-fn clamp_to_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
+    fn tail_forbidden(ch: char) -> bool {
+        matches!(
+            ch,
+            '!' | '#'
+                | '$'
+                | '&'
+                | '('
+                | ')'
+                | '*'
+                | '-'
+                | '.'
+                | ':'
+                | ';'
+                | '<'
+                | '='
+                | '>'
+                | '?'
+                | '@'
+                | '['
+                | ']'
+                | '^'
+                | '_'
+                | '{'
+                | '|'
+                | '}'
+                | '~'
+        )
     }
-    index
-}
 
-fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
-    let mut runs = Vec::new();
-    let mut start = None;
-    for (idx, ch) in line.char_indices() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '/' | '=' | '.') {
-            start.get_or_insert(idx);
-        } else if let Some(s) = start.take() {
-            runs.push(Candidate {
-                start: s,
-                end: idx,
-                value: &line[s..idx],
-                variable_start: None,
-                variable_end: None,
-                variable: None,
-                separator: None,
-                wrap: None,
-                value_leftquote: None,
-                value_rightquote: None,
-                line_data: Vec::new(),
-            });
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(relative) = line[search_start..].find("MII") {
+        let start = search_start + relative;
+        let Some(prefix) = line.as_bytes().get(start..start + 12) else {
+            break;
+        };
+        let fourth = prefix[3];
+        if !(fourth.is_ascii_uppercase() || matches!(fourth, b'a'..=b'f'))
+            || !prefix[4..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'+'))
+        {
+            search_start = start + 3;
+            continue;
         }
-    }
-    if let Some(s) = start {
-        runs.push(Candidate {
-            start: s,
-            end: line.len(),
-            value: &line[s..],
+
+        let tail_start = start + 12;
+        let mut tail_chars = 0usize;
+        let mut end = tail_start;
+        for (relative, ch) in line[tail_start..].char_indices() {
+            if tail_forbidden(ch) || tail_chars == 8000 {
+                break;
+            }
+            tail_chars += 1;
+            end = tail_start + relative + ch.len_utf8();
+        }
+        if tail_chars < 8 {
+            search_start = start + 3;
+            continue;
+        }
+        out.push(Candidate {
+            start,
+            end,
+            value: &line[start..end],
             variable_start: None,
             variable_end: None,
             variable: None,
@@ -2534,8 +2577,17 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
             value_rightquote: None,
             line_data: Vec::new(),
         });
+        search_start = end;
     }
-    runs.into_iter()
+    out
+}
+
+fn clamp_to_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 struct PendingMlFinding {
@@ -2967,24 +3019,76 @@ fn push_match(
         .as_ref()
         .map(|(variable, _, _)| variable.as_str())
         .unwrap_or_default();
-    ml_pending.push(PendingMlFinding {
-        finding,
-        input: MlInput {
-            line: line_ctx.line.to_string(),
-            value: sanitized_value.value.to_string(),
-            variable: variable.to_string(),
-            value_start: sanitized_value.start,
-            value_end: sanitized_value.end,
-            variable_start: sanitized_variable
+    let ml_primary = candidate.line_data.first().map(|primary| {
+        let text = ctx.view.text();
+        let line_start = text[..primary.start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = text[primary.start..]
+            .find('\n')
+            .map_or(text.len(), |relative| primary.start + relative);
+        (
+            text[line_start..line_end]
+                .trim_end_matches('\r')
+                .to_string(),
+            primary.value.to_string(),
+            primary.start - line_start,
+            primary.end - line_start,
+            primary.variable.unwrap_or_default().to_string(),
+            primary
+                .variable_start
+                .map(|start| (start - line_start) as isize)
+                .unwrap_or(-2),
+            primary
+                .variable_end
+                .map(|end| (end - line_start) as isize)
+                .unwrap_or(-2),
+            text[..line_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1,
+        )
+    });
+    let (
+        ml_line,
+        ml_value,
+        ml_value_start,
+        ml_value_end,
+        ml_variable,
+        ml_variable_start,
+        ml_variable_end,
+        ml_line_num,
+    ) = ml_primary.unwrap_or_else(|| {
+        (
+            line_ctx.line.to_string(),
+            sanitized_value.value.to_string(),
+            sanitized_value.start,
+            sanitized_value.end,
+            variable.to_string(),
+            sanitized_variable
                 .as_ref()
                 .map(|(_, start, _)| *start as isize)
                 .unwrap_or(-2),
-            variable_end: sanitized_variable
+            sanitized_variable
                 .as_ref()
                 .map(|(_, _, end)| *end as isize)
                 .unwrap_or(-2),
+            line_ctx.line_index + 1,
+        )
+    });
+    ml_pending.push(PendingMlFinding {
+        finding,
+        input: MlInput {
+            line: ml_line,
+            value: ml_value,
+            variable: ml_variable,
+            value_start: ml_value_start,
+            value_end: ml_value_end,
+            variable_start: ml_variable_start,
+            variable_end: ml_variable_end,
             path: ctx.path.to_string(),
-            line_num: line_ctx.line_index + 1,
+            line_num: ml_line_num,
             file_type: ctx.file_type.to_string(),
             rule_name: rule.rule_name.clone(),
             severity: rule.severity,
@@ -4992,12 +5096,6 @@ fn base64_part_filtered(line: &str, value: &str, value_start: usize, value_end: 
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\\'))
 }
 
-fn is_base64ish(value: &str) -> bool {
-    value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
-}
-
 fn dedupe_findings(mut findings: Vec<CredSweeperNativeFinding>) -> Vec<CredSweeperNativeFinding> {
     findings.sort_by(|a, b| {
         (
@@ -5471,6 +5569,18 @@ mod tests {
     }
 
     #[test]
+    fn pem_line_data_keeps_a_single_physical_line_as_one_value() {
+        let text = r#"const key = "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----";"#;
+        let begin = text.find("-----BEGIN").unwrap();
+        let header_end = begin + "-----BEGIN PRIVATE KEY-----".len();
+        let end =
+            text.find("-----END PRIVATE KEY-----").unwrap() + "-----END PRIVATE KEY-----".len();
+        let lines = pem_private_key_line_data(text, begin, header_end, end);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].value, &text[begin..end]);
+    }
+
+    #[test]
     fn long_json_web_token_pattern_does_not_hit_the_regex_runtime_limit() {
         let source = r"(?P<value>eyJ[=0-9A-Za-z_+/-]{15,8000}(\.[=0-9A-Za-z_+/-]{0,8000}){2,16})(?![=0-9A-Za-z_-])";
         let token = format!(
@@ -5498,6 +5608,16 @@ mod tests {
     }
 
     #[test]
+    fn base64_private_key_uses_the_official_pattern_boundaries() {
+        let input = r#"const key = "MIIAabcdefghABCDEFGH\nIJKLMNOP==";"#;
+        let matches = base64_private_key_candidates(input);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].value.starts_with("MIIA"));
+        assert!(!matches[0].value.ends_with('='));
+        assert!(matches[0].value.contains("\\n"));
+    }
+
+    #[test]
     fn structured_keyword_parser_handles_typed_quoted_declarations() {
         let keyword = FancyRegex::new("(?is:token(?!ize))").unwrap();
         let value = "A".repeat(96);
@@ -5512,6 +5632,14 @@ mod tests {
             keyword_structured_candidates("private val api_token: String", &keyword, &[])
                 .is_empty()
         );
+
+        let plain = format!(r#"const api_token = "{value}";"#);
+        let plain_candidates = keyword_structured_candidates(&plain, &keyword, &[]);
+        assert_eq!(plain_candidates.len(), 1);
+        assert_eq!(plain_candidates[0].value, value);
+
+        let ambiguous = format!(r#"const api_token = "{value}"[continued]"#);
+        assert!(keyword_structured_candidates(&ambiguous, &keyword, &[]).is_empty());
     }
 
     #[test]
