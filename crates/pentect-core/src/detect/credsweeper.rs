@@ -2199,7 +2199,11 @@ fn value_pattern_filtered(value: &str, pattern_len: Option<usize>) -> bool {
     const MIN_DATA_LEN: usize = 8;
     const MAX_PATTERN_BIT_LENGTH: usize = 13;
     let value_len = value.chars().count();
-    let bit_length = value_len.ilog2() as usize + 1;
+    let bit_length = if value_len == 0 {
+        0
+    } else {
+        value_len.ilog2() as usize + 1
+    };
     let bit_length = bit_length.max(DEFAULT_PATTERN_LEN);
     if MAX_PATTERN_BIT_LENGTH < bit_length {
         return false;
@@ -2231,8 +2235,7 @@ fn repeated_or_sequence_pattern(
     let mut descending = 1usize;
     for pair in chars.windows(2) {
         if pair[0] == pair[1]
-            && !(ignore_base64_a_slash
-                && matches!(pair[0], 'A' | '/' | '_' | char::REPLACEMENT_CHARACTER))
+            && !(ignore_base64_a_slash && matches!(pair[0], 'A' | '/' | '_'))
         {
             equal += 1;
         } else {
@@ -2984,6 +2987,39 @@ mod tests {
             let view = NormalizedView::build(&region, raw);
             let _ = CredSweeperNativeDetector::builtin().detect(&view);
         }
+    }
+
+    #[test]
+    fn value_pattern_check_matches_upstream_examples() {
+        for value in [
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526",
+            "c0ffeecc-dead-beef-cafe-1a2b3c4d5e6f",
+            "123456ff-dead-beef-cafe-7a24ca6a903c",
+            "ffffff00-dead-beef-cafe-4a25c06a902d",
+            "Crackle4444",
+            "Crackle1234",
+            "Crackle4321",
+            "@$%",
+            "a5",
+            "_",
+            "",
+        ] {
+            assert!(value_pattern_filtered(value, None), "expected filtered: {value:?}");
+        }
+        for value in ["Crackle123", "IEEE32441", "Pass..."] {
+            assert!(!value_pattern_filtered(value, None), "expected accepted: {value:?}");
+        }
+        for value in ["11223344", "010101010", "40302010"] {
+            assert!(value_pattern_filtered(value, Some(4)), "expected duple filter: {value:?}");
+        }
+    }
+
+    #[test]
+    fn value_pattern_check_only_exempts_upstream_base64_fill_characters() {
+        for value in ["AAAAAAAA", "////////", "________"] {
+            assert!(!value_pattern_filtered(value, Some(8)), "expected accepted: {value:?}");
+        }
+        assert!(value_pattern_filtered("��������", Some(8)));
     }
 
     #[test]
