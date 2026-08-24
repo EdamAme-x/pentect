@@ -2,12 +2,13 @@ use super::util::token_runs;
 use super::{AuthCodeDetector, Bip39Detector, Detector, RuleDetector};
 use crate::codec::{
     is_rfc1924_base85_byte, is_z85_byte, Ascii85Codec, Base32Codec, Base32HexCodec, Base58Codec,
-    Base64Codec, Base85Codec, BinaryCodec, Codec, HexCodec, OctalCodec, Z85Codec,
+    Base64Codec, Base85Codec, BinaryCodec, Codec, HexCodec, OctalCodec, PercentCodec, Z85Codec,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use std::io::Read;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MIN_DECODE_BYTES: usize = 16;
 pub const DEFAULT_MAX_DECODE_BYTES: usize = 256 * 1024;
@@ -18,8 +19,81 @@ pub const DEFAULT_MIN_OPAQUE_RUN: usize = 24;
 pub const DEFAULT_MAX_INFLATE_BYTES: u64 = 8 * 1024 * 1024;
 /// Fraction of C0 control bytes above which decoded text is treated as binary.
 const BINARY_NONPRINT_RATIO: f64 = 0.3;
+const MAX_DECODE_CANDIDATES: usize = 256;
+const MAX_TOTAL_DECODED_BYTES: usize = 1024 * 1024;
+const MAX_DECODE_EXPANSION_RATIO: usize = 32;
+const MAX_DECODE_ELAPSED: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeLimitReason {
+    Candidates,
+    DecodedBytes,
+    Expansion,
+    Elapsed,
+}
+
+impl DecodeLimitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidates => "candidate-limit",
+            Self::DecodedBytes => "decoded-byte-limit",
+            Self::Expansion => "expansion-limit",
+            Self::Elapsed => "elapsed-limit",
+        }
+    }
+}
+
+struct DecodeBudget {
+    candidates: usize,
+    decoded_bytes: usize,
+    deadline: Instant,
+    reporter: Option<fn(DecodeLimitReason)>,
+    reported: bool,
+}
+
+impl DecodeBudget {
+    fn new(reporter: Option<fn(DecodeLimitReason)>) -> Self {
+        Self {
+            candidates: 0,
+            decoded_bytes: 0,
+            deadline: Instant::now() + MAX_DECODE_ELAPSED,
+            reporter,
+            reported: false,
+        }
+    }
+
+    fn accept(&mut self, encoded_len: usize, decoded_len: usize) -> bool {
+        let reason = if Instant::now() >= self.deadline {
+            Some(DecodeLimitReason::Elapsed)
+        } else if self.candidates >= MAX_DECODE_CANDIDATES {
+            Some(DecodeLimitReason::Candidates)
+        } else if decoded_len
+            > encoded_len
+                .saturating_mul(MAX_DECODE_EXPANSION_RATIO)
+                .max(1)
+        {
+            Some(DecodeLimitReason::Expansion)
+        } else if self.decoded_bytes.saturating_add(decoded_len) > MAX_TOTAL_DECODED_BYTES {
+            Some(DecodeLimitReason::DecodedBytes)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if !self.reported {
+                if let Some(reporter) = self.reporter {
+                    reporter(reason);
+                }
+                self.reported = true;
+            }
+            return false;
+        }
+        self.candidates += 1;
+        self.decoded_bytes += decoded_len;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct DecodeConfig {
     pub enabled: bool,
     /// `None` means unlimited. A numeric value counts codec and decompression
@@ -32,7 +106,23 @@ pub struct DecodeConfig {
     pub max_inflate_bytes: Option<u64>,
     pub mask_unknown: bool,
     pub unknown_min_bytes: usize,
+    /// Optional value-free observer for hard safety-budget exhaustion.
+    pub limit_reporter: Option<fn(DecodeLimitReason)>,
 }
+
+impl PartialEq for DecodeConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.max_depth == other.max_depth
+            && self.min_bytes == other.min_bytes
+            && self.max_bytes == other.max_bytes
+            && self.max_inflate_bytes == other.max_inflate_bytes
+            && self.mask_unknown == other.mask_unknown
+            && self.unknown_min_bytes == other.unknown_min_bytes
+    }
+}
+
+impl Eq for DecodeConfig {}
 
 impl Default for DecodeConfig {
     fn default() -> Self {
@@ -44,6 +134,7 @@ impl Default for DecodeConfig {
             max_inflate_bytes: Some(DEFAULT_MAX_INFLATE_BYTES),
             mask_unknown: false,
             unknown_min_bytes: DEFAULT_MIN_OPAQUE_RUN,
+            limit_reporter: None,
         }
     }
 }
@@ -102,6 +193,7 @@ impl DecodeDetector {
                 Box::new(BinaryCodec),
                 Box::new(OctalCodec),
                 Box::new(HexCodec),
+                Box::new(PercentCodec),
                 Box::new(Base32Codec),
                 Box::new(Base32HexCodec),
                 Box::new(Base64Codec),
@@ -137,11 +229,15 @@ impl DecodeDetector {
         &self,
         run: &str,
         remaining_depth: Option<usize>,
+        budget: &mut DecodeBudget,
     ) -> Option<(Category, String, Confidence)> {
         let after_decode = consume_depth(remaining_depth)?;
         for codec in &self.codecs {
             if let Some(bytes) = codec.decode(run) {
-                if let Some(hit) = self.scan_bytes(&bytes, after_decode) {
+                if !budget.accept(run.len(), bytes.len()) {
+                    return None;
+                }
+                if let Some(hit) = self.scan_bytes(&bytes, after_decode, budget) {
                     return Some(hit);
                 }
             }
@@ -153,6 +249,7 @@ impl DecodeDetector {
         &self,
         bytes: &[u8],
         remaining_depth: Option<usize>,
+        budget: &mut DecodeBudget,
     ) -> Option<(Category, String, Confidence)> {
         match std::str::from_utf8(bytes) {
             Ok(text) => {
@@ -162,7 +259,7 @@ impl DecodeDetector {
                 if remaining_depth != Some(0) {
                     for (a, b) in token_runs(text) {
                         if self.accepts_run(b - a) {
-                            if let Some(hit) = self.probe(&text[a..b], remaining_depth) {
+                            if let Some(hit) = self.probe(&text[a..b], remaining_depth, budget) {
                                 return Some(hit);
                             }
                         }
@@ -170,7 +267,7 @@ impl DecodeDetector {
                     for (a, b) in encoded85_runs(text, self.config.min_bytes) {
                         if self.accepts_run(b - a) {
                             if let Some(hit) =
-                                self.probe_assignment_aware(&text[a..b], remaining_depth)
+                                self.probe_assignment_aware(&text[a..b], remaining_depth, budget)
                             {
                                 return Some(hit.0);
                             }
@@ -178,7 +275,14 @@ impl DecodeDetector {
                     }
                     for (a, b) in wrapped_base64_runs(text, self.config.min_bytes) {
                         if self.accepts_run(b - a) {
-                            if let Some(hit) = self.probe(&text[a..b], remaining_depth) {
+                            if let Some(hit) = self.probe(&text[a..b], remaining_depth, budget) {
+                                return Some(hit);
+                            }
+                        }
+                    }
+                    for (a, b) in percent_encoded_runs(text, self.config.min_bytes) {
+                        if self.accepts_run(b - a) {
+                            if let Some(hit) = self.probe(&text[a..b], remaining_depth, budget) {
                                 return Some(hit);
                             }
                         }
@@ -189,7 +293,10 @@ impl DecodeDetector {
             Err(_) if remaining_depth != Some(0) => {
                 let after_decompress = consume_depth(remaining_depth)?;
                 if let Some(inflated) = decompress(bytes, self.config.max_inflate_bytes) {
-                    return self.scan_bytes(&inflated, after_decompress);
+                    if !budget.accept(bytes.len(), inflated.len()) {
+                        return None;
+                    }
+                    return self.scan_bytes(&inflated, after_decompress, budget);
                 }
             }
             Err(_) => {}
@@ -231,15 +338,16 @@ impl DecodeDetector {
         &self,
         run: &str,
         remaining_depth: Option<usize>,
+        budget: &mut DecodeBudget,
     ) -> Option<((Category, String, Confidence), usize)> {
-        if let Some(hit) = self.probe(run, remaining_depth) {
+        if let Some(hit) = self.probe(run, remaining_depth, budget) {
             return Some((hit, 0));
         }
         let (prefix, value) = run.split_once('=')?;
         if prefix.is_empty() || !self.accepts_run(value.len()) {
             return None;
         }
-        self.probe(value, remaining_depth)
+        self.probe(value, remaining_depth, budget)
             .map(|hit| (hit, prefix.len() + 1))
     }
 
@@ -299,6 +407,7 @@ impl Detector for DecodeDetector {
         }
         let s = view.text();
         let mut out = Vec::new();
+        let mut budget = DecodeBudget::new(self.config.limit_reporter);
         for (start, end) in token_runs(s) {
             if !self.accepts_run(end - start) {
                 continue;
@@ -306,7 +415,7 @@ impl Detector for DecodeDetector {
             let run = &s[start..end];
             let mut pushed = false;
             if let Some(((cat, label, conf), relative_start)) =
-                self.probe_assignment_aware(run, self.config.max_depth)
+                self.probe_assignment_aware(run, self.config.max_depth, &mut budget)
             {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start + relative_start, end)),
@@ -336,7 +445,7 @@ impl Detector for DecodeDetector {
                 continue;
             }
             if let Some(((category, label, confidence), relative_start)) =
-                self.probe_assignment_aware(&s[start..end], self.config.max_depth)
+                self.probe_assignment_aware(&s[start..end], self.config.max_depth, &mut budget)
             {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start + relative_start, end)),
@@ -352,7 +461,23 @@ impl Detector for DecodeDetector {
                 continue;
             }
             if let Some((category, label, confidence)) =
-                self.probe(&s[start..end], self.config.max_depth)
+                self.probe(&s[start..end], self.config.max_depth, &mut budget)
+            {
+                out.push(Span {
+                    range: view.to_raw(ByteRange::new(start, end)),
+                    category,
+                    label,
+                    confidence,
+                    source: DetectorId::Decode,
+                });
+            }
+        }
+        for (start, end) in percent_encoded_runs(s, self.config.min_bytes) {
+            if !self.accepts_run(end - start) {
+                continue;
+            }
+            if let Some((category, label, confidence)) =
+                self.probe(&s[start..end], self.config.max_depth, &mut budget)
             {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start, end)),
@@ -365,6 +490,33 @@ impl Detector for DecodeDetector {
         }
         out
     }
+}
+
+fn percent_encoded_runs(text: &str, min_bytes: usize) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 2 < bytes.len() {
+        if bytes[cursor] != b'%'
+            || !bytes[cursor + 1].is_ascii_hexdigit()
+            || !bytes[cursor + 2].is_ascii_hexdigit()
+        {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor + 2 < bytes.len()
+            && bytes[cursor] == b'%'
+            && bytes[cursor + 1].is_ascii_hexdigit()
+            && bytes[cursor + 2].is_ascii_hexdigit()
+        {
+            cursor += 3;
+        }
+        if cursor - start >= min_bytes {
+            runs.push((start, cursor));
+        }
+    }
+    runs
 }
 
 fn encoded85_runs(text: &str, min_bytes: usize) -> Vec<(usize, usize)> {
@@ -566,6 +718,25 @@ fn inflate<R: Read>(mut reader: R, max_bytes: Option<u64>) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::detect::region;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static LIMIT_REPORTS: AtomicUsize = AtomicUsize::new(0);
+    static LIMIT_REASON: AtomicU8 = AtomicU8::new(0);
+    static LIMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn record_limit(reason: DecodeLimitReason) {
+        LIMIT_REPORTS.fetch_add(1, Ordering::SeqCst);
+        LIMIT_REASON.store(
+            match reason {
+                DecodeLimitReason::Candidates => 1,
+                DecodeLimitReason::DecodedBytes => 2,
+                DecodeLimitReason::Expansion => 3,
+                DecodeLimitReason::Elapsed => 4,
+            },
+            Ordering::SeqCst,
+        );
+    }
 
     #[test]
     fn opaque_blob_only_when_mask_unknown() {
@@ -631,6 +802,14 @@ mod tests {
         })
     }
 
+    fn percent_encode(value: &str) -> String {
+        value.bytes().map(|byte| format!("%{byte:02X}")).collect()
+    }
+
+    fn hex_encode(value: &str) -> String {
+        value.bytes().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     fn detects_with_config(value: &str, config: DecodeConfig) -> bool {
         let reg = region(value);
         !DecodeDetector::builtin_with_config(config)
@@ -652,6 +831,121 @@ mod tests {
             &nested_base64("AKIAIOSFODNN7EXAMPLE", 4),
             config
         ));
+    }
+
+    #[test]
+    fn detects_base64url_percent_and_hex_layers() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let base64url = data_encoding::BASE64URL_NOPAD.encode(secret.as_bytes());
+        assert!(detects_with_config(&base64url, DecodeConfig::default()));
+
+        let percent_hex = percent_encode(&hex_encode(secret));
+        assert!(detects_with_config(&percent_hex, DecodeConfig::default()));
+
+        let mixed = data_encoding::BASE64URL_NOPAD.encode(percent_hex.as_bytes());
+        assert!(detects_with_config(&mixed, DecodeConfig::default()));
+    }
+
+    #[test]
+    fn mixed_encoded_secret_recovers_exact_outer_source() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let percent_hex = percent_encode(&hex_encode(secret));
+        let mixed = data_encoding::BASE64URL_NOPAD.encode(percent_hex.as_bytes());
+        let engine = crate::Engine::with_profile_and_decode_config(
+            crate::Profile::Strict,
+            DecodeConfig::default(),
+        );
+        let result = engine.mask(
+            crate::Input {
+                kind: crate::Kind::Text,
+                data: mixed.clone(),
+            },
+            &crate::Config::insecure_testing(),
+        );
+
+        assert_eq!(result.recovery.resolve(&result.masked), mixed);
+        assert!(result
+            .items
+            .iter()
+            .any(|item| item.source == DetectorId::Decode));
+        assert!(!result.masked.contains(secret));
+        assert!(!result.masked.contains(&percent_hex));
+    }
+
+    #[test]
+    fn percent_candidates_require_dense_complete_triplets() {
+        assert_eq!(
+            percent_encoded_runs("x=%41%4B%49%41 end", 12),
+            vec![(2, 14)]
+        );
+        assert!(percent_encoded_runs("https://example.test/%2Fdocs", 12).is_empty());
+        assert!(PercentCodec.decode("%41%4").is_none());
+    }
+
+    #[test]
+    fn candidate_budget_reports_once_without_including_candidate_text() {
+        let _guard = LIMIT_TEST_LOCK.lock().unwrap();
+        LIMIT_REPORTS.store(0, Ordering::SeqCst);
+        LIMIT_REASON.store(0, Ordering::SeqCst);
+        let encoded = data_encoding::BASE64.encode(b"AKIAIOSFODNN7EXAMPLE");
+        let input = std::iter::repeat_n(encoded, MAX_DECODE_CANDIDATES + 32)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let config = DecodeConfig {
+            limit_reporter: Some(record_limit),
+            ..DecodeConfig::default()
+        };
+        let spans = DecodeDetector::builtin_with_config(config)
+            .detect(&NormalizedView::build(&region(&input), &input));
+
+        assert!(!spans.is_empty());
+        assert!(spans.len() <= MAX_DECODE_CANDIDATES);
+        assert_eq!(LIMIT_REPORTS.load(Ordering::SeqCst), 1);
+        assert!(matches!(LIMIT_REASON.load(Ordering::SeqCst), 1 | 4));
+    }
+
+    #[test]
+    fn byte_expansion_and_elapsed_budgets_have_fixed_reasons() {
+        let _guard = LIMIT_TEST_LOCK.lock().unwrap();
+        for (reason, expected) in [
+            (DecodeLimitReason::Candidates, 1),
+            (DecodeLimitReason::Expansion, 3),
+            (DecodeLimitReason::DecodedBytes, 2),
+            (DecodeLimitReason::Elapsed, 4),
+        ] {
+            LIMIT_REPORTS.store(0, Ordering::SeqCst);
+            LIMIT_REASON.store(0, Ordering::SeqCst);
+            let mut budget = DecodeBudget::new(Some(record_limit));
+            match reason {
+                DecodeLimitReason::Expansion => {
+                    assert!(!budget.accept(1, MAX_DECODE_EXPANSION_RATIO + 1));
+                }
+                DecodeLimitReason::DecodedBytes => {
+                    budget.decoded_bytes = MAX_TOTAL_DECODED_BYTES;
+                    assert!(!budget.accept(1, 1));
+                }
+                DecodeLimitReason::Elapsed => {
+                    budget.deadline = Instant::now();
+                    assert!(!budget.accept(1, 1));
+                }
+                DecodeLimitReason::Candidates => {
+                    budget.candidates = MAX_DECODE_CANDIDATES;
+                    assert!(!budget.accept(1, 1));
+                }
+            }
+            assert_eq!(LIMIT_REPORTS.load(Ordering::SeqCst), 1);
+            assert_eq!(LIMIT_REASON.load(Ordering::SeqCst), expected);
+            assert!(!budget.accept(1, usize::MAX));
+            assert_eq!(LIMIT_REPORTS.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_percent_text_never_panics(value in proptest::prelude::any::<String>()) {
+            let _ = percent_encoded_runs(&value, DEFAULT_MIN_DECODE_BYTES);
+            let _ = PercentCodec.decode(&value);
+        }
     }
 
     #[test]
