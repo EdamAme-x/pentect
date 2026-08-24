@@ -385,6 +385,28 @@ pub fn resolve_known_text_from_active_memory_store(text: &str) -> Result<Option<
     ActiveMemoryStoreResolver::new()?.resolve_known_text(text)
 }
 
+/// Move a shell command containing known handles behind the local Pentect
+/// execution boundary. The model-facing command contains only an opaque
+/// encoded script or a one-time script identifier; plaintext is delivered to
+/// the shell over stdin or the existing same-shell bridge, never embedded in
+/// the returned command argv.
+pub fn wrap_shell_command_from_active_memory_store(
+    tool_name: &str,
+    command: &str,
+) -> Result<Option<String>, String> {
+    let resolver = ActiveMemoryStoreResolver::new()?;
+    let Some(mut probe) = resolver.resolve_known_text(command)? else {
+        return Ok(None);
+    };
+    let has_known_reference = probe != command;
+    probe.zeroize();
+    if !has_known_reference {
+        return Ok(None);
+    }
+    let session_name = default_session_name()?;
+    wrap_shell_command(HookProvider::Generic, &session_name, tool_name, command).map(Some)
+}
+
 /// A point-in-time resolver for one model-authored object or request.
 ///
 /// Constructing this value takes one memory-store snapshot. Callers should
@@ -545,6 +567,7 @@ pub fn preflight_exec_server_process_start_from_active_memory_store(
     let opts = ExecOpts {
         session: session_name,
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: argv_mode,
     };
@@ -1440,7 +1463,7 @@ fn run_resolved_command(
                 return Err("exec requires a program after `--`".to_string());
             }
             let env = requested_env_bindings(store, &opts.mode)?;
-            let resolved_args = resolve_command_args(store, args)?;
+            let resolved_args = resolve_command_args(store, args, opts.allow_secret_argv)?;
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
             let mut command = Command::new(program);
@@ -1467,7 +1490,7 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
                 return Err("exec requires a program after `--`".to_string());
             }
             let env = requested_env_bindings(store, &opts.mode)?;
-            let resolved_args = resolve_command_args(store, args)?;
+            let resolved_args = resolve_command_args(store, args, opts.allow_secret_argv)?;
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
             let mut command = Command::new(program);
@@ -1487,10 +1510,24 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
     }
 }
 
-fn resolve_command_args(store: &MemoryStore, args: &[String]) -> Result<Vec<String>, String> {
-    args.iter()
-        .map(|arg| resolve_command_text(store, arg))
-        .collect()
+fn resolve_command_args(
+    store: &MemoryStore,
+    args: &[String],
+    allow_secret_argv: bool,
+) -> Result<Vec<String>, String> {
+    let mut resolved_args = Vec::with_capacity(args.len());
+    for arg in args {
+        let mut resolved = resolve_command_text(store, arg)?;
+        if resolved != *arg && !allow_secret_argv {
+            resolved.zeroize();
+            return Err(
+                "refusing to place a restored secret in process arguments; use a shell/stdin/environment binding, or pass --allow-secret-argv after reviewing same-user process visibility"
+                    .to_string(),
+            );
+        }
+        resolved_args.push(resolved);
+    }
+    Ok(resolved_args)
 }
 
 fn resolve_command_text(store: &MemoryStore, text: &str) -> Result<String, String> {
@@ -2296,6 +2333,7 @@ impl HookOpts {
 struct ExecOpts {
     session: String,
     live: bool,
+    allow_secret_argv: bool,
     script_shell: ScriptShell,
     mode: ExecMode,
 }
@@ -2451,6 +2489,7 @@ impl ExecOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = default_session_name()?;
         let mut live = false;
+        let mut allow_secret_argv = false;
         let mut stdin = false;
         let mut script_shell = ScriptShell::Native;
         let mut i = 2;
@@ -2461,6 +2500,10 @@ impl ExecOpts {
                 }
                 "--live" => {
                     live = true;
+                    i += 1;
+                }
+                "--allow-secret-argv" => {
+                    allow_secret_argv = true;
                     i += 1;
                 }
                 "--stdin" => {
@@ -2485,6 +2528,7 @@ impl ExecOpts {
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
+                        allow_secret_argv,
                         script_shell,
                         mode: ExecMode::Shell(script),
                     });
@@ -2505,6 +2549,7 @@ impl ExecOpts {
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
+                        allow_secret_argv,
                         script_shell: ScriptShell::Native,
                         mode: ExecMode::Program(command),
                     });
@@ -2517,6 +2562,7 @@ impl ExecOpts {
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
+                        allow_secret_argv,
                         script_shell,
                         mode: ExecMode::Shell(args[i..].join(" ")),
                     });
@@ -2527,6 +2573,7 @@ impl ExecOpts {
             return Ok(Self {
                 session: checked_session_name(&session).map_err(|e| e.to_string())?,
                 live,
+                allow_secret_argv,
                 script_shell,
                 mode: ExecMode::Stdin,
             });

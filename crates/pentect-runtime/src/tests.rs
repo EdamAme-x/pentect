@@ -294,10 +294,33 @@ fn exec_parse_rejects_shell_flag() {
 #[test]
 fn exec_parse_accepts_program_after_separator() {
     let args = strings(["pentect", "exec", "--", "echo", "hi"]);
-    assert!(matches!(
-        ExecOpts::parse(&args).unwrap().mode,
-        ExecMode::Program(_)
-    ));
+    let opts = ExecOpts::parse(&args).unwrap();
+    assert!(!opts.allow_secret_argv);
+    assert!(matches!(opts.mode, ExecMode::Program(_)));
+
+    let args = strings(["pentect", "exec", "--allow-secret-argv", "--", "echo", "hi"]);
+    let opts = ExecOpts::parse(&args).unwrap();
+    assert!(opts.allow_secret_argv);
+    assert!(matches!(opts.mode, ExecMode::Program(_)));
+}
+
+#[test]
+fn direct_program_secret_arguments_require_explicit_opt_in() {
+    let root = temp_root("secret-argv-opt-in");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked.split_once('=').unwrap().1.trim().to_string();
+    let args = vec!["tool".to_string(), handle];
+
+    let error = resolve_command_args(&store, &args, false).unwrap_err();
+    assert!(error.contains("refusing"), "{error}");
+    assert!(!error.contains(raw), "{error}");
+
+    let resolved = resolve_command_args(&store, &args, true).unwrap();
+    assert_eq!(resolved, ["tool", raw]);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -447,6 +470,7 @@ fn exec_allows_secret_file_reads_because_output_is_remasked() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -483,6 +507,7 @@ fn exec_registers_referenced_local_files_as_env_capabilities() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -527,6 +552,7 @@ fn exec_inherits_parent_environment_and_masks_output() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode,
     };
@@ -976,6 +1002,7 @@ fn exec_capability_env_does_not_shadow_parent_environment() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode,
     };
@@ -1004,6 +1031,7 @@ fn exec_resolves_masked_handle_in_command_text() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -1072,6 +1100,7 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -1336,6 +1365,7 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -2362,6 +2392,7 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -2453,6 +2484,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
         live: false,
+        allow_secret_argv: false,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -4072,6 +4104,27 @@ fn hook_bash_transport_keeps_shell_syntax_and_environment_aliases() {
     );
     assert!(rendered.contains(raw), "{rendered:?}");
     assert!(client.take_agent_script(&id).is_err());
+}
+
+#[test]
+fn active_shell_wrapper_keeps_plaintext_out_of_model_facing_argv() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-shell-wrapper");
+    let producer = Session::open_capability(DEFAULT_SESSION).unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&producer, &format!("RUNPOD_API_KEY={raw}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "RUNPOD_API_KEY");
+    let command = format!("printf '%s' '{handle}'");
+
+    let wrapped = wrap_shell_command_from_active_memory_store("exec_command", &command)
+        .unwrap()
+        .expect("known handle should move behind the local execution boundary");
+
+    assert!(!wrapped.contains(raw), "{wrapped}");
+    assert!(!wrapped.contains(&handle), "{wrapped}");
+    assert!(wrapped.contains("pentect"), "{wrapped}");
+    assert!(wrapped.contains("--script-b64"), "{wrapped}");
+    assert_eq!(wrapped_payload(&wrapped), command);
 }
 
 #[test]
