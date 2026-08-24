@@ -62,6 +62,73 @@ pub struct CredSweeperNativeStats {
     pub ml_model_onnx_bytes: usize,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct CredSweeperFilterProbe {
+    pub filter: String,
+    pub value: String,
+    pub line: String,
+    pub value_start: usize,
+    pub value_end: usize,
+    #[serde(default)]
+    pub variable: Option<String>,
+    #[serde(default)]
+    pub wrap: Option<String>,
+    #[serde(default)]
+    pub value_leftquote: Option<String>,
+    #[serde(default)]
+    pub value_rightquote: Option<String>,
+    #[serde(default)]
+    pub previous: Option<String>,
+    #[serde(default)]
+    pub next: Option<String>,
+    #[serde(default)]
+    pub file_type: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub line_index: usize,
+}
+
+impl CredSweeperFilterProbe {
+    pub fn is_filtered(&self) -> bool {
+        let candidate = Candidate {
+            start: self.value_start,
+            end: self.value_end,
+            value: &self.value,
+            variable_start: None,
+            variable_end: None,
+            variable: self.variable.as_deref(),
+            separator: None,
+            wrap: self.wrap.as_deref(),
+            value_leftquote: self.value_leftquote.as_deref(),
+            value_rightquote: self.value_rightquote.as_deref(),
+            line_data: Vec::new(),
+        };
+        let target = if self.target.is_empty() {
+            &self.line
+        } else {
+            &self.target
+        };
+        let context = CandidateLineContext {
+            start: 0,
+            line: &self.line,
+            previous: self.previous.as_deref(),
+            next: self.next.as_deref(),
+            file_type: &self.file_type,
+            target,
+            line_index: self.line_index,
+        };
+        !accept_filter_list(
+            &self.value,
+            std::slice::from_ref(&self.filter),
+            &candidate,
+            &context,
+            self.value_start,
+            self.value_end,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CredSweeperNativeFinding {
     pub range: ByteRange,
@@ -2305,12 +2372,30 @@ fn accept_value(
     value_start: usize,
     value_end: usize,
 ) -> bool {
-    let line = line_ctx.line;
     let value = value.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
     if value.len() < 4 || is_obvious_placeholder(value) || is_repeated_symbol(value) {
         return false;
     }
-    for filter in &rule.filter_types {
+    accept_filter_list(
+        value,
+        &rule.filter_types,
+        candidate,
+        line_ctx,
+        value_start,
+        value_end,
+    )
+}
+
+fn accept_filter_list(
+    value: &str,
+    filters: &[String],
+    candidate: &Candidate<'_>,
+    line_ctx: &CandidateLineContext<'_>,
+    value_start: usize,
+    value_end: usize,
+) -> bool {
+    let line = line_ctx.line;
+    for filter in filters {
         if filter == "LineGitBinaryCheck" && line_git_binary_filtered(line) {
             return false;
         }
@@ -2466,8 +2551,7 @@ fn accept_value(
             return false;
         }
     }
-    if rule
-        .filter_types
+    if filters
         .iter()
         .any(|filter| filter.contains("ValueFilePathCheck"))
         && looks_like_file_path(value)

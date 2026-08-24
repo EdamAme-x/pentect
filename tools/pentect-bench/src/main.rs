@@ -1,7 +1,7 @@
 use pentect_core::normalize::NormalizedView;
 use pentect_core::{
-    infer_kind, ByteRange, Category, Context, CredSweeperNativeDetector, CredSweeperNativeFinding,
-    Engine, Input, Profile, Region, RegionKind, Span,
+    infer_kind, ByteRange, Category, Context, CredSweeperFilterProbe, CredSweeperNativeDetector,
+    CredSweeperNativeFinding, Engine, Input, Profile, Region, RegionKind, Span,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,6 +25,23 @@ fn die(msg: impl std::fmt::Display) -> ! {
 }
 
 fn cmd_bench(args: &[String]) {
+    if args.first().map(String::as_str) == Some("credsweeper-filter-probe") {
+        let Some(path) = args.get(1) else {
+            die("usage: pentect-bench credsweeper-filter-probe PROBES.json");
+        };
+        let source = std::fs::read(path).unwrap_or_else(|error| die(error));
+        let probes: Vec<CredSweeperFilterProbe> =
+            serde_json::from_slice(&source).unwrap_or_else(|error| die(error));
+        let results = probes
+            .iter()
+            .map(CredSweeperFilterProbe::is_filtered)
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&results).unwrap_or_else(|error| die(error))
+        );
+        return;
+    }
     if args.first().map(String::as_str) == Some("credsweeper-parity") {
         let opts = match CredSweeperParityOpts::parse(args) {
             Ok(opts) => opts,
