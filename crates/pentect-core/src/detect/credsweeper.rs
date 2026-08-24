@@ -72,6 +72,8 @@ pub struct CredSweeperFilterProbe {
     #[serde(default)]
     pub variable: Option<String>,
     #[serde(default)]
+    pub separator: Option<String>,
+    #[serde(default)]
     pub wrap: Option<String>,
     #[serde(default)]
     pub value_leftquote: Option<String>,
@@ -98,7 +100,7 @@ impl CredSweeperFilterProbe {
             variable_start: None,
             variable_end: None,
             variable: self.variable.as_deref(),
-            separator: None,
+            separator: self.separator.as_deref(),
             wrap: self.wrap.as_deref(),
             value_leftquote: self.value_leftquote.as_deref(),
             value_rightquote: self.value_rightquote.as_deref(),
