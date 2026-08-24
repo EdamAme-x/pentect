@@ -677,6 +677,8 @@ impl DeferredRegex {
         };
         if let Some(keyword) = self.compiled_keyword() {
             out.extend(keyword_set_call_candidates(text, keyword));
+            out.extend(keyword_directive_candidates(text, keyword));
+            out.extend(keyword_percent_bracket_candidates(text, keyword));
         }
         out
     }
@@ -843,6 +845,202 @@ fn keyword_set_call_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<C
     out
 }
 
+fn keyword_directive_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let prefix = &text[..matched.start()];
+        let trimmed = prefix.trim_end_matches(char::is_whitespace);
+        let Some((directive_start, directive_name)) = ["#define", "%define", "%global", "define"]
+            .into_iter()
+            .filter_map(|name| {
+                let start = trimmed.len().checked_sub(name.len())?;
+                trimmed
+                    .as_bytes()
+                    .get(start..)
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(name.as_bytes()))
+                    .then_some((start, name))
+            })
+            .next()
+        else {
+            continue;
+        };
+        if directive_name == "define"
+            && directive_start > 0
+            && text.as_bytes()[directive_start - 1].is_ascii_alphanumeric()
+        {
+            continue;
+        }
+
+        let mut variable_end = matched.end();
+        while text
+            .as_bytes()
+            .get(variable_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            variable_end += 1;
+        }
+        let separator_start = variable_end;
+        let mut cursor = variable_end;
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if separator_start == cursor {
+            continue;
+        }
+        let separator_end = cursor;
+
+        let wrap_start = cursor;
+        let wrap_close = match text.as_bytes().get(cursor) {
+            Some(b'{') => Some(b'}'),
+            Some(b'[') => Some(b']'),
+            Some(b'(') => Some(b')'),
+            _ => None,
+        };
+        if wrap_close.is_some() {
+            cursor += 1;
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                cursor += 1;
+            }
+        }
+
+        let (value_start, value_end, left_quote, right_quote) = if let Some(&quote) = text
+            .as_bytes()
+            .get(cursor)
+            .filter(|byte| matches!(byte, b'\'' | b'"' | b'`'))
+        {
+            let quote_start = cursor;
+            cursor += 1;
+            let value_start = cursor;
+            let mut escaped = false;
+            while let Some(&byte) = text.as_bytes().get(cursor) {
+                if byte == quote && !escaped {
+                    break;
+                }
+                escaped = byte == b'\\' && !escaped;
+                if byte != b'\\' {
+                    escaped = false;
+                }
+                cursor += 1;
+            }
+            if text.as_bytes().get(cursor) != Some(&quote) {
+                continue;
+            }
+            (
+                value_start,
+                cursor,
+                Some(&text[quote_start..quote_start + 1]),
+                Some(&text[cursor..cursor + 1]),
+            )
+        } else {
+            let value_start = cursor;
+            if let Some(close) = wrap_close {
+                while text
+                    .as_bytes()
+                    .get(cursor)
+                    .is_some_and(|byte| *byte != close)
+                {
+                    cursor += 1;
+                }
+            } else {
+                while text.as_bytes().get(cursor).is_some_and(|byte| {
+                    !byte.is_ascii_whitespace()
+                        && !matches!(*byte, b'\'' | b'"' | b'`' | b',' | b';' | b'\\' | b'&')
+                }) {
+                    cursor += 1;
+                }
+            }
+            (value_start, cursor, None, None)
+        };
+        if value_end.saturating_sub(value_start) < 4 {
+            continue;
+        }
+
+        out.push(Candidate {
+            start: value_start,
+            end: value_end,
+            value: &text[value_start..value_end],
+            variable_start: Some(matched.start()),
+            variable_end: Some(variable_end),
+            variable: Some(&text[matched.start()..variable_end]),
+            separator: Some(&text[separator_start..separator_end]),
+            wrap: wrap_close.map(|_| &text[wrap_start..wrap_start + 1]),
+            value_leftquote: left_quote,
+            value_rightquote: right_quote,
+            line_data: Vec::new(),
+        });
+    }
+    out
+}
+
+fn keyword_percent_bracket_candidates<'a>(
+    text: &'a str,
+    keyword: &FancyRegex,
+) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let Some(prefix_start) = matched.start().checked_sub(3) else {
+            continue;
+        };
+        let Some(prefix) = text.get(prefix_start..matched.start()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case("%5B") {
+            continue;
+        }
+        let mut variable_end = matched.end();
+        while text
+            .as_bytes()
+            .get(variable_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            variable_end += 1;
+        }
+        let Some(encoded_close) = text.get(variable_end..variable_end + 3) else {
+            continue;
+        };
+        if !encoded_close.eq_ignore_ascii_case("%5D") {
+            continue;
+        }
+        variable_end += 3;
+        if text.as_bytes().get(variable_end) != Some(&b'=') {
+            continue;
+        }
+        let value_start = variable_end + 1;
+        let mut value_end = value_start;
+        while text.as_bytes().get(value_end).is_some_and(|byte| {
+            !byte.is_ascii_whitespace()
+                && !matches!(*byte, b'&' | b'"' | b'\'' | b'`' | b',' | b';' | b'\\')
+        }) {
+            value_end += 1;
+        }
+        if value_end.saturating_sub(value_start) < 4 {
+            continue;
+        }
+        out.push(Candidate {
+            start: value_start,
+            end: value_end,
+            value: &text[value_start..value_end],
+            variable_start: Some(matched.start()),
+            variable_end: Some(variable_end),
+            variable: Some(&text[matched.start()..variable_end]),
+            separator: Some(&text[variable_end..variable_end + 1]),
+            wrap: None,
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        });
+    }
+    out
+}
+
 fn rust_candidate<'a>(
     captures: &regex::Captures<'a>,
     value_capture: bool,
@@ -891,17 +1089,48 @@ fn fancy_candidate<'a>(
     // keyword pattern. `fancy_regex` can match the same conditional expression
     // while leaving that nested capture unset. Recover it only for keyword
     // matches when the exact left-quote bytes follow the value in the input.
-    let recovered_rightquote = value_rightquote.map(|m| m.as_str()).or_else(|| {
-        captures.name("keyword")?;
-        let left = value_leftquote.as_ref()?.as_str();
-        text.get(value.end()..)?
-            .strip_prefix(left)
-            .map(|_| &text[value.end()..value.end() + left.len()])
-    });
+    let (value_end, recovered_rightquote) = if let Some(right) = value_rightquote {
+        (value.end(), Some(right.as_str()))
+    } else if captures.name("keyword").is_some() {
+        let recovered = value_leftquote.as_ref().and_then(|left_match| {
+            let left = left_match.as_str();
+            let overlap = (0..left.len()).rev().find_map(|overlap| {
+                let quote_start = value.end().checked_sub(overlap)?;
+                let consumed = text.get(quote_start..value.end())?;
+                let remaining = left.get(overlap..)?;
+                (consumed == left.get(..overlap)?
+                    && text.get(value.end()..)?.starts_with(remaining))
+                .then(|| (quote_start, &text[quote_start..quote_start + left.len()]))
+            });
+            overlap.or_else(|| {
+                if !(value.as_str().ends_with("\\n") || value.as_str().ends_with("\\r")) {
+                    return None;
+                }
+                let tail = text.get(value.end()..)?;
+                tail.match_indices(left).find_map(|(relative, _)| {
+                    let quote_start = value.end() + relative;
+                    if left.len() == 1 {
+                        let preceding_slashes = text[..quote_start]
+                            .bytes()
+                            .rev()
+                            .take_while(|byte| *byte == b'\\')
+                            .count();
+                        if preceding_slashes % 2 == 1 {
+                            return None;
+                        }
+                    }
+                    Some((quote_start, &text[quote_start..quote_start + left.len()]))
+                })
+            })
+        });
+        recovered.map_or((value.end(), None), |(end, right)| (end, Some(right)))
+    } else {
+        (value.end(), None)
+    };
     Some(Candidate {
         start: value.start(),
-        end: value.end(),
-        value: value.as_str(),
+        end: value_end,
+        value: &text[value.start()..value_end],
         variable_start: variable.as_ref().map(|m| m.start()),
         variable_end: variable.as_ref().map(|m| m.end()),
         variable: variable.map(|m| m.as_str()),
@@ -5280,6 +5509,42 @@ mod tests {
         for (path, raw, rule_name, expected) in [
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"                "//&user%5Bemail%5D=credsweeper%40example.com&user%5Bpassword%5D=Dmdkesfdsq452%23%40!&user%5Bpassword_","#,
+                "Password",
+                "Dmdkesfdsq452%23%40!",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ['''final String body = \"{ \\"passwords\\":\\"i0sEcReT\\\\/MwX3X\\","''', '''i0sEcReT\\\\/MwX3X'''],"#,
+                "Password",
+                r#"i0sEcReT\\\\/MwX3X"#,
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                "            ['password = \"3VNdhWT3oFo5I7faffKO\\n   gnK7tYBcGxhla\\n\";', '''3VNdhWT3oFo5I7faffKO\\n   gnK7tYBcGxhla\\n'''],",
+                "Password",
+                "3VNdhWT3oFo5I7faffKO\\n   gnK7tYBcGxhla\\n",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ['#define password {0x35, 0x34, 0x65, 0x9b, 0x1c, 0x2e}', '0x35, 0x34, 0x65, 0x9b, 0x1c, 0x2e'],"#,
+                "Password",
+                "0x35, 0x34, 0x65, 0x9b, 0x1c, 0x2e",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ['#define password ";,}d4s@\\on"', ";,}d4s@\\on"],"#,
+                "Password",
+                r#";,}d4s@\\on"#,
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ['%define password "CEKPET"', "CEKPET"],"#,
+                "Password",
+                "CEKPET",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
                 r#"            ['self.setPassword("0bead47f3c5bc275ec7b5eda8a333f")', "0bead47f3c5bc275ec7b5eda8a333f"],"#,
                 "Password",
                 "0bead47f3c5bc275ec7b5eda8a333f",
@@ -5376,6 +5641,32 @@ mod tests {
                 "{rule_name} {raw:?}: candidates={candidates:?} findings={findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn keyword_directive_probe_is_unicode_safe() {
+        let keyword = FancyRegex::new("(?is:pass)").expect("keyword regex");
+        assert!(keyword_directive_candidates("“password = secret-value", &keyword).is_empty());
+    }
+
+    #[test]
+    fn keyword_quote_recovery_does_not_extend_empty_official_capture() {
+        let raw = r#"            # ['''"password = 'sec;$2`\\'[\\/*;ret';";''', '''sec;$2`\\'[\\/*;ret'''],  # todo"#;
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("test_keyword_pattern.py".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, raw);
+        assert!(CredSweeperNativeDetector::builtin()
+            .detect_findings(&view)
+            .iter()
+            .all(|finding| finding.rule_name != "Password"));
     }
 
     #[test]
