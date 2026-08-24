@@ -1,8 +1,8 @@
 //! Two deliberately opposite normalizations live here, and conflating them is a
 //! bug:
-//! - `n_id` (identity): conservative NFC, so distinct values never merge. Used
-//!   for placeholder hashing and the identity sweep — folding here would make two
-//!   different secrets share one placeholder.
+//! - `n_id` (detection identity): conservative NFC for the identity sweep. It
+//!   may merge canonically equivalent source bytes, so placeholder hashing uses
+//!   the original UTF-8 value instead.
 //! - `NormalizedView` (detection): aggressive NFKC + percent-decode, so spoofing
 //!   tricks can't hide a secret from a detector. It keeps a map back to raw, so
 //!   spans are always reported in raw coordinates.
@@ -13,8 +13,8 @@ use std::borrow::Cow;
 use unicode_normalization::UnicodeNormalization;
 
 /// Identity normalization: NFC only (deliberately not NFKC, and deliberately
-/// not dropping zero-width/bidi controls). Used for placeholder hashing and the
-/// sweep, where merging distinct source bytes would make restore ambiguous.
+/// not dropping zero-width/bidi controls). Used only for detection-time identity
+/// sweep grouping; exact recovery identity hashes the original UTF-8 bytes.
 pub fn n_id(s: &str) -> String {
     s.nfc().collect()
 }

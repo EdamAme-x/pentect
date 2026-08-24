@@ -94,9 +94,8 @@ pub struct Summary {
     /// Opaque candidates that were warned about rather than masked (no value).
     #[serde(default)]
     pub residual: Vec<ResidualNote>,
-    /// Placeholders that two distinct values collided on (restore would be wrong
-    /// for the second). Practically never with a 64-bit keyed hash, but surfaced
-    /// instead of silently corrupting reversibility.
+    /// Short placeholders that two distinct values collided on and were safely
+    /// disambiguated with a full-width keyed hash.
     #[serde(default)]
     pub collisions: Vec<String>,
     /// The requested format parser failed and we fell back to plaintext, so key
@@ -799,11 +798,11 @@ impl Default for EngineBuilder {
 }
 
 static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // Hash width comes from the renderer so the freeze pattern can't drift from
-    // what we emit.
+    // Normal handles use the compact width. A safely disambiguated short-hash
+    // collision uses the full SHA-256 HMAC and must also remain frozen.
     let w = crate::placeholder::HASH_HEX_WIDTH;
     Regex::new(&format!(
-        r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{{{w}}}(?:_(?:len[0-9]+|length_[0-9]+_chars|length_at_least_[0-9]+_chars))?>>"
+        r"<<[A-Z][A-Z0-9_]*_(?:[0-9a-f]{{{w}}}|[0-9a-f]{{64}})(?:_(?:len[0-9]+|length_[0-9]+_chars|length_at_least_[0-9]+_chars))?>>"
     ))
     .expect("placeholder regex compiles")
 });
@@ -819,6 +818,15 @@ fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_width_collision_handle_is_frozen() {
+        let handle = format!("<<SECRET_{}>>", "a".repeat(64));
+        assert_eq!(
+            scan_placeholders(&handle),
+            [ByteRange::new(0, handle.len())]
+        );
+    }
 
     struct InvalidUtf8BoundaryDetector;
 

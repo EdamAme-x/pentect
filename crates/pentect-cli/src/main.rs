@@ -919,7 +919,7 @@ fn cmd_mask(args: &[String]) {
     }
     if !result.summary.collisions.is_empty() {
         eprintln!(
-            "[pentect] WARNING: {} placeholder collision(s) — resolve/restore may be wrong for the colliding value(s).",
+            "[pentect] note: {} short placeholder collision(s) safely disambiguated with full-width handles.",
             result.summary.collisions.len()
         );
     }
