@@ -347,6 +347,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueFilePathCheck"
             | "ValueHexNumberCheck"
             | "ValueLastWordCheck"
+            | "ValueLengthCheck"
             | "ValueMethodCheck"
             | "ValueMorphemesCheck"
             | "ValueNumberCheck"
@@ -1953,7 +1954,7 @@ fn expand_filter_group(name: &str) -> Vec<String> {
             "ValueTokenCheck",
             "ValuePatternCheck",
             "ValueNotAllowedPatternCheck",
-            "ValueLengthCheck(64)",
+            "ValueLengthCheck(4,64)",
             "ValueSplitKeywordCheck",
             "ValueSealedSecretCheck",
             "LineGitBinaryCheck",
@@ -1970,7 +1971,7 @@ fn expand_filter_group(name: &str) -> Vec<String> {
             "ValueStringTypeCheck",
             "ValueNotAllowedPatternCheck",
             "ValueTokenCheck",
-            "ValueLengthCheck(80)",
+            "ValueLengthCheck(4,80)",
             "ValuePatternCheck",
         ],
         "WeirdBase36Token" => &[
@@ -2075,6 +2076,12 @@ fn accept_value(
         }
         if filter == "ValueLastWordCheck" && value_last_word_filtered(value, candidate) {
             return false;
+        }
+        if filter.starts_with("ValueLengthCheck") {
+            let (min_len, max_len) = parse_filter_length_range(filter).unwrap_or((4, 8000));
+            if value_length_filtered(value, min_len, max_len) {
+                return false;
+            }
         }
         if filter == "ValueMethodCheck" && value_method_filtered(value, candidate) {
             return false;
@@ -2242,6 +2249,19 @@ fn value_hex_number_filtered(value: &str) -> bool {
 
 fn value_last_word_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
     value.chars().count() < 16 && !candidate_is_well_quoted(candidate) && value.ends_with(':')
+}
+
+fn value_length_filtered(value: &str, min_len: usize, max_len: usize) -> bool {
+    !(min_len..=max_len).contains(&value.chars().count())
+}
+
+fn parse_filter_length_range(filter: &str) -> Option<(usize, usize)> {
+    let start = filter.find('(')? + 1;
+    let end = filter[start..].find(')')? + start;
+    let mut values = filter[start..end].split(',').map(str::trim);
+    let min_len = values.next()?.parse().ok()?;
+    let max_len = values.next()?.parse().ok()?;
+    (values.next().is_none()).then_some((min_len, max_len))
 }
 
 fn value_method_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
@@ -2847,7 +2867,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 26, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 25, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3304,6 +3324,24 @@ mod tests {
 
         let unicode = test_candidate("秘密:", None, None, None);
         assert!(value_last_word_filtered(unicode.value, &unicode));
+    }
+
+    #[test]
+    fn value_length_check_matches_upstream_inclusive_character_bounds() {
+        assert!(value_length_filtered("Cra", 4, 42));
+        assert!(!value_length_filtered("Crackle", 4, 42));
+        assert!(value_length_filtered(
+            "CrackleCrackleCrackleCrackleCrackleCrackle123",
+            4,
+            42
+        ));
+        assert!(!value_length_filtered("秘密情報", 4, 4));
+        assert!(value_length_filtered("秘密情報", 5, 8));
+        assert_eq!(
+            parse_filter_length_range("ValueLengthCheck(4,64)"),
+            Some((4, 64))
+        );
+        assert_eq!(parse_filter_length_range("ValueLengthCheck(4)"), None);
     }
 
     #[test]
