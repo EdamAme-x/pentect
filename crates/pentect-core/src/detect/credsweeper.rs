@@ -382,6 +382,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueCamelCaseCheck"
             | "ValueDictionaryKeywordCheck"
             | "ValueEntropyBase36Check"
+            | "ValueEntropyBase32Check"
             | "ValueEntropyBase64Check"
             | "ValueFilePathCheck"
             | "ValueHexNumberCheck"
@@ -2214,6 +2215,9 @@ fn accept_value(
         if filter == "ValueEntropyBase36Check" && entropy_base36_filtered(value) {
             return false;
         }
+        if filter == "ValueEntropyBase32Check" && entropy_base32_filtered(value) {
+            return false;
+        }
         if filter == "ValueEntropyBase64Check" && entropy_base64_filtered(value) {
             return false;
         }
@@ -2849,6 +2853,17 @@ fn entropy_base36_filtered(value: &str) -> bool {
     min == 0.0 || shannon_entropy(value) < min
 }
 
+fn entropy_base32_filtered(value: &str) -> bool {
+    let len = value.chars().count();
+    let min = match len {
+        8..=16 => 0.805_692_36 * (len as f64).log2() + 0.134_397_34,
+        17..=32 => 0.663_504_81 * (len as f64).log2() + 0.711_438_62,
+        33.. => 4.04,
+        _ => 0.0,
+    };
+    min == 0.0 || min > shannon_entropy(value)
+}
+
 fn entropy_base64_filtered(value: &str) -> bool {
     let len = value.len();
     let min = match len {
@@ -3245,7 +3260,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 18, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 17, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3871,6 +3886,19 @@ mod tests {
             assert!(!value_split_keyword_filtered(value), "{value:?}");
         }
         assert!(value_split_keyword_filtered("prefix\tabstract\nsuffix"));
+    }
+
+    #[test]
+    fn value_entropy_base32_check_matches_upstream_examples_and_boundaries() {
+        assert!(!entropy_base32_filtered("WXFES7QNTET5DQYC"));
+        assert!(entropy_base32_filtered("200X300X4000X123"));
+        assert!(entropy_base32_filtered("ABCDEF7"));
+        for len in [8, 16, 17, 32, 33] {
+            let value = (0..len)
+                .map(|index| char::from(b'A' + (index % 26) as u8))
+                .collect::<String>();
+            let _ = entropy_base32_filtered(&value);
+        }
     }
 
     #[test]
