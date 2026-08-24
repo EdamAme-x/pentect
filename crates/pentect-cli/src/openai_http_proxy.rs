@@ -3770,7 +3770,7 @@ mod tests {
         let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
         let original: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(allowed["input"], original["input"]);
-        assert_eq!(allowed["instructions"], HANDLE_CONTRACT);
+        assert!(allowed.get("instructions").is_none());
     }
 
     #[test]
