@@ -1103,7 +1103,15 @@ fn fancy_candidate<'a>(
                 .then(|| (quote_start, &text[quote_start..quote_start + left.len()]))
             });
             overlap.or_else(|| {
-                if !(value.as_str().ends_with("\\n") || value.as_str().ends_with("\\r")) {
+                let stopped_on_other_quote = !value.as_str().is_empty()
+                    && left.chars().count() == 1
+                    && text[value.end()..].chars().next().is_some_and(|next| {
+                        matches!(next, '\'' | '"' | '`') && !left.starts_with(next)
+                    });
+                if !(value.as_str().ends_with("\\n")
+                    || value.as_str().ends_with("\\r")
+                    || stopped_on_other_quote)
+                {
                     return None;
                 }
                 let tail = text.get(value.end()..)?;
@@ -1123,10 +1131,27 @@ fn fancy_candidate<'a>(
                 })
             })
         });
-        recovered.map_or((value.end(), None), |(end, right)| (end, Some(right)))
+        recovered.map_or_else(
+            || {
+                if text.get(value.end()..) == Some("\\") {
+                    (value.end(), text.get(value.end()..))
+                } else {
+                    (value.end(), None)
+                }
+            },
+            |(end, right)| (end, Some(right)),
+        )
     } else {
         (value.end(), None)
     };
+    if captures.name("keyword").is_some()
+        && value_leftquote.is_some()
+        && recovered_rightquote.is_none()
+        && value_end < text.len()
+        && text.get(value_end..) != Some("\\")
+    {
+        return None;
+    }
     Some(Candidate {
         start: value.start(),
         end: value_end,
@@ -2584,7 +2609,28 @@ fn push_match(
         .variable
         .zip(candidate.variable_start.zip(candidate.variable_end))
         .and_then(|(variable, (start, end))| {
-            sanitize_variable_capture(line_ctx.line, variable, start, end)
+            let url_variable = candidate
+                .separator
+                .filter(|separator| separator.eq_ignore_ascii_case("%3D"))
+                .map(|_| {
+                    variable
+                        .rsplit('&')
+                        .next()
+                        .unwrap_or(variable)
+                        .rsplit('?')
+                        .next()
+                        .unwrap_or(variable)
+                        .rsplit(';')
+                        .next()
+                        .unwrap_or(variable)
+                })
+                .unwrap_or(variable);
+            let sanitized = sanitize_variable_capture(line_ctx.line, url_variable, start, end)?;
+            if url_variable != variable && sanitized.0 == url_variable {
+                Some((sanitized.0, start, end))
+            } else {
+                Some(sanitized)
+            }
         });
     let filter_candidate = Candidate {
         start: sanitized_value.start,
@@ -2871,7 +2917,7 @@ fn accept_value(
     value_end: usize,
 ) -> bool {
     let value = value.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
-    if value.len() < 4 || is_obvious_placeholder(value) || is_repeated_symbol(value) {
+    if value.len() < 4 {
         return false;
     }
     accept_filter_list(
@@ -4800,26 +4846,6 @@ fn is_generic_label(label: &str) -> bool {
     )
 }
 
-fn is_obvious_placeholder(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("example")
-        || lower.contains("changeme")
-        || lower.contains("dummy")
-        || lower.contains("placeholder")
-        || lower.contains("<secret")
-        || lower.contains("<token")
-        || lower.contains("your_")
-        || lower.contains("your-")
-}
-
-fn is_repeated_symbol(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    chars.all(|ch| ch == first)
-}
-
 fn value_file_path_filtered(value: &str, separator: Option<&str>) -> bool {
     let bit_length = value
         .chars()
@@ -5505,8 +5531,61 @@ mod tests {
     }
 
     #[test]
+    fn line_wrapped_key_matches_official_ml_decision() {
+        let raw = "key_wrap = 'KJHhJKhKU7yguyuyfrtsdESffhjgkhYT\\";
+        let input = MlInput {
+            line: raw.to_string(),
+            value: "KJHhJKhKU7yguyuyfrtsdESffhjgkhYT".to_string(),
+            variable: "key_wrap".to_string(),
+            value_start: 12,
+            value_end: 44,
+            variable_start: 0,
+            variable_end: 8,
+            path: "samples/nonce.py".to_string(),
+            file_type: ".py".to_string(),
+            rule_name: "Key".to_string(),
+            severity: RuleSeverity::High,
+        };
+        let (score, threshold) = credsweeper_ml::score_group_for_test(&[&input]);
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("samples/nonce.py".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert!(
+            findings.iter().any(|finding| finding.rule_name == "Key"),
+            "score={score} threshold={threshold} findings={findings:?}"
+        );
+    }
+
+    #[test]
     fn keyword_rules_match_official_nested_fixture_literals() {
         for (path, raw, rule_name, expected) in [
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/samples/nonce.py",
+                "key_wrap = 'KJHhJKhKU7yguyuyfrtsdESffhjgkhYT\\",
+                "Key",
+                "KJHhJKhKU7yguyuyfrtsdESffhjgkhYT",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/filters/test_value_grafana_service_check.py",
+                r#"    @pytest.mark.parametrize("line", ["glsa_DuMmY-T0K3N-f0R-tHe-Te5t-CRC32Ok_770c8cda"])"#,
+                "Grafana Service Account Token",
+                "glsa_DuMmY-T0K3N-f0R-tHe-Te5t-CRC32Ok_770c8cda",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/deep_scanner/test_sqlite3_scanner.py",
+                r#"                                  'KEY': b'0\x82\x01=\x02\x01\x00\x02A\x00\xaf\xa2\x08\xbf\\U\xc2\xb8`\xa1'"#,
+                "Key",
+                r#"0\x82\x01=\x02\x01\x00\x02A\x00\xaf\xa2\x08\xbf\\U\xc2\xb8`\xa1"#,
+            ),
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
                 r#"                "//&user%5Bemail%5D=credsweeper%40example.com&user%5Bpassword%5D=Dmdkesfdsq452%23%40!&user%5Bpassword_","#,
@@ -5667,6 +5746,33 @@ mod tests {
             .detect_findings(&view)
             .iter()
             .all(|finding| finding.rule_name != "Password"));
+    }
+
+    #[test]
+    fn percent_separator_preserves_official_variable_capture_range() {
+        let raw =
+            r#"            ("pw.html", b'user%3Dadmin;pw%3DjakC5df5G4WL;', "pw", "jakC5df5G4WL"),"#;
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("test_app.py".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, raw);
+        let finding = CredSweeperNativeDetector::builtin()
+            .detect_findings(&view)
+            .into_iter()
+            .find(|finding| finding.rule_name == "Password" && finding.value == "jakC5df5G4WL")
+            .expect("official password candidate");
+        assert_eq!(Some("pw"), finding.variable.as_deref());
+        assert_eq!(
+            (Some(25), Some(41)),
+            (finding.variable_start, finding.variable_end)
+        );
     }
 
     #[test]
