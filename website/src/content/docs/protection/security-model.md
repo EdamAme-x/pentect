@@ -50,6 +50,12 @@ a child deliberately started by the command can still retain its inherited
 copy. Pentect cannot distinguish an intended child from a daemon started by
 the same command.
 
+When the target supports it, `pentect exec --secret-stdin HANDLE -- PROGRAM`
+does not create an environment binding at all. The selected program receives
+the bytes only on stdin, so descendants do not inherit a Pentect-created copy.
+This narrows the operating-system exposure but cannot stop the selected program
+from deliberately copying or exporting what it reads.
+
 ## Trust boundaries
 
 | Component | Boundary |

@@ -77,7 +77,11 @@ pentect exec --secret-stdin '<<API_TOKEN_0123456789abcdef>>' -- .\consumer.exe
 :::
 
 The restored value reaches the child process through stdin, but not the
-terminal or Pentect log. Pentect does not append a newline. Use
+terminal, process arguments, injected environment bindings, or Pentect log.
+An ordinary or daemonized descendant therefore does not receive a Pentect
+binding from this mode. The receiving program can still deliberately copy,
+export, persist, or forward the bytes after reading them; the operating system
+cannot revoke such a copy. Pentect does not append a newline. Use
 `--allow-secret-argv` only when a target program cannot accept a safer channel;
 same-user processes may be able to inspect process arguments.
 
