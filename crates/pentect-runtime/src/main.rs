@@ -1144,16 +1144,57 @@ fn render_agent_script(
             }
         }
         "powershell" => {
+            let env = env
+                .iter()
+                .filter(|(name, _)| looks_like_env_name(name) && !is_pentect_control_env_name(name))
+                .collect::<Vec<_>>();
+            if env.is_empty() {
+                rendered.push_str(resolved);
+                return Ok(rendered);
+            }
+            let digest = Sha256::digest(
+                env.iter()
+                    .flat_map(|(name, _)| name.as_bytes().iter().copied())
+                    .chain(resolved.as_bytes().iter().copied())
+                    .collect::<Vec<_>>(),
+            );
+            let suffix = digest[..6]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let saved = format!("__pentect_saved_env_{suffix}");
+            let entry = format!("__pentect_env_entry_{suffix}");
+            rendered.push('$');
+            rendered.push_str(&saved);
+            rendered.push_str(" = @{}\n");
             for (name, value) in env {
-                if !looks_like_env_name(name) || is_pentect_control_env_name(name) {
-                    continue;
-                }
+                rendered.push('$');
+                rendered.push_str(&saved);
+                rendered.push('[');
+                rendered.push_str(&powershell_string_literal(name));
+                rendered.push_str("] = [Environment]::GetEnvironmentVariable(");
+                rendered.push_str(&powershell_string_literal(name));
+                rendered.push_str(", 'Process')\n");
                 rendered.push_str("$env:");
                 rendered.push_str(name);
                 rendered.push_str(" = ");
                 rendered.push_str(&powershell_string_literal(value));
                 rendered.push('\n');
             }
+            rendered.push_str("try {\n");
+            rendered.push_str(resolved);
+            rendered.push_str("\n} finally {\nforeach ($");
+            rendered.push_str(&entry);
+            rendered.push_str(" in $");
+            rendered.push_str(&saved);
+            rendered.push_str(".GetEnumerator()) { [Environment]::SetEnvironmentVariable($");
+            rendered.push_str(&entry);
+            rendered.push_str(".Key, $");
+            rendered.push_str(&entry);
+            rendered.push_str(".Value, 'Process') }\n$");
+            rendered.push_str(&saved);
+            rendered.push_str(" = $null\n}\n");
+            return Ok(rendered);
         }
         _ => return Err("agent script shell is invalid".to_string()),
     }

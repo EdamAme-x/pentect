@@ -40,6 +40,16 @@ Pentect control environment variables carry local process-host addresses and
 tokens. They are filtered from normal tool environment exposure. Wasm plugins
 do not receive them.
 
+When a command explicitly references a recovered environment binding, Pentect
+passes only that binding to the command process. The operating system then
+makes it part of that process environment, so child processes can inherit it
+and other processes running as the same user may be able to inspect it. Bash
+same-shell execution runs in a temporary subshell. PowerShell same-shell
+execution restores every previous environment value in a `finally` block, but
+a child deliberately started by the command can still retain its inherited
+copy. Pentect cannot distinguish an intended child from a daemon started by
+the same command.
+
 ## Trust boundaries
 
 | Component | Boundary |
@@ -71,6 +81,8 @@ a remote service.
   sandboxes
 - Protection from a malicious local process running as the same user with
   access to the same files or debugging rights
+- Revoking a secret already inherited by a child or daemon started by an
+  approved command
 - Proof that every OCR engine or detector will find every sensitive value
 
 ## Compatibility mode

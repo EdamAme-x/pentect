@@ -4068,6 +4068,66 @@ fn hook_shell_transport_round_trips_powershell_without_outer_shell_quoting() {
 }
 
 #[test]
+fn powershell_agent_script_restores_the_previous_process_environment() {
+    let rendered = render_agent_script(
+        "powershell",
+        &[(
+            "PENTECT_TEST_SECRET".to_string(),
+            "temporary-value".to_string(),
+        )],
+        "Write-Output $env:PENTECT_TEST_SECRET",
+    )
+    .unwrap();
+
+    assert!(
+        rendered.contains("[Environment]::GetEnvironmentVariable("),
+        "{rendered}"
+    );
+    assert!(rendered.contains("try {"), "{rendered}");
+    assert!(rendered.contains("finally {"), "{rendered}");
+    assert!(
+        rendered.contains("[Environment]::SetEnvironmentVariable("),
+        "{rendered}"
+    );
+    assert!(rendered.contains("temporary-value"), "{rendered}");
+}
+
+#[test]
+fn powershell_agent_script_without_bindings_is_unchanged() {
+    let script = "Write-Output 'ok'";
+    assert_eq!(
+        render_agent_script("powershell", &[], script).unwrap(),
+        script
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_agent_script_cleans_up_environment_in_a_real_shell() {
+    let rendered = render_agent_script(
+        "powershell",
+        &[(
+            "PENTECT_TEST_SECRET".to_string(),
+            "temporary-value".to_string(),
+        )],
+        "Write-Output \"DURING=$env:PENTECT_TEST_SECRET\"",
+    )
+    .unwrap();
+    let command = format!(
+        "$env:PENTECT_TEST_SECRET = 'previous-value'; {rendered}; Write-Output \"AFTER=$env:PENTECT_TEST_SECRET\""
+    );
+    let output = Command::new(windows_powershell_path())
+        .args(["-NoProfile", "-Command", &command])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("DURING=temporary-value"), "{stdout}");
+    assert!(stdout.contains("AFTER=previous-value"), "{stdout}");
+}
+
+#[test]
 fn hook_bash_transport_keeps_shell_syntax_and_environment_aliases() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("hook-shared-env-alias");
