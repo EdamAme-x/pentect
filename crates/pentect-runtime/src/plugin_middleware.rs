@@ -258,13 +258,6 @@ impl PluginChainBudget {
         }
     }
 
-    fn exclude_startup(&mut self, elapsed: Duration) {
-        // An approved native command may need to load a large local model before
-        // its first response. That separately bounded initialization must not
-        // consume the request-wide budget of the remaining plugin chain.
-        self.deadline = self.deadline.checked_add(elapsed).unwrap_or(self.deadline);
-    }
-
     fn charge_input(&mut self, bytes: usize) -> Result<(), String> {
         charge_chain_total(
             &mut self.input_bytes,
@@ -1080,7 +1073,6 @@ impl CommandProgram {
         record_plugin_access(name, "command");
         let mut state = self.lock_state_until(budget.deadline, name)?;
         let starting = state.is_none();
-        let started = Instant::now();
         if starting {
             *state = Some(CommandSession::start(
                 &self.argv,
@@ -1089,21 +1081,23 @@ impl CommandProgram {
                 name,
             )?);
         }
-        let exchange_timeout = if starting {
-            startup_timeout
-        } else {
-            timeout.min(
-                budget
-                    .remaining()
-                    .map_err(|_| format!("plugin '{name}' command state is unavailable"))?,
+        let remaining = budget.remaining().map_err(|_| {
+            format!("plugin '{name}' command chain deadline exceeded before execution")
+        })?;
+        let (exchange_timeout, phase) = if starting {
+            (
+                startup_timeout.min(remaining),
+                CommandExchangePhase::Startup,
             )
+        } else {
+            (timeout.min(remaining), CommandExchangePhase::Request)
         };
         let result = state
             .as_mut()
             .expect("command session initialized")
-            .exchange(request, exchange_timeout, name);
-        if starting {
-            budget.exclude_startup(started.elapsed());
+            .exchange(request, exchange_timeout, name, phase);
+        if result.is_err() {
+            record_plugin_access(name, phase.diagnostic_operation());
         }
         if result.is_err() {
             if let Some(mut session) = state.take() {
@@ -1127,7 +1121,8 @@ impl CommandProgram {
                 Err(TryLockError::WouldBlock) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return Err(format!("plugin '{name}' command state is unavailable"));
+                        record_plugin_access(name, "command-lock-timeout");
+                        return Err(format!("plugin '{name}' command lock wait timed out"));
                     }
                     std::thread::sleep(remaining.min(Duration::from_millis(5)));
                 }
@@ -1141,6 +1136,28 @@ struct CommandSession {
     tree: CommandTree,
     stdin: Option<ChildStdin>,
     responses: mpsc::Receiver<Result<Vec<u8>, String>>,
+}
+
+#[derive(Clone, Copy)]
+enum CommandExchangePhase {
+    Startup,
+    Request,
+}
+
+impl CommandExchangePhase {
+    fn timeout_error(self, name: &str) -> String {
+        match self {
+            Self::Startup => format!("plugin '{name}' command startup timed out"),
+            Self::Request => format!("plugin '{name}' command request timed out"),
+        }
+    }
+
+    fn diagnostic_operation(self) -> &'static str {
+        match self {
+            Self::Startup => "command-startup-failed",
+            Self::Request => "command-request-failed",
+        }
+    }
 }
 
 impl CommandSession {
@@ -1224,6 +1241,7 @@ impl CommandSession {
         request: &[u8],
         timeout: Duration,
         name: &str,
+        phase: CommandExchangePhase,
     ) -> Result<Vec<u8>, String> {
         let deadline = Instant::now() + timeout;
         let mut stdin = self
@@ -1245,21 +1263,19 @@ impl CommandSession {
         match write_rx.recv_timeout(timeout) {
             Ok((stdin, Ok(()))) => self.stdin = Some(stdin),
             Ok((_stdin, Err(_))) => return Err(format!("plugin '{name}' command input failed")),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(format!("plugin '{name}' timed out"))
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(phase.timeout_error(name)),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(format!("plugin '{name}' command input failed"));
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!("plugin '{name}' timed out"));
+            return Err(phase.timeout_error(name));
         }
         self.responses
             .recv_timeout(remaining)
             .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => format!("plugin '{name}' timed out"),
+                mpsc::RecvTimeoutError::Timeout => phase.timeout_error(name),
                 mpsc::RecvTimeoutError::Disconnected => {
                     format!("plugin '{name}' command stopped without a response")
                 }
@@ -3713,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    fn command_program_uses_longer_timeout_only_for_cold_start() {
+    fn command_program_cold_start_consumes_the_chain_deadline() {
         let Some(command) = python_protocol_fixture(
             "import json,sys,time; time.sleep(0.15);\nfor line in sys.stdin:\n r=json.loads(line); time.sleep(0.10); print(json.dumps({'id':r['id']}), flush=True)",
         ) else {
@@ -3733,13 +3749,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&first).unwrap()["id"], 1);
-        assert!(
-            budget
-                .deadline
-                .saturating_duration_since(deadline_before_start)
-                > Duration::from_millis(200),
-            "cold start was not excluded from the chain deadline"
-        );
+        assert_eq!(budget.deadline, deadline_before_start);
 
         let second = program
             .invoke_with_startup_timeout(
@@ -3754,6 +3764,30 @@ mod tests {
     }
 
     #[test]
+    fn command_program_cold_start_is_capped_by_remaining_chain_budget() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys,time; time.sleep(2);\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'id':r['id']}), flush=True)",
+        ) else {
+            return;
+        };
+        let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
+        let mut budget = PluginChainBudget::new();
+        budget.deadline = Instant::now() + Duration::from_millis(50);
+        let started = Instant::now();
+        let error = program
+            .invoke_with_startup_timeout(
+                br#"{"id":1}"#,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                "fixture",
+                &mut budget,
+            )
+            .unwrap_err();
+        assert!(error.contains("startup timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn command_program_state_wait_is_bounded_by_chain_deadline() {
         let Some(command) = python_protocol_fixture("pass") else {
             return;
@@ -3765,7 +3799,7 @@ mod tests {
             Err(error) => error,
         };
         drop(held_state);
-        assert!(error.contains("state is unavailable"));
+        assert!(error.contains("lock wait timed out"));
     }
 
     #[test]

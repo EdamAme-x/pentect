@@ -109,7 +109,10 @@ max_spans = 512
 The largest allowed values are 60 seconds per invocation, 10 minutes for
 `startup_timeout_ms`, 4 MiB input, 4 MiB output, and 4,096 findings. The startup
 limit applies only to the first response from a native Command process; later
-responses use `timeout_ms`. If omitted, it equals `timeout_ms`. The Wasm file
+responses use `timeout_ms`. If omitted, it equals `timeout_ms`. It is still
+capped by the time remaining in the 60-second plugin-chain deadline; cold
+startup never extends that deadline. Waiting for another request to release a
+shared Command process uses the same remaining deadline. The Wasm file
 itself must be 32 MiB or smaller. Pentect infers the form, so new manifests do
 not set a runtime or mode.
 
@@ -119,6 +122,8 @@ Pentect also applies one shared ceiling to the complete plugin chain for a
 protected action: 60 seconds, 16 MiB total input, 16 MiB total output, 8,192
 findings, and 32 brokered HTTP requests. These host limits need no manifest
 settings. A plugin's own limits can only make its invocation stricter.
+Value-free diagnostics distinguish Command startup failure, shared-session
+lock timeout, and request execution failure.
 
 Wasm modules are checked before compilation with `wasmi`'s strict untrusted
 module limits. At runtime Pentect permits one memory, one table, and one
