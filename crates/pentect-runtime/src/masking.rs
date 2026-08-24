@@ -5,10 +5,8 @@ use crate::plugin_middleware::PluginMiddleware;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
-    EntropyDetector, EnvParser, EnvValueDetector, ExplicitSecretDetector, Input, JsonParser,
-    KeyValueDetector, Kind, MaskResult, NdjsonParser, PemDetector, Profile, ProfilePolicy,
-    Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    load_pack, ByteRange, Category, Config, Context, Engine, Input, Kind, MaskResult, Profile,
+    ProfilePolicy, Recovery, Region, RegionKind, ShapeGuard, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -18,7 +16,6 @@ const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 const EXPLICIT_UNMASK_PREFIXES: [&str; 2] = ["unpentect(", "unmask("];
 static PENTECT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
-static PENTECT_PROMPT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -1004,45 +1001,21 @@ fn pentect_engine() -> Result<&'static Engine, String> {
 }
 
 fn pentect_prompt_engine() -> Result<&'static Engine, String> {
-    match PENTECT_PROMPT_ENGINE.get_or_init(build_pentect_prompt_engine) {
-        Ok(engine) => Ok(engine),
-        Err(error) => Err(error.clone()),
-    }
+    pentect_engine()
 }
 
 fn build_pentect_engine() -> Result<Engine, String> {
-    build_pentect_engine_with_prompt_detectors(false)
-}
-
-fn build_pentect_prompt_engine() -> Result<Engine, String> {
-    build_pentect_engine_with_prompt_detectors(true)
-}
-
-fn build_pentect_engine_with_prompt_detectors(prompt: bool) -> Result<Engine, String> {
+    let profile = Profile::Strict;
     let mut builder = Engine::builder()
-        .parser(Kind::Json, Box::new(JsonParser))
-        .parser(Kind::Ndjson, Box::new(NdjsonParser))
-        .parser(Kind::Env, Box::new(EnvParser))
-        .structured_parsers()
-        .parser(Kind::Har, Box::new(JsonParser))
-        .parser(Kind::ToolResult, Box::new(ToolResultParser))
-        .detector(Box::new(CredSweeperNativeDetector::builtin()))
-        .detector(Box::new(ExplicitSecretDetector));
-    if prompt {
-        builder = builder.detector(Box::new(KeyValueDetector));
-    }
-    builder = builder
-        .detector(Box::new(EnvValueDetector))
-        .detector(Box::new(PemDetector::default()))
-        .detector(Box::new(EntropyDetector::default()))
-        .detector(Box::new(SensitiveKeyDetector));
+        .standard_stack_with_decode(profile.knobs(), config::decode_config(profile)?)
+        .parser(Kind::ToolResult, Box::new(ToolResultParser));
     for config_pack in plugin_configs_from_env()? {
         builder = builder
             .detector(Box::new(config_pack.rules))
             .disable_labels(config_pack.disable);
     }
     Ok(builder
-        .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
+        .policy(Box::new(ProfilePolicy::new(profile)))
         .guard(Box::new(ShapeGuard::builtin()))
         .build())
 }

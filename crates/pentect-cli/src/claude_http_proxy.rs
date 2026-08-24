@@ -3241,6 +3241,53 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_provider_boundary_masks_free_text_pii() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let phone = "+81 90-9876-5432";
+        let email = "hanako.suzuki@example.co.jp";
+        let card = "4242 4242 4242 4242";
+        let prompt = format!("Call {phone}, email {email}, and verify card {card}.");
+
+        let (upstream, request, thread) = mock_upstream(MockProvider::Anthropic);
+        let proxy = ClaudeHttpProxyGuard::start(upstream).unwrap();
+        reqwest::blocking::Client::new()
+            .post(format!("{}/v1/messages", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": prompt}]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let provider_body = request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        for plaintext in [phone, email, card] {
+            assert!(
+                !provider_body.contains(plaintext),
+                "PII reached the Anthropic upstream: {provider_body}"
+            );
+        }
+        for label in ["PHONE_NUMBER", "IDENTITY", "CARD"] {
+            assert!(
+                provider_body.contains(&format!("<<{label}_")),
+                "missing {label} handle: {provider_body}"
+            );
+        }
+        drop(proxy);
+        thread.join().unwrap();
+    }
+
+    #[test]
     fn sse_parser_preserves_normal_text() {
         let input = concat!(
             "event: content_block_delta\n",

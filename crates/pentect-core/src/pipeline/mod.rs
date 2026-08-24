@@ -705,6 +705,7 @@ impl EngineBuilder {
             .parser(Kind::Env, Box::new(EnvParser))
             .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
+            .detector(Box::new(CredSweeperNativeDetector::builtin()))
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))

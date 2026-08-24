@@ -747,6 +747,40 @@ fn active_prompt_masks_keyed_and_vendor_secrets_in_prose() {
 }
 
 #[test]
+fn mask_command_and_agent_prompt_use_the_same_canonical_detectors() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-pii-detectors");
+
+    let phone = "+81 90-9876-5432";
+    let email = "hanako.suzuki@example.co.jp";
+    let card = "4242 4242 4242 4242";
+    let prompt = format!("Call {phone}, email {email}, and verify card {card}.");
+    let client = MemoryStoreClient::from_env().unwrap();
+    let (key, identity_key) = client.keys().unwrap();
+    let command_result = masking::mask_read_input_with_profile_and_identity(
+        key,
+        identity_key,
+        Input {
+            kind: Kind::Text,
+            data: prompt.clone(),
+        },
+        Profile::Strict,
+        Vec::new(),
+    )
+    .unwrap();
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let masked = masker.mask_prompt_text(&prompt).unwrap().unwrap();
+
+    assert_eq!(masked, command_result.masked);
+    for plaintext in [phone, email, card] {
+        assert!(!masked.contains(plaintext), "PII was not masked: {masked}");
+    }
+    assert!(masked.contains("<<PHONE_NUMBER_"), "{masked}");
+    assert!(masked.contains("<<CARD_"), "{masked}");
+    assert!(masked.contains("<<IDENTITY_"), "{masked}");
+}
+
+#[test]
 fn active_prompt_explicit_marker_masks_low_entropy_value_and_removes_wrapper() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-explicit-marker");
