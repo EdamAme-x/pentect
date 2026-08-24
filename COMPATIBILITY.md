@@ -11,7 +11,7 @@ through the release binary:
 | OpenCode `1.18.16` | automated on Linux | `pentect opencode` |
 | Pi `0.84.1` | launcher and published extension discovery | `pentect pi` or `@pentect/pi` |
 | ChatGPT desktop app (Codex mode) | launcher and Responses protocol tests | `pentect codex app` |
-| Claude Desktop (supported Chat, attachment, and Claude Code routes) | launcher and protocol tests | `pentect claude app` |
+| Claude Desktop | protocol tests; signed app `1.24012.9` was manually launch-tested, while `1.34493.1` is known incompatible | `pentect claude app` only on an explicitly compatible build |
 
 The CLI gate proves that the vendor executable still starts under Pentect.
 Mock protocol tests cover text, streaming responses, completed tool calls,
@@ -34,6 +34,15 @@ The v0.0.23 release binary was exercised on Windows on 2026-08-03 UTC
 | Claude Code | `2.1.220` | A later PowerShell tool call using the opaque value was restored locally to the exact synthetic value; final output did not contain it. |
 | ChatGPT desktop app (Codex mode) | `26.721.4979.0` | v0.0.23 installation, running-process detection, and protected Responses routing preflight passed. No signed-GUI message was sent. |
 | Claude Desktop | `1.24012.9` | The signed app launched through v0.0.23 with the local proxy, certificate pin, and memory store attached. No signed-GUI message was sent. |
+
+Claude Desktop `1.34493.1` on Windows was tested on 2026-08-24 and deliberately
+refused Pentect's required `--ignore-certificate-errors-spki-list` switch. The
+proxy switch alone is accepted, but Pentect does not disable certificate
+verification or install its ephemeral CA into the system trust store. That
+build is therefore incompatible with `pentect claude app`; updating is not a
+remedy. Use `pentect claude` for Claude Code. The exact first incompatible
+Claude Desktop version is not known, so `1.24012.9` is an observed compatible
+point, not a claimed version ceiling.
 
 The CLI probe compares the final local file with the original synthetic value
 without printing the value and deletes its temporary files. It covers a real

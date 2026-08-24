@@ -45,8 +45,7 @@ const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_UPLOADS: usize = 256;
 const MAX_IDS_PER_UPLOAD: usize = 16;
-#[cfg(windows)]
-const PACKAGED_APP_STARTUP_GRACE: Duration = Duration::from_secs(2);
+const APP_STARTUP_GRACE: Duration = Duration::from_secs(2);
 
 pub(crate) fn cmd_claude_app(args: &[String]) -> i32 {
     match run_claude_app(args) {
@@ -77,7 +76,10 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
                 "no"
             }
         );
-        println!("Protection: Claude Chat, attachments, and Anthropic Messages APIs");
+        println!("Protection: supported Claude Desktop Chat and attachment routes");
+        println!(
+            "Compatibility: the app must accept Pentect's required certificate-pin switch; Claude Desktop 1.34493.1 is known incompatible"
+        );
         let upstream = options
             .upstream
             .as_deref()
@@ -130,11 +132,9 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
                 "could not install Claude Desktop shutdown handler: {error}"
             ));
         }
-        thread::sleep(PACKAGED_APP_STARTUP_GRACE);
+        thread::sleep(APP_STARTUP_GRACE);
         if let Some(status) = process.try_wait()? {
-            return Err(format!(
-                "Claude Desktop package exited before protection attached ({status}); update Claude Desktop or pass --app PATH to a non-MSIX installation"
-            ));
+            return Err(claude_desktop_early_exit_error(status, true));
         }
         print_gateway_ready(&proxy);
         let status = process.wait()?;
@@ -156,7 +156,6 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .spawn()
         .map_err(|error| format!("could not start Claude Desktop: {error}"))?;
     let child_id = child.id();
-    print_gateway_ready(&proxy);
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
         std::process::exit(130);
@@ -167,12 +166,27 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             "could not install Claude Desktop shutdown handler: {error}"
         ));
     }
+    thread::sleep(APP_STARTUP_GRACE);
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("could not inspect Claude Desktop startup: {error}"))?
+    {
+        return Err(claude_desktop_early_exit_error(status, false));
+    }
+    print_gateway_ready(&proxy);
     let status = child
         .wait()
         .map_err(|error| format!("could not wait for Claude Desktop: {error}"))?;
     drop(proxy);
     drop(anthropic);
     Ok(status)
+}
+
+fn claude_desktop_early_exit_error(status: impl std::fmt::Display, packaged: bool) -> String {
+    let installation = if packaged { " package" } else { "" };
+    format!(
+        "Claude Desktop{installation} exited while Pentect was attaching its required local-proxy certificate pin ({status}). Claude Desktop 1.34493.1 is known to reject this Chromium switch. Pentect will not bypass certificate verification or install a system CA, so this app build cannot be protected; use `pentect claude` for Claude Code or a Claude Desktop build explicitly listed as compatible"
+    )
 }
 
 fn claude_chromium_arguments(proxy: &ClaudeAppProxyGuard, user_data_dir: &Path) -> Vec<String> {
@@ -192,7 +206,7 @@ fn print_gateway_ready(proxy: &ClaudeAppProxyGuard) {
         proxy.proxy_url()
     );
     eprintln!(
-        "[pentect] Chat, supported attachments, and Claude Code model traffic are protected; bodies are not logged"
+        "[pentect] Supported Claude Desktop Chat and attachment traffic is protected; bodies are not logged"
     );
 }
 
@@ -2508,6 +2522,21 @@ fn success_status() -> std::process::ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_exit_diagnostic_does_not_recommend_an_update_or_unsafe_bypass() {
+        for packaged in [false, true] {
+            let error = claude_desktop_early_exit_error("exit code: 1", packaged);
+            assert!(
+                error.contains("required local-proxy certificate pin"),
+                "{error}"
+            );
+            assert!(error.contains("1.34493.1 is known to reject"), "{error}");
+            assert!(error.contains("cannot be protected"), "{error}");
+            assert!(error.contains("`pentect claude`"), "{error}");
+            assert!(!error.contains("update Claude Desktop"), "{error}");
+        }
+    }
 
     struct MaskingTestEnv {
         _guard: crate::EnvVarGuard,
