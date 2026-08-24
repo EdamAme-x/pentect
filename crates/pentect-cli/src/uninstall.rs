@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Command;
 
 pub(crate) fn cmd_uninstall(args: &[String]) {
     if let Err(error) = uninstall(args) {
@@ -17,6 +18,9 @@ fn uninstall(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("could not locate the installed executable: {error}"))?;
     if let Some(installation) = crate::installation::installation_for_executable(&executable)? {
         if !installation.is_self_managed() {
+            if installation.manager == "npm" {
+                return uninstall_npm();
+            }
             return Err(installation.uninstall_message());
         }
     }
@@ -43,6 +47,36 @@ fn uninstall(args: &[String]) -> Result<(), String> {
         println!("pentect: project configuration and plugin data were kept");
     }
     Ok(())
+}
+
+fn uninstall_npm() -> Result<(), String> {
+    let installation = crate::installation::npm_installation()?;
+    let mut command = npm_uninstall_command(&installation);
+    let status = command
+        .status()
+        .map_err(|error| format!("could not start npm uninstall: {error}"))?;
+    if !status.success() {
+        return Err(format!("npm uninstall failed with {status}"));
+    }
+    println!("pentect: uninstalled npm package");
+    println!("pentect: project configuration and plugin data were kept");
+    Ok(())
+}
+
+fn npm_uninstall_command(installation: &crate::installation::NpmInstallation) -> Command {
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let mut command = Command::new(npm);
+    command.arg("uninstall");
+    match &installation.scope {
+        crate::installation::NpmScope::Global => {
+            command.arg("--global");
+        }
+        crate::installation::NpmScope::Local(project) => {
+            command.current_dir(project);
+        }
+    }
+    command.arg("pentect");
+    command
 }
 
 fn validate_executable_name(path: &Path) -> Result<(), String> {
@@ -209,6 +243,8 @@ fn timestamp_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::installation::{NpmInstallation, NpmScope};
+    use std::path::PathBuf;
 
     #[test]
     fn only_accepts_the_public_command_shape() {
@@ -221,6 +257,30 @@ mod tests {
         assert!(validate_executable_name(Path::new("pentect")).is_ok());
         assert!(validate_executable_name(Path::new("pentect.exe")).is_ok());
         assert!(validate_executable_name(Path::new("other.exe")).is_err());
+    }
+
+    #[test]
+    fn builds_global_and_local_npm_uninstalls_without_a_shell() {
+        let global = NpmInstallation {
+            package_root: PathBuf::from("/npm/pentect"),
+            scope: NpmScope::Global,
+        };
+        let command = npm_uninstall_command(&global);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["uninstall", "--global", "pentect"]
+        );
+
+        let local = NpmInstallation {
+            package_root: PathBuf::from("/project/node_modules/pentect"),
+            scope: NpmScope::Local(PathBuf::from("/project")),
+        };
+        let command = npm_uninstall_command(&local);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["uninstall", "pentect"]
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/project")));
     }
 
     #[test]

@@ -64,3 +64,10 @@ test('does not rely on npm lifecycle scripts', async () => {
   const metadata = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
   assert.equal(metadata.scripts.postinstall, undefined);
 });
+
+test('npm launcher passes structured installation context instead of a shell command', async () => {
+  const launcher = await readFile(new URL('./bin/pentect.js', import.meta.url), 'utf8');
+  assert.match(launcher, /PENTECT_NPM_PACKAGE_ROOT/);
+  assert.match(launcher, /PENTECT_NPM_SCOPE/);
+  assert.doesNotMatch(launcher, /npm update -g/);
+});
