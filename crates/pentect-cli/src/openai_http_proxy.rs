@@ -4056,10 +4056,10 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(!query.contains(&secret), "{query}");
-        assert!(query.contains("<<KEYED_SECRET_"), "{query}");
+        assert!(query.contains("<<OPENAI_API_KEY_"), "{query}");
         let reasoning = protected["reasoning"]["summary"].as_str().unwrap();
         assert!(!reasoning.contains(&secret), "{reasoning}");
-        assert!(reasoning.contains("<<KEYED_SECRET_"), "{reasoning}");
+        assert!(reasoning.contains("<<OPENAI_API_KEY_"), "{reasoning}");
         assert!(protected.get("instructions").is_none());
     }
 
