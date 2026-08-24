@@ -346,6 +346,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueEntropyBase64Check"
             | "ValueFilePathCheck"
             | "ValueHexNumberCheck"
+            | "ValueLastWordCheck"
             | "ValueMorphemesCheck"
             | "ValueNumberCheck"
             | "ValuePatternCheck"
@@ -2071,6 +2072,9 @@ fn accept_value(
         if filter == "ValueHexNumberCheck" && value_hex_number_filtered(value) {
             return false;
         }
+        if filter == "ValueLastWordCheck" && value_last_word_filtered(value, candidate) {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2230,6 +2234,10 @@ fn value_hex_number_filtered(value: &str) -> bool {
         return false;
     };
     (1..=16).contains(&hex.len()) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn value_last_word_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
+    value.chars().count() < 16 && !candidate_is_well_quoted(candidate) && value.ends_with(':')
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -2825,7 +2833,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 28, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 27, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3265,6 +3273,23 @@ mod tests {
         ] {
             assert!(!value_hex_number_filtered(value), "{value:?}");
         }
+    }
+
+    #[test]
+    fn value_last_word_check_matches_upstream_boundaries() {
+        let short = test_candidate("value:", None, None, None);
+        assert!(value_last_word_filtered(short.value, &short));
+
+        let quoted = test_candidate("value:", None, Some("\""), Some("\""));
+        assert!(!value_last_word_filtered(quoted.value, &quoted));
+
+        let fifteen = test_candidate("12345678901234:", None, None, None);
+        assert!(value_last_word_filtered(fifteen.value, &fifteen));
+        let sixteen = test_candidate("123456789012345:", None, None, None);
+        assert!(!value_last_word_filtered(sixteen.value, &sixteen));
+
+        let unicode = test_candidate("秘密:", None, None, None);
+        assert!(value_last_word_filtered(unicode.value, &unicode));
     }
 
     fn test_candidate<'a>(
