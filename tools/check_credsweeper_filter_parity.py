@@ -78,6 +78,47 @@ class Recorder:
             cls.run = original
 
 
+def exercise_filters_missing_upstream_tests() -> None:
+    """Exercise official classes that CredSweeper 1.17.4 does not test."""
+    import base64
+
+    import bech32
+    from credsweeper.filters import (
+        ValueBase64EncodedPem,
+        ValueBech32Check,
+        ValueDiscordBotCheck,
+        ValueJfrogTokenCheck,
+    )
+    from tests.filters.conftest import DUMMY_ANALYSIS_TARGET
+    from tests.test_utils.dummy_line_data import get_line_data
+
+    def run(instance: Any, value: str) -> None:
+        instance.run(get_line_data(line=value), DUMMY_ANALYSIS_TARGET)
+
+    der = bytes([0x30, 0x81, 0x80]) + bytes([0x42]) * 128
+    body = base64.b64encode(der).decode("ascii")
+    pem = f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+    run(ValueBase64EncodedPem(), base64.b64encode(pem.encode("ascii")).decode("ascii"))
+    run(ValueBase64EncodedPem(), base64.b64encode(b"not a pem key").decode("ascii"))
+
+    run(ValueBech32Check(), bech32.bech32_encode("bc", [0, 1, 2, 3]))
+    run(ValueBech32Check(), "bc1invalid")
+
+    discord_id = base64.b64encode(b"1234567890").decode("ascii").rstrip("=")
+    run(ValueDiscordBotCheck(), f"{discord_id}.abcdefghijklmnopqrstuvwxyz012345")
+    run(ValueDiscordBotCheck(), "OTk5.aaaaaaaaaaaa")
+
+    identity = "".join(
+        ["cmVmdGtuOjAxOjAxMjM0NTY3ODk6", "QWJjZGVmR2hpamtsbW5vUHFyc3R1dnd4eXow"]
+    )
+    api_key = "".join(
+        ["AKCp2UNCd8uK7hQoxZnFE4PGtRHnAcBHr43", "HgLcj7nJmWb4JhVUqBwa2iwXszftnogpo2EVFa"]
+    )
+    run(ValueJfrogTokenCheck(), identity)
+    run(ValueJfrogTokenCheck(), api_key)
+    run(ValueJfrogTokenCheck(), f"{api_key[:-1]}0")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rust", type=Path, required=True)
@@ -86,6 +127,7 @@ def main() -> int:
         "--tests", type=Path, default=Path("crates/pentect-core/vendors/CredSweeper/tests/filters")
     )
     parser.add_argument("--work", type=Path, required=True)
+    parser.add_argument("--allow-missing", action="store_true")
     args = parser.parse_args()
 
     inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
@@ -96,6 +138,8 @@ def main() -> int:
         import pytest
 
         status = pytest.main([str(args.tests), "-q", "--disable-warnings"])
+        if status == 0:
+            exercise_filters_missing_upstream_tests()
     finally:
         recorder.restore()
     if status != 0:
@@ -108,7 +152,7 @@ def main() -> int:
     records = list(deduplicated.values())
     covered = {probe["filter"].split("(", 1)[0] for probe, _ in records}
     missing = sorted(expected_filters - covered)
-    if missing:
+    if missing and not args.allow_missing:
         raise SystemExit("official tests did not exercise filters: " + ", ".join(missing))
 
     args.work.mkdir(parents=True, exist_ok=True)
@@ -119,10 +163,13 @@ def main() -> int:
     )
     completed = subprocess.run(
         [str(args.rust), "credsweeper-filter-probe", str(probes_path)],
-        check=True,
         capture_output=True,
         text=True,
     )
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"Rust filter probe failed with status {completed.returncode}: {completed.stderr.strip()}"
+        )
     actual = json.loads(completed.stdout)
     if len(actual) != len(records):
         raise SystemExit(f"Rust returned {len(actual)} results for {len(records)} probes")

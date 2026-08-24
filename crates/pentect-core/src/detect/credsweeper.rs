@@ -65,7 +65,7 @@ pub struct CredSweeperNativeStats {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct CredSweeperFilterProbe {
     pub filter: String,
-    pub value: String,
+    pub value: Option<String>,
     pub line: String,
     pub value_start: usize,
     pub value_end: usize,
@@ -93,10 +93,13 @@ pub struct CredSweeperFilterProbe {
 
 impl CredSweeperFilterProbe {
     pub fn is_filtered(&self) -> bool {
+        let Some(value) = self.value.as_deref() else {
+            return true;
+        };
         let candidate = Candidate {
             start: self.value_start,
             end: self.value_end,
-            value: &self.value,
+            value,
             variable_start: None,
             variable_end: None,
             variable: self.variable.as_deref(),
@@ -121,7 +124,7 @@ impl CredSweeperFilterProbe {
             line_index: self.line_index,
         };
         !accept_filter_list(
-            &self.value,
+            value,
             std::slice::from_ref(&self.filter),
             &candidate,
             &context,
@@ -2397,6 +2400,7 @@ fn accept_filter_list(
     value_end: usize,
 ) -> bool {
     let line = line_ctx.line;
+    let well_quoted = candidate_is_well_quoted(candidate, value, line, line_ctx.file_type);
     for filter in filters {
         if filter == "LineGitBinaryCheck" && line_git_binary_filtered(line) {
             return false;
@@ -2412,12 +2416,12 @@ fn accept_filter_list(
             return false;
         }
         if filter == "ValueAllowlistCheck"
-            && value_allowlist_filtered(value, candidate_is_well_quoted(candidate))
+            && value_allowlist_filtered(value, candidate, well_quoted)
         {
             return false;
         }
         if filter == "ValueArrayDictionaryCheck"
-            && value_array_dictionary_filtered(value, candidate)
+            && value_array_dictionary_filtered(value, candidate, well_quoted)
         {
             return false;
         }
@@ -2471,7 +2475,7 @@ fn accept_filter_list(
         if filter == "ValueJfrogTokenCheck" && value_jfrog_token_filtered(value) {
             return false;
         }
-        if filter == "ValueLastWordCheck" && value_last_word_filtered(value, candidate) {
+        if filter == "ValueLastWordCheck" && value_last_word_filtered(value, well_quoted) {
             return false;
         }
         if filter.starts_with("ValueLengthCheck") {
@@ -2480,11 +2484,11 @@ fn accept_filter_list(
                 return false;
             }
         }
-        if filter == "ValueMethodCheck" && value_method_filtered(value, candidate) {
+        if filter == "ValueMethodCheck" && value_method_filtered(value, well_quoted) {
             return false;
         }
         if filter == "ValueNotAllowedPatternCheck"
-            && value_not_allowed_pattern_filtered(value, candidate)
+            && value_not_allowed_pattern_filtered(value, well_quoted)
         {
             return false;
         }
@@ -2505,7 +2509,7 @@ fn accept_filter_list(
         if filter == "ValueSplitKeywordCheck" && value_split_keyword_filtered(value) {
             return false;
         }
-        if filter == "ValueTokenCheck" && value_token_filtered(value, candidate) {
+        if filter == "ValueTokenCheck" && value_token_filtered(value, well_quoted) {
             return false;
         }
         if filter == "ValueTokenBase32Check" && value_token_base_filtered(value, TokenBase::Base32)
@@ -2535,9 +2539,7 @@ fn accept_filter_list(
         if filter == "ValueNumberCheck" && number_filtered(value) {
             return false;
         }
-        if filter == "ValueCamelCaseCheck"
-            && camel_case_filtered(value, candidate_is_well_quoted(candidate))
-        {
+        if filter == "ValueCamelCaseCheck" && camel_case_filtered(value, well_quoted) {
             return false;
         }
         if filter == "ValueEntropyBase36Check" && entropy_base36_filtered(value) {
@@ -2563,15 +2565,48 @@ fn accept_filter_list(
     true
 }
 
-fn candidate_is_well_quoted(candidate: &Candidate<'_>) -> bool {
-    matches!(
-        (candidate.value_leftquote, candidate.value_rightquote),
-        (Some(left), Some(right)) if left == right
-    )
+fn candidate_is_well_quoted(
+    candidate: &Candidate<'_>,
+    value: &str,
+    line: &str,
+    file_type: &str,
+) -> bool {
+    let left = candidate.value_leftquote.unwrap_or_default();
+    let right = candidate.value_rightquote.unwrap_or_default();
+    if !left.is_empty() && !right.is_empty() {
+        if left == right {
+            return true;
+        }
+        let left_quote = if left.len() == 1 {
+            left.chars().next()
+        } else {
+            left.chars().last().filter(|quote| "\"'`".contains(*quote))
+        };
+        let right_quote = if right.len() == 1 {
+            right.chars().next()
+        } else {
+            right.chars().find(|quote| "\"'`".contains(*quote))
+        };
+        return left_quote.is_some()
+            && ((right_quote.is_some() && left_quote == right_quote)
+                || (candidate.value_rightquote == Some("\\") && line.ends_with('\\')));
+    }
+    if !left.is_empty() {
+        return ((candidate.value_rightquote == Some("\\") || value.ends_with('\\'))
+            && line.ends_with('\\'))
+            || file_type == ".php"
+            || left.matches('"').count() == 3
+            || left.matches('\'').count() == 3;
+    }
+    false
 }
 
-fn value_array_dictionary_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
-    if candidate_is_well_quoted(candidate) {
+fn value_array_dictionary_filtered(
+    value: &str,
+    candidate: &Candidate<'_>,
+    well_quoted: bool,
+) -> bool {
+    if well_quoted {
         return false;
     }
     let wrap = candidate.wrap.unwrap_or_default();
@@ -2698,7 +2733,7 @@ fn minimum_data_entropy(len: usize) -> f64 {
     }
 }
 
-fn value_allowlist_filtered(value: &str, is_well_quoted: bool) -> bool {
+fn value_allowlist_filtered(value: &str, candidate: &Candidate<'_>, well_quoted: bool) -> bool {
     // Mirrors CredSweeper ValueAllowlistCheck: these are syntax/template
     // expressions, not credential material.
     if value_allowlist_common_patterns()
@@ -2707,12 +2742,22 @@ fn value_allowlist_filtered(value: &str, is_well_quoted: bool) -> bool {
     {
         return true;
     }
-    let patterns = if is_well_quoted {
+    if well_quoted {
         value_allowlist_quoted_patterns()
+            .iter()
+            .any(|pattern| pattern.is_match(value))
     } else {
+        let wrapped;
+        let value = if let Some(wrap) = candidate.wrap {
+            wrapped = format!("{wrap}{value}");
+            wrapped.as_str()
+        } else {
+            value
+        };
         value_allowlist_unquoted_patterns()
-    };
-    patterns.iter().any(|pattern| pattern.is_match(value))
+            .iter()
+            .any(|pattern| pattern.is_match(value))
+    }
 }
 
 fn value_allowlist_common_patterns() -> &'static [RustRegex] {
@@ -2725,7 +2770,7 @@ fn value_allowlist_common_patterns() -> &'static [RustRegex] {
             r"(?i)^\$\$[a-z_]+(\^%[0-9a-z_]+)?",
             r"(?i)^#\{.+\}",
             r"(?i)^\{\{.+\}\}",
-            r"(?i)^.*@@@hl@@@.*@@@endhl@@@",
+            r"(?i)^.*@@@hl@@@(암호|비번|PW|PASS)@@@endhl@@@",
         ]
         .into_iter()
         .map(|pattern| RustRegex::new(pattern).expect("static CredSweeper allowlist regex"))
@@ -2739,7 +2784,7 @@ fn value_allowlist_quoted_patterns() -> &'static [RustRegex] {
         [
             r"(?i)^\$[a-z_][0-9a-z_]+((::|->|\.)[a-z_]|\[|$)",
             r"(?i)^\$\([^)]+\)",
-            r"(?i)^.*\*\*\*\*",
+            r"(?i)^.*\*\*\*",
         ]
         .into_iter()
         .map(|pattern| RustRegex::new(pattern).expect("static CredSweeper quoted allowlist regex"))
@@ -2754,7 +2799,7 @@ fn value_allowlist_unquoted_patterns() -> &'static [RustRegex] {
             r"(?i)^[~a-z0-9_]+((\.|->)[a-z0-9_]+)+\(.*$",
             r"(?i)^\$[a-z_][0-9a-z_]+((::|->|\.)[a-z_]|\[|$)",
             r"(?i)^\$\([.0-9a-z_-]+",
-            r"(?i)^.*\*\*\*\*\*\*",
+            r"(?i)^.*\*\*\*\*\*",
         ]
         .into_iter()
         .map(|pattern| {
@@ -3278,8 +3323,8 @@ fn value_json_web_token_filtered(value: &str) -> bool {
     !(header && payload && signature)
 }
 
-fn value_last_word_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
-    value.chars().count() < 16 && !candidate_is_well_quoted(candidate) && value.ends_with(':')
+fn value_last_word_filtered(value: &str, well_quoted: bool) -> bool {
+    value.chars().count() < 16 && !well_quoted && value.ends_with(':')
 }
 
 fn value_length_filtered(value: &str, min_len: usize, max_len: usize) -> bool {
@@ -3295,8 +3340,8 @@ fn parse_filter_length_range(filter: &str) -> Option<(usize, usize)> {
     (values.next().is_none()).then_some((min_len, max_len))
 }
 
-fn value_method_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
-    if candidate_is_well_quoted(candidate) {
+fn value_method_filtered(value: &str, well_quoted: bool) -> bool {
+    if well_quoted {
         return false;
     }
     static METHOD: LazyLock<RustRegex> = LazyLock::new(|| {
@@ -3305,8 +3350,8 @@ fn value_method_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
     value.contains("function") || METHOD.is_match(value)
 }
 
-fn value_not_allowed_pattern_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
-    if candidate_is_well_quoted(candidate) {
+fn value_not_allowed_pattern_filtered(value: &str, well_quoted: bool) -> bool {
+    if well_quoted {
         return false;
     }
     static NOT_ALLOWED: LazyLock<RustRegex> = LazyLock::new(|| {
@@ -3428,8 +3473,8 @@ fn sequence_longest_match(
     (best_i, best_j, best_size)
 }
 
-fn value_token_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
-    if candidate_is_well_quoted(candidate) {
+fn value_token_filtered(value: &str, well_quoted: bool) -> bool {
+    if well_quoted {
         return false;
     }
     let chars = value.chars().collect::<Vec<_>>();
@@ -3817,17 +3862,23 @@ fn is_basic_auth_token68(value: &str) -> bool {
 }
 
 fn morphemes_filtered(value: &str, threshold: Option<usize>) -> bool {
-    let threshold = threshold
-        .unwrap_or_else(|| value.len().ilog2() as usize + 1)
-        .saturating_sub(4)
-        .max(1);
+    let threshold = threshold.unwrap_or_else(|| {
+        let bit_length = value
+            .chars()
+            .count()
+            .checked_ilog2()
+            .map_or(0, |value| value + 1);
+        (bit_length as usize).saturating_sub(4).max(1)
+    });
     morphemes_filtered_with_threshold(value, threshold)
 }
 
 fn morphemes_filtered_with_threshold(value: &str, threshold: usize) -> bool {
     let lower = value.to_ascii_lowercase();
     let mut matches = 0usize;
-    for morpheme in MORPHEME_CHECKLIST.split_whitespace() {
+    static MORPHEMES: LazyLock<std::collections::BTreeSet<&'static str>> =
+        LazyLock::new(|| MORPHEME_CHECKLIST.split_whitespace().collect());
+    for morpheme in MORPHEMES.iter() {
         if lower.contains(morpheme) {
             matches += 1;
             if threshold < matches {
@@ -4707,14 +4758,21 @@ mod tests {
 
     #[test]
     fn value_allowlist_matches_credsweeper_code_expressions() {
+        let unquoted = test_candidate("", None, None, None);
         assert!(value_allowlist_filtered(
             "xmlKey->NextSiblingElement();",
+            &unquoted,
             false
         ));
-        assert!(value_allowlist_filtered("config.secret.value()", false));
-        assert!(value_allowlist_filtered("${SECRET_NAME}", false));
+        assert!(value_allowlist_filtered(
+            "config.secret.value()",
+            &unquoted,
+            false
+        ));
+        assert!(value_allowlist_filtered("${SECRET_NAME}", &unquoted, false));
         assert!(!value_allowlist_filtered(
             "opaqueCredentialValue1234567890",
+            &unquoted,
             false
         ));
     }
@@ -5086,18 +5144,28 @@ mod tests {
             "values[token_id]",
         ] {
             let item = test_candidate(value, None, None, None);
-            assert!(value_array_dictionary_filtered(value, &item), "{value:?}");
+            assert!(
+                value_array_dictionary_filtered(value, &item, false),
+                "{value:?}"
+            );
         }
         for value in ["passwords['user1']", "passwords('user1')", "{'root'}"] {
             let item = test_candidate(value, None, Some("'"), Some("'"));
-            assert!(!value_array_dictionary_filtered(value, &item), "{value:?}");
+            assert!(
+                !value_array_dictionary_filtered(value, &item, false),
+                "{value:?}"
+            );
         }
         let byte_wrap = test_candidate("values[i]", Some("byte["), None, None);
-        assert!(!value_array_dictionary_filtered("values[i]", &byte_wrap));
+        assert!(!value_array_dictionary_filtered(
+            "values[i]",
+            &byte_wrap,
+            false
+        ));
         let array_wrap = test_candidate("root", Some("values["), None, None);
-        assert!(value_array_dictionary_filtered("root", &array_wrap));
+        assert!(value_array_dictionary_filtered("root", &array_wrap, false));
         let call_wrap = test_candidate("root", Some("values("), None, None);
-        assert!(value_array_dictionary_filtered("root", &call_wrap));
+        assert!(value_array_dictionary_filtered("root", &call_wrap, false));
     }
 
     #[test]
@@ -5119,18 +5187,18 @@ mod tests {
     #[test]
     fn value_last_word_check_matches_upstream_boundaries() {
         let short = test_candidate("value:", None, None, None);
-        assert!(value_last_word_filtered(short.value, &short));
+        assert!(value_last_word_filtered(short.value, false));
 
         let quoted = test_candidate("value:", None, Some("\""), Some("\""));
-        assert!(!value_last_word_filtered(quoted.value, &quoted));
+        assert!(!value_last_word_filtered(quoted.value, true));
 
         let fifteen = test_candidate("12345678901234:", None, None, None);
-        assert!(value_last_word_filtered(fifteen.value, &fifteen));
+        assert!(value_last_word_filtered(fifteen.value, false));
         let sixteen = test_candidate("123456789012345:", None, None, None);
-        assert!(!value_last_word_filtered(sixteen.value, &sixteen));
+        assert!(!value_last_word_filtered(sixteen.value, false));
 
         let unicode = test_candidate("秘密:", None, None, None);
-        assert!(value_last_word_filtered(unicode.value, &unicode));
+        assert!(value_last_word_filtered(unicode.value, false));
     }
 
     #[test]
@@ -5154,35 +5222,31 @@ mod tests {
     #[test]
     fn value_method_check_matches_upstream_examples() {
         for value in ["Crac.method()", "Crac_function", "object->method(arg)"] {
-            let item = test_candidate(value, None, None, None);
-            assert!(value_method_filtered(value, &item), "{value:?}");
+            assert!(value_method_filtered(value, false), "{value:?}");
         }
         for value in ["CracFunction", "method(", " method()"] {
-            let item = test_candidate(value, None, None, None);
-            assert!(!value_method_filtered(value, &item), "{value:?}");
+            assert!(!value_method_filtered(value, false), "{value:?}");
         }
         let quoted = test_candidate("Crac.method()", None, Some("\""), Some("\""));
-        assert!(!value_method_filtered(quoted.value, &quoted));
+        assert!(!value_method_filtered(quoted.value, true));
     }
 
     #[test]
     fn value_not_allowed_pattern_check_matches_upstream_examples() {
         for value in ["[{ ", "\\n", "\t\t\t\\", "\t \\n\t \t", "\\u003cgt;"] {
-            let item = test_candidate(value, None, None, None);
             assert!(
-                value_not_allowed_pattern_filtered(value, &item),
+                value_not_allowed_pattern_filtered(value, false),
                 "{value:?}"
             );
         }
         for value in ["secret", "[{x", "line\n"] {
-            let item = test_candidate(value, None, None, None);
             assert!(
-                !value_not_allowed_pattern_filtered(value, &item),
+                !value_not_allowed_pattern_filtered(value, false),
                 "{value:?}"
             );
         }
         let quoted = test_candidate("\\n", None, Some("\""), Some("\""));
-        assert!(!value_not_allowed_pattern_filtered(quoted.value, &quoted));
+        assert!(!value_not_allowed_pattern_filtered(quoted.value, true));
     }
 
     #[test]
@@ -5223,8 +5287,7 @@ mod tests {
     #[test]
     fn value_token_check_matches_upstream_split_semantics() {
         for value in ["Crac>crackle1", "my<password", "my)password", "鍵 秘密"] {
-            let item = test_candidate(value, None, None, None);
-            assert!(value_token_filtered(value, &item), "{value:?}");
+            assert!(value_token_filtered(value, false), "{value:?}");
         }
         for value in [
             "Crackle>secret",
@@ -5232,11 +5295,10 @@ mod tests {
             "my - password",
             "words password",
         ] {
-            let item = test_candidate(value, None, None, None);
-            assert!(!value_token_filtered(value, &item), "{value:?}");
+            assert!(!value_token_filtered(value, false), "{value:?}");
         }
         let quoted = test_candidate("my<password", None, Some("\""), Some("\""));
-        assert!(!value_token_filtered(quoted.value, &quoted));
+        assert!(!value_token_filtered(quoted.value, true));
     }
 
     #[test]
