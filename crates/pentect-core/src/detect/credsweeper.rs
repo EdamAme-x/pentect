@@ -1923,6 +1923,14 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "TokenPattern"
+            && (morphemes_filtered(value, None)
+                || number_filtered(value)
+                || camel_case_filtered(value, candidate_is_well_quoted(candidate))
+                || value_pattern_filtered(value, None))
+        {
+            return false;
+        }
         if filter == "ValueAllowlistCheck"
             && value_allowlist_filtered(value, candidate_is_well_quoted(candidate))
         {
@@ -2173,6 +2181,17 @@ fn number_filtered(value: &str) -> bool {
     }
     let decimal = lower.trim_start_matches('-').trim_end_matches(['u', 'l']);
     !decimal.is_empty() && decimal.len() <= 20 && decimal.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn camel_case_filtered(value: &str, is_well_quoted: bool) -> bool {
+    if is_well_quoted {
+        return false;
+    }
+    static CAMEL_CASE: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"^(?:[a-z]+(?:[A-Z][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)$")
+            .expect("CredSweeper camel-case regex")
+    });
+    CAMEL_CASE.is_match(value) && morphemes_filtered_with_threshold(&value.to_ascii_lowercase(), 1)
 }
 
 fn value_pattern_filtered(value: &str, pattern_len: Option<usize>) -> bool {
@@ -2731,7 +2750,7 @@ mod tests {
 
     #[test]
     fn detects_wundergraph_rule_from_v1_17_1() {
-        let raw = "token=cosmo_0123456789abcdef0123456789abcdef\n";
+        let raw = "token=cosmo_66ebe5a6121b52c86058ecd8803ce4bb\n";
         let region = region(raw);
         let view = NormalizedView::build(&region, raw);
         let spans = CredSweeperNativeDetector::builtin().detect(&view);
@@ -2739,6 +2758,15 @@ mod tests {
             spans.iter().any(|span| span.label == "WUNDERGRAPH_API_KEY"),
             "{spans:?}"
         );
+    }
+
+    #[test]
+    fn token_pattern_filters_sequential_fixture_tokens_like_official_credsweeper() {
+        let raw = "token=cosmo_0123456789abcdef0123456789abcdef\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let spans = CredSweeperNativeDetector::builtin().detect(&view);
+        assert!(spans.is_empty(), "{spans:?}");
     }
 
     #[test]
