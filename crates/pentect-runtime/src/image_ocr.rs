@@ -790,7 +790,14 @@ fn secret_entries(
         let Some(value) = text.get(range.start..range.end) else {
             continue;
         };
-        let value = value.trim();
+        // Ranged detector hits identify the exact recoverable value. In
+        // particular, explicit mask markers may intentionally include leading
+        // or trailing whitespace, which must not be changed during recovery.
+        let value = if hit.range.is_some() {
+            value
+        } else {
+            value.trim()
+        };
         if value.is_empty() {
             continue;
         }
@@ -3340,6 +3347,30 @@ mod tests {
     }
 
     #[test]
+    fn ocr_explicit_markers_preserve_exact_values_and_survive_malformed_prefixes() {
+        let key = [7; 32];
+        let text = "pentect(unclosed\nmask( pa(ss), 日本語 )\npentect(alpha!\nbeta)";
+        let hits = image_text_secret_hits(text, &key).unwrap();
+        let entries = secret_entries(text, &hits, &key);
+        let recovered = entries
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(recovered.contains(&" pa(ss), 日本語 "), "{recovered:?}");
+        assert!(recovered.contains(&"alpha!\nbeta"), "{recovered:?}");
+    }
+
+    #[test]
+    fn ocr_unmask_wrappers_do_not_exempt_detectable_external_secrets() {
+        let text = "unmask(sk-ABCDEFGHIJKLMNOPQRSTUVWX)";
+        let hits = image_text_secret_hits(text, &[7; 32]).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.label == "OPENAI_API_KEY"),
+            "{hits:?}"
+        );
+    }
+
+    #[test]
     fn fragmented_ocr_key_without_value_shape_is_not_secret() {
         for text in [
             "Kaggle API settings API token Create new token",
@@ -3409,6 +3440,38 @@ mod tests {
                 .contains(metadata_secret),
             "{metadata}"
         );
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn qr_image_explicit_markers_are_redacted_with_recoverable_handles() {
+        let payload = "pentect(unclosed\nmask( pa(ss), 日本語 )\npentect(alpha!\nbeta)";
+        let original = qr_png(payload);
+        let value = serde_json::json!({
+            "content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": data_encoding::BASE64.encode(&original)
+            }]
+        });
+        let key = [7; 32];
+        let redaction = redact_tool_images_for_secrets(&value, &key, &key, &test_config()).unwrap();
+        let note = redaction.visual_notes.join("\n");
+        let recovered = redaction
+            .recovery
+            .placeholders()
+            .into_iter()
+            .map(|handle| redaction.recovery.resolve(&handle))
+            .collect::<Vec<_>>();
+
+        assert!(redaction.changed);
+        assert!(note.matches("<<KEYED_SECRET_").count() >= 2, "{note}");
+        assert!(!note.contains("pentect("), "{note}");
+        assert!(!note.contains("mask("), "{note}");
+        assert!(!note.contains("日本語"), "{note}");
+        assert!(recovered.iter().any(|value| value == " pa(ss), 日本語 "));
+        assert!(recovered.iter().any(|value| value == "alpha!\nbeta"));
+        assert_ne!(redaction.updated, value);
     }
 
     #[cfg(feature = "ocr")]

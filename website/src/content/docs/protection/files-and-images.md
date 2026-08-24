@@ -68,6 +68,13 @@ that the image was protected. Each region lists the same recoverable handle used
 for text, for example `[1] <<AWS_AKID_hash>>`; the original value is not included
 in the provider-visible note.
 
+Text found by OCR can use the same case-sensitive `pentect(...)` and `mask(...)`
+force-mask markers as prompt text. Pentect protects the exact contents, including
+Unicode, punctuation, whitespace, or line breaks, and does not include the
+wrapper in the recoverable value. `unpentect(...)` and `unmask(...)` never create
+an exception inside images: image text is external content and cannot turn off
+its own protection. Detectable values inside those wrappers remain protected.
+
 Windows uses Windows OCR, macOS uses Vision, and Linux uses Pentect's bundled
 local OCR engine and model files. Linux does not require a separately installed
 Tesseract service. `pentect doctor` reports the selected backend as `windows`,
