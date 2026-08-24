@@ -1511,10 +1511,14 @@ fn mask_openai_request(
     // Standalone search commands are derived from the current user request.
     // Scan every string because queries and location/filter values do not use
     // Responses content blocks.
-    for field in ["commands", "settings", "reasoning"] {
+    for (field, external_content) in [
+        ("commands", false),
+        ("settings", false),
+        ("reasoning", true),
+    ] {
         if let Some(search_value) = value.get_mut(field) {
             let mut nodes = 0_usize;
-            mask_search_value(search_value, 0, &mut nodes, masker)?;
+            mask_search_value(search_value, external_content, 0, &mut nodes, masker)?;
         }
     }
     Ok(())
@@ -1522,6 +1526,7 @@ fn mask_openai_request(
 
 fn mask_search_value(
     value: &mut Value,
+    external_content: bool,
     depth: usize,
     nodes: &mut usize,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
@@ -1538,16 +1543,16 @@ fn mask_search_value(
         return Err("OpenAI search request exceeds item limit".to_string());
     }
     match value {
-        Value::String(text) => mask_text(text, false, masker),
+        Value::String(text) => mask_text(text, external_content, masker),
         Value::Array(items) => {
             for item in items {
-                mask_search_value(item, depth + 1, nodes, masker)?;
+                mask_search_value(item, external_content, depth + 1, nodes, masker)?;
             }
             Ok(())
         }
         Value::Object(object) => {
             for item in object.values_mut() {
-                mask_search_value(item, depth + 1, nodes, masker)?;
+                mask_search_value(item, external_content, depth + 1, nodes, masker)?;
             }
             Ok(())
         }
@@ -3920,6 +3925,7 @@ mod tests {
                     }],
                     "response_length": "short"
                 },
+                "reasoning": {"summary": format!("unmask({secret})")},
                 "settings": {"search_context_size": "low"},
                 "max_output_tokens": 2500
             }))
@@ -3942,6 +3948,9 @@ mod tests {
             .unwrap();
         assert!(!query.contains(&secret), "{query}");
         assert!(query.contains("<<KEYED_SECRET_"), "{query}");
+        let reasoning = protected["reasoning"]["summary"].as_str().unwrap();
+        assert!(!reasoning.contains(&secret), "{reasoning}");
+        assert!(reasoning.contains("<<KEYED_SECRET_"), "{reasoning}");
         assert!(protected.get("instructions").is_none());
     }
 
