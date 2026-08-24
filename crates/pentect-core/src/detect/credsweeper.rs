@@ -377,6 +377,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "LineUUEPartCheck"
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
+            | "ValueAtlassianTokenCheck"
             | "ValueAzureTokenCheck"
             | "ValueBase32DataCheck"
             | "ValueBech32Check"
@@ -392,8 +393,10 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueHexNumberCheck"
             | "ValueGrafanaCheck"
             | "ValueGrafanaServiceCheck"
+            | "ValueGitHubCheck"
             | "ValueJsonWebKeyCheck"
             | "ValueJsonWebTokenCheck"
+            | "ValueJfrogTokenCheck"
             | "ValueLastWordCheck"
             | "ValueLengthCheck"
             | "ValueMethodCheck"
@@ -2160,6 +2163,9 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueAtlassianTokenCheck" && value_atlassian_token_filtered(value) {
+            return false;
+        }
         if filter == "ValueAzureTokenCheck" && value_azure_token_filtered(value) {
             return false;
         }
@@ -2181,6 +2187,9 @@ fn accept_value(
         if filter == "ValueGrafanaServiceCheck" && value_grafana_service_filtered(value) {
             return false;
         }
+        if filter == "ValueGitHubCheck" && value_github_filtered(value) {
+            return false;
+        }
         if filter == "ValueHexNumberCheck" && value_hex_number_filtered(value) {
             return false;
         }
@@ -2188,6 +2197,9 @@ fn accept_value(
             return false;
         }
         if filter == "ValueJsonWebTokenCheck" && value_json_web_token_filtered(value) {
+            return false;
+        }
+        if filter == "ValueJfrogTokenCheck" && value_jfrog_token_filtered(value) {
             return false;
         }
         if filter == "ValueLastWordCheck" && value_last_word_filtered(value, candidate) {
@@ -2625,6 +2637,114 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+fn atlassian_struct_filtered(value: &str) -> bool {
+    let Some(decoded) = decode_base64_like_upstream(value) else {
+        return true;
+    };
+    let Some(delimiter) = decoded.iter().position(|byte| *byte == b':') else {
+        return true;
+    };
+    if !(1..=20).contains(&delimiter) {
+        return true;
+    }
+    let integer = decoded[..delimiter]
+        .iter()
+        .map(|byte| char::from(*byte))
+        .collect::<String>();
+    let normalized = integer.trim().replace('_', "");
+    let Ok(integer) = normalized.parse::<i128>() else {
+        return true;
+    };
+    integer < 1000 || ascii_entropy_filtered(&decoded[delimiter + 1..])
+}
+
+fn atlassian_crc32_struct_filtered(value: &str) -> bool {
+    if !value.is_ascii() || value.len() < 8 {
+        return true;
+    }
+    let Ok(checksum) = u32::from_str_radix(&value[value.len() - 8..], 16) else {
+        return true;
+    };
+    checksum != crc32(&value.as_bytes()[..value.len() - 8])
+}
+
+fn value_atlassian_token_filtered(value: &str) -> bool {
+    if let Some(value) = value.strip_prefix("BBDC-") {
+        return atlassian_struct_filtered(value);
+    }
+    if value.starts_with("AT") {
+        let mut value = value.to_string();
+        while value.contains("\\=") || value.contains("%3d") || value.contains("%3D") {
+            value = value.replace('\\', "");
+            value = value.replace("%3d", "=");
+            value = value.replace("%3D", "=");
+        }
+        return atlassian_crc32_struct_filtered(&value);
+    }
+    atlassian_struct_filtered(value)
+}
+
+fn decode_base62_integer(value: &str) -> Option<u64> {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    value.bytes().try_fold(0u64, |output, byte| {
+        let digit = ALPHABET.iter().position(|item| *item == byte)? as u64;
+        output.checked_mul(62)?.checked_add(digit)
+    })
+}
+
+fn value_github_filtered(value: &str) -> bool {
+    let github_prefix = value.starts_with("gh") && value.as_bytes().get(3) == Some(&b'_');
+    if !(github_prefix || value.starts_with("npm_")) || value.len() < 10 || !value.is_ascii() {
+        return true;
+    }
+    let token_end = value.len() - 6;
+    let Some(checksum) = decode_base62_integer(&value[token_end..]) else {
+        return true;
+    };
+    u64::from(crc32(&value.as_bytes()[4..token_end])) != checksum
+}
+
+fn base58_decoded_length(value: &str) -> Option<usize> {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let leading_zeroes = value.bytes().take_while(|byte| *byte == b'1').count();
+    let mut little_endian = Vec::<u8>::new();
+    for byte in value.bytes() {
+        let mut carry = ALPHABET.iter().position(|item| *item == byte)? as u32;
+        for output in &mut little_endian {
+            carry += u32::from(*output) * 58;
+            *output = carry as u8;
+            carry >>= 8;
+        }
+        while carry != 0 {
+            little_endian.push(carry as u8);
+            carry >>= 8;
+        }
+    }
+    Some(leading_zeroes + little_endian.len())
+}
+
+fn value_jfrog_token_filtered(value: &str) -> bool {
+    if value.starts_with("cmVmdGtuO") {
+        let Some(decoded) = decode_base64_like_upstream(value) else {
+            return true;
+        };
+        let Ok(decoded) = std::str::from_utf8(&decoded) else {
+            return true;
+        };
+        static IDENTITY: LazyLock<RustRegex> = LazyLock::new(|| {
+            RustRegex::new(r"^reftkn:\d+:\d+:[\w_/+\-]+")
+                .expect("static JFrog identity token regex")
+        });
+        if IDENTITY.is_match(decoded) {
+            return false;
+        }
+    }
+    if value.starts_with("AKCp") && base58_decoded_length(value) == Some(54) {
+        return false;
+    }
+    true
 }
 
 fn value_grafana_service_filtered(value: &str) -> bool {
@@ -3815,11 +3935,11 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 7, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 4, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
-                .contains(&"ValueJfrogTokenCheck".to_string()),
+                .contains(&"ValueBase64EncodedPem".to_string()),
             "{stats:?}"
         );
     }
@@ -3873,6 +3993,59 @@ mod tests {
             "glpl_DuMmY-T0K3N-f0R-tHe-Te5t-CRC32Ok_770c8CdA"
         ));
         assert!(value_grafana_service_filtered("too-short"));
+    }
+
+    #[test]
+    fn value_atlassian_token_matches_official_fixtures() {
+        let structured = "MTIzNDU6q1bPZWwJU3DB36G7cb7k114w99VK/HKwZcYN";
+        assert!(!value_atlassian_token_filtered(structured));
+        assert!(!value_atlassian_token_filtered(&format!(
+            "BBDC-{structured}"
+        )));
+        let app_password = ["ATBBMTIzNDU6q1bP", "ZWwJU3DB36G7", "378C86CF"].concat();
+        assert!(!value_atlassian_token_filtered(&app_password));
+        assert!(value_atlassian_token_filtered("MTJ4NDU6YXNiZHNhOjI4eWQ="));
+        assert!(value_atlassian_token_filtered(
+            "ATBBMTIzNDU6q1bPZWwJU3DB36G7012345678"
+        ));
+    }
+
+    #[test]
+    fn value_github_matches_official_fixtures() {
+        assert!(!value_github_filtered(
+            "gh?_00000000000000000000000000000004WZ4EQ"
+        ));
+        assert!(!value_github_filtered(
+            "npm_00000000000000000000000000000004WZ4EQ"
+        ));
+        assert!(value_github_filtered(
+            "hhh_00000000000000000000000000000004WZ4EQ"
+        ));
+        assert!(value_github_filtered(
+            "npm_00000000000000000000000000000004WZAEQ"
+        ));
+    }
+
+    #[test]
+    fn value_jfrog_token_matches_official_samples() {
+        let identity = [
+            "cmVmdGtuOjAxOjAxMjM0NTY3ODk6",
+            "QWJjZGVmR2hpamtsbW5vUHFyc3R1dnd4eXow",
+        ]
+        .concat();
+        assert!(!value_jfrog_token_filtered(&identity));
+        let api_key = [
+            "AKCp2UNCd8uK7hQoxZnFE4PGtRHnAcBHr43",
+            "HgLcj7nJmWb4JhVUqBwa2iwXszftnogpo2EVFa",
+        ]
+        .concat();
+        assert!(!value_jfrog_token_filtered(&api_key));
+        assert!(value_jfrog_token_filtered(
+            "cmVmdGtuOlRoZXJlIGFyZSBub3QgdGhlIHRva2VucyB5b3UncmUgbG9va2luZyA0"
+        ));
+        assert!(value_jfrog_token_filtered(
+            "AKCp2UNCd8uK7hQoxZnFE4PGtRHnAcBHr43HgLcj7nJmWb4JhVUqBwa2iwXszftnogpo2EVF0"
+        ));
     }
 
     #[test]
