@@ -355,6 +355,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValuePatternCheck"
             | "ValueSealedSecretCheck"
             | "ValueSimilarityCheck"
+            | "ValueTokenCheck"
     )
 }
 
@@ -2097,6 +2098,9 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueTokenCheck" && value_token_filtered(value, candidate) {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2406,6 +2410,35 @@ fn sequence_longest_match(
         best_size += 1;
     }
     (best_i, best_j, best_size)
+}
+
+fn value_token_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
+    if candidate_is_well_quoted(candidate) {
+        return false;
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    let split = chars.iter().enumerate().find_map(|(index, ch)| {
+        if matches!(
+            ch,
+            ';' | '(' | ')' | '{' | '}' | '<' | '>' | '[' | ']' | '`'
+        ) {
+            return Some(index);
+        }
+        if *ch == ' '
+            && 0 < index
+            && index + 1 < chars.len()
+            && python_word_char(chars[index - 1])
+            && python_word_char(chars[index + 1])
+        {
+            return Some(index);
+        }
+        None
+    });
+    split.is_some_and(|token_len| token_len < 5)
+}
+
+fn python_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -3001,7 +3034,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 23, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 22, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3545,6 +3578,25 @@ mod tests {
         let a = format!("{}b", "a".repeat(210));
         let b = format!("{}c", "a".repeat(210));
         assert!((sequence_matcher_ratio(&a, &b) - 0.995_260_663_507_109).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn value_token_check_matches_upstream_split_semantics() {
+        for value in ["Crac>crackle1", "my<password", "my)password", "鍵 秘密"] {
+            let item = test_candidate(value, None, None, None);
+            assert!(value_token_filtered(value, &item), "{value:?}");
+        }
+        for value in [
+            "Crackle>secret",
+            "password",
+            "my - password",
+            "words password",
+        ] {
+            let item = test_candidate(value, None, None, None);
+            assert!(!value_token_filtered(value, &item), "{value:?}");
+        }
+        let quoted = test_candidate("my<password", None, Some("\""), Some("\""));
+        assert!(!value_token_filtered(quoted.value, &quoted));
     }
 
     fn test_candidate<'a>(
