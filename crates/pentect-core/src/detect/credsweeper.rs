@@ -398,6 +398,8 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueSimilarityCheck"
             | "ValueStringTypeCheck"
             | "ValueSplitKeywordCheck"
+            | "ValueTokenBase32Check"
+            | "ValueTokenBase36Check"
             | "ValueTokenCheck"
     )
 }
@@ -2192,6 +2194,14 @@ fn accept_value(
         if filter == "ValueTokenCheck" && value_token_filtered(value, candidate) {
             return false;
         }
+        if filter == "ValueTokenBase32Check" && value_token_base_filtered(value, TokenBase::Base32)
+        {
+            return false;
+        }
+        if filter == "ValueTokenBase36Check" && value_token_base_filtered(value, TokenBase::Base36)
+        {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2720,6 +2730,203 @@ fn url_forbidden_char(ch: char) -> bool {
 
 fn python_word_char(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
+}
+
+#[derive(Clone, Copy)]
+enum TokenBase {
+    Base32,
+    Base36,
+}
+
+fn value_token_base_filtered(value: &str, base: TokenBase) -> bool {
+    let Some((hop, deviation)) = keyboard_hop_stats(value) else {
+        return false;
+    };
+    let Some(((hop_mean, hop_dev), (dev_mean, dev_dev))) = token_base_range(value.len(), base)
+    else {
+        return false;
+    };
+    let Some(ppf) = token_base_ppf(value.len()) else {
+        return false;
+    };
+    let hop_range = (hop_mean - ppf * hop_dev)..=(hop_mean + ppf * hop_dev);
+    let deviation_range = (dev_mean - ppf * dev_dev)..=(dev_mean + ppf * dev_dev);
+    !(hop_range.contains(&hop) && deviation_range.contains(&deviation))
+}
+
+fn keyboard_hop_stats(value: &str) -> Option<(f64, f64)> {
+    let normalized = value.chars().map(keyboard_normalize).collect::<String>();
+    let chars = normalized.chars().collect::<Vec<_>>();
+    if chars.len() < 3 {
+        return None;
+    }
+    let mut hops = Vec::with_capacity(chars.len() - 1);
+    for pair in chars.windows(2) {
+        let (ax, ay, az) = keyboard_coordinates(pair[0])?;
+        let (bx, by, bz) = keyboard_coordinates(pair[1])?;
+        hops.push(((ax - bx).abs() + (ay - by).abs() + (az - bz).abs()) as f64 / 2.0);
+    }
+    let mean = hops.iter().sum::<f64>() / hops.len() as f64;
+    let variance =
+        hops.iter().map(|hop| (hop - mean).powi(2)).sum::<f64>() / (hops.len() - 1) as f64;
+    Some((mean, variance.sqrt()))
+}
+
+fn keyboard_normalize(ch: char) -> char {
+    match ch {
+        '~' => '`',
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        _ => ch.to_ascii_lowercase(),
+    }
+}
+
+fn keyboard_coordinates(ch: char) -> Option<(isize, isize, isize)> {
+    const ROWS: &[&str] = &[
+        "`1234567890-=",
+        "\0qwertyuiop[]\\",
+        "\0\0asdfghjkl;'",
+        "\0\0zxcvbnm,./",
+    ];
+    for (row, keys) in ROWS.iter().enumerate() {
+        if let Some(raw_x) = keys.find(ch) {
+            let x = raw_x as isize - (row / 2) as isize;
+            let z = row as isize;
+            return Some((x, -(z + x), z));
+        }
+    }
+    None
+}
+
+fn token_base_ppf(len: usize) -> Option<f64> {
+    Some(match len {
+        8 => 2.616_197_46,
+        10 => 2.486_856_59,
+        15 => 2.340_252_71,
+        16 => 2.323_702_90,
+        20 => 2.276_149_96,
+        24 => 2.246_095_86,
+        25 => 2.240_235_15,
+        32 => 2.210_252_77,
+        40 => 2.189_615_71,
+        50 => 2.173_552_82,
+        64 => 2.159_812_41,
+        _ => return None,
+    })
+}
+
+type TokenRange = ((f64, f64), (f64, f64));
+
+fn token_base_range(len: usize, base: TokenBase) -> Option<TokenRange> {
+    Some(match (base, len) {
+        (TokenBase::Base32, 8) => (
+            (3.480934, 0.8482364556537906),
+            (1.9280820731422028, 0.5833143826506801),
+        ),
+        (TokenBase::Base32, 10) => (
+            (3.4801753333333334, 0.7508676237320747),
+            (1.9558544090983234, 0.5119385414964345),
+        ),
+        (TokenBase::Base32, 15) => (
+            (3.4803549285714284, 0.603220270918794),
+            (1.9896690734372564, 0.40640877687972476),
+        ),
+        (TokenBase::Base32, 16) => (
+            (3.4798649333333334, 0.5837818960141307),
+            (1.9938368543943692, 0.392547066949958),
+        ),
+        (TokenBase::Base32, 20) => (
+            (3.4809878947368422, 0.518785674729997),
+            (2.0058661928593517, 0.34692788889724946),
+        ),
+        (TokenBase::Base32, 24) => (
+            (3.480511086956522, 0.4726670109337228),
+            (2.0131379532992537, 0.31476354168931936),
+        ),
+        (TokenBase::Base32, 25) => (
+            (3.480877375, 0.4626150412368404),
+            (2.0147828593929953, 0.3075894753390553),
+        ),
+        (TokenBase::Base32, 32) => (
+            (3.4809023548387095, 0.4072672632996217),
+            (2.0231609118646867, 0.2700344059876962),
+        ),
+        (TokenBase::Base32, 40) => (
+            (3.4801929743589746, 0.36361457820793436),
+            (2.027858606807074, 0.2401498396303172),
+        ),
+        (TokenBase::Base32, 50) => (
+            (3.4798551224489795, 0.323708167297437),
+            (2.0318808048208794, 0.2138098551294688),
+        ),
+        (TokenBase::Base32, 64) => (
+            (3.4805990476190476, 0.28572156450556774),
+            (2.035756800745673, 0.18815721535870078),
+        ),
+        (TokenBase::Base36, 8) => (
+            (3.7190542428571427, 0.8995506118495411),
+            (2.066095086865182, 0.609210293352161),
+        ),
+        (TokenBase::Base36, 10) => (
+            (3.719109611111111, 0.7956463384852813),
+            (2.0946299036665494, 0.5322004874842623),
+        ),
+        (TokenBase::Base36, 15) => (
+            (3.719274257142857, 0.6401989313894239),
+            (2.129437216268589, 0.42108786288993155),
+        ),
+        (TokenBase::Base36, 16) => (
+            (3.7192072666666665, 0.6188627491757901),
+            (2.1336109506109366, 0.4064699817331141),
+        ),
+        (TokenBase::Base36, 20) => (
+            (3.719249815789474, 0.5506473627709657),
+            (2.145293932511567, 0.3591543917048417),
+        ),
+        (TokenBase::Base36, 24) => (
+            (3.7191934304347827, 0.50051922802262),
+            (2.152858549996053, 0.3252064160191062),
+        ),
+        (TokenBase::Base36, 25) => (
+            (3.7192351583333334, 0.4904181410613897),
+            (2.1543202565038735, 0.31823801389315026),
+        ),
+        (TokenBase::Base36, 32) => (
+            (3.7190408419354837, 0.4315967526660196),
+            (2.1620321219700767, 0.2788634701820312),
+        ),
+        (TokenBase::Base36, 40) => (
+            (3.7191682666666668, 0.3852248727988986),
+            (2.16746680811131, 0.24802261318501675),
+        ),
+        (TokenBase::Base36, 50) => (
+            (3.718913744897959, 0.3436564880405547),
+            (2.1715676118603806, 0.22070510537297627),
+        ),
+        (TokenBase::Base36, 64) => (
+            (3.7190009761904763, 0.30325954360127116),
+            (2.1751172797904093, 0.1942582237461476),
+        ),
+        _ => return None,
+    })
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -3326,11 +3533,11 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 16, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 14, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
-                .contains(&"ValueTokenBase36Check".to_string()),
+                .contains(&"ValueJsonWebTokenCheck".to_string()),
             "{stats:?}"
         );
     }
@@ -4000,6 +4207,49 @@ mod tests {
             assert_eq!(minimum_data_entropy(len), expected);
         }
         assert_eq!(minimum_data_entropy(8), 0.0);
+    }
+
+    #[test]
+    fn value_token_base32_check_matches_upstream_examples() {
+        for value in ["4K26IPW7VBHMFT4D", "NAQ4BVWT", "WXFES7QNTET5DQYC"] {
+            assert!(
+                !value_token_base_filtered(value, TokenBase::Base32),
+                "{value:?}"
+            );
+        }
+        for value in ["OOOOOOMMMMMMMMMM", "1MZ0A9L2", "QAZXSWEDCVFRTGBN"] {
+            assert!(
+                value_token_base_filtered(value, TokenBase::Base32),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_token_base36_check_matches_upstream_examples() {
+        for value in [
+            "jvzec4y51fkrrd39czz1nfbw",
+            "nf6lqy74gp53f7w08gn4l0vrk",
+            "wpv1jq9xwanbn3n",
+            "123456789",
+        ] {
+            assert!(
+                !value_token_base_filtered(value, TokenBase::Base36),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "100x200x300x400",
+            "qwertyui",
+            "0o9i8u7y6t5r4e3",
+            "0k9j8h7g6f5d4s3a",
+            "gfkjjhgy7r457y54jfhhgvcnf",
+        ] {
+            assert!(
+                value_token_base_filtered(value, TokenBase::Base36),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
