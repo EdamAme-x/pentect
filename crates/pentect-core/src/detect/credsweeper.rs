@@ -443,6 +443,8 @@ impl CredSweeperNativeDetector {
             previous: None,
             next: None,
             file_type: &ml_file_type,
+            target: text,
+            line_index: 0,
         };
         for rule in &self.rules {
             if !rule_available_for_code_scan(rule) {
@@ -485,6 +487,8 @@ impl CredSweeperNativeDetector {
                 previous: previous_line,
                 next: next_line,
                 file_type: &ml_file_type,
+                target: text,
+                line_index,
             };
             let line_lower = LazyLower::new(line_body);
             self.line_prefilter
@@ -1702,6 +1706,8 @@ struct CandidateLineContext<'a> {
     previous: Option<&'a str>,
     next: Option<&'a str>,
     file_type: &'a str,
+    target: &'a str,
+    line_index: usize,
 }
 
 fn sanitize_variable_capture(
@@ -2456,7 +2462,7 @@ fn accept_value(
         if filter == "ValueEntropyBase64Check" && entropy_base64_filtered(value) {
             return false;
         }
-        if filter == "ValueSealedSecretCheck" && value_sealed_secret_filtered(value, "") {
+        if filter == "ValueSealedSecretCheck" && value_sealed_secret_filtered(value, line_ctx) {
             return false;
         }
     }
@@ -3929,17 +3935,38 @@ fn shannon_entropy(value: &str) -> f64 {
         .sum()
 }
 
-fn value_sealed_secret_filtered(value: &str, context: &str) -> bool {
+fn value_sealed_secret_filtered(value: &str, context: &CandidateLineContext<'_>) -> bool {
     let sealed_shape = (value.starts_with("Ag") && value.len() > 700)
         || (value.starts_with("AQ") && value.len() > 350);
-    sealed_shape
-        && value
+    if !sealed_shape
+        || !value
             .as_bytes()
             .get(2)
-            .is_some_and(|b| (b'A'..=b'D').contains(b))
-        && context.contains("SealedSecret")
-        && context.contains("encryptedData")
-        && context.contains("bitnami")
+            .is_some_and(|byte| (b'A'..=b'D').contains(byte))
+    {
+        return false;
+    }
+    let from = context.line_index.saturating_sub(100);
+    let to = context.line_index.saturating_add(100);
+    let mut sealed_secret = false;
+    let mut encrypted_data = false;
+    let mut bitnami = false;
+    for line in context
+        .target
+        .lines()
+        .enumerate()
+        .skip(from)
+        .take(to.saturating_sub(from))
+        .map(|(_, line)| &line[..clamp_to_char_boundary(line, line.len().min(8000))])
+    {
+        sealed_secret |= line.contains("SealedSecret");
+        encrypted_data |= line.contains("encryptedData");
+        bitnami |= line.contains("bitnami");
+        if sealed_secret && encrypted_data && bitnami {
+            return true;
+        }
+    }
+    false
 }
 
 fn has_upper_lower_digit_or_aws_symbol(value: &str) -> bool {
@@ -4460,6 +4487,31 @@ mod tests {
         assert_eq!(asn1_size(&[0x30, 0x80, 1, 2, 0, 0]), Some(6));
         assert_eq!(asn1_size(&[0x30, 0x03, 1, 2]), None);
         assert_eq!(asn1_size(&[0x31, 0x00]), None);
+    }
+
+    #[test]
+    fn sealed_secret_searches_the_official_hundred_line_window() {
+        let secret = format!("AgA{}", "A".repeat(698));
+        let target = format!(
+            "apiVersion: bitnami.com/v1alpha1\nkind: SealedSecret\nspec:\n  encryptedData:\n  value: {secret}\n"
+        );
+        let context = CandidateLineContext {
+            start: 0,
+            line: &secret,
+            previous: None,
+            next: None,
+            file_type: "yaml",
+            target: &target,
+            line_index: 4,
+        };
+        assert!(value_sealed_secret_filtered(&secret, &context));
+
+        let unrelated = CandidateLineContext {
+            target: &secret,
+            line_index: 0,
+            ..context
+        };
+        assert!(!value_sealed_secret_filtered(&secret, &unrelated));
     }
 
     #[test]
@@ -5313,6 +5365,8 @@ mod tests {
             previous: None,
             next: None,
             file_type,
+            target: line,
+            line_index: 0,
         }
     }
 
