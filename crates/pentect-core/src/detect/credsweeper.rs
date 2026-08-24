@@ -378,6 +378,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
             | "ValueBase32DataCheck"
+            | "ValueBech32Check"
             | "ValueBasicAuthCheck"
             | "ValueBlocklistCheck"
             | "ValueCamelCaseCheck"
@@ -2156,6 +2157,9 @@ fn accept_value(
         if filter == "ValueBase32DataCheck" && value_base32_data_filtered(value) {
             return false;
         }
+        if filter == "ValueBech32Check" && value_bech32_filtered(value) {
+            return false;
+        }
         if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
             return false;
         }
@@ -2284,6 +2288,58 @@ fn value_base32_data_filtered(value: &str) -> bool {
     BASE32
         .decode(padded.as_bytes())
         .map_or(true, |decoded| ascii_entropy_filtered(&decoded))
+}
+
+fn value_bech32_filtered(value: &str) -> bool {
+    let value = value.to_lowercase();
+    if value.chars().any(|ch| !(33..=126).contains(&(ch as u32))) {
+        return true;
+    }
+    let Some(separator) = value.rfind('1') else {
+        return true;
+    };
+    if !(1..=83).contains(&separator) || separator + 7 > value.len() {
+        return true;
+    }
+    const CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let Some(data) = value[separator + 1..]
+        .chars()
+        .map(|ch| CHARSET.find(ch).map(|index| index as u8))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return true;
+    };
+    if data.len() <= 6 {
+        return true;
+    }
+    bech32_polymod(&value[..separator], &data) != 1
+}
+
+fn bech32_polymod(hrp: &str, data: &[u8]) -> u32 {
+    const GENERATOR: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
+    let mut checksum = 1u32;
+    let values = hrp
+        .bytes()
+        .map(|byte| byte >> 5)
+        .chain(std::iter::once(0))
+        .chain(hrp.bytes().map(|byte| byte & 31))
+        .chain(data.iter().copied());
+    for value in values {
+        let top = checksum >> 25;
+        checksum = (checksum & 0x01ff_ffff) << 5 ^ u32::from(value);
+        for (index, generator) in GENERATOR.iter().enumerate() {
+            if ((top >> index) & 1) != 0 {
+                checksum ^= generator;
+            }
+        }
+    }
+    checksum
 }
 
 fn ascii_entropy_filtered(data: &[u8]) -> bool {
@@ -3533,7 +3589,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 14, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 13, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -4249,6 +4305,25 @@ mod tests {
                 value_token_base_filtered(value, TokenBase::Base36),
                 "{value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn value_bech32_check_matches_python_library_behavior() {
+        for value in [
+            "bc1qpzry6fjyzh",
+            "secret1lq8verf5x28p2",
+            "SeCrEt1LQ8vErF5x28P2",
+        ] {
+            assert!(!value_bech32_filtered(value), "{value:?}");
+        }
+        for value in [
+            "secret1lq8verf5x28p3",
+            "A12UEL5L",
+            "no-separator",
+            "bc1qpzry6fjyzh ",
+        ] {
+            assert!(value_bech32_filtered(value), "{value:?}");
         }
     }
 
