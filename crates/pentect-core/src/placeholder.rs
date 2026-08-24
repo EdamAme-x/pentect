@@ -12,10 +12,16 @@ impl IdentityHasher {
         Self(HmacSha256::new_from_slice(key).expect("HMAC accepts any key length"))
     }
 
-    pub(crate) fn hash(&self, n_id_value: &str) -> String {
+    pub(crate) fn hash(&self, value: &str) -> String {
         let mut mac = self.0.clone();
-        mac.update(n_id_value.as_bytes());
+        mac.update(value.as_bytes());
         encode_hash(mac.finalize().into_bytes().as_slice())
+    }
+
+    pub(crate) fn full_hash(&self, value: &str) -> String {
+        let mut mac = self.0.clone();
+        mac.update(value.as_bytes());
+        encode_full_hash(mac.finalize().into_bytes().as_slice())
     }
 }
 
@@ -56,13 +62,23 @@ impl LengthHint {
 
 /// Keyed so the cloud side cannot dictionary-attack low-entropy values such as
 /// emails, names, or "admin"; an unkeyed digest would be a reversible commitment.
-pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
-    IdentityHasher::new(key).hash(n_id_value)
+pub fn identity_hash(key: &[u8; 32], value: &str) -> String {
+    IdentityHasher::new(key).hash(value)
 }
 
 fn encode_hash(out: &[u8]) -> String {
     let mut s = String::with_capacity(HASH_HEX_WIDTH);
     for b in out.iter().take(HASH_HEX_WIDTH / 2) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn encode_full_hash(out: &[u8]) -> String {
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         s.push(HEX[(b >> 4) as usize] as char);
         s.push(HEX[(b & 0x0f) as usize] as char);
@@ -146,9 +162,9 @@ fn validate_label(label: &str) -> Result<(), String> {
 }
 
 fn validate_hash(hash: &str) -> Result<(), String> {
-    if hash.len() != HASH_HEX_WIDTH || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !matches!(hash.len(), HASH_HEX_WIDTH | 64) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
-            "placeholder hash must be {HASH_HEX_WIDTH} lowercase hex chars"
+            "placeholder hash must be {HASH_HEX_WIDTH} or 64 lowercase hex chars"
         ));
     }
     if !hash
@@ -156,7 +172,7 @@ fn validate_hash(hash: &str) -> Result<(), String> {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return Err(format!(
-            "placeholder hash must be {HASH_HEX_WIDTH} lowercase hex chars"
+            "placeholder hash must be {HASH_HEX_WIDTH} or 64 lowercase hex chars"
         ));
     }
     Ok(())
@@ -178,6 +194,14 @@ mod tests {
         assert_eq!(identity_hash(&key, "alice"), identity_hash(&key, "alice"));
         assert_ne!(identity_hash(&key, "alice"), identity_hash(&key, "bob"));
         assert_eq!(identity_hash(&key, "alice").len(), HASH_HEX_WIDTH);
+    }
+
+    #[test]
+    fn ascii_identity_hash_vector_is_stable() {
+        assert_eq!(
+            identity_hash(&[7u8; 32], "ascii-secret"),
+            "81d9224f60a278d6"
+        );
     }
 
     #[test]
@@ -220,6 +244,15 @@ mod tests {
         assert_eq!(env.label, "TOKEN");
         assert_eq!(env.hash, "0123456789abcdef");
         assert_eq!(env.length_hint, Some(LengthHint::LegacyLen(24)));
+    }
+
+    #[test]
+    fn placeholder_parse_accepts_full_width_collision_handle() {
+        let hash = "a".repeat(64);
+        let handle = format!("<<SECRET_{hash}>>");
+        let parts = parse_placeholder(&handle).unwrap();
+        assert_eq!(parts.hash, hash);
+        assert_eq!(parts.handle, handle);
     }
 
     #[test]

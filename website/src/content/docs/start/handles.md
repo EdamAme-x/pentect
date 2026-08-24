@@ -30,6 +30,11 @@ a general `SECRET` or `PII` label.
 The ID is a keyed hash. It is not a plain checksum of the value. The private
 identity key stays on the local device.
 
+IDs normally use 16 hexadecimal characters. If two different values ever
+produce the same short ID under the same label, Pentect keeps the first compact
+handle and gives the other value a 64-character full-width ID. This preserves
+exact recovery instead of publishing an ambiguous mapping.
+
 ## Force a value to become a handle
 
 Wrap a value in `pentect(...)` or its shorter alias `mask(...)` when it must be

@@ -1,6 +1,5 @@
 use crate::detect::EXPLICIT_SECRET_PREFIXES;
 use crate::model::*;
-use crate::normalize::n_id_cow;
 use crate::placeholder::{render_placeholder, IdentityHasher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -208,10 +207,12 @@ fn masked_seg(
     let ph = match placeholder_cache.get(&cache_key) {
         Some(ph) => ph.clone(),
         None => {
-            let hash = hasher.hash(&n_id_cow(val));
-            let ph = render_placeholder(&span.label, &hash, len);
+            let hash = hasher.hash(val);
+            let mut ph = render_placeholder(&span.label, &hash, len);
             if record(map, &ph, val) {
                 collisions.push(ph.clone());
+                ph = render_placeholder(&span.label, &hasher.full_hash(val), len);
+                assert!(!record(map, &ph, val), "full HMAC placeholder collision");
             }
             placeholder_cache.insert(cache_key, ph.clone());
             ph
@@ -228,7 +229,7 @@ fn masked_seg(
 /// Insert a placeholder->value mapping. Returns true on collision: the
 /// placeholder already maps to a *different* value (same value is the expected
 /// identity case). On collision the first mapping is kept and restore would
-/// mis-expand the second, so the caller surfaces it rather than failing silently.
+/// mis-expand the second unless the caller switches it to the full HMAC handle.
 fn record(map: &mut HashMap<String, String>, ph: &str, val: &str) -> bool {
     match map.get(ph) {
         Some(existing) => existing != val,
@@ -250,6 +251,75 @@ mod tests {
         assert!(!record(&mut map, "<<X_aa>>", "alice")); // same value, identity
         assert!(record(&mut map, "<<X_aa>>", "bob")); // collision
         assert_eq!(map["<<X_aa>>"], "alice"); // first mapping kept
+    }
+
+    #[test]
+    fn truncated_collision_uses_an_unambiguous_full_hmac_placeholder() {
+        let hasher = IdentityHasher::new(&[3u8; 32]);
+        let span = Span {
+            range: ByteRange::new(0, 3),
+            category: Category::Secret,
+            label: "SECRET".into(),
+            confidence: Confidence::High,
+            source: DetectorId::Rule,
+        };
+        let short = render_placeholder("SECRET", &hasher.hash("bob"), None);
+        let mut map = HashMap::from([(short.clone(), "alice".to_string())]);
+        let mut cache = HashMap::new();
+        let mut collisions = Vec::new();
+
+        let segment = masked_seg(
+            &hasher,
+            &span,
+            "bob",
+            None,
+            &mut map,
+            &mut cache,
+            &mut collisions,
+        );
+
+        assert_ne!(segment.text(), short);
+        assert_eq!(segment.text().len(), "<<SECRET_>>".len() + 64);
+        assert_eq!(map[segment.text()], "bob");
+        assert_eq!(collisions, [short]);
+    }
+
+    #[test]
+    fn canonically_equivalent_raw_values_get_distinct_recovery_handles() {
+        let raw = "\u{00e9} e\u{0301}";
+        let spans = vec![
+            Span {
+                range: ByteRange::new(0, 2),
+                category: Category::Secret,
+                label: "SECRET".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Rule,
+            },
+            Span {
+                range: ByteRange::new(3, raw.len()),
+                category: Category::Secret,
+                label: "SECRET".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Rule,
+            },
+        ];
+
+        let key = [5u8; 32];
+        let rendered = render(raw, &key, spans, false);
+        let handles = rendered.map.keys().collect::<Vec<_>>();
+        assert_eq!(handles.len(), 2);
+        assert_ne!(handles[0], handles[1]);
+        assert!(rendered.map.values().any(|value| value == "\u{00e9}"));
+        assert!(rendered.map.values().any(|value| value == "e\u{0301}"));
+        assert!(rendered.collisions.is_empty());
+        assert_eq!(
+            crate::recovery::restore(
+                &rendered.masked,
+                &crate::recovery::Recovery::seal(rendered.map, &key),
+            )
+            .unwrap(),
+            raw
+        );
     }
 
     fn email_span(start: usize, end: usize) -> Span {
