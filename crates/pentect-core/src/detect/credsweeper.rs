@@ -348,11 +348,33 @@ fn line_git_binary_filtered(line: &str) -> bool {
     bytes[1..].iter().all(|byte| BASE85.contains(byte)) && (bytes.len() - 1) / 5 * 4 == size
 }
 
+fn line_uue_part_filtered(
+    line: &str,
+    previous_line: Option<&str>,
+    next_line: Option<&str>,
+) -> bool {
+    if line.is_empty() {
+        return true;
+    }
+    if !is_uue_max_line(line) {
+        return false;
+    }
+    previous_line.is_some_and(is_uue_max_line) || next_line.is_some_and(is_uue_max_line)
+}
+
+fn is_uue_max_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() == 61
+        && bytes[0] == b'M'
+        && bytes[1..].iter().all(|byte| (b'!'..=b'`').contains(byte))
+}
+
 fn filter_has_native_handler(filter: &str) -> bool {
     matches!(
         filter_name(filter),
         "LineGitBinaryCheck"
             | "LineSpecificKeyCheck"
+            | "LineUUEPartCheck"
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
             | "ValueBasicAuthCheck"
@@ -390,6 +412,12 @@ impl CredSweeperNativeDetector {
             path: &ml_path,
             file_type: &ml_file_type,
         };
+        let whole_text_ctx = CandidateLineContext {
+            start: 0,
+            line: text,
+            previous: None,
+            next: None,
+        };
         for rule in &self.rules {
             if !rule_available_for_code_scan(rule) {
                 continue;
@@ -408,16 +436,29 @@ impl CredSweeperNativeDetector {
                             &mut ml_pending,
                             &push_ctx,
                             rule,
-                            0,
-                            text,
+                            &whole_text_ctx,
                             &candidate,
                         );
                     }
                 }
             }
         }
-        for (line_start, line) in LineRanges::new(text) {
+        let lines = LineRanges::new(text).collect::<Vec<_>>();
+        for (line_index, &(line_start, line)) in lines.iter().enumerate() {
             let line_body = line.trim_end_matches(['\r', '\n']);
+            let previous_line = line_index
+                .checked_sub(1)
+                .and_then(|index| lines.get(index))
+                .map(|(_, line)| line.trim_end_matches(['\r', '\n']));
+            let next_line = lines
+                .get(line_index + 1)
+                .map(|(_, line)| line.trim_end_matches(['\r', '\n']));
+            let line_ctx = CandidateLineContext {
+                start: line_start,
+                line: line_body,
+                previous: previous_line,
+                next: next_line,
+            };
             let line_lower = LazyLower::new(line_body);
             self.line_prefilter
                 .collect(&line_lower, &mut seen_rules, &mut rule_candidates);
@@ -441,8 +482,7 @@ impl CredSweeperNativeDetector {
                                     &mut ml_pending,
                                     &push_ctx,
                                     rule,
-                                    line_start,
-                                    line_body,
+                                    &line_ctx,
                                     &candidate,
                                 );
                             }
@@ -454,8 +494,7 @@ impl CredSweeperNativeDetector {
                                     &mut ml_pending,
                                     &push_ctx,
                                     rule,
-                                    line_start,
-                                    line_body,
+                                    &line_ctx,
                                     &m,
                                 );
                             }
@@ -1474,6 +1513,13 @@ struct PushMatchCtx<'view, 'data> {
     file_type: &'data str,
 }
 
+struct CandidateLineContext<'a> {
+    start: usize,
+    line: &'a str,
+    previous: Option<&'a str>,
+    next: Option<&'a str>,
+}
+
 fn sanitize_variable_capture(
     line: &str,
     variable: &str,
@@ -1783,14 +1829,13 @@ fn push_match(
     ml_pending: &mut Vec<PendingMlFinding>,
     ctx: &PushMatchCtx<'_, '_>,
     rule: &NativeRule,
-    line_start: usize,
-    line: &str,
+    line_ctx: &CandidateLineContext<'_>,
     candidate: &Candidate<'_>,
 ) {
-    let sanitized_value = sanitize_value_capture(line, ctx.file_type, candidate);
+    let sanitized_value = sanitize_value_capture(line_ctx.line, ctx.file_type, candidate);
     let range = ctx.view.to_raw(ByteRange::new(
-        line_start + sanitized_value.start,
-        line_start + sanitized_value.end,
+        line_ctx.start + sanitized_value.start,
+        line_ctx.start + sanitized_value.end,
     ));
     if range.is_empty() {
         return;
@@ -1799,7 +1844,7 @@ fn push_match(
         sanitized_value.value,
         rule,
         candidate,
-        line,
+        line_ctx,
         sanitized_value.start,
         sanitized_value.end,
     ) {
@@ -1808,7 +1853,9 @@ fn push_match(
     let sanitized_variable = candidate
         .variable
         .zip(candidate.variable_start.zip(candidate.variable_end))
-        .and_then(|(variable, (start, end))| sanitize_variable_capture(line, variable, start, end));
+        .and_then(|(variable, (start, end))| {
+            sanitize_variable_capture(line_ctx.line, variable, start, end)
+        });
     let finding = CredSweeperNativeFinding {
         range,
         rule_name: rule.rule_name.clone(),
@@ -1829,8 +1876,8 @@ fn push_match(
             .iter()
             .map(|line_data| CredSweeperNativeRelatedFinding {
                 range: ctx.view.to_raw(ByteRange::new(
-                    line_start + line_data.start,
-                    line_start + line_data.end,
+                    line_ctx.start + line_data.start,
+                    line_ctx.start + line_data.end,
                 )),
                 value: line_data.value.to_string(),
                 value_start: line_data.start,
@@ -1849,7 +1896,7 @@ fn push_match(
         ml_pending.push(PendingMlFinding {
             finding,
             input: MlInput {
-                line: line.to_string(),
+                line: line_ctx.line.to_string(),
                 value: sanitized_value.value.to_string(),
                 variable: variable.to_string(),
                 value_start: sanitized_value.start,
@@ -2064,16 +2111,22 @@ fn accept_value(
     value: &str,
     rule: &NativeRule,
     candidate: &Candidate<'_>,
-    line: &str,
+    line_ctx: &CandidateLineContext<'_>,
     value_start: usize,
     value_end: usize,
 ) -> bool {
+    let line = line_ctx.line;
     let value = value.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
     if value.len() < 4 || is_obvious_placeholder(value) || is_repeated_symbol(value) {
         return false;
     }
     for filter in &rule.filter_types {
         if filter == "LineGitBinaryCheck" && line_git_binary_filtered(line) {
+            return false;
+        }
+        if filter == "LineUUEPartCheck"
+            && line_uue_part_filtered(line, line_ctx.previous, line_ctx.next)
+        {
             return false;
         }
         if filter == "LineSpecificKeyCheck"
@@ -3054,7 +3107,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 21, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 20, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3635,6 +3688,29 @@ mod tests {
         ] {
             assert!(!line_git_binary_filtered(line), "{line:?}");
         }
+    }
+
+    #[test]
+    fn line_uue_part_check_matches_upstream_adjacent_line_requirement() {
+        let line = r#"M[@%]PW:2Z.Q?2M^S;`4G?E0C.@V&?0KY]]"H3Y@6$#I4V*R^"+B,2P6`A)UL"#;
+        assert_eq!(line.len(), 61);
+        assert!(!line_uue_part_filtered(line, None, None));
+        assert!(line_uue_part_filtered(line, None, Some(line)));
+        assert!(line_uue_part_filtered(line, Some(line), None));
+        assert!(!line_uue_part_filtered(
+            line,
+            Some("begin 644 x3wo.bin"),
+            Some("#````")
+        ));
+        assert!(!line_uue_part_filtered("#````", Some("#````"), None));
+        assert!(line_uue_part_filtered("", None, None));
+
+        let invalid = r#"M[@%]PW:2Z.Q?2M^S;`4G?E0C.@V&?0KY]]"H3Y@6$#I4V*R^"D+lowercase"#;
+        assert!(!line_uue_part_filtered(
+            invalid,
+            Some(invalid),
+            Some(invalid)
+        ));
     }
 
     fn test_candidate<'a>(
