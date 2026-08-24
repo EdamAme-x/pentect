@@ -377,17 +377,21 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "LineUUEPartCheck"
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
+            | "ValueAzureTokenCheck"
             | "ValueBase32DataCheck"
             | "ValueBech32Check"
             | "ValueBasicAuthCheck"
             | "ValueBlocklistCheck"
             | "ValueCamelCaseCheck"
             | "ValueDictionaryKeywordCheck"
+            | "ValueDiscordBotCheck"
             | "ValueEntropyBase36Check"
             | "ValueEntropyBase32Check"
             | "ValueEntropyBase64Check"
             | "ValueFilePathCheck"
             | "ValueHexNumberCheck"
+            | "ValueGrafanaCheck"
+            | "ValueGrafanaServiceCheck"
             | "ValueJsonWebKeyCheck"
             | "ValueJsonWebTokenCheck"
             | "ValueLastWordCheck"
@@ -2156,6 +2160,9 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueAzureTokenCheck" && value_azure_token_filtered(value) {
+            return false;
+        }
         if filter == "ValueBase32DataCheck" && value_base32_data_filtered(value) {
             return false;
         }
@@ -2163,6 +2170,15 @@ fn accept_value(
             return false;
         }
         if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
+            return false;
+        }
+        if filter == "ValueDiscordBotCheck" && value_discord_bot_filtered(value) {
+            return false;
+        }
+        if filter == "ValueGrafanaCheck" && value_grafana_filtered(value) {
+            return false;
+        }
+        if filter == "ValueGrafanaServiceCheck" && value_grafana_service_filtered(value) {
             return false;
         }
         if filter == "ValueHexNumberCheck" && value_hex_number_filtered(value) {
@@ -2508,6 +2524,128 @@ fn decode_base64_like_upstream(value: &str) -> Option<Vec<u8>> {
     } else {
         BASE64.decode(value.as_bytes()).ok()
     }
+}
+
+fn json_is_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        serde_json::Value::String(value) => !value.is_empty(),
+        serde_json::Value::Array(value) => !value.is_empty(),
+        serde_json::Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn json_contains_python(value: &serde_json::Value, key: &str) -> Option<bool> {
+    match value {
+        serde_json::Value::Object(value) => Some(value.contains_key(key)),
+        serde_json::Value::Array(value) => Some(
+            value
+                .iter()
+                .any(|item| item.as_str().is_some_and(|item| item == key)),
+        ),
+        serde_json::Value::String(value) => Some(value.contains(key)),
+        _ => None,
+    }
+}
+
+fn value_azure_token_filtered(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    let Some(header) = decode_base64_like_upstream(header)
+        .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+    else {
+        return true;
+    };
+    if !["alg", "typ", "kid"]
+        .iter()
+        .all(|key| json_contains_python(&header, key) == Some(true))
+    {
+        return true;
+    }
+    let Some(payload) = decode_base64_like_upstream(payload)
+        .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+    else {
+        return true;
+    };
+    if !["iss", "exp", "iat"]
+        .iter()
+        .all(|key| json_contains_python(&payload, key) == Some(true))
+    {
+        return true;
+    }
+    shannon_entropy(signature) < minimum_base64_entropy(signature.len())
+}
+
+fn value_discord_bot_filtered(value: &str) -> bool {
+    let Some(separator) = value.find('.') else {
+        return true;
+    };
+    let Some(id) = decode_base64_like_upstream(&value[..separator]) else {
+        return true;
+    };
+    let Ok(id) = std::str::from_utf8(&id) else {
+        return true;
+    };
+    let Ok(id) = id.trim().parse::<u128>() else {
+        return true;
+    };
+    let entropy_part = &value[separator..];
+    id < 1000 || shannon_entropy(entropy_part) < minimum_base64_entropy(entropy_part.len())
+}
+
+fn value_grafana_filtered(value: &str) -> bool {
+    let (encoded, keys): (&str, &[&str]) = if let Some(encoded) = value.strip_prefix("glc_") {
+        (encoded, &["o", "n", "k", "m"])
+    } else {
+        (value, &["n", "k", "id"])
+    };
+    let Some(payload) = decode_base64_like_upstream(encoded)
+        .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+    else {
+        return true;
+    };
+    !json_is_truthy(&payload)
+        || !keys
+            .iter()
+            .all(|key| json_contains_python(&payload, key) == Some(true))
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+fn value_grafana_service_filtered(value: &str) -> bool {
+    if !value.is_ascii() || value.len() < 46 {
+        return true;
+    }
+    let checksum = &value.as_bytes()[38..];
+    if checksum.len() != 8 {
+        return true;
+    }
+    let mut checksum_bytes = [0u8; 4];
+    for (output, digits) in checksum_bytes.iter_mut().zip(checksum.chunks_exact(2)) {
+        let Some(high) = (digits[0] as char).to_digit(16) else {
+            return true;
+        };
+        let Some(low) = (digits[1] as char).to_digit(16) else {
+            return true;
+        };
+        *output = ((high << 4) | low) as u8;
+    }
+    u32::from_le_bytes(checksum_bytes) != crc32(&value.as_bytes()[..37])
 }
 
 fn value_json_web_key_filtered(value: &str) -> bool {
@@ -3278,16 +3416,19 @@ fn entropy_base32_filtered(value: &str) -> bool {
     min == 0.0 || min > shannon_entropy(value)
 }
 
-fn entropy_base64_filtered(value: &str) -> bool {
-    let len = value.len();
-    let min = match len {
+fn minimum_base64_entropy(len: usize) -> f64 {
+    match len {
         12..=17 => 0.915 * (len as f64).log2() - 0.047,
         18..=34 => 0.767 * (len as f64).log2() + 0.5677,
         35..=64 => 0.944 * (len as f64).log2() - 0.009 * len as f64 - 0.04,
         65..=255 => 0.621 * (len as f64).log2() - 0.003 * len as f64 + 1.54,
         256.. => 6.0 - 64.0 / len as f64,
         _ => 0.0,
-    };
+    }
+}
+
+fn entropy_base64_filtered(value: &str) -> bool {
+    let min = minimum_base64_entropy(value.len());
     min == 0.0 || shannon_entropy(value) < min
 }
 
@@ -3674,13 +3815,64 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 11, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 7, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
                 .contains(&"ValueJfrogTokenCheck".to_string()),
             "{stats:?}"
         );
+    }
+
+    #[test]
+    fn value_azure_token_matches_official_fixtures() {
+        assert!(value_azure_token_filtered("eyJungle"));
+        assert!(value_azure_token_filtered(
+            "eyJhbGciOjEsInR5cCI6Miwia2lkIjozfQo"
+        ));
+        assert!(value_azure_token_filtered(concat!(
+            "eyJhbGciOjEsInR5cCI6Miwia2lkIjozfQo.",
+            "eyJhbGciOjEsInR5cCI6Miwia2lkIjozfQo.",
+            "eyJhbGciOjEsInR5cCI6Miwia2lkIjozfQo"
+        )));
+        assert!(!value_azure_token_filtered(concat!(
+            "eyJhbGciOjEsInR5cCI6Miwia2lkIjozfQo.",
+            "eyJpc3MiOjEsImV4cCI6MiwiaWF0IjozfQo.",
+            "1234567890qwertyuiopasdfghjklzxc"
+        )));
+    }
+
+    #[test]
+    fn value_discord_bot_requires_numeric_id_and_signature_entropy() {
+        assert!(!value_discord_bot_filtered(
+            "MTIzNDU2Nzg5MA.abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        assert!(value_discord_bot_filtered(
+            "OTk5.abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        assert!(value_discord_bot_filtered("MTIzNDU2Nzg5MA.aaaaaaaaaaaa"));
+        assert!(value_discord_bot_filtered("not-a-token"));
+    }
+
+    #[test]
+    fn value_grafana_matches_official_fixtures() {
+        assert!(!value_grafana_filtered(
+            "glc_eyJvIjoiTyIsIm4iOiJOIiwiayI6IksiLCJtIjp7InIiOiIwIn19"
+        ));
+        assert!(!value_grafana_filtered("eyJrIjoiSyIsIm4iOiJOIiwiaWQiOjF9"));
+        assert!(value_grafana_filtered("eyJLIjoiSyIsIm4iOiJOIiwiaWQiOjF9"));
+        assert!(value_grafana_filtered("e30="));
+    }
+
+    #[test]
+    fn value_grafana_service_matches_official_fixtures() {
+        assert!(!value_grafana_service_filtered(
+            "glsa_DuMmY-T0K3N-f0R-tHe-Te5t-CRC32Ok_770c8cda"
+        ));
+        assert!(value_grafana_service_filtered(
+            "glpl_DuMmY-T0K3N-f0R-tHe-Te5t-CRC32Ok_770c8CdA"
+        ));
+        assert!(value_grafana_service_filtered("too-short"));
     }
 
     #[test]
