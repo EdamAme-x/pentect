@@ -2136,6 +2136,14 @@ where
                     "powershell" | "pwsh" | "cmd"
                 )
             });
+        let environment_syntax = match tool_name.map(|name| name.to_ascii_lowercase()) {
+            Some(name) if matches!(name.as_str(), "powershell" | "pwsh") => {
+                ShellEnvironmentSyntax::PowerShell
+            }
+            Some(name) if name == "cmd" => ShellEnvironmentSyntax::Cmd,
+            _ if cfg!(windows) => ShellEnvironmentSyntax::PowerShell,
+            _ => ShellEnvironmentSyntax::Posix,
+        };
         if let Some(object) = value.as_object_mut() {
             for key in ["command", "script", "code"] {
                 if let Some(Value::String(text)) = object.get_mut(key) {
@@ -2147,6 +2155,7 @@ where
                         None => resolve_shell_text_safely_with_context(
                             text,
                             allow_direct_posix_secrets,
+                            environment_syntax,
                             resolve,
                         )?,
                     };
@@ -2183,12 +2192,18 @@ where
     {
         return Ok(wrapped);
     }
-    resolve_shell_text_safely_with_context(text, !cfg!(windows), resolve)
+    let environment_syntax = if cfg!(windows) {
+        ShellEnvironmentSyntax::PowerShell
+    } else {
+        ShellEnvironmentSyntax::Posix
+    };
+    resolve_shell_text_safely_with_context(text, !cfg!(windows), environment_syntax, resolve)
 }
 
 fn resolve_shell_text_safely_with_context<R>(
     text: &str,
     allow_direct_posix_secrets: bool,
+    environment_syntax: ShellEnvironmentSyntax,
     resolve: &mut R,
 ) -> Result<String, String>
 where
@@ -2218,6 +2233,22 @@ where
                 out.push_str(&resolved.replace('\'', "'\\''"));
             } else {
                 out.push_str(&resolved);
+            }
+        } else if !resolved
+            .chars()
+            .any(|character| matches!(character, '\0' | '\r' | '\n'))
+            && (environment_syntax != ShellEnvironmentSyntax::Cmd
+                || shell_safe_secret_token(&resolved))
+            && pentect_core::parse_placeholder(reference).is_ok()
+        {
+            let parts = pentect_core::parse_placeholder(reference)
+                .expect("placeholder was validated in the branch condition");
+            let name = format!("PENTECT_{}_{}", parts.label, parts.hash);
+            environment.push((environment_syntax, name.clone(), resolved));
+            match environment_syntax {
+                ShellEnvironmentSyntax::PowerShell => out.push_str(&format!("$env:{name}")),
+                ShellEnvironmentSyntax::Posix => out.push_str(&format!("${{{name}}}")),
+                ShellEnvironmentSyntax::Cmd => out.push_str(&format!("%{name}%")),
             }
         } else {
             diagnostic("shell-secret-unresolved", "resolution", "tool-input", false);
@@ -3702,6 +3733,32 @@ mod tests {
             )),
             "{codex}"
         );
+
+        let handle = "<<KEYED_SECRET_a2c25e122d2e002f>>";
+        let direct_secret = "fixture key with @ and 'quote'";
+        let mut direct = |text: &str| Ok(text.replace(handle, direct_secret));
+        let powershell = resolve_tool_input_json(
+            &format!(
+                r#"{{"command":"Invoke-RestMethod http://127.0.0.1/check -Headers @{{ Authorization = \"Bearer {handle}\" }}"}}"#
+            ),
+            Some("PowerShell"),
+            &mut direct,
+        )
+        .unwrap();
+        let powershell: Value = serde_json::from_str(&powershell).unwrap();
+        let command = powershell["command"].as_str().unwrap();
+        assert!(
+            command.starts_with(
+                "$env:PENTECT_KEYED_SECRET_a2c25e122d2e002f = 'fixture key with @ and ''quote'''; "
+            ),
+            "{command}"
+        );
+        assert!(
+            command
+                .contains("Authorization = \"Bearer $env:PENTECT_KEYED_SECRET_a2c25e122d2e002f\""),
+            "{command}"
+        );
+        assert!(!command.contains(handle), "{command}");
     }
 
     #[test]
