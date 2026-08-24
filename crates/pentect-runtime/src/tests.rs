@@ -4667,3 +4667,29 @@ fn pentect_env_name_for_handle(handle: &str) -> String {
     };
     format!("PENTECT_{core}")
 }
+#[test]
+fn exec_start_errors_never_repeat_the_command_or_os_message() {
+    let sensitive_command = "private-command-name";
+    let error = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("localized failure: {sensitive_command}"),
+    );
+    let diagnostic = command_start_error(&error);
+    assert_eq!(
+        diagnostic,
+        "could not start command: executable was not found; `pentect exec --` requires a program name"
+    );
+    assert!(!diagnostic.contains(sensitive_command));
+    assert!(!diagnostic.contains("localized failure"));
+}
+
+#[test]
+fn powershell_exec_preamble_forces_utf8_and_sanitizes_missing_commands() {
+    let script = "Write-Output '日本語'; private-command-name";
+    let prepared = prepare_shell_script(script, ScriptShell::PowerShell);
+    assert!(prepared.contains("[Console]::InputEncoding=[Text.UTF8Encoding]"));
+    assert!(prepared.contains("[Console]::OutputEncoding=[Text.UTF8Encoding]"));
+    assert!(prepared.contains("System.Management.Automation.CommandNotFoundException"));
+    assert!(prepared.contains("executable was not found"));
+    assert!(prepared.ends_with(script));
+}

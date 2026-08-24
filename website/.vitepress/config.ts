@@ -49,6 +49,7 @@ const sidebar = [
       { text: sidebarLabel('Install', 'download'), link: '/start/install/' },
       { text: sidebarLabel('How it works', 'flow'), link: '/start/how-it-works/' },
       { text: sidebarLabel('Handles', 'key'), link: '/start/handles/' },
+      { text: sidebarLabel('Command guide', 'terminal'), link: '/start/commands/' },
       { text: sidebarLabel('Examples', 'examples'), link: '/start/examples/' },
     ],
   },

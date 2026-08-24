@@ -1006,6 +1006,8 @@ fn exec_help() {
             "pentect exec --stdin\n",
             "pentect exec --secret-stdin <HANDLE> -- PROGRAM...\n",
             "pentect exec --live \"<command>\"\n\n",
+            "COMMAND is a native-shell script; after `--`, PROGRAM is executed directly.\n",
+            "exec does not interpret arbitrary text as a file, secret, or handle lookup.\n",
             "stdout/stderr: masked\n",
             "handles: in memory\n",
             "env: $env:KEY or $KEY\n",
@@ -1523,7 +1525,7 @@ fn run_resolved_command(
             } else {
                 command
                     .output()
-                    .map_err(|e| format!("could not execute command: {e}"))
+                    .map_err(|error| command_start_error(&error))
             }
         }
         ExecMode::Shell(command) => {
@@ -1562,6 +1564,7 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
             let env = requested_env_bindings(store, &opts.mode)?;
             let mut shell = shell_script_command(opts.script_shell)?;
             apply_child_env_overlays(&mut shell, &env, &opts.session);
+            let command = prepare_shell_script(&command, opts.script_shell);
             run_live_command(shell, Some(&command), store.clone())
         }
         ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
@@ -1591,7 +1594,7 @@ fn run_command_with_stdin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not execute command: {e}"))?;
+        .map_err(|error| command_start_error(&error))?;
     let mut stdin = child
         .stdin
         .take()
@@ -1931,6 +1934,52 @@ fn looks_like_non_file_reference(value: &str) -> bool {
         || value.contains('}')
 }
 
+const POWERSHELL_EXEC_PREAMBLE: &str = concat!(
+    "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);",
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);",
+    "$OutputEncoding=[Text.UTF8Encoding]::new($false);",
+    "trap [System.Management.Automation.CommandNotFoundException] {",
+    "[Console]::Error.WriteLine('[pentect] exec could not start command: executable was not found; use `pentect exec -- PROGRAM ARG...` for direct execution');",
+    "exit 127",
+    "}\n",
+);
+
+fn prepare_shell_script(script: &str, script_shell: ScriptShell) -> String {
+    let powershell = match script_shell {
+        ScriptShell::PowerShell => true,
+        ScriptShell::Native => cfg!(windows),
+        ScriptShell::Bash => false,
+    };
+    if powershell {
+        format!("{POWERSHELL_EXEC_PREAMBLE}{script}")
+    } else {
+        script.to_string()
+    }
+}
+
+fn command_start_error(error: &std::io::Error) -> String {
+    let reason = match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            "executable was not found; `pentect exec --` requires a program name"
+        }
+        std::io::ErrorKind::PermissionDenied => "permission was denied by the operating system",
+        std::io::ErrorKind::InvalidInput => "the operating system rejected the command format",
+        _ => "the operating system could not start the process",
+    };
+    format!("could not start command: {reason}")
+}
+
+fn command_shell_start_error(error: &std::io::Error) -> String {
+    let reason = match error.kind() {
+        std::io::ErrorKind::NotFound => "the native command shell was not found",
+        std::io::ErrorKind::PermissionDenied => {
+            "permission to start the native command shell was denied"
+        }
+        _ => "the operating system could not start the native command shell",
+    };
+    format!("could not start command shell: {reason}")
+}
+
 fn run_shell_script(
     script: &str,
     env: &[(String, String)],
@@ -1939,12 +1988,13 @@ fn run_shell_script(
 ) -> Result<std::process::Output, String> {
     let mut command = shell_script_command(script_shell)?;
     apply_child_env_overlays(&mut command, env, session);
+    let script = prepare_shell_script(script, script_shell);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not execute shell command: {e}"))?;
+        .map_err(|error| command_shell_start_error(&error))?;
     {
         let stdin = child
             .stdin
@@ -1979,7 +2029,7 @@ fn run_live_command(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|e| format!("could not execute command: {e}"))?;
+        .map_err(|error| command_start_error(&error))?;
     if let Some(payload) = stdin_payload {
         let mut stdin = child
             .stdin
