@@ -1486,10 +1486,16 @@ fn mask_anthropic_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
+    // Anthropic system content is client/provider-authored. It must be
+    // protected, but prompt-only unmask markers are not trusted here.
+    if let Some(system) = value.get_mut("system") {
+        mask_content(system, true, masker, files)?;
+    }
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
+            let external_content = message.get("role").and_then(Value::as_str) != Some("user");
             if let Some(content) = message.get_mut("content") {
-                mask_content(content, false, masker, files)?;
+                mask_content(content, external_content, masker, files)?;
             }
         }
     }

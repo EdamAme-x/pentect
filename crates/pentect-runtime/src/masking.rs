@@ -122,14 +122,18 @@ impl OutputMasker {
     }
 
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
-        let remasked = self.remask_all(text)?;
+        // Protect an explicit user-authored exception before remasking values
+        // already known to the session. Otherwise a value first seen in tool,
+        // system, or assistant content can never be explicitly unmasked by the
+        // user later in the same session.
+        let (protected, unmasked_values) =
+            protect_prompt_unmask_markers(text, &self.store.session.identity_key);
+        let remasked = self.remask_all(&protected)?;
         let remasked = self.run_text_plugins(
             crate::plugin_middleware::MiddlewareStage::Prepare,
             remasked,
             &Kind::Text,
         )?;
-        let (remasked, unmasked_values) =
-            protect_prompt_unmask_markers(&remasked, &self.store.session.identity_key);
         // Prompt scalars are structurally text, but dotenv assignments can be
         // embedded in prose. Run the Env parser first so assignment labels are
         // preserved, then feed the result through the same cached text engine.
