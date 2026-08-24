@@ -101,6 +101,14 @@ Pentect also respects the documented endpoint variable for each supported
 client, such as `OPENAI_BASE_URL`. You normally do not set it for Pentect. Use
 `--upstream` when you want an explicit one-launch override.
 
+For `pentect codex app`, a selected custom Codex provider may declare
+`env_key` in `config.toml`. Pentect reads that variable before launch and
+applies it as the upstream Bearer credential itself, so authentication does
+not depend on the desktop app forwarding the header. A missing or empty
+variable stops launch with its variable name, never its value. An explicit
+`--upstream-header-env` credential takes precedence when the upstream expects
+a different header.
+
 ## Supported API formats
 
 - Gateways that support OpenAI Responses for Codex

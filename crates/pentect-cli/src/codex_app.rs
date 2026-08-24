@@ -43,7 +43,10 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             }
         );
         let routing = crate::codex_app_routing(options.upstream)?;
-        crate::upstream::header_overrides(&options.upstream_header_env)?;
+        crate::upstream::header_overrides_with_bearer_env(
+            &options.upstream_header_env,
+            routing.bearer_env.as_deref(),
+        )?;
         println!("Provider: {}", routing.provider);
         println!("Protection: OpenAI Responses API (HTTP)");
         if !installed {
@@ -62,10 +65,12 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }
 
     let routing = crate::codex_app_routing(options.upstream)?;
-    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
-        routing.upstream,
-        &options.upstream_header_env,
-    )?;
+    let proxy =
+        crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
+            routing.upstream,
+            &options.upstream_header_env,
+            routing.bearer_env.as_deref(),
+        )?;
     let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
     let session_home = CodexSessionHome::create(&routing.provider, proxy.base_url())?;
     let lifecycle_log = match CodexAppLifecycleLog::open(session_home.source_home()) {
@@ -1405,6 +1410,7 @@ model_provider = "proxy"
 [model_providers.proxy]
 base_url = "https://upstream.example/v1"
 wire_api = "responses"
+env_key = "PROXY_API_KEY"
 
 [model_providers.other]
 base_url = "https://other.example/v1"
@@ -1423,6 +1429,10 @@ base_url = "https://other.example/v1"
         assert_eq!(
             config["model_providers"]["proxy"]["supports_websockets"].as_bool(),
             Some(false)
+        );
+        assert_eq!(
+            config["model_providers"]["proxy"]["env_key"].as_str(),
+            Some("PROXY_API_KEY")
         );
     }
 

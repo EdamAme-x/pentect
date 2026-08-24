@@ -2487,6 +2487,7 @@ fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, Str
 pub(crate) struct CodexAppRouting {
     upstream: String,
     provider: String,
+    bearer_env: Option<String>,
 }
 
 /// Resolve the App's selected provider without changing user configuration.
@@ -2499,18 +2500,23 @@ pub(crate) fn codex_app_routing(explicit: Option<String>) -> Result<CodexAppRout
         .and_then(toml::Value::as_str)
         .unwrap_or("openai")
         .to_string();
+    let provider_config = (provider != "openai")
+        .then(|| {
+            config
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .and_then(|providers| providers.get(&provider))
+                .and_then(toml::Value::as_table)
+                .ok_or_else(|| format!("Codex provider '{provider}' has no configuration"))
+        })
+        .transpose()?;
     let configured_upstream = if provider == "openai" {
         config
             .get("openai_base_url")
             .and_then(toml::Value::as_str)
             .map(str::to_owned)
     } else {
-        let provider_config = config
-            .get("model_providers")
-            .and_then(toml::Value::as_table)
-            .and_then(|providers| providers.get(&provider))
-            .and_then(toml::Value::as_table)
-            .ok_or_else(|| format!("Codex provider '{provider}' has no configuration"))?;
+        let provider_config = provider_config.expect("custom provider config resolved");
         let wire_api = provider_config
             .get("wire_api")
             .and_then(toml::Value::as_str)
@@ -2540,7 +2546,15 @@ pub(crate) fn codex_app_routing(explicit: Option<String>) -> Result<CodexAppRout
                 "could not determine upstream for Codex App provider '{provider}'; pass --upstream URL"
             )
         })?;
-    Ok(CodexAppRouting { upstream, provider })
+    let bearer_env = provider_config
+        .and_then(|provider| provider.get("env_key"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    Ok(CodexAppRouting {
+        upstream,
+        provider,
+        bearer_env,
+    })
 }
 
 fn load_codex_user_config(args: &[String]) -> Result<toml::Value, String> {
