@@ -637,6 +637,21 @@ fn run_response_plugins(
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
+    let mut payload = run_response_plugins_value(value, plugins, provider)?;
+    let plugins = plugins
+        .lock()
+        .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+    run_openai_tool_plugins(&mut payload, &plugins)?;
+    serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .map_err(|error| format!("could not encode plugin response payload: {error}"))
+}
+
+fn run_response_plugins_value(
+    value: Value,
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    provider: &str,
+) -> Result<Value, String> {
     let plugins = plugins
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
@@ -652,11 +667,7 @@ fn run_response_plugins(
                 .unwrap_or_else(|| "response blocked".to_string())
         ));
     }
-    let mut payload = run.payload;
-    run_openai_tool_plugins(&mut payload, &plugins)?;
-    serde_json::to_vec(&payload)
-        .map(Bytes::from)
-        .map_err(|error| format!("could not encode plugin response payload: {error}"))
+    Ok(run.payload)
 }
 
 fn run_openai_tool_plugins(
@@ -1397,7 +1408,10 @@ fn mask_openai_request(
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     if let Some(Value::String(instructions)) = value.get_mut("instructions") {
-        mask_text(instructions, false, masker)?;
+        // Instructions are supplied by the client or provider, not authored by
+        // the current user. Prompt-only unmask markers must never take effect
+        // here.
+        mask_text(instructions, true, masker)?;
     }
     if let Some(input) = value.get_mut("input") {
         mask_openai_input(input, false, masker, files)?;
@@ -1436,7 +1450,9 @@ fn mask_model_definition(
         return Err("OpenAI model definition exceeds item limit".to_string());
     }
     match value {
-        Value::String(text) => mask_text(text, false, masker),
+        // Tool definitions can originate from an MCP server or extension.
+        // Treat them as external content so they cannot opt out of masking.
+        Value::String(text) => mask_text(text, true, masker),
         Value::Array(items) => {
             for item in items {
                 mask_model_definition(item, depth + 1, nodes, masker)?;
@@ -1465,9 +1481,11 @@ fn mask_chat_messages(
         let Some(object) = message.as_object_mut() else {
             return Err("OpenAI Chat Completions message must be an object".to_string());
         };
-        let tool_result = object.get("role").and_then(Value::as_str) == Some("tool");
+        // Only the current user's message may use unmask()/unpentect(). System,
+        // developer, assistant, and tool history can be externally controlled.
+        let external_content = object.get("role").and_then(Value::as_str) != Some("user");
         if let Some(content) = object.get_mut("content") {
-            mask_chat_content(content, tool_result, masker, files)?;
+            mask_chat_content(content, external_content, masker, files)?;
         }
         if let Some(tool_calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut) {
             for call in tool_calls {
@@ -1590,8 +1608,10 @@ fn mask_openai_input(
                 "input_image" => inspect_openai_image(object)?,
                 "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
                 "message" => {
+                    let external_content =
+                        object.get("role").and_then(Value::as_str) != Some("user");
                     if let Some(content) = object.get_mut("content") {
-                        mask_openai_input(content, tool_result, masker, files)?;
+                        mask_openai_input(content, external_content, masker, files)?;
                     }
                 }
                 _ => {
@@ -2234,6 +2254,17 @@ fn streaming_response_body(
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
+                        let block = match run_sse_response_plugins(&block, &state.plugins) {
+                            Ok(block) => block,
+                            Err(error) => {
+                                state.finished = true;
+                                state.ready.push_back(Err(Box::new(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    error,
+                                ))));
+                                break;
+                            }
+                        };
                         let rewritten = match state.transform {
                             StreamTransform::Responses => rewrite_openai_sse_block(
                                 &block,
@@ -2519,6 +2550,26 @@ fn sse_data(text: &str) -> Option<&str> {
         .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
 }
 
+fn run_sse_response_plugins(
+    block: &[u8],
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+) -> Result<Vec<u8>, String> {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return Ok(block.to_vec());
+    };
+    let Some(data) = sse_data(text) else {
+        return Ok(block.to_vec());
+    };
+    if data == "[DONE]" {
+        return Ok(block.to_vec());
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Ok(block.to_vec());
+    };
+    let payload = run_response_plugins_value(value, plugins, "openai")?;
+    encode_sse_value(text, &payload).map(|bytes| bytes.to_vec())
+}
+
 fn encode_sse_value(template: &str, value: &Value) -> Result<Bytes, String> {
     let encoded = serde_json::to_string(value)
         .map_err(|error| format!("could not encode OpenAI SSE event: {error}"))?;
@@ -2747,25 +2798,47 @@ impl OpenAiEndpoint {
 
 fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
     if path.ends_with("/responses/input_tokens") {
         OpenAiEndpoint::InputTokens
     } else if path.ends_with("/responses") {
         OpenAiEndpoint::Responses
-    } else if path.contains("/responses/") {
+    } else if is_known_openai_resource_path(&segments, "responses") {
         OpenAiEndpoint::ResponsesResource
     } else if path.ends_with("/chat/completions") {
         OpenAiEndpoint::ChatCompletions
     } else if path.ends_with("/files") {
         OpenAiEndpoint::FilesCollection
-    } else if path.contains("/files/") {
+    } else if is_known_openai_resource_path(&segments, "files") {
         OpenAiEndpoint::Files
-    } else if path.ends_with("/models") || path.contains("/models/") {
+    } else if path.ends_with("/models") || is_known_openai_resource_path(&segments, "models") {
         OpenAiEndpoint::Models
     } else if path == "/api/hello" {
         OpenAiEndpoint::Health
     } else {
         OpenAiEndpoint::Unknown
     }
+}
+
+fn is_known_openai_resource_path(segments: &[&str], collection: &str) -> bool {
+    let Some(collection_index) = segments.iter().position(|segment| *segment == collection) else {
+        return false;
+    };
+    if collection_index + 1 >= segments.len() {
+        return false;
+    }
+
+    // Accepted model API roots are the public /v1 form and Codex's observed
+    // /backend-api/codex form. Do not accept a collection name buried under an
+    // arbitrary unknown path, because those requests bypass collection body
+    // protection and take the resource passthrough path.
+    matches!(
+        &segments[..collection_index],
+        [.., "v1"] | [.., "backend-api", "codex"]
+    )
 }
 
 fn enforce_known_openai_endpoint(
@@ -2989,6 +3062,45 @@ mod tests {
             offset = end;
         }
         None
+    }
+
+    #[test]
+    fn only_current_user_content_can_use_unmask_markers() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "USERONLY", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let mut messages = serde_json::json!([
+            {"role": "system", "content": format!("unmask({secret})")},
+            {"role": "assistant", "content": format!("unmask({secret})")},
+            {"role": "tool", "content": format!("unmask({secret})")},
+            {"role": "user", "content": format!("unmask({secret})")}
+        ]);
+
+        mask_chat_messages(&mut messages, &mut masker, &HashMap::new()).unwrap();
+
+        for index in 0..3 {
+            let content = messages[index]["content"].as_str().unwrap();
+            assert!(
+                !content.contains(&secret),
+                "external role leaked at {index}"
+            );
+            assert!(
+                content.contains("<<"),
+                "external role was not masked at {index}"
+            );
+        }
+        assert_eq!(messages[3]["content"], Value::String(secret));
+
+        let mut definition = serde_json::json!({
+            "description": format!("unmask({})", messages[3]["content"].as_str().unwrap())
+        });
+        let mut nodes = 0;
+        mask_model_definition(&mut definition, 0, &mut nodes, &mut masker).unwrap();
+        let description = definition["description"].as_str().unwrap();
+        assert!(!description.contains(messages[3]["content"].as_str().unwrap()));
+        assert!(description.contains("<<"));
     }
 
     #[test]
@@ -3390,6 +3502,21 @@ mod tests {
         assert_eq!(
             classify_openai_endpoint("/v1/unknown"),
             OpenAiEndpoint::Unknown
+        );
+        for disguised in [
+            "/v1/unknown/responses/resp_123",
+            "/v1/unknown/files/file_123",
+            "/v1/unknown/models/model_123",
+        ] {
+            assert_eq!(
+                classify_openai_endpoint(disguised),
+                OpenAiEndpoint::Unknown,
+                "disguised resource path was accepted: {disguised}"
+            );
+        }
+        assert_eq!(
+            classify_openai_endpoint("/backend-api/codex/responses/resp_123"),
+            OpenAiEndpoint::ResponsesResource
         );
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, true).is_err());
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, false).is_ok());

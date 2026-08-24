@@ -38,7 +38,11 @@ impl Detector for ExplicitSecretDetector {
                 close += 1;
             }
             if depth != 0 {
-                break;
+                // A malformed marker must not disable explicit protection for
+                // the rest of the input. Resume after this prefix so a later
+                // complete pentect()/mask() marker can still be detected.
+                cursor = value_start;
+                continue;
             }
 
             let raw_marker = view.to_raw(ByteRange::new(marker_start, value_start));
@@ -115,5 +119,16 @@ mod tests {
         assert!(detect("pentect() mask() pentect(unclosed mask(unclosed").is_empty());
         assert!(detect("ｐｅｎｔｅｃｔ(value)").is_empty());
         assert!(detect("unpentect(value) unmask(value)").is_empty());
+    }
+
+    #[test]
+    fn continues_after_an_unclosed_marker() {
+        let text = "pentect(unclosed then mask(protect-me)";
+        let spans = detect(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            &text[spans[0].range.start..spans[0].range.end],
+            "protect-me"
+        );
     }
 }
