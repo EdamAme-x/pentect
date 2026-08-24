@@ -1963,11 +1963,11 @@ enum StreamTarget {
 
 fn run_live_command(
     mut command: Command,
-    stdin_script: Option<&str>,
+    stdin_payload: Option<&str>,
     store: MemoryStore,
 ) -> Result<ExitStatus, String> {
     live_status("streaming masked command output");
-    if stdin_script.is_some() {
+    if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
     } else {
         command.stdin(Stdio::null());
@@ -1976,14 +1976,14 @@ fn run_live_command(
     let mut child = command
         .spawn()
         .map_err(|e| format!("could not execute command: {e}"))?;
-    if let Some(script) = stdin_script {
+    if let Some(payload) = stdin_payload {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| "could not open command stdin".to_string())?;
         stdin
-            .write_all(script.as_bytes())
-            .map_err(|e| format!("could not write shell script to stdin: {e}"))?;
+            .write_all(payload.as_bytes())
+            .map_err(|e| format!("could not write command stdin: {e}"))?;
     }
     let stdout = child
         .stdout
