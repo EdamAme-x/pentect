@@ -378,6 +378,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
             | "ValueAtlassianTokenCheck"
+            | "ValueBase64PartCheck"
             | "ValueAzureTokenCheck"
             | "ValueBase32DataCheck"
             | "ValueBech32Check"
@@ -400,6 +401,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueLastWordCheck"
             | "ValueLengthCheck"
             | "ValueMethodCheck"
+            | "ValueNotPartEncodedCheck"
             | "ValueNotAllowedPatternCheck"
             | "ValueMorphemesCheck"
             | "ValueNumberCheck"
@@ -2166,6 +2168,11 @@ fn accept_value(
         if filter == "ValueAtlassianTokenCheck" && value_atlassian_token_filtered(value) {
             return false;
         }
+        if filter == "ValueBase64PartCheck"
+            && value_base64_part_filtered(value, line, value_start, value_end)
+        {
+            return false;
+        }
         if filter == "ValueAzureTokenCheck" && value_azure_token_filtered(value) {
             return false;
         }
@@ -2216,6 +2223,11 @@ fn accept_value(
         }
         if filter == "ValueNotAllowedPatternCheck"
             && value_not_allowed_pattern_filtered(value, candidate)
+        {
+            return false;
+        }
+        if filter == "ValueNotPartEncodedCheck"
+            && value_not_part_encoded_filtered(line_ctx.previous, line_ctx.next)
         {
             return false;
         }
@@ -2745,6 +2757,184 @@ fn value_jfrog_token_filtered(value: &str) -> bool {
         return false;
     }
     true
+}
+
+fn is_base64_standard_or_backslash(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\\')
+}
+
+fn base64_hunk_matches(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 4000 {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'+' | b'/' | b'=') {
+            index += 1;
+            continue;
+        }
+        if bytes[index] != b'\\' {
+            return false;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index] == b'\\' && index - start < 8 {
+            index += 1;
+        }
+        if index == bytes.len()
+            || !matches!(
+                bytes[index],
+                b'0' | b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v'
+            )
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn sample_stdev(values: &[f64], mean: f64) -> f64 {
+    (values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64)
+        .sqrt()
+}
+
+fn value_base64_part_filtered(
+    value: &str,
+    line: &str,
+    value_start: usize,
+    value_end: usize,
+) -> bool {
+    if value_start > line.len()
+        || value_end > line.len()
+        || value_start > value_end
+        || !line.is_char_boundary(value_start)
+        || !line.is_char_boundary(value_end)
+    {
+        return false;
+    }
+    let len_value = value.len();
+    if len_value == 0 {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let adjacent = (value_start == 0 && line.len() >= 2 * len_value)
+        || (value_start > 0 && matches!(bytes[value_start - 1], b'/' | b'+' | b'\\' | b'%'))
+        || (value_end > 0
+            && value_end < line.len()
+            && matches!(bytes[value_end], b'/' | b'+' | b'\\' | b'%'));
+    if !adjacent {
+        return false;
+    }
+    if value.contains(['-', '_']) {
+        return false;
+    }
+    let left_start = value_start.saturating_sub(len_value);
+    let right_end = line.len().min(value_end.saturating_add(len_value));
+    let hunk = &line[left_start..right_end];
+    if right_end - left_start == 3 * len_value {
+        if base64_hunk_matches(hunk) {
+            return true;
+        }
+    } else if right_end - left_start >= 2 * len_value
+        && hunk.bytes().all(is_base64_standard_or_backslash)
+    {
+        return true;
+    }
+    let left_part = line[left_start..value_start]
+        .bytes()
+        .rev()
+        .take_while(|byte| is_base64_standard_or_backslash(*byte))
+        .map(char::from)
+        .collect::<String>();
+    let right_part = line[value_end..right_end]
+        .bytes()
+        .take_while(|byte| is_base64_standard_or_backslash(*byte))
+        .map(char::from)
+        .collect::<String>();
+    let left_entropy = shannon_entropy(&left_part);
+    let value_entropy = shannon_entropy(value);
+    let right_entropy = shannon_entropy(&right_part);
+    let common = format!("{left_part}{value}{right_part}");
+    let common_entropy = shannon_entropy(&common);
+    if minimum_base64_entropy(common.len()) < common_entropy {
+        return true;
+    }
+    let minimum = minimum_base64_entropy(len_value);
+    let data = if left_entropy != 0.0 && right_entropy != 0.0 {
+        [
+            left_entropy,
+            value_entropy,
+            right_entropy,
+            minimum,
+            common_entropy,
+        ]
+    } else if left_entropy != 0.0 {
+        [
+            left_entropy,
+            value_entropy,
+            minimum,
+            minimum,
+            common_entropy,
+        ]
+    } else if right_entropy != 0.0 {
+        [
+            value_entropy,
+            right_entropy,
+            minimum,
+            minimum,
+            common_entropy,
+        ]
+    } else {
+        return false;
+    };
+    let average = data.iter().sum::<f64>() / data.len() as f64;
+    let average_minimum = average - 1.1 * sample_stdev(&data, average);
+    (left_entropy == 0.0
+        || average_minimum < left_entropy
+        || (left_entropy < value_entropy && value_entropy < right_entropy))
+        && (right_entropy == 0.0
+            || average_minimum < right_entropy
+            || (right_entropy < value_entropy && value_entropy < left_entropy))
+}
+
+fn encoded_adjacent_line_filtered(line: &str, before: bool) -> Option<bool> {
+    static BEFORE: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(concat!(
+            r"^(?:^|[^A-Za-z0-9]+)(?P<val>",
+            r"(?:[A-Za-z0-9_-]{4}){16,64}|(?:[A-Za-z0-9+/]{4}){16,64}",
+            r")(?:[^=A-Za-z0-9+/|_-]+|$)"
+        ))
+        .expect("static preceding encoded-data regex")
+    });
+    static AFTER: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(concat!(
+            r"^(?:^|[^A-Za-z0-9]+)(?P<val>",
+            r"(?:[A-Za-z0-9=_-]{4}){4,64}|(?:[A-Za-z0-9=+/]{4}){4,64}",
+            r")(?:[^=A-Za-z0-9+/|_-]+|$)"
+        ))
+        .expect("static following encoded-data regex")
+    });
+    let value = if before { &BEFORE } else { &AFTER }
+        .captures(line)?
+        .name("val")?
+        .as_str();
+    Some(
+        !value.starts_with('/')
+            || !morphemes_filtered_with_threshold(&value.to_lowercase(), 2)
+            || value.ends_with('='),
+    )
+}
+
+fn value_not_part_encoded_filtered(previous: Option<&str>, next: Option<&str>) -> bool {
+    previous
+        .and_then(|line| encoded_adjacent_line_filtered(line, true))
+        .or_else(|| next.and_then(|line| encoded_adjacent_line_filtered(line, false)))
+        .unwrap_or(false)
 }
 
 fn value_grafana_service_filtered(value: &str) -> bool {
@@ -3935,7 +4125,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 4, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 2, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -4045,6 +4235,42 @@ mod tests {
         ));
         assert!(value_jfrog_token_filtered(
             "AKCp2UNCd8uK7hQoxZnFE4PGtRHnAcBHr43HgLcj7nJmWb4JhVUqBwa2iwXszftnogpo2EVF0"
+        ));
+    }
+
+    #[test]
+    fn value_base64_part_matches_official_fixtures() {
+        let prefix = "sha512-eGuFFw7Upda+g4p+QHvnW0RyTX/SVeJBDM/";
+        let value = "gCtMARO0cLuT2HcEKnTPvhjV6aGeqrCB";
+        let suffix = "/sbNop0Kszm0jsaWU4A==";
+        let line = format!("{prefix}{value}{suffix}");
+        assert!(value_base64_part_filtered(
+            value,
+            &line,
+            prefix.len(),
+            prefix.len() + value.len()
+        ));
+
+        let prefix = " http://localhost:8888/v1/api/get?token=";
+        let value = "zUkITxodk63bDVUMwIymb3zKTxICz85zC00cv0Geline80";
+        let line = format!("{prefix}{value}");
+        assert!(!value_base64_part_filtered(
+            value,
+            &line,
+            prefix.len(),
+            line.len()
+        ));
+    }
+
+    #[test]
+    fn value_not_part_encoded_checks_adjacent_lines() {
+        let encoded_before = format!("{}\n", "A1b2".repeat(16));
+        let encoded_after = format!("{}\n", "C3d4".repeat(4));
+        assert!(value_not_part_encoded_filtered(Some(&encoded_before), None));
+        assert!(value_not_part_encoded_filtered(None, Some(&encoded_after)));
+        assert!(!value_not_part_encoded_filtered(
+            Some("ordinary text\n"),
+            Some("more text\n")
         ));
     }
 
