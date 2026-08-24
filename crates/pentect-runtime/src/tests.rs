@@ -781,7 +781,7 @@ fn mask_command_and_agent_prompt_use_the_same_credsweeper_detectors() {
         );
     }
     assert!(
-        !masked.contains(&api_key),
+        !masked.contains(api_key),
         "credential was not masked: {masked}"
     );
     assert!(masked.contains("<<WUNDERGRAPH_API_KEY_"), "{masked}");
