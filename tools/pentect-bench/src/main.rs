@@ -25,6 +25,25 @@ fn die(msg: impl std::fmt::Display) -> ! {
 }
 
 fn cmd_bench(args: &[String]) {
+    if args.first().map(String::as_str) == Some("credsweeper-scan") {
+        if args.len() < 2 {
+            die("usage: pentect-bench credsweeper-scan PATH...");
+        }
+        let mut credentials = Vec::new();
+        for value in &args[1..] {
+            let path = Path::new(value);
+            let raw = std::fs::read_to_string(path)
+                .map(normalize_newlines)
+                .unwrap_or_else(|error| die(format!("could not read '{}': {error}", path.display())));
+            let line_index = LineIndex::new(&raw);
+            credentials.extend(detect_credsweeper_json(path, &raw, &line_index));
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&credentials).unwrap_or_else(|error| die(error))
+        );
+        return;
+    }
     if args.first().map(String::as_str) == Some("credsweeper-filter-probe") {
         let Some(path) = args.get(1) else {
             die("usage: pentect-bench credsweeper-filter-probe PROBES.json");

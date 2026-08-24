@@ -1424,6 +1424,7 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
         let end = end_header_search + end_close_rel + "-----".len();
         let block = &text[begin..end];
         if valid_pem_private_key_block(block) {
+            let line_data = pem_private_key_line_data(text, begin, header_end, end);
             out.push(Candidate {
                 start: begin,
                 end,
@@ -1435,10 +1436,59 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
                 wrap: None,
                 value_leftquote: None,
                 value_rightquote: None,
-                line_data: Vec::new(),
+                line_data,
             });
         }
         search_start = end;
+    }
+    out
+}
+
+fn pem_private_key_line_data(
+    text: &str,
+    begin: usize,
+    header_end: usize,
+    end: usize,
+) -> Vec<CandidateLineData<'_>> {
+    let mut out = Vec::new();
+    for (line_start, line) in LineRanges::new(text) {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let line_end = line_start + line.len();
+        if line_end <= begin || end <= line_start {
+            continue;
+        }
+        if out.is_empty() {
+            out.push(CandidateLineData {
+                start: begin,
+                end: header_end,
+                value: &text[begin..header_end],
+                variable_start: None,
+                variable_end: None,
+                variable: None,
+            });
+            continue;
+        }
+
+        let sanitized = sanitize_pem_line(line, 5);
+        let valuable = sanitized.contains("-----END")
+            || (!sanitized.is_empty() && sanitized.bytes().all(is_pem_base64_byte));
+        let (start, value_end) = if valuable {
+            let Some(local_start) = line.find(&sanitized) else {
+                continue;
+            };
+            let start = line_start + local_start;
+            (start, start + sanitized.len())
+        } else {
+            (line_start, line_end)
+        };
+        out.push(CandidateLineData {
+            start,
+            end: value_end,
+            value: &text[start..value_end],
+            variable_start: None,
+            variable_end: None,
+            variable: None,
+        });
     }
     out
 }
@@ -2114,22 +2164,37 @@ fn push_match(
     if range.is_empty() {
         return;
     }
-    if !accept_value(
-        sanitized_value.value,
-        rule,
-        candidate,
-        line_ctx,
-        sanitized_value.start,
-        sanitized_value.end,
-    ) {
-        return;
-    }
     let sanitized_variable = candidate
         .variable
         .zip(candidate.variable_start.zip(candidate.variable_end))
         .and_then(|(variable, (start, end))| {
             sanitize_variable_capture(line_ctx.line, variable, start, end)
         });
+    let filter_candidate = Candidate {
+        start: sanitized_value.start,
+        end: sanitized_value.end,
+        value: sanitized_value.value,
+        variable_start: sanitized_variable.as_ref().map(|(_, start, _)| *start),
+        variable_end: sanitized_variable.as_ref().map(|(_, _, end)| *end),
+        variable: sanitized_variable
+            .as_ref()
+            .map(|(variable, _, _)| variable.as_str()),
+        separator: candidate.separator,
+        wrap: candidate.wrap,
+        value_leftquote: candidate.value_leftquote,
+        value_rightquote: candidate.value_rightquote,
+        line_data: candidate.line_data.clone(),
+    };
+    if !accept_value(
+        sanitized_value.value,
+        rule,
+        &filter_candidate,
+        line_ctx,
+        sanitized_value.start,
+        sanitized_value.end,
+    ) {
+        return;
+    }
     let finding = CredSweeperNativeFinding {
         range,
         rule_name: rule.rule_name.clone(),
@@ -5021,6 +5086,97 @@ mod tests {
             .detect_findings(&view)
             .iter()
             .all(|finding| finding.value != "ouywdakchdmtjjva"));
+    }
+
+    #[test]
+    fn keyword_rules_match_official_nested_fixture_literals() {
+        for (path, raw, rule_name, expected) in [
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/rules/test_password.py",
+                r#"    @pytest.fixture(params=[["password = cackle!"], ["gi_reo_gi_passwd = cackle!"], ["pwd = cackle!"]])"#,
+                "Password",
+                "cackle!",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/rules/test_token.py",
+                r#"    @pytest.fixture(params=[["gi_reo_gi_token = @@cacklecackle_gi_reo_gi@@"]])"#,
+                "Token",
+                "@@cacklecackle_gi_reo_gi@@",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/rules/test_token.py",
+                r##"    @pytest.fixture(params=[["# gi_reo_gi_token = @@cacklecackle_gi_reo_gi@@"]])"##,
+                "Token",
+                "@@cacklecackle_gi_reo_gi@@",
+            ),
+        ] {
+            let region = crate::model::Region {
+                span: ByteRange::new(0, raw.len()),
+                ctx: crate::model::Context {
+                    path: Some(path.to_string()),
+                    key: None,
+                    hints: Vec::new(),
+                    kind: crate::model::RegionKind::PlainText,
+                    format: crate::model::Kind::Text,
+                },
+            };
+            let view = NormalizedView::build(&region, raw);
+            let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+            let detector = CredSweeperNativeDetector::builtin();
+            let rule = detector
+                .rules
+                .iter()
+                .find(|rule| rule.rule_name == rule_name)
+                .unwrap();
+            let line_ctx = CandidateLineContext {
+                start: 0,
+                line: raw,
+                previous: None,
+                next: None,
+                file_type: ".py",
+                target: raw,
+                line_index: 0,
+            };
+            let candidates = rule
+                .patterns
+                .iter()
+                .flat_map(|pattern| match &pattern.matcher {
+                    PatternMatcher::Deferred(regex) => regex.find(raw, pattern.value_capture),
+                    PatternMatcher::Special(_) => Vec::new(),
+                })
+                .map(|candidate| {
+                    let rejected_by = rule
+                        .filter_types
+                        .iter()
+                        .filter(|filter| {
+                            !accept_filter_list(
+                                candidate.value,
+                                std::slice::from_ref(*filter),
+                                &candidate,
+                                &line_ctx,
+                                candidate.start,
+                                candidate.end,
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (
+                        candidate.value.to_string(),
+                        candidate.variable.map(str::to_string),
+                        candidate.wrap.map(str::to_string),
+                        candidate.value_leftquote.map(str::to_string),
+                        candidate.value_rightquote.map(str::to_string),
+                        rejected_by,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_name == rule_name && finding.value == expected),
+                "{rule_name} {raw:?}: candidates={candidates:?} findings={findings:?}"
+            );
+        }
     }
 
     #[test]
