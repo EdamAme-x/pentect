@@ -695,8 +695,13 @@ pub(crate) fn mask_content(
         .ok_or_else(|| {
             "unknown format blocked: Google Cloud Code content.parts must be an array".to_string()
         })?;
-    for part in parts {
-        mask_part(part, tool_result, masker, block_unknown_formats)?;
+    let original = std::mem::take(parts);
+    for mut part in original {
+        let note = mask_part(&mut part, tool_result, masker, block_unknown_formats)?;
+        parts.push(part);
+        if let Some(text) = note {
+            parts.push(serde_json::json!({"text": text}));
+        }
     }
     Ok(())
 }
@@ -706,7 +711,7 @@ fn mask_part(
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     block_unknown_formats: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let object = part.as_object_mut().ok_or_else(|| {
         "unknown format blocked: Google Cloud Code part must be an object".to_string()
     })?;
@@ -750,9 +755,11 @@ fn mask_part(
     if let Some(response) = object.get_mut("functionResponse") {
         mask_value_strings(response, true, masker)?;
     }
-    if let Some(inline) = object.get_mut("inlineData") {
-        inspect_inline_data(inline, tool_result, masker)?;
-    }
+    let note = object
+        .get_mut("inlineData")
+        .map(|inline| inspect_inline_data(inline, tool_result, masker))
+        .transpose()?
+        .flatten();
     if object.contains_key("fileData") && pentect_agent::unscanned_images_should_block()? {
         return Err(
             "document blocked: Google Cloud Code fileData could not be scanned".to_string(),
@@ -764,7 +771,7 @@ fn mask_part(
     if let Some(result) = object.get_mut("codeExecutionResult") {
         mask_value_strings(result, true, masker)?;
     }
-    Ok(())
+    Ok(note)
 }
 
 fn mask_value_strings(
@@ -794,7 +801,7 @@ fn inspect_inline_data(
     value: &mut Value,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let object = value
         .as_object_mut()
         .ok_or_else(|| "unknown format blocked: inlineData must be an object".to_string())?;
@@ -813,14 +820,15 @@ fn inspect_inline_data(
     };
     if media_type.starts_with("image/") {
         if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(&data)? {
-            object.insert("data".to_string(), Value::String(protected));
+            object.insert("data".to_string(), Value::String(protected.data));
             object.insert(
                 "mimeType".to_string(),
                 Value::String("image/png".to_string()),
             );
             object.remove("mime_type");
+            return Ok(Some(protected.note));
         }
-        return Ok(());
+        return Ok(None);
     }
     if media_type.starts_with("text/") || media_type == "application/json" {
         let mut decoded = data_encoding::BASE64
@@ -836,9 +844,9 @@ fn inspect_inline_data(
             Value::String(data_encoding::BASE64.encode(protected.as_bytes())),
         );
         protected.zeroize();
-        return Ok(());
+        return Ok(None);
     }
-    crate::claude_http_proxy::enforce_unscanned_document_policy()
+    crate::claude_http_proxy::enforce_unscanned_document_policy().map(|_| None)
 }
 
 fn inject_handle_contract(value: &mut Value) -> Result<(), String> {

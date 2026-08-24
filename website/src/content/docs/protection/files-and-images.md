@@ -11,7 +11,8 @@ because text handles cannot replace pixels.
 | --- | --- | --- |
 | UTF-8 text | Detect and replace | Text with handles |
 | Supported PDF | Read and check supported content | Protected document content |
-| Supported image | Local OCR and visual masking | Masked pixels |
+| Supported inline image | Local OCR and visual masking | Masked pixels and an adjacent handle note |
+| Supported Files API image upload | Local OCR and visual masking | Masked pixels; `partial` coverage when handles cannot be attached |
 | Unknown binary | Block | Nothing |
 | File ID or remote file that Pentect cannot check | Use the unscanned setting | Nothing when set to `block` |
 
@@ -31,6 +32,9 @@ validates UTF-8 before rewriting the body.
 
 Supported upload images are PNG, JPEG, WebP, GIF, and BMP. When masking is
 needed, Pentect safely regenerates the image and updates its media type.
+Because a standalone Files API upload has no adjacent model-visible text slot,
+Pentect reports partial coverage when the protected image has recoverable
+handles. Inline image requests carry those handles in an adjacent text part.
 
 Pentect checks an upload before sending it. A later request can use its file ID
 only when Pentect knows the content behind that ID. A provider file ID alone

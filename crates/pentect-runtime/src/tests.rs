@@ -1096,6 +1096,34 @@ fn ocr_off_obeys_block_policy_for_active_image_redaction() {
     assert!(unscanned_images_should_block().unwrap());
 }
 
+#[cfg(feature = "ocr")]
+#[test]
+fn active_image_byte_redaction_returns_opaque_annotation_without_plaintext() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("active-image-byte-annotation");
+    write_project_config(&root, "[image]\nocr = \"on\"\nunscanned = \"block\"\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-image-byte-store");
+    let _cwd = enter_temp_cwd(&root);
+    let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+
+    let protected = redact_image_bytes_into_active_memory_store(&qr_png(raw))
+        .unwrap()
+        .expect("secret image should be redacted");
+
+    assert!(!protected.bytes.is_empty());
+    assert!(
+        protected.note.contains("Masked regions:"),
+        "{}",
+        protected.note
+    );
+    assert!(
+        protected.note.contains("<<OPENAI_API_KEY_"),
+        "{}",
+        protected.note
+    );
+    assert!(!protected.note.contains(raw), "{}", protected.note);
+}
+
 #[test]
 fn exec_capability_env_does_not_shadow_parent_environment() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();

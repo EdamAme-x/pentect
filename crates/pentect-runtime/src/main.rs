@@ -320,9 +320,16 @@ pub fn unscanned_images_should_block() -> Result<bool, String> {
     ))
 }
 
+/// Protected image bytes and the model-safe explanation that must accompany
+/// them. The note contains opaque handles only; OCR plaintext is never copied.
+pub struct ProtectedImage {
+    pub bytes: Vec<u8>,
+    pub note: String,
+}
+
 pub fn redact_image_bytes_into_active_memory_store(
     bytes: &[u8],
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<ProtectedImage>, String> {
     let mut encoded = data_encoding::BASE64.encode(bytes);
     let mut value = Value::String(format!("data:image/png;base64,{encoded}"));
     encoded.zeroize();
@@ -339,8 +346,25 @@ pub fn redact_image_bytes_into_active_memory_store(
     let decoded = data_encoding::BASE64
         .decode(payload.as_bytes())
         .map_err(|_| "protected image payload is invalid".to_string());
+    let note = first_image_mask_note(&updated)
+        .ok_or_else(|| "protected image annotation is missing".to_string())?
+        .to_string();
     zeroize_value_strings(&mut updated);
-    decoded.map(Some)
+    decoded.map(|bytes| Some(ProtectedImage { bytes, note }))
+}
+
+fn first_image_mask_note(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(text)
+            if text.starts_with("Pentect masked sensitive information")
+                || text.starts_with("Pentect removed sensitive metadata") =>
+        {
+            Some(text)
+        }
+        Value::Array(values) => values.iter().find_map(first_image_mask_note),
+        Value::Object(object) => object.values().find_map(first_image_mask_note),
+        _ => None,
+    }
 }
 
 fn first_image_data_url(value: &Value) -> Option<&str> {

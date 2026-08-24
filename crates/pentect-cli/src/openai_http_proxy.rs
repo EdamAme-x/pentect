@@ -1652,13 +1652,14 @@ fn mask_chat_content(
         Value::String(text) => mask_text(text, tool_result, masker),
         Value::Null => Ok(()),
         Value::Array(parts) => {
-            for part in parts {
+            let original = std::mem::take(parts);
+            for mut part in original {
                 let Some(object) = part.as_object_mut() else {
                     return Err(
                         "OpenAI Chat Completions content part must be an object".to_string()
                     );
                 };
-                match object
+                let note = match object
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
@@ -1667,6 +1668,7 @@ fn mask_chat_content(
                         if let Some(Value::String(text)) = object.get_mut("text") {
                             mask_text(text, tool_result, masker)?;
                         }
+                        None
                     }
                     "image_url" => inspect_chat_image(object)?,
                     "input_image" => inspect_openai_image(object)?,
@@ -1676,13 +1678,19 @@ fn mask_chat_content(
                             return Err("OpenAI Chat Completions file part is invalid".to_string());
                         };
                         inspect_openai_file(file, tool_result, masker, files)?;
+                        None
                     }
                     "refusal" => {
                         if let Some(Value::String(text)) = object.get_mut("refusal") {
                             mask_text(text, tool_result, masker)?;
                         }
+                        None
                     }
-                    _ => {}
+                    _ => None,
+                };
+                parts.push(part);
+                if let Some(text) = note {
+                    parts.push(serde_json::json!({"type": "text", "text": text}));
                 }
             }
             Ok(())
@@ -1691,23 +1699,26 @@ fn mask_chat_content(
     }
 }
 
-fn inspect_chat_image(object: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+fn inspect_chat_image(
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<Option<String>, String> {
     let Some(image) = object.get_mut("image_url").and_then(Value::as_object_mut) else {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     };
     let Some(Value::String(url)) = image.get_mut("url") else {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     };
     let Some((metadata, encoded)) = url.split_once(',') else {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     };
     if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     }
     if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(encoded)? {
-        *url = format!("data:image/png;base64,{protected}");
+        *url = format!("data:image/png;base64,{}", protected.data);
+        return Ok(Some(protected.note));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn mask_openai_input(
@@ -1719,8 +1730,21 @@ fn mask_openai_input(
     match value {
         Value::String(text) => mask_text(text, tool_result, masker),
         Value::Array(items) => {
-            for item in items {
-                mask_openai_input(item, tool_result, masker, files)?;
+            let original = std::mem::take(items);
+            for mut item in original {
+                let note = if item.get("type").and_then(Value::as_str) == Some("input_image") {
+                    match item.as_object_mut() {
+                        Some(object) => inspect_openai_image(object)?,
+                        None => None,
+                    }
+                } else {
+                    mask_openai_input(&mut item, tool_result, masker, files)?;
+                    None
+                };
+                items.push(item);
+                if let Some(text) = note {
+                    items.push(serde_json::json!({"type": "input_text", "text": text}));
+                }
             }
             Ok(())
         }
@@ -1741,7 +1765,9 @@ fn mask_openai_input(
                         mask_text(text, tool_result, masker)?;
                     }
                 }
-                "input_image" => inspect_openai_image(object)?,
+                "input_image" => {
+                    let _ = inspect_openai_image(object)?;
+                }
                 "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
                 "message" => {
                     let external_content =
@@ -1764,20 +1790,23 @@ fn mask_openai_input(
     }
 }
 
-fn inspect_openai_image(object: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+fn inspect_openai_image(
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<Option<String>, String> {
     let Some(Value::String(url)) = object.get_mut("image_url") else {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     };
     let Some((metadata, encoded)) = url.split_once(',') else {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     };
     if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
-        return unscanned_image_policy();
+        return unscanned_image_policy().map(|_| None);
     }
     if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(encoded)? {
-        *url = format!("data:image/png;base64,{protected}");
+        *url = format!("data:image/png;base64,{}", protected.data);
+        return Ok(Some(protected.note));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn inspect_openai_file(
