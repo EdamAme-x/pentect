@@ -82,8 +82,16 @@ impl OpenAiHttpProxyGuard {
         upstream: String,
         header_env: &[String],
     ) -> Result<Self, String> {
+        Self::start_with_header_env_and_bearer_env(upstream, header_env, None)
+    }
+
+    pub(crate) fn start_with_header_env_and_bearer_env(
+        upstream: String,
+        header_env: &[String],
+        bearer_env: Option<&str>,
+    ) -> Result<Self, String> {
         let upstream = parse_upstream_base(&upstream)?;
-        let headers = crate::upstream::header_overrides(header_env)?;
+        let headers = crate::upstream::header_overrides_with_bearer_env(header_env, bearer_env)?;
         let auth = random_auth_token()?;
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3168,6 +3176,11 @@ mod tests {
                 process_host_candidate,
             }
         }
+
+        fn set(&mut self, name: &'static str, value: &str) {
+            self.saved.push((name, std::env::var_os(name)));
+            std::env::set_var(name, value);
+        }
     }
 
     impl Drop for ProviderBoundaryTestEnv {
@@ -3371,7 +3384,8 @@ mod tests {
     fn provider_boundary_masks_chat_requests_and_restores_only_tool_arguments() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
-        let _env = ProviderBoundaryTestEnv::install(&store);
+        let mut env = ProviderBoundaryTestEnv::install(&store);
+        env.set("PENTECT_TEST_OPENAI_PROVIDER_KEY", "provider-test-key");
         let secret = [
             "rpa_",
             "ZYXWVUTS",
@@ -3382,7 +3396,12 @@ mod tests {
         ]
         .concat();
         let (upstream, captured, thread) = mock_chat_upstream();
-        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+        let proxy = OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
+            upstream,
+            &[],
+            Some("PENTECT_TEST_OPENAI_PROVIDER_KEY"),
+        )
+        .unwrap();
         let response = reqwest::blocking::Client::new()
             .post(format!("{}/v1/chat/completions", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -3419,10 +3438,16 @@ mod tests {
             .text()
             .unwrap();
         let response: Value = serde_json::from_str(&response).unwrap();
-        let (_, request) = captured
+        let (headers, request) = captured
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         thread.join().unwrap();
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer provider-test-key")),
+            "provider bearer header did not reach the upstream"
+        );
         assert!(!request.contains(&secret), "{request}");
         let handle = first_handle(&request).unwrap();
         assert!(request.matches(&handle).count() >= 3);

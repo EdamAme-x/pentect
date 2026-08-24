@@ -147,6 +147,45 @@ pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, Stri
     Ok(overrides)
 }
 
+pub(crate) fn header_overrides_with_bearer_env(
+    specs: &[String],
+    bearer_env: Option<&str>,
+) -> Result<HeaderOverrides, String> {
+    let mut overrides = header_overrides(specs)?;
+    let Some(env_name) = bearer_env.filter(|_| !overrides.suppress_origin_auth) else {
+        return Ok(overrides);
+    };
+    if env_name.is_empty() || env_name.contains('=') || env_name.contains('\0') {
+        return Err("provider API key environment variable name is invalid".to_string());
+    }
+    let mut value = std::env::var(env_name).map_err(|_| {
+        format!(
+            "provider API key environment variable {env_name} is not set or is not valid Unicode"
+        )
+    })?;
+    if value.is_empty() {
+        return Err(format!(
+            "provider API key environment variable {env_name} is empty"
+        ));
+    }
+    if value.len() > 16 * 1024 {
+        value.zeroize();
+        return Err(format!(
+            "provider API key environment variable {env_name} is too large"
+        ));
+    }
+    let mut authorization = format!("Bearer {value}");
+    value.zeroize();
+    let header = sensitive_header_value(&authorization, env_name);
+    authorization.zeroize();
+    overrides.suppress_origin_auth = true;
+    overrides.values.push(HeaderOverride {
+        name: reqwest::header::AUTHORIZATION,
+        value: Some(header?),
+    });
+    Ok(overrides)
+}
+
 pub(crate) fn hide_header_source_env(command: &mut std::process::Command, specs: &[String]) {
     for spec in specs {
         if let Some((_, env_name)) = spec.split_once('=') {
@@ -410,5 +449,49 @@ mod tests {
         std::env::remove_var("PENTECT_TEST_MISSING_KEY");
         assert!(header_overrides(&["x-bf-vk=PENTECT_TEST_MISSING_KEY".to_string()]).is_err());
         assert!(header_overrides(&["host=PENTECT_TEST_MISSING_KEY".to_string()]).is_err());
+    }
+
+    #[test]
+    fn provider_env_key_becomes_a_bearer_header() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _secret = EnvRestore::set("PENTECT_TEST_PROVIDER_KEY", "provider-test-key");
+        let overrides =
+            header_overrides_with_bearer_env(&[], Some("PENTECT_TEST_PROVIDER_KEY")).unwrap();
+        let request = overrides
+            .apply(reqwest::Client::new().get("https://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer provider-test-key"
+        );
+        assert!(!overrides.forward_incoming_header("authorization"));
+    }
+
+    #[test]
+    fn explicit_header_override_takes_precedence_over_provider_env_key() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _explicit = EnvRestore::set("PENTECT_TEST_EXPLICIT_KEY", "explicit-test-key");
+        std::env::remove_var("PENTECT_TEST_PROVIDER_MISSING");
+        let overrides = header_overrides_with_bearer_env(
+            &["x-api-key=PENTECT_TEST_EXPLICIT_KEY".to_string()],
+            Some("PENTECT_TEST_PROVIDER_MISSING"),
+        )
+        .unwrap();
+        let request = overrides
+            .apply(reqwest::Client::new().get("https://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("x-api-key").unwrap(),
+            "explicit-test-key"
+        );
+        assert!(request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none());
     }
 }
