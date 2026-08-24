@@ -2816,7 +2816,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "model": "claude-test-model",
-                "organization_uuid": "11111111-2222-3333-4444-555555555555",
+                "organization_uuid": "123e4567-e89b-12d3-a456-4266abcdef00",
                 "prompt": format!("Use this value:\nRUNPOD_API_KEY={secret}\n"),
                 "future_instructions": format!("A future field contains {secret}"),
                 "messages": [{"content": [{
@@ -2844,7 +2844,7 @@ mod tests {
         assert_eq!(value["model"], "claude-test-model");
         assert_eq!(
             value["organization_uuid"],
-            "11111111-2222-3333-4444-555555555555"
+            "123e4567-e89b-12d3-a456-4266abcdef00"
         );
         assert_eq!(value["client_context"]["revision"], 7);
         assert_eq!(
