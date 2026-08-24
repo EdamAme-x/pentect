@@ -305,6 +305,36 @@ fn exec_parse_accepts_program_after_separator() {
 }
 
 #[test]
+fn exec_parse_accepts_one_handle_for_program_stdin_only() {
+    let handle = "<<API_TOKEN_0123456789abcdef>>";
+    let args = strings(["pentect", "exec", "--secret-stdin", handle, "--", "tool"]);
+    let opts = ExecOpts::parse(&args).unwrap();
+    assert_eq!(opts.secret_stdin.as_deref(), Some(handle));
+    assert!(matches!(opts.mode, ExecMode::Program(_)));
+
+    let args = strings([
+        "pentect",
+        "exec",
+        "--secret-stdin",
+        "not-a-handle",
+        "--",
+        "tool",
+    ]);
+    let error = match ExecOpts::parse(&args) {
+        Ok(_) => panic!("expected a non-handle to fail"),
+        Err(error) => error,
+    };
+    assert!(error.contains("exactly one masked handle"), "{error}");
+
+    let args = strings(["pentect", "exec", "--secret-stdin", handle, "echo ok"]);
+    let error = match ExecOpts::parse(&args) {
+        Ok(_) => panic!("expected shell mode to fail"),
+        Err(error) => error,
+    };
+    assert!(error.contains("program after `--`"), "{error}");
+}
+
+#[test]
 fn direct_program_secret_arguments_require_explicit_opt_in() {
     let root = temp_root("secret-argv-opt-in");
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -320,6 +350,36 @@ fn direct_program_secret_arguments_require_explicit_opt_in() {
 
     let resolved = resolve_command_args(&store, &args, true).unwrap();
     assert_eq!(resolved, ["tool", raw]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_program_receives_a_known_secret_only_on_stdin() {
+    let root = temp_root("secret-stdin");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked.split_once('=').unwrap().1.trim().to_string();
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: false,
+        secret_stdin: Some(handle),
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'STDIN='; cat".to_string(),
+        ]),
+    };
+
+    let output = run_resolved_command(&store, &opts).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, format!("STDIN={raw}"));
+    let masked = mask_tool_output(&session, &stdout).unwrap();
+    assert!(!masked.contains(raw), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -471,6 +531,7 @@ fn exec_allows_secret_file_reads_because_output_is_remasked() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -508,6 +569,7 @@ fn exec_registers_referenced_local_files_as_env_capabilities() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -553,6 +615,7 @@ fn exec_inherits_parent_environment_and_masks_output() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode,
     };
@@ -1003,6 +1066,7 @@ fn exec_capability_env_does_not_shadow_parent_environment() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode,
     };
@@ -1032,6 +1096,7 @@ fn exec_resolves_masked_handle_in_command_text() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -1101,6 +1166,7 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -1366,6 +1432,7 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -2393,6 +2460,7 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };
@@ -2485,6 +2553,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
         session: DEFAULT_SESSION.to_string(),
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: ExecMode::Shell(command),
     };

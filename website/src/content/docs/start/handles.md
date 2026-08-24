@@ -143,5 +143,12 @@ pentect exec 'command --token <<API_TOKEN_...>>'
 pentect resolve config.masked.toml
 ```
 
+If a program supports credentials on stdin, keep the value out of both argv
+and the environment:
+
+```sh
+pentect exec --secret-stdin '<<SUDO_PASSWORD_...>>' -- sudo -S -p '' command
+```
+
 `resolve` changes the data boundary. Review its destination and permissions
 before running it.
