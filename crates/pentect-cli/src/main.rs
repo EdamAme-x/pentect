@@ -63,6 +63,7 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MEMORY_STORE_STARTUP_STDERR: usize = 64 * 1024;
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1972,6 +1973,71 @@ struct MemoryStoreGuard {
     process_host_candidate: Option<PathBuf>,
 }
 
+fn capture_bounded_stderr(mut stderr: impl Read) -> Vec<u8> {
+    let mut captured = Vec::with_capacity(MAX_MEMORY_STORE_STARTUP_STDERR);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = MAX_MEMORY_STORE_STARTUP_STDERR.saturating_sub(captured.len());
+                captured.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+    }
+    captured
+}
+
+fn classify_memory_store_startup_stderr(stderr: &[u8]) -> (&'static str, &'static str) {
+    let message = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if message.contains("permission denied") || message.contains("access is denied") {
+        (
+            "permission-denied",
+            "check ownership and permissions of the Pentect state directory",
+        )
+    } else if message.contains("not a directory") {
+        (
+            "state-path-not-directory",
+            "check that the configured Pentect state path is a directory",
+        )
+    } else if message.contains("read-only file system") {
+        (
+            "read-only-filesystem",
+            "use a writable Pentect state directory",
+        )
+    } else if message.contains("no space left") || message.contains("disk full") {
+        ("storage-full", "free space on the Pentect state volume")
+    } else if message.contains("address already in use") {
+        ("address-in-use", "stop the stale Pentect process and retry")
+    } else if message.contains("identity") || message.contains("signing key") {
+        (
+            "identity-key-invalid",
+            "run `pentect doctor` to repair local identity state",
+        )
+    } else if message.contains("config") || message.contains("toml") {
+        (
+            "configuration-invalid",
+            "run `pentect doctor` and check the local configuration",
+        )
+    } else {
+        (
+            "child-exited",
+            "run `pentect doctor` and inspect `pentect log` for diagnostics",
+        )
+    }
+}
+
+fn memory_store_startup_failure(
+    message: String,
+    stderr_reader: thread::JoinHandle<Vec<u8>>,
+) -> String {
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let (reason, action) = classify_memory_store_startup_stderr(&stderr);
+    pentect_agent::record_diagnostic_activity("memory-store-startup", reason);
+    pentect_agent::flush_activity_log();
+    format!("{message} ({reason}; {action})")
+}
+
 impl MemoryStoreGuard {
     fn start(pentect: &Path) -> Result<Self, String> {
         if let (Some(addr), Some(token), Some(launch_proof)) = (
@@ -2009,10 +2075,15 @@ impl MemoryStoreGuard {
             .arg("--serve")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = command
             .spawn()
             .map_err(|e| format!("could not start Pentect memory store: {e}"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "could not capture Pentect memory store diagnostics".to_string())?;
+        let stderr_reader = thread::spawn(move || capture_bounded_stderr(stderr));
         let stdout = child
             .stdout
             .take()
@@ -2037,12 +2108,15 @@ impl MemoryStoreGuard {
             Ok(Err(e)) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(e);
+                return Err(memory_store_startup_failure(e, stderr_reader));
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Pentect memory store did not start within 5 seconds".to_string());
+                return Err(memory_store_startup_failure(
+                    "Pentect memory store did not start within 5 seconds".to_string(),
+                    stderr_reader,
+                ));
             }
         };
         let (addr, token, mut process_host_read_token, mut process_host_write_token) =
@@ -2051,7 +2125,7 @@ impl MemoryStoreGuard {
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(e);
+                    return Err(memory_store_startup_failure(e, stderr_reader));
                 }
             };
         let lease = match pentect_agent::open_memory_store_lease(&addr, &token) {
@@ -3306,5 +3380,27 @@ mod tests {
             ),
             release_asset
         );
+    }
+
+    #[test]
+    fn memory_store_startup_stderr_is_bounded_while_reader_is_drained() {
+        let input = vec![b'x'; MAX_MEMORY_STORE_STARTUP_STDERR * 2];
+        let captured = capture_bounded_stderr(std::io::Cursor::new(input));
+        assert_eq!(captured.len(), MAX_MEMORY_STORE_STARTUP_STDERR);
+    }
+
+    #[test]
+    fn memory_store_startup_diagnostics_are_actionable_without_raw_stderr() {
+        let secret = "sk-must-not-be-persisted";
+        let stderr = format!("Permission denied while opening {secret}");
+        let (reason, action) = classify_memory_store_startup_stderr(stderr.as_bytes());
+        assert_eq!(reason, "permission-denied");
+        assert!(action.contains("permissions"));
+        assert!(!reason.contains(secret));
+        assert!(!action.contains(secret));
+
+        let (reason, action) = classify_memory_store_startup_stderr(b"unexpected child crash");
+        assert_eq!(reason, "child-exited");
+        assert!(action.contains("pentect log"));
     }
 }
