@@ -38,7 +38,7 @@ ignored.
 | `files.remember` | `true` | Remember safe local file-to-handle information |
 | `activity.share` | `true` | Share events with compatible local Pentect processes |
 | `agent.required` | `false` | Require supported agents to start through Pentect |
-| `output.restore` | `false` | Restore known handles in assistant text shown by supported clients |
+| `output.restore` | `true` | Restore known handles in assistant text shown by supported clients |
 | `update.check` | `true` | Check in the background for a newer Pentect release |
 
 ## Update notification
@@ -158,23 +158,26 @@ either file sets it to `true`, the effective value is true.
 
 ## Assistant output restoration
 
-By default, assistant text keeps protected handles visible. To restore known
-handles in assistant text locally, opt in from the user config:
+By default, Pentect restores known handles in assistant text shown to the local
+user. To keep handles visible instead, opt out in either the user config or a
+project config:
 
 ```toml
 [output]
-restore = true
+restore = false
 ```
 
 This affects supported JSON and streaming responses for Codex, Claude,
 OpenCode, and Pi. It does not send plaintext back to the model provider, but it
 does place the restored value in the client UI and may place it in terminal
-scrollback, screenshots, or client logs. Unknown and expired handles remain
-unchanged.
+scrollback, screenshots, or user-visible client conversation history. Pentect's
+persistent logs, diagnostics, and telemetry do not record the restored response
+body. Unknown and expired handles remain unchanged.
 
-A project config cannot enable this wider output boundary by itself. It may set
-`output.restore = false` to disable a user-level opt-in for that project. Restart
-the protected client after changing the setting.
+A `false` in either scope wins, so a project cannot override a user-level
+opt-out. Set `output.restore = true` explicitly only when recording the desired
+default in managed configuration. Restart the protected client after changing
+the setting.
 
 ## Require the agent to start through Pentect
 

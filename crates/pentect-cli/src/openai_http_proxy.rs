@@ -2,8 +2,8 @@
 //!
 //! Model-bound prompts and local function outputs are masked on requests.
 //! Completed client function-call arguments are resolved on responses. Local
-//! Provider-generated text remains masked unless the user opts into local
-//! output restoration.
+//! Provider-generated text restores known handles for the local user unless
+//! user or project policy opts out.
 
 use futures_util::{stream, Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -3465,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_boundary_masks_chat_requests_and_restores_only_tool_arguments() {
+    fn provider_boundary_masks_chat_requests_and_restores_local_assistant_output() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let mut env = ProviderBoundaryTestEnv::install(&store);
@@ -3537,7 +3537,7 @@ mod tests {
         assert!(request.matches(&handle).count() >= 3);
         let protected_request: Value = serde_json::from_str(&request).unwrap();
         assert_eq!(protected_request["messages"][0]["content"], HANDLE_CONTRACT);
-        assert_eq!(response["choices"][0]["message"]["content"], handle);
+        assert_eq!(response["choices"][0]["message"]["content"], secret);
         let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
@@ -4246,7 +4246,7 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_response_text_restores_known_handles_only() {
+    fn enabled_response_text_restores_known_handles_only() {
         let mut value = serde_json::json!({
             "output": [{
                 "type": "message",
@@ -4266,7 +4266,7 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_openai_stream_restores_a_handle_split_across_events() {
+    fn enabled_openai_stream_restores_a_handle_split_across_events() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut streams = HashMap::new();
         let mut resolve: HandleResolver =
