@@ -91,6 +91,16 @@ impl DecodeBudget {
         self.decoded_bytes += decoded_len;
         true
     }
+
+    fn output_probe_limit(&self, encoded_len: usize) -> u64 {
+        let expansion_limit = encoded_len
+            .saturating_mul(MAX_DECODE_EXPANSION_RATIO)
+            .saturating_add(1);
+        let aggregate_limit = MAX_TOTAL_DECODED_BYTES
+            .saturating_sub(self.decoded_bytes)
+            .saturating_add(1);
+        expansion_limit.min(aggregate_limit) as u64
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -292,7 +302,9 @@ impl DecodeDetector {
             // Binary bytes might be compressed (e.g. SAML's base64(deflate(..))).
             Err(_) if remaining_depth != Some(0) => {
                 let after_decompress = consume_depth(remaining_depth)?;
-                if let Some(inflated) = decompress(bytes, self.config.max_inflate_bytes) {
+                let hard_limit = budget.output_probe_limit(bytes.len());
+                if let Some(inflated) = decompress(bytes, self.config.max_inflate_bytes, hard_limit)
+                {
                     if !budget.accept(bytes.len(), inflated.len()) {
                         return None;
                     }
@@ -681,17 +693,18 @@ fn looks_binary(bytes: &[u8]) -> bool {
     nonprint as f64 > bytes.len() as f64 * BINARY_NONPRINT_RATIO
 }
 
-fn decompress(data: &[u8], max_bytes: Option<u64>) -> Option<Vec<u8>> {
+fn decompress(data: &[u8], max_bytes: Option<u64>, hard_limit: u64) -> Option<Vec<u8>> {
+    let read_limit = max_bytes.map_or(hard_limit, |configured| configured.min(hard_limit));
     if data.starts_with(&[0x1f, 0x8b]) {
-        return inflate(GzDecoder::new(data), max_bytes);
+        return inflate(GzDecoder::new(data), read_limit);
     }
     if looks_like_zlib(data) {
-        return inflate(ZlibDecoder::new(data), max_bytes);
+        return inflate(ZlibDecoder::new(data), read_limit);
     }
     // Raw DEFLATE has no reliable magic bytes. Trying it on every random decoded
     // hash is expensive, so only keep it as a fallback for payload-sized blobs.
     if data.len() >= 32 {
-        return inflate(DeflateDecoder::new(data), max_bytes);
+        return inflate(DeflateDecoder::new(data), read_limit);
     }
     None
 }
@@ -705,12 +718,9 @@ fn looks_like_zlib(data: &[u8]) -> bool {
     cmf & 0x0f == 8 && (cmf >> 4) <= 7 && u16::from_be_bytes([cmf, flg]).is_multiple_of(31)
 }
 
-fn inflate<R: Read>(mut reader: R, max_bytes: Option<u64>) -> Option<Vec<u8>> {
+fn inflate<R: Read>(reader: R, max_bytes: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    match max_bytes {
-        Some(max_bytes) => reader.take(max_bytes).read_to_end(&mut out).ok()?,
-        None => reader.read_to_end(&mut out).ok()?,
-    };
+    reader.take(max_bytes).read_to_end(&mut out).ok()?;
     (!out.is_empty()).then_some(out)
 }
 
@@ -718,6 +728,8 @@ fn inflate<R: Read>(mut reader: R, max_bytes: Option<u64>) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::detect::region;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -938,6 +950,19 @@ mod tests {
             assert!(!budget.accept(1, usize::MAX));
             assert_eq!(LIMIT_REPORTS.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn decompression_is_bounded_before_allocating_the_full_output() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![b'A'; 1_000_000]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let hard_limit = compressed.len() as u64 * MAX_DECODE_EXPANSION_RATIO as u64 + 1;
+
+        let inflated = decompress(&compressed, None, hard_limit).unwrap();
+
+        assert_eq!(inflated.len() as u64, hard_limit);
+        assert!(inflated.len() < 1_000_000);
     }
 
     proptest::proptest! {
