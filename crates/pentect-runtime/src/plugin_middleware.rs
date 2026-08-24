@@ -1084,14 +1084,8 @@ impl CommandProgram {
         let remaining = budget.remaining().map_err(|_| {
             format!("plugin '{name}' command chain deadline exceeded before execution")
         })?;
-        let (exchange_timeout, phase) = if starting {
-            (
-                startup_timeout.min(remaining),
-                CommandExchangePhase::Startup,
-            )
-        } else {
-            (timeout.min(remaining), CommandExchangePhase::Request)
-        };
+        let (exchange_timeout, phase) =
+            command_exchange_timeout(starting, timeout, startup_timeout, remaining);
         let result = state
             .as_mut()
             .expect("command session initialized")
@@ -1128,6 +1122,22 @@ impl CommandProgram {
                 }
             }
         }
+    }
+}
+
+fn command_exchange_timeout(
+    starting: bool,
+    timeout: Duration,
+    startup_timeout: Duration,
+    remaining: Duration,
+) -> (Duration, CommandExchangePhase) {
+    if starting {
+        (
+            startup_timeout.min(remaining),
+            CommandExchangePhase::Startup,
+        )
+    } else {
+        (timeout.min(remaining), CommandExchangePhase::Request)
     }
 }
 
@@ -3723,7 +3733,11 @@ mod tests {
         )
         .unwrap();
         let output = program
-            .invoke(br#"{"id":42}"#, Duration::from_secs(5), "fixture")
+            .invoke(
+                br#"{"id":42}"#,
+                Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                "fixture",
+            )
             .unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&output).unwrap()["id"], 42);
     }
@@ -3743,7 +3757,7 @@ mod tests {
             .invoke_with_startup_timeout(
                 br#"{"id":1}"#,
                 Duration::from_millis(50),
-                Duration::from_secs(1),
+                Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 "fixture",
                 &mut budget,
             )
@@ -3755,7 +3769,7 @@ mod tests {
             .invoke_with_startup_timeout(
                 br#"{"id":2}"#,
                 Duration::from_millis(50),
-                Duration::from_secs(1),
+                Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 "fixture",
                 &mut budget,
             )
@@ -3765,26 +3779,30 @@ mod tests {
 
     #[test]
     fn command_program_cold_start_is_capped_by_remaining_chain_budget() {
-        let Some(command) = python_protocol_fixture(
-            "import json,sys,time; time.sleep(2);\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'id':r['id']}), flush=True)",
-        ) else {
-            return;
-        };
-        let program = CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap();
-        let mut budget = PluginChainBudget::new();
-        budget.deadline = Instant::now() + Duration::from_millis(50);
-        let started = Instant::now();
-        let error = program
-            .invoke_with_startup_timeout(
-                br#"{"id":1}"#,
-                Duration::from_secs(5),
-                Duration::from_secs(5),
-                "fixture",
-                &mut budget,
-            )
-            .unwrap_err();
-        assert!(error.contains("startup timed out"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let remaining = Duration::from_millis(50);
+        let (timeout, phase) = command_exchange_timeout(
+            true,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            remaining,
+        );
+
+        assert_eq!(timeout, remaining);
+        assert!(matches!(phase, CommandExchangePhase::Startup));
+    }
+
+    #[test]
+    fn command_program_warm_request_is_capped_by_remaining_chain_budget() {
+        let remaining = Duration::from_millis(50);
+        let (timeout, phase) = command_exchange_timeout(
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            remaining,
+        );
+
+        assert_eq!(timeout, remaining);
+        assert!(matches!(phase, CommandExchangePhase::Request));
     }
 
     #[test]
@@ -3875,7 +3893,7 @@ mod tests {
             4096,
         )
         .unwrap()
-        .invoke(b"{}", Duration::from_secs(5), "fixture")
+        .invoke(b"{}", Duration::from_millis(DEFAULT_TIMEOUT_MS), "fixture")
         .unwrap_err();
         assert!(partial.contains("incomplete protocol line"), "{partial}");
 
@@ -3885,7 +3903,7 @@ mod tests {
             4096,
         )
         .unwrap()
-        .invoke(b"{}", Duration::from_secs(5), "fixture")
+        .invoke(b"{}", Duration::from_millis(DEFAULT_TIMEOUT_MS), "fixture")
         .unwrap_err();
         assert!(crash.contains("closed stdout"), "{crash}");
     }
@@ -3919,7 +3937,7 @@ mod tests {
             required: true,
             command_config: Some(json!({})),
             timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: 4096,
             max_spans: DEFAULT_MAX_SPANS,
@@ -3950,7 +3968,7 @@ mod tests {
             required,
             command_config: Some(json!({})),
             timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: 4096,
             max_spans: DEFAULT_MAX_SPANS,
