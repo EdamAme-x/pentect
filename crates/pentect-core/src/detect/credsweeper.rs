@@ -1843,11 +1843,86 @@ enum FilterList {
 
 impl FilterList {
     fn items(&self) -> Vec<String> {
-        match self {
+        let raw = match self {
             Self::One(item) => vec![item.clone()],
             Self::Many(items) => items.clone(),
-        }
+        };
+        raw.into_iter()
+            .flat_map(|item| expand_filter_group(&item))
+            .collect()
     }
+}
+
+fn expand_filter_group(name: &str) -> Vec<String> {
+    let filters: &[&str] = match name {
+        "GeneralPattern" => &["LineSpecificKeyCheck", "ValuePatternCheck"],
+        "TokenPattern" => &[
+            "ValueMorphemesCheck",
+            "ValueNumberCheck",
+            "ValueCamelCaseCheck",
+            "ValuePatternCheck",
+        ],
+        "GeneralKeyword" => &[
+            "ValueAllowlistCheck",
+            "ValueArrayDictionaryCheck",
+            "ValueBlocklistCheck",
+            "ValueCamelCaseCheck",
+            "ValueFilePathCheck",
+            "ValueHexNumberCheck",
+            "ValueLastWordCheck",
+            "ValueMethodCheck",
+            "ValueSimilarityCheck",
+            "ValueStringTypeCheck",
+            "ValueTokenCheck",
+            "ValuePatternCheck",
+            "ValueNotAllowedPatternCheck",
+            "ValueDictionaryKeywordCheck",
+            "ValueSealedSecretCheck",
+        ],
+        "PasswordKeyword" => &[
+            "ValueAllowlistCheck",
+            "ValueArrayDictionaryCheck",
+            "ValueBlocklistCheck",
+            "ValueCamelCaseCheck",
+            "ValueFilePathCheck",
+            "ValueHexNumberCheck",
+            "ValueLastWordCheck",
+            "ValueMethodCheck",
+            "ValueSimilarityCheck",
+            "ValueStringTypeCheck",
+            "ValueTokenCheck",
+            "ValuePatternCheck",
+            "ValueNotAllowedPatternCheck",
+            "ValueLengthCheck(64)",
+            "ValueSplitKeywordCheck",
+            "ValueSealedSecretCheck",
+            "LineGitBinaryCheck",
+            "LineUUEPartCheck",
+        ],
+        "UrlCredentialsGroup" => &[
+            "ValueAllowlistCheck",
+            "ValueArrayDictionaryCheck",
+            "ValueBlocklistCheck",
+            "ValueCamelCaseCheck",
+            "ValueFilePathCheck",
+            "ValueLastWordCheck",
+            "ValueMethodCheck",
+            "ValueStringTypeCheck",
+            "ValueNotAllowedPatternCheck",
+            "ValueTokenCheck",
+            "ValueLengthCheck(80)",
+            "ValuePatternCheck",
+        ],
+        "WeirdBase36Token" => &[
+            "ValueMorphemesCheck(1)",
+            "ValuePatternCheck",
+            "ValueNumberCheck",
+            "ValueTokenBase36Check",
+            "ValueEntropyBase36Check",
+        ],
+        _ => return vec![name.to_string()],
+    };
+    filters.iter().map(|filter| (*filter).to_string()).collect()
 }
 
 struct LineRanges<'a> {
@@ -1917,17 +1992,8 @@ fn accept_value(
         return false;
     }
     for filter in &rule.filter_types {
-        if filter == "GeneralPattern"
-            && (line_specific_key_filtered(line, value_start, value_end)
-                || value_pattern_filtered(value, None))
-        {
-            return false;
-        }
-        if filter == "TokenPattern"
-            && (morphemes_filtered(value, None)
-                || number_filtered(value)
-                || camel_case_filtered(value, candidate_is_well_quoted(candidate))
-                || value_pattern_filtered(value, None))
+        if filter == "LineSpecificKeyCheck"
+            && line_specific_key_filtered(line, value_start, value_end)
         {
             return false;
         }
@@ -1940,14 +2006,6 @@ fn accept_value(
             return false;
         }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
-            return false;
-        }
-        if filter == "WeirdBase36Token" && weird_base36_token_filtered(value) {
-            return false;
-        }
-        if filter == "GeneralKeyword"
-            && (dictionary_keyword_filtered(value) || value_sealed_secret_filtered(value, ""))
-        {
             return false;
         }
         if filter.starts_with("ValuePatternCheck")
@@ -1964,6 +2022,11 @@ fn accept_value(
             return false;
         }
         if filter == "ValueNumberCheck" && number_filtered(value) {
+            return false;
+        }
+        if filter == "ValueCamelCaseCheck"
+            && camel_case_filtered(value, candidate_is_well_quoted(candidate))
+        {
             return false;
         }
         if filter == "ValueEntropyBase36Check" && entropy_base36_filtered(value) {
@@ -2116,13 +2179,6 @@ fn is_basic_auth_token68(value: &str) -> bool {
     0 < colon && colon + 4 < decoded.len() && std::str::from_utf8(&decoded).is_ok()
 }
 
-fn weird_base36_token_filtered(value: &str) -> bool {
-    morphemes_filtered_with_threshold(value, 1)
-        || value_pattern_filtered(value, None)
-        || number_filtered(value)
-        || entropy_base36_filtered(value)
-}
-
 fn morphemes_filtered(value: &str, threshold: Option<usize>) -> bool {
     let threshold = threshold
         .unwrap_or_else(|| value.len().ilog2() as usize + 1)
@@ -2234,9 +2290,7 @@ fn repeated_or_sequence_pattern(
     let mut ascending = 1usize;
     let mut descending = 1usize;
     for pair in chars.windows(2) {
-        if pair[0] == pair[1]
-            && !(ignore_base64_a_slash && matches!(pair[0], 'A' | '/' | '_'))
-        {
+        if pair[0] == pair[1] && !(ignore_base64_a_slash && matches!(pair[0], 'A' | '/' | '_')) {
             equal += 1;
         } else {
             equal = 1;
@@ -3004,22 +3058,68 @@ mod tests {
             "_",
             "",
         ] {
-            assert!(value_pattern_filtered(value, None), "expected filtered: {value:?}");
+            assert!(
+                value_pattern_filtered(value, None),
+                "expected filtered: {value:?}"
+            );
         }
         for value in ["Crackle123", "IEEE32441", "Pass..."] {
-            assert!(!value_pattern_filtered(value, None), "expected accepted: {value:?}");
+            assert!(
+                !value_pattern_filtered(value, None),
+                "expected accepted: {value:?}"
+            );
         }
         for value in ["11223344", "010101010", "40302010"] {
-            assert!(value_pattern_filtered(value, Some(4)), "expected duple filter: {value:?}");
+            assert!(
+                value_pattern_filtered(value, Some(4)),
+                "expected duple filter: {value:?}"
+            );
         }
     }
 
     #[test]
     fn value_pattern_check_only_exempts_upstream_base64_fill_characters() {
         for value in ["AAAAAAAA", "////////", "________"] {
-            assert!(!value_pattern_filtered(value, Some(8)), "expected accepted: {value:?}");
+            assert!(
+                !value_pattern_filtered(value, Some(8)),
+                "expected accepted: {value:?}"
+            );
         }
         assert!(value_pattern_filtered("��������", Some(8)));
+    }
+
+    #[test]
+    fn filter_groups_expand_in_upstream_order() {
+        assert_eq!(
+            expand_filter_group("GeneralPattern"),
+            ["LineSpecificKeyCheck", "ValuePatternCheck"]
+        );
+        assert_eq!(
+            expand_filter_group("TokenPattern"),
+            [
+                "ValueMorphemesCheck",
+                "ValueNumberCheck",
+                "ValueCamelCaseCheck",
+                "ValuePatternCheck",
+            ]
+        );
+        assert_eq!(expand_filter_group("GeneralKeyword").len(), 15);
+        assert_eq!(expand_filter_group("PasswordKeyword").len(), 18);
+        assert_eq!(expand_filter_group("UrlCredentialsGroup").len(), 12);
+        assert_eq!(
+            expand_filter_group("WeirdBase36Token"),
+            [
+                "ValueMorphemesCheck(1)",
+                "ValuePatternCheck",
+                "ValueNumberCheck",
+                "ValueTokenBase36Check",
+                "ValueEntropyBase36Check",
+            ]
+        );
+        assert_eq!(
+            expand_filter_group("ValueGitHubCheck"),
+            ["ValueGitHubCheck"]
+        );
     }
 
     #[test]
