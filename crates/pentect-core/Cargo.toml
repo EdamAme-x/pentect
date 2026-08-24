@@ -27,6 +27,7 @@ chacha20 = { workspace = true }
 zeroize = { workspace = true }
 unicode-normalization = { workspace = true }
 data-encoding = { workspace = true }
+openssl = { workspace = true }
 bs58 = { workspace = true }
 bip39 = { workspace = true }
 flate2 = { workspace = true }

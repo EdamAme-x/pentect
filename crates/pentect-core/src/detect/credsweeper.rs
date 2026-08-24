@@ -5,6 +5,11 @@ use crate::normalize::NormalizedView;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use data_encoding::{BASE32, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
+use openssl::encrypt::{Decrypter, Encrypter};
+use openssl::hash::MessageDigest;
+use openssl::pkcs12::Pkcs12;
+use openssl::pkey::{Id, PKey, Private};
+use openssl::rsa::Padding;
 use regex::Regex as RustRegex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -379,6 +384,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueArrayDictionaryCheck"
             | "ValueAtlassianTokenCheck"
             | "ValueBase64EncodedPem"
+            | "ValueBase64KeyCheck"
             | "ValueBase64PartCheck"
             | "ValueAzureTokenCheck"
             | "ValueBase32DataCheck"
@@ -1461,6 +1467,107 @@ fn value_base64_encoded_pem_filtered(value: &str) -> bool {
     true
 }
 
+fn load_der_private_key(data: &[u8]) -> Option<PKey<Private>> {
+    PKey::private_key_from_der(data)
+        .ok()
+        .or_else(|| Pkcs12::from_der(data).ok()?.parse2("").ok()?.pkey)
+}
+
+fn rsa_private_key_roundtrip(key: &PKey<Private>) -> bool {
+    const DATA: &[u8] = b"CredSweeperRSAProbe";
+    let Ok(mut encrypter) = Encrypter::new(key) else {
+        return false;
+    };
+    if encrypter.set_rsa_padding(Padding::PKCS1_OAEP).is_err()
+        || encrypter.set_rsa_oaep_md(MessageDigest::sha1()).is_err()
+        || encrypter.set_rsa_mgf1_md(MessageDigest::sha1()).is_err()
+    {
+        return false;
+    }
+    let Ok(encrypted_len) = encrypter.encrypt_len(DATA) else {
+        return false;
+    };
+    let mut encrypted = vec![0u8; encrypted_len];
+    let Ok(encrypted_len) = encrypter.encrypt(DATA, &mut encrypted) else {
+        return false;
+    };
+    encrypted.truncate(encrypted_len);
+
+    let Ok(mut decrypter) = Decrypter::new(key) else {
+        return false;
+    };
+    if decrypter.set_rsa_padding(Padding::PKCS1_OAEP).is_err()
+        || decrypter.set_rsa_oaep_md(MessageDigest::sha1()).is_err()
+        || decrypter.set_rsa_mgf1_md(MessageDigest::sha1()).is_err()
+    {
+        return false;
+    }
+    let Ok(decrypted_len) = decrypter.decrypt_len(&encrypted) else {
+        return false;
+    };
+    let mut decrypted = vec![0u8; decrypted_len];
+    let Ok(decrypted_len) = decrypter.decrypt(&encrypted, &mut decrypted) else {
+        return false;
+    };
+    decrypted.truncate(decrypted_len);
+    decrypted == DATA
+}
+
+fn private_key_is_valid(key: &PKey<Private>) -> bool {
+    match key.id() {
+        Id::RSA | Id::RSA_PSS => rsa_private_key_roundtrip(key),
+        Id::EC | Id::DSA | Id::DH | Id::DHX | Id::ED448 | Id::ED25519 | Id::X448 | Id::X25519 => {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn value_base64_key_filtered(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut cleaned = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && bytes
+                .get(index + 1)
+                .is_some_and(|byte| matches!(byte, b't' | b'n' | b'r' | b'v' | b'f'))
+        {
+            index += 2;
+            continue;
+        }
+        let Some(ch) = value[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+        if !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c') {
+            cleaned.push(ch);
+        }
+    }
+    cleaned = cleaned
+        .replace("'+'", "")
+        .replace("\"+\"", "")
+        .replace("%2B", "+")
+        .replace("%2F", "/")
+        .replace("%3D", "=")
+        .replace(['"', '\'', '\\'], "");
+    let Some(key) = decode_base64_standard_like_upstream(&cleaned) else {
+        return true;
+    };
+    load_der_private_key(&key).is_none_or(|key| !private_key_is_valid(&key))
+}
+
+fn decode_base64_standard_like_upstream(value: &str) -> Option<Vec<u8>> {
+    let mut value = value.to_string();
+    while value.ends_with('=') {
+        value.pop();
+    }
+    if !value.len().is_multiple_of(4) {
+        value.extend(std::iter::repeat_n('=', 4 - value.len() % 4));
+    }
+    BASE64.decode(value.as_bytes()).ok()
+}
+
 fn sanitize_pem_line(line: &str, recurse: usize) -> String {
     if recurse == 0 {
         return line.to_string();
@@ -2225,6 +2332,9 @@ fn accept_value(
             return false;
         }
         if filter == "ValueBase64EncodedPem" && value_base64_encoded_pem_filtered(value) {
+            return false;
+        }
+        if filter == "ValueBase64KeyCheck" && value_base64_key_filtered(value) {
             return false;
         }
         if filter == "ValueBase64PartCheck"
@@ -4183,14 +4293,8 @@ mod tests {
     fn unsupported_filter_coverage_is_explicit() {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
-        assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 1, "{stats:?}");
-        assert!(
-            stats
-                .unsupported_filter_types
-                .contains(&"ValueBase64KeyCheck".to_string()),
-            "{stats:?}"
-        );
+        assert_eq!(stats.unsupported_filter_invocations, 0, "{stats:?}");
+        assert!(stats.unsupported_filter_types.is_empty(), "{stats:?}");
     }
 
     #[test]
@@ -4356,6 +4460,23 @@ mod tests {
         assert_eq!(asn1_size(&[0x30, 0x80, 1, 2, 0, 0]), Some(6));
         assert_eq!(asn1_size(&[0x30, 0x03, 1, 2]), None);
         assert_eq!(asn1_size(&[0x31, 0x00]), None);
+    }
+
+    #[test]
+    fn value_base64_key_loads_and_checks_private_keys() {
+        let rsa = openssl::rsa::Rsa::generate(1024).unwrap();
+        let der = rsa.private_key_to_der().unwrap();
+        let encoded = BASE64.encode(&der);
+        assert!(!value_base64_key_filtered(&encoded));
+
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\\n");
+        assert!(!value_base64_key_filtered(&format!("'''{wrapped}'''")));
+        assert!(value_base64_key_filtered("MIIXXXXX"));
     }
 
     #[test]
