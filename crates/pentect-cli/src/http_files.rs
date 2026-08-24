@@ -181,8 +181,8 @@ pub(crate) fn protect_multipart_upload_with_plugins(
             } else if file.is_supported_image {
                 let protected = pentect_agent::redact_image_bytes_into_active_memory_store(content)
                     .map_err(|error| format!("file upload blocked: {error}"))?;
-                if let Some(protected) = protected {
-                    let media_type = image_media_type(&protected).ok_or_else(|| {
+                if let Some(mut protected) = protected {
+                    let media_type = image_media_type(&protected.bytes).ok_or_else(|| {
                         "file upload blocked: protected image has an unknown format".to_string()
                     })?;
                     output.extend_from_slice(
@@ -191,7 +191,11 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                         })?,
                     );
                     output.extend_from_slice(body_separator);
-                    extend_protected_output(&mut output, &protected)?;
+                    extend_protected_output(&mut output, &protected.bytes)?;
+                    protected.bytes.zeroize();
+                    // A Files API upload has no adjacent model-visible text
+                    // block in which to carry the opaque handles.
+                    coverage = Coverage::Partial;
                 } else {
                     output.extend_from_slice(headers);
                     output.extend_from_slice(body_separator);

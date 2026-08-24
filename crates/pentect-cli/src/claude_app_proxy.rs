@@ -1630,8 +1630,25 @@ fn mask_chat_value(
             crate::claude_http_proxy::mask_string(text, tool_result, masker)
         }
         serde_json::Value::Array(values) => {
-            for value in values {
-                mask_chat_value(value, tool_result, masker, files)?;
+            let original = std::mem::take(values);
+            for mut item in original {
+                let note = if item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.to_ascii_lowercase().contains("image"))
+                {
+                    match item.as_object_mut() {
+                        Some(object) => inspect_chat_image(object, files)?,
+                        None => None,
+                    }
+                } else {
+                    mask_chat_value(&mut item, tool_result, masker, files)?;
+                    None
+                };
+                values.push(item);
+                if let Some(text) = note {
+                    values.push(serde_json::json!({"type": "text", "text": text}));
+                }
             }
             Ok(())
         }
@@ -1642,7 +1659,7 @@ fn mask_chat_value(
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if kind.contains("image") {
-                inspect_chat_image(object, files)?;
+                let _ = inspect_chat_image(object, files)?;
                 return Ok(());
             }
             if kind.contains("file") || kind.contains("document") || looks_like_chat_file(object) {
@@ -1671,13 +1688,13 @@ fn mask_chat_value(
 fn inspect_chat_image(
     object: &mut serde_json::Map<String, serde_json::Value>,
     files: &HashMap<String, crate::http_files::Coverage>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if chat_file_reference(object)
         .and_then(|id| files.get(id))
         .copied()
         == Some(crate::http_files::Coverage::Full)
     {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(source) = object
         .get_mut("source")
@@ -1690,35 +1707,37 @@ fn inspect_chat_image(
                 .is_some_and(|media_type| media_type.starts_with("image/"))
         {
             let Some(serde_json::Value::String(encoded)) = source.get_mut("data") else {
-                return unscanned_chat_image();
+                return unscanned_chat_image().map(|_| None);
             };
             if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(encoded)? {
-                *encoded = protected;
+                *encoded = protected.data;
                 source.insert(
                     "media_type".to_string(),
                     serde_json::Value::String("image/png".to_string()),
                 );
+                return Ok(Some(protected.note));
             }
-            return Ok(());
+            return Ok(None);
         }
-        return unscanned_chat_image();
+        return unscanned_chat_image().map(|_| None);
     }
     let key = ["image_url", "url", "data"]
         .into_iter()
         .find(|key| object.contains_key(*key));
     let Some(serde_json::Value::String(url)) = key.and_then(|key| object.get_mut(key)) else {
-        return unscanned_chat_image();
+        return unscanned_chat_image().map(|_| None);
     };
     let Some((metadata, encoded)) = url.split_once(',') else {
-        return unscanned_chat_image();
+        return unscanned_chat_image().map(|_| None);
     };
     if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
-        return unscanned_chat_image();
+        return unscanned_chat_image().map(|_| None);
     }
     if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(encoded)? {
-        *url = format!("data:image/png;base64,{protected}");
+        *url = format!("data:image/png;base64,{}", protected.data);
+        return Ok(Some(protected.note));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn inspect_chat_document(

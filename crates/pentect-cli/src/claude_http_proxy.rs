@@ -1538,15 +1538,21 @@ fn redact_content_images(
     let Value::Array(blocks) = content else {
         return Ok(());
     };
-    for block in blocks {
-        match block.get("type").and_then(Value::as_str) {
-            Some("image") => redact_base64_image_block(block, files)?,
+    let original = std::mem::take(blocks);
+    for mut block in original {
+        let note = match block.get("type").and_then(Value::as_str) {
+            Some("image") => redact_base64_image_block(&mut block, files)?,
             Some("tool_result") => {
                 if let Some(nested) = block.get_mut("content") {
                     redact_content_images(nested, files)?;
                 }
+                None
             }
-            _ => {}
+            _ => None,
+        };
+        blocks.push(block);
+        if let Some(text) = note {
+            blocks.push(serde_json::json!({"type": "text", "text": text}));
         }
     }
     Ok(())
@@ -1555,12 +1561,12 @@ fn redact_content_images(
 fn redact_base64_image_block(
     block: &mut Value,
     files: &HashMap<String, crate::http_files::Coverage>,
-) -> Result<(), String> {
-    let block_unscanned = || -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    let block_unscanned = || -> Result<Option<String>, String> {
         if pentect_agent::unscanned_images_should_block()? {
             Err("image blocked: image source could not be scanned".to_string())
         } else {
-            Ok(())
+            Ok(None)
         }
     };
     let Some(source) = block.get_mut("source") else {
@@ -1575,7 +1581,7 @@ fn redact_base64_image_block(
                 .and_then(Value::as_str)
                 .is_some_and(|id| files.get(id) == Some(&crate::http_files::Coverage::Full)) =>
         {
-            return Ok(());
+            return Ok(None);
         }
         // URL sources have already been replaced by the constrained remote
         // fetcher. Unknown Files API references follow the media policy.
@@ -1591,14 +1597,21 @@ fn redact_base64_image_block(
         // A successfully scanned image with no detected secret is unchanged.
         // The runtime returns an error for unscannable images when policy is
         // block, so `None` here is the clean-image result.
-        return Ok(());
+        return Ok(None);
     };
-    source["data"] = Value::String(protected);
+    source["data"] = Value::String(protected.data);
     source["media_type"] = Value::String("image/png".to_string());
-    Ok(())
+    Ok(Some(protected.note))
 }
 
-pub(crate) fn redact_inline_image_data(encoded: &str) -> Result<Option<String>, String> {
+pub(crate) struct ProtectedInlineImage {
+    pub(crate) data: String,
+    pub(crate) note: String,
+}
+
+pub(crate) fn redact_inline_image_data(
+    encoded: &str,
+) -> Result<Option<ProtectedInlineImage>, String> {
     let mut bytes = match data_encoding::BASE64.decode(encoded.as_bytes()) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -1614,9 +1627,12 @@ pub(crate) fn redact_inline_image_data(encoded: &str) -> Result<Option<String>, 
     let Some(mut redacted) = redacted? else {
         return Ok(None);
     };
-    let protected = data_encoding::BASE64.encode(&redacted);
-    redacted.zeroize();
-    Ok(Some(protected))
+    let protected = data_encoding::BASE64.encode(&redacted.bytes);
+    redacted.bytes.zeroize();
+    Ok(Some(ProtectedInlineImage {
+        data: protected,
+        note: redacted.note,
+    }))
 }
 
 fn mask_content(
