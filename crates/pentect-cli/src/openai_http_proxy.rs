@@ -1349,6 +1349,9 @@ fn visit_chat_messages(value: &Value) -> Option<&str> {
 }
 
 fn inject_handle_contract(value: &mut Value) {
+    if !request_contains_masked_handle(value) {
+        return;
+    }
     if value.get("messages").is_some() {
         inject_chat_handle_contract(value);
         return;
@@ -1362,6 +1365,15 @@ fn inject_handle_contract(value: &mut Value) {
             value["instructions"] = Value::String(HANDLE_CONTRACT.to_string());
         }
         _ => {}
+    }
+}
+
+fn request_contains_masked_handle(value: &Value) -> bool {
+    match value {
+        Value::String(text) => pentect_agent::contains_pentect_masked_handle(text),
+        Value::Array(values) => values.iter().any(request_contains_masked_handle),
+        Value::Object(object) => object.values().any(request_contains_masked_handle),
+        _ => false,
     }
 }
 

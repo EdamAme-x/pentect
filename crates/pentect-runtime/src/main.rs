@@ -3200,7 +3200,7 @@ fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, Str
     Ok(resolved)
 }
 
-fn contains_pentect_masked_handle(text: &str) -> bool {
+pub fn contains_pentect_masked_handle(text: &str) -> bool {
     let mut offset = 0usize;
     while let Some(start_rel) = text[offset..].find("<<") {
         let start = offset + start_rel;
