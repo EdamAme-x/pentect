@@ -3310,14 +3310,10 @@ mod tests {
             .as_str()
             .unwrap();
         let arguments: Value = serde_json::from_str(arguments).unwrap();
-        assert!(
-            arguments["command"].as_str().is_some_and(|command| {
-                command
-                    .strip_prefix("echo ")
-                    .is_some_and(|value| value == secret)
-            }),
-            "trusted shell argument was not restored"
-        );
+        let command = arguments["command"].as_str().unwrap();
+        assert!(!command.contains(&secret), "{command}");
+        assert!(!command.contains(&handle), "{command}");
+        assert!(command.contains("script-b64"), "{command}");
     }
 
     #[test]
