@@ -34,6 +34,15 @@ static BUILTIN: LazyLock<CredSweeperNativeDetector> = LazyLock::new(|| {
 });
 static BUILTIN_STATS: LazyLock<CredSweeperNativeStats> =
     LazyLock::new(|| audit_builtin_stats().expect("embedded CredSweeper assets compile"));
+static CREDSWEEPER_BASE64: LazyLock<data_encoding::Encoding> = LazyLock::new(|| {
+    let mut specification = BASE64.specification();
+    // Python's base64.b64decode(validate=True), used by CredSweeper, validates
+    // the alphabet and padding but accepts non-zero unused trailing bits.
+    specification.check_trailing_bits = false;
+    specification
+        .encoding()
+        .expect("CredSweeper-compatible base64 specification")
+});
 
 #[derive(Clone)]
 pub struct CredSweeperNativeDetector {
@@ -1120,6 +1129,24 @@ fn keyword_structured_candidates<'a>(
             continue;
         }
         let variable_end = separator_start;
+        let mut typed_annotation = false;
+        if text.as_bytes().get(separator_start) == Some(&b':') {
+            let annotation_start = separator_start + 1;
+            if let Some(relative) = text[annotation_start..].find('=') {
+                let assignment = annotation_start + relative;
+                let annotation = &text[annotation_start..assignment];
+                if !annotation.trim().is_empty()
+                    && annotation.chars().all(|ch| {
+                        ch.is_alphanumeric()
+                            || ch.is_whitespace()
+                            || matches!(ch, '_' | '.' | '?' | '<' | '>' | '[' | ']' | ',')
+                    })
+                {
+                    separator_start = assignment;
+                    typed_annotation = true;
+                }
+            }
+        }
         let mut cursor = separator_start + 1;
         while text
             .as_bytes()
@@ -1142,7 +1169,7 @@ fn keyword_structured_candidates<'a>(
             prefix.to_ascii_lowercase().as_str(),
             "" | "b" | "r" | "br" | "rb" | "u" | "t" | "f" | "rf" | "fr" | "l"
         );
-        if valid_prefix && !prefix.is_empty() && !has_existing {
+        if valid_prefix && !has_existing && (!prefix.is_empty() || typed_annotation) {
             if let Some(&quote) = text
                 .as_bytes()
                 .get(cursor)
@@ -2148,6 +2175,7 @@ fn pem_private_key_line_data(
             continue;
         }
 
+        let line = &text[line_start..line_end.min(end)];
         let sanitized = sanitize_pem_line(line, 5);
         let valuable = sanitized.contains("-----END")
             || (!sanitized.is_empty() && sanitized.bytes().all(is_pem_base64_byte));
@@ -2390,6 +2418,14 @@ fn sanitize_pem_line(line: &str, recurse: usize) -> String {
         return line.to_string();
     }
     let mut line = line.trim().to_string();
+    while line.contains("\\\\") {
+        line = line.replace("\\\\", "\\");
+    }
+    line = line
+        .replace("\\r\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t");
     while line.starts_with("// ") || line.starts_with("//\t") {
         line = line[3..].to_string();
     }
@@ -3627,10 +3663,11 @@ fn decode_base64_like_upstream(value: &str) -> Option<Vec<u8>> {
         value.extend(std::iter::repeat_n('=', 4 - value.len() % 4));
     }
     if value.contains(['-', '_']) {
-        BASE64URL.decode(value.as_bytes()).ok()
-    } else {
-        BASE64.decode(value.as_bytes()).ok()
+        // Python's altchars mode accepts both the standard and URL-safe
+        // alphabet in one value. Translate only the URL-safe alternatives.
+        value = value.replace('-', "+").replace('_', "/");
     }
+    CREDSWEEPER_BASE64.decode(value.as_bytes()).ok()
 }
 
 fn json_is_truthy(value: &serde_json::Value) -> bool {
@@ -5408,6 +5445,73 @@ mod tests {
         let malformed =
             BASE64.encode(b"-----BEGIN PRIVATE KEY-----\nQUJDREVGRw==\n-----END PRIVATE KEY-----");
         assert!(value_base64_encoded_pem_filtered(&malformed));
+    }
+
+    #[test]
+    fn pem_sanitize_treats_escaped_line_separators_like_credsweeper() {
+        assert_eq!(
+            sanitize_pem_line(r#"                "QUJDREVGRw==\n" +"#, 5),
+            "QUJDREVGRw=="
+        );
+        assert_eq!(
+            sanitize_pem_line(r#"                "\tQUJDREVGRw==\r\n" +"#, 5),
+            "QUJDREVGRw=="
+        );
+    }
+
+    #[test]
+    fn pem_line_data_stops_at_the_candidate_end() {
+        let text = "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----`)";
+        let begin = text.find("-----BEGIN").unwrap();
+        let header_end = text.find("-----\n").unwrap() + 5;
+        let end =
+            text.find("-----END PRIVATE KEY-----").unwrap() + "-----END PRIVATE KEY-----".len();
+        let lines = pem_private_key_line_data(text, begin, header_end, end);
+        assert_eq!(lines.last().unwrap().value, "-----END PRIVATE KEY-----");
+    }
+
+    #[test]
+    fn long_json_web_token_pattern_does_not_hit_the_regex_runtime_limit() {
+        let source = r"(?P<value>eyJ[=0-9A-Za-z_+/-]{15,8000}(\.[=0-9A-Za-z_+/-]{0,8000}){2,16})(?![=0-9A-Za-z_-])";
+        let token = format!(
+            "eyJ{}.eyJ{}.{}",
+            "A".repeat(67),
+            "B".repeat(663),
+            "C".repeat(322)
+        );
+        let PatternMatcher::Deferred(regex) = compile_pattern(source).unwrap() else {
+            panic!("JWT must use the deferred regex matcher");
+        };
+        let input = format!("{token}\"");
+        let matches = regex.find(&input, true);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].value, token);
+    }
+
+    #[test]
+    fn credsweeper_base64_accepts_python_compatible_trailing_bits_and_altchars() {
+        assert_eq!(decode_base64_like_upstream("YR=="), Some(b"a".to_vec()));
+        assert_eq!(
+            decode_base64_like_upstream("-___"),
+            decode_base64_like_upstream("+///")
+        );
+    }
+
+    #[test]
+    fn structured_keyword_parser_handles_typed_quoted_declarations() {
+        let keyword = FancyRegex::new("(?is:token(?!ize))").unwrap();
+        let value = "A".repeat(96);
+        let line = format!(r#"private val api_token: String = " {value}""#);
+        let candidates = keyword_structured_candidates(&line, &keyword, &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].variable, Some("api_token"));
+        assert_eq!(candidates[0].separator, Some("="));
+        assert_eq!(candidates[0].value, format!(" {value}"));
+
+        assert!(
+            keyword_structured_candidates("private val api_token: String", &keyword, &[])
+                .is_empty()
+        );
     }
 
     #[test]
