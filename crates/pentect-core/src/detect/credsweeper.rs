@@ -332,10 +332,27 @@ fn filter_name(filter: &str) -> &str {
     filter.split_once('(').map_or(filter, |(name, _)| name)
 }
 
+fn line_git_binary_filtered(line: &str) -> bool {
+    let line = line.trim();
+    let bytes = line.as_bytes();
+    if bytes.len() > 66 || bytes.len() < 6 || !(bytes.len() - 1).is_multiple_of(5) {
+        return false;
+    }
+    let size = match bytes[0] {
+        b'A'..=b'Z' => usize::from(bytes[0] - 64),
+        b'a'..=b'z' => usize::from(bytes[0] - 70),
+        _ => return false,
+    };
+    const BASE85: &[u8] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+    bytes[1..].iter().all(|byte| BASE85.contains(byte)) && (bytes.len() - 1) / 5 * 4 == size
+}
+
 fn filter_has_native_handler(filter: &str) -> bool {
     matches!(
         filter_name(filter),
-        "LineSpecificKeyCheck"
+        "LineGitBinaryCheck"
+            | "LineSpecificKeyCheck"
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
             | "ValueBasicAuthCheck"
@@ -2056,6 +2073,9 @@ fn accept_value(
         return false;
     }
     for filter in &rule.filter_types {
+        if filter == "LineGitBinaryCheck" && line_git_binary_filtered(line) {
+            return false;
+        }
         if filter == "LineSpecificKeyCheck"
             && line_specific_key_filtered(line, value_start, value_end)
         {
@@ -3034,7 +3054,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 22, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 21, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3597,6 +3617,24 @@ mod tests {
         }
         let quoted = test_candidate("my<password", None, Some("\""), Some("\""));
         assert!(!value_token_filtered(quoted.value, &quoted));
+    }
+
+    #[test]
+    fn line_git_binary_check_matches_upstream_examples() {
+        for line in [
+            "zxNdj)EYlS}b8JGyg7Pw=wujtWvwg9)mv+;vvr}dADtX-(^(6N+C(YT)lWLG7tdu$7",
+            "HcmV?d00001",
+            "  HcmV?d00001  ",
+        ] {
+            assert!(line_git_binary_filtered(line), "{line:?}");
+        }
+        for line in [
+            r#"{"test":1,"pw":"sn2e8dgWwW","payload":"EYlS}b+C(YT)lWLGxNdj7Pw=w"}"#,
+            "XcmV?d00001",
+            "HcmV?d0000/",
+        ] {
+            assert!(!line_git_binary_filtered(line), "{line:?}");
+        }
     }
 
     fn test_candidate<'a>(
