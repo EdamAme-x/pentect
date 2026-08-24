@@ -9,6 +9,53 @@ pub(crate) struct SecureTempFile {
     path: PathBuf,
 }
 
+#[derive(Debug)]
+pub(crate) struct SecureTempDirectory {
+    path: PathBuf,
+}
+
+impl SecureTempDirectory {
+    pub(crate) fn create(prefix: &str, purpose: &str) -> Result<Self, String> {
+        validate_name_part(prefix)?;
+        let parent = std::env::temp_dir();
+        let mut nonce = [0_u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| format!("OS CSPRNG unavailable for {purpose}: {error}"))?;
+        let path = parent.join(format!(
+            "{prefix}{}-{}",
+            std::process::id(),
+            data_encoding::HEXLOWER.encode(&nonce)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(|error| {
+            format!(
+                "could not create protected {purpose} directory ({}): {error}",
+                path.display()
+            )
+        })?;
+        if let Err(error) = restrict_to_current_user(&path) {
+            let _ = std::fs::remove_dir(&path);
+            return Err(error);
+        }
+        Ok(Self { path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SecureTempDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
 impl SecureTempFile {
     pub(crate) fn create(
         directory: &Path,
@@ -217,5 +264,30 @@ mod tests {
         let directory = directory();
         assert!(SecureTempFile::create(&directory, "../bad", ".json", b"", "test").is_err());
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn private_directory_is_removed_on_drop() {
+        let directory = SecureTempDirectory::create("pentect-test-", "test").unwrap();
+        let path = directory.path().to_path_buf();
+        assert!(path.is_dir());
+        drop(directory);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = SecureTempDirectory::create("pentect-test-", "test").unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
