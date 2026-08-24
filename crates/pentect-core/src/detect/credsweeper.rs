@@ -378,6 +378,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
             | "ValueAtlassianTokenCheck"
+            | "ValueBase64EncodedPem"
             | "ValueBase64PartCheck"
             | "ValueAzureTokenCheck"
             | "ValueBase32DataCheck"
@@ -1383,7 +1384,81 @@ fn valid_pem_private_key_block(block: &str) -> bool {
         }
         key_data.push_str(&line);
     }
-    saw_end && decodes_as_pem_payload(&key_data)
+    saw_end && pem_payload_is_valid(block, &key_data)
+}
+
+fn asn1_size(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 || data[0] != 0x30 {
+        return None;
+    }
+    let first = data[1];
+    if first == 0x80 {
+        return data.ends_with(&[0, 0]).then_some(data.len());
+    }
+    if first > 0x80 {
+        let byte_len = usize::from(first & 0x7f);
+        let length_end = 2usize.checked_add(byte_len)?;
+        if byte_len > 4 || data.len() < length_end {
+            return None;
+        }
+        let length = data[2..length_end]
+            .iter()
+            .try_fold(0usize, |length, byte| {
+                length.checked_shl(8)?.checked_add(usize::from(*byte))
+            })?;
+        let total = length.checked_add(length_end)?;
+        return (data.len() >= total).then_some(total);
+    }
+    let total = usize::from(first) + 2;
+    (data.len() >= total).then_some(total)
+}
+
+fn pem_payload_is_valid(header: &str, value: &str) -> bool {
+    if header.contains("PGP") {
+        return shannon_entropy(value) >= 4.5;
+    }
+    let Some(decoded) = decode_base64_like_upstream(value) else {
+        return false;
+    };
+    if header.contains("OPENSSH") {
+        return decoded.len() > 32 && !decoded.windows(6).any(|window| window == b"bcrypt");
+    }
+    asn1_size(&decoded) == Some(decoded.len())
+}
+
+fn value_base64_encoded_pem_filtered(value: &str) -> bool {
+    let Some(decoded) = decode_base64_like_upstream(value) else {
+        return true;
+    };
+    let Ok(text) = std::str::from_utf8(&decoded) else {
+        return true;
+    };
+    let mut pem = String::new();
+    for line in text.lines() {
+        if pem.is_empty() {
+            let Some(begin) = line.find("-----BEGIN") else {
+                continue;
+            };
+            let header = &line[begin..line.len().min(begin + 8000)];
+            if !header.contains("PRIVATE")
+                || !header.contains("KEY")
+                || header.contains("ENCRYPTED")
+            {
+                continue;
+            }
+            pem.push_str(header);
+        } else {
+            pem.push('\n');
+            pem.push_str(line);
+        }
+        if line.contains("-----END") {
+            if valid_pem_private_key_block(&pem) {
+                return false;
+            }
+            pem.clear();
+        }
+    }
+    true
 }
 
 fn sanitize_pem_line(line: &str, recurse: usize) -> String {
@@ -1436,25 +1511,6 @@ fn sanitize_pem_line(line: &str, recurse: usize) -> String {
         return sanitize_pem_line(&trimmed, recurse - 1);
     }
     trimmed
-}
-
-fn decodes_as_pem_payload(value: &str) -> bool {
-    if value.len() < 64 {
-        return false;
-    }
-    let padded = match value.len() % 4 {
-        0 => Cow::Borrowed(value),
-        2 => Cow::Owned(format!("{value}==")),
-        3 => Cow::Owned(format!("{value}=")),
-        _ => return false,
-    };
-    BASE64
-        .decode(padded.as_bytes())
-        .or_else(|_| BASE64_NOPAD.decode(value.trim_end_matches('=').as_bytes()))
-        .map_or_else(
-            |_| shannon_entropy(value) >= 3.5,
-            |decoded| decoded.len() > 32,
-        )
 }
 
 fn is_pem_base64_byte(byte: u8) -> bool {
@@ -2166,6 +2222,9 @@ fn accept_value(
             return false;
         }
         if filter == "ValueAtlassianTokenCheck" && value_atlassian_token_filtered(value) {
+            return false;
+        }
+        if filter == "ValueBase64EncodedPem" && value_base64_encoded_pem_filtered(value) {
             return false;
         }
         if filter == "ValueBase64PartCheck"
@@ -4125,11 +4184,11 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 2, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 1, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
-                .contains(&"ValueBase64EncodedPem".to_string()),
+                .contains(&"ValueBase64KeyCheck".to_string()),
             "{stats:?}"
         );
     }
@@ -4272,6 +4331,31 @@ mod tests {
             Some("ordinary text\n"),
             Some("more text\n")
         ));
+    }
+
+    #[test]
+    fn value_base64_encoded_pem_requires_official_pem_payload_structure() {
+        let mut der = vec![0x30, 0x81, 0x80];
+        der.extend(std::iter::repeat_n(0x42, 128));
+        let body = BASE64.encode(&der);
+        let pem = format!(
+            "prefix\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\nsuffix"
+        );
+        let encoded = BASE64.encode(pem.as_bytes());
+        assert!(!value_base64_encoded_pem_filtered(&encoded));
+
+        let malformed =
+            BASE64.encode(b"-----BEGIN PRIVATE KEY-----\nQUJDREVGRw==\n-----END PRIVATE KEY-----");
+        assert!(value_base64_encoded_pem_filtered(&malformed));
+    }
+
+    #[test]
+    fn asn1_size_matches_credsweeper_length_rules() {
+        assert_eq!(asn1_size(&[0x30, 0x03, 1, 2, 3]), Some(5));
+        assert_eq!(asn1_size(&[0x30, 0x81, 0x02, 1, 2]), Some(5));
+        assert_eq!(asn1_size(&[0x30, 0x80, 1, 2, 0, 0]), Some(6));
+        assert_eq!(asn1_size(&[0x30, 0x03, 1, 2]), None);
+        assert_eq!(asn1_size(&[0x31, 0x00]), None);
     }
 
     #[test]
