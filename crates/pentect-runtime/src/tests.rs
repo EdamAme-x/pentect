@@ -383,6 +383,60 @@ fn direct_program_receives_a_known_secret_only_on_stdin() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn secret_stdin_does_not_create_an_inherited_binding_for_a_descendant() {
+    let root = temp_root("secret-stdin-descendant");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked.split_once('=').unwrap().1.trim().to_string();
+    let binding_name = store
+        .auto_env_bindings()
+        .unwrap()
+        .into_iter()
+        .find_map(|(name, value)| (value == raw).then_some(name))
+        .unwrap();
+    let descendant_env = root.join("descendant.env");
+    let script = format!(
+        "secret=$(cat); printf 'TARGET=%s' \"$secret\"; sh -c 'env > \"$1\"' sh '{}'",
+        descendant_env.display()
+    );
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: false,
+        secret_stdin: Some(handle),
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["sh".to_string(), "-c".to_string(), script]),
+    };
+
+    let output = run_resolved_command(&store, &opts).unwrap();
+    assert!(
+        output.status.success(),
+        "descendant fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("TARGET={raw}")
+    );
+    let inherited = std::fs::read_to_string(&descendant_env).unwrap();
+    assert!(!inherited.contains(raw), "descendant inherited plaintext");
+    assert!(
+        !inherited
+            .lines()
+            .any(|line| line.starts_with(&format!("{binding_name}="))),
+        "descendant inherited the Pentect binding"
+    );
+    let safe = mask_tool_output(&session, &String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(!safe.contains(raw), "masked stdout exposed plaintext");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn resolve_parse_accepts_multiple_paths() {
     let args = strings(["pentect", "resolve", "a.env", "b.env"]);
