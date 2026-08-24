@@ -247,9 +247,8 @@ impl ActivatedWindowsProcess {
 
     fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, String> {
         use std::os::windows::process::ExitStatusExt;
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, WaitForSingleObject, WAIT_OBJECT_0, WAIT_TIMEOUT,
-        };
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
         let result = unsafe { WaitForSingleObject(self.handle, 0) };
         if result == WAIT_TIMEOUT {
             return Ok(None);
@@ -265,7 +264,8 @@ impl ActivatedWindowsProcess {
     }
 
     fn wait(&self) -> Result<std::process::ExitStatus, String> {
-        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE, WAIT_OBJECT_0};
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
         if unsafe { WaitForSingleObject(self.handle, INFINITE) } != WAIT_OBJECT_0 {
             return Err("could not wait for activated Claude Desktop process".to_string());
         }
@@ -289,7 +289,7 @@ fn activate_windows_package(
     aumid: &str,
     arguments: &[String],
 ) -> Result<ActivatedWindowsProcess, String> {
-    use windows::core::{Interface, PCWSTR};
+    use windows::core::PCWSTR;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER,
         COINIT_APARTMENTTHREADED,
@@ -297,9 +297,8 @@ fn activate_windows_package(
     use windows::Win32::UI::Shell::{
         ApplicationActivationManager, IApplicationActivationManager, AO_NONE,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     initialized
@@ -329,7 +328,13 @@ fn activate_windows_package(
             )
         }
         .map_err(|error| format!("could not activate Claude Desktop package: {error}"))?;
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, id) };
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+                0,
+                id,
+            )
+        };
         if handle.is_null() {
             return Err(
                 "Claude Desktop activated but its process could not be observed".to_string(),
@@ -2403,10 +2408,9 @@ fn appx_application_id(path: &Path) -> Result<String, String> {
             {
                 for attribute in element.attributes().flatten() {
                     if attribute.key.local_name().as_ref() == b"Id" {
-                        let value = attribute
-                            .unescape_value()
+                        let value = std::str::from_utf8(attribute.value.as_ref())
                             .map_err(|_| "Claude application ID is invalid".to_string())?
-                            .into_owned();
+                            .to_string();
                         if !value.is_empty()
                             && value.len() <= 128
                             && value
