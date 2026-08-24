@@ -3,7 +3,7 @@ use super::Detector;
 use crate::model::{ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use data_encoding::{BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
+use data_encoding::{BASE32, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex as RustRegex;
 use std::borrow::Cow;
@@ -377,6 +377,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "LineUUEPartCheck"
             | "ValueAllowlistCheck"
             | "ValueArrayDictionaryCheck"
+            | "ValueBase32DataCheck"
             | "ValueBasicAuthCheck"
             | "ValueBlocklistCheck"
             | "ValueCamelCaseCheck"
@@ -2150,6 +2151,9 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueBase32DataCheck" && value_base32_data_filtered(value) {
+            return false;
+        }
         if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
             return false;
         }
@@ -2255,6 +2259,68 @@ fn value_array_dictionary_filtered(value: &str, candidate: &Candidate<'_>) -> bo
         RustRegex::new(r#"\[['\"]?[^,]+['\"]?]"#).expect("CredSweeper array/dictionary call regex")
     });
     ARRAY_OR_DICTIONARY_CALL.is_match(value) || wrap.ends_with('[') || wrap.ends_with('(')
+}
+
+fn value_base32_data_filtered(value: &str) -> bool {
+    if !value.bytes().any(|byte| byte.is_ascii_digit())
+        || !value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return true;
+    }
+    let mut padded = value.to_string();
+    if !padded.len().is_multiple_of(8) {
+        padded.extend(std::iter::repeat_n('=', 8 - padded.len() % 8));
+    }
+    BASE32
+        .decode(padded.as_bytes())
+        .map_or(true, |decoded| ascii_entropy_filtered(&decoded))
+}
+
+fn ascii_entropy_filtered(data: &[u8]) -> bool {
+    if data.len() < 9 || data.iter().all(u8::is_ascii) {
+        return true;
+    }
+    let mut cells = [0usize; 256];
+    for byte in data {
+        cells[usize::from(*byte)] += 1;
+    }
+    let mut entropy = 0.0;
+    let step = 256.0 / data.len() as f64;
+    let (mut left, mut right) = (0.0, step);
+    while left < 256.0 {
+        let start = left as usize;
+        let end = (right as usize).min(256);
+        let count = cells[start..end].iter().sum::<usize>();
+        let probability = count as f64 / data.len() as f64;
+        if probability > 0.0 {
+            entropy -= probability * probability.log2();
+        }
+        left = right;
+        right += step;
+    }
+    entropy < minimum_data_entropy(data.len())
+}
+
+fn minimum_data_entropy(len: usize) -> f64 {
+    match len {
+        16 => 1.669_736_717_803_48,
+        20 => 2.077_235_445_408_31,
+        32 => 3.253_928_031_846_02,
+        40 => 3.648_535_670_648_67,
+        64 => 4.577_569_336_880_35,
+        384 => 7.39,
+        512 => 7.55,
+        9..=63 => {
+            let x = (len - 8) as f64;
+            ((0.000_016_617_804 * x - 0.002_695_077) * x + 0.170_393) * x + 0.4
+        }
+        65..=383 => 1.095_884 * ((len - 8) as f64).log2() - 1.901_56,
+        385..=511 => {
+            let log = (len as f64).log2();
+            -0.112_158_51 * log * log + 2.343_034_84 * log - 4.446_623_7
+        }
+        _ => 0.0,
+    }
 }
 
 fn value_allowlist_filtered(value: &str, is_well_quoted: bool) -> bool {
@@ -3260,7 +3326,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 17, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 16, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3899,6 +3965,41 @@ mod tests {
                 .collect::<String>();
             let _ = entropy_base32_filtered(&value);
         }
+    }
+
+    #[test]
+    fn value_base32_data_check_matches_upstream_examples() {
+        for value in [
+            "SUAML2GCZ7IK7E7UD4VZ7ELPZW7DK2ZNL35WSMW3IORHC3BWBSDQXUQRBU",
+            "WXFES7QNTET5DQYC",
+        ] {
+            assert!(!value_base32_data_filtered(value), "{value:?}");
+        }
+        for value in [
+            "PMRGSZBCHIYTEM35",
+            "ABCDEFGHIJKLMNOP",
+            "5555555555555555",
+            "GAYDAMBQGAYDAMBQ",
+            "invalid1!",
+        ] {
+            assert!(value_base32_data_filtered(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn minimum_data_entropy_matches_upstream_fixed_points() {
+        for (len, expected) in [
+            (16, 1.669_736_717_803_48),
+            (20, 2.077_235_445_408_31),
+            (32, 3.253_928_031_846_02),
+            (40, 3.648_535_670_648_67),
+            (64, 4.577_569_336_880_35),
+            (384, 7.39),
+            (512, 7.55),
+        ] {
+            assert_eq!(minimum_data_entropy(len), expected);
+        }
+        assert_eq!(minimum_data_entropy(8), 0.0);
     }
 
     #[test]
