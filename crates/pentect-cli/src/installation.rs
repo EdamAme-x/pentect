@@ -1,6 +1,22 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+pub(crate) const NPM_PACKAGE_ROOT_ENV: &str = "PENTECT_NPM_PACKAGE_ROOT";
+pub(crate) const NPM_PROJECT_ROOT_ENV: &str = "PENTECT_NPM_PROJECT_ROOT";
+pub(crate) const NPM_SCOPE_ENV: &str = "PENTECT_NPM_SCOPE";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NpmScope {
+    Global,
+    Local(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NpmInstallation {
+    pub(crate) package_root: PathBuf,
+    pub(crate) scope: NpmScope,
+}
+
 pub(crate) const INSTALL_MARKER: &str = ".pentect-managed-install.json";
 const MAX_MARKER_BYTES: u64 = 4 * 1024;
 
@@ -40,6 +56,41 @@ impl ManagedInstallation {
             "the package manager that installed Pentect",
         )
     }
+}
+
+pub(crate) fn npm_installation() -> Result<NpmInstallation, String> {
+    let package_root = absolute_env_path(NPM_PACKAGE_ROOT_ENV)?;
+    if !package_root.join("package.json").is_file() {
+        return Err("npm package root does not contain package.json".to_string());
+    }
+    let scope = match std::env::var(NPM_SCOPE_ENV).as_deref() {
+        Ok("global") => NpmScope::Global,
+        Ok("local") => {
+            let project = absolute_env_path(NPM_PROJECT_ROOT_ENV)?;
+            if !project.join("package.json").is_file() {
+                return Err("npm project root does not contain package.json".to_string());
+            }
+            NpmScope::Local(project)
+        }
+        _ => {
+            return Err(
+                "npm installation scope is unavailable; reinstall the npm package".to_string(),
+            )
+        }
+    };
+    Ok(NpmInstallation {
+        package_root,
+        scope,
+    })
+}
+
+fn absolute_env_path(name: &str) -> Result<PathBuf, String> {
+    let path =
+        PathBuf::from(std::env::var_os(name).ok_or_else(|| format!("{name} is unavailable"))?);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be an absolute path"));
+    }
+    Ok(path)
 }
 
 fn instruction(manager: &str, action: &str, command: Option<&str>, fallback: &str) -> String {

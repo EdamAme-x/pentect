@@ -187,7 +187,7 @@ Treat redirected or in-place resolved output as plaintext secret material.
 | `pentect doctor --json` | Print results as JSON |
 | `pentect doctor --fix` | Show and apply approved fixes |
 | `pentect doctor --fix --yes` | Apply all offered fixes without another prompt |
-| `pentect update [VERSION]` | Install a verified GitHub Release binary |
+| `pentect update [VERSION]` | Update directly or through the recorded package manager |
 | `pentect update --check` | Check without installing |
 | `pentect update --force` | Reinstall even when the selected version is already present |
 | `pentect uninstall` | Remove Pentect but keep project data |

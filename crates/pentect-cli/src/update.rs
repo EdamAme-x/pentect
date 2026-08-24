@@ -3,7 +3,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -81,11 +80,7 @@ fn parse_update_options(args: &[String]) -> Result<UpdateOptions, String> {
 }
 
 fn update(options: UpdateOptions) -> Result<(), String> {
-    if let Some(installation) = crate::installation::current_installation()? {
-        if !installation.is_self_managed() {
-            return Err(installation.update_message());
-        }
-    }
+    let installation = crate::installation::current_installation()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -129,6 +124,16 @@ fn update(options: UpdateOptions) -> Result<(), String> {
         return Ok(());
     }
 
+    if let Some(installation) = installation
+        .as_ref()
+        .filter(|value| !value.is_self_managed())
+    {
+        if installation.manager == "npm" {
+            return install_npm_update(&latest);
+        }
+        return Err(installation.update_message());
+    }
+
     let binary_name = release_asset_name()?;
     let checksum_name = format!("{binary_name}.sha256");
     let binary = find_asset(&release, &binary_name)?;
@@ -162,6 +167,58 @@ fn update(options: UpdateOptions) -> Result<(), String> {
         ));
     }
     install_update(&bytes, &latest, &expected)
+}
+
+fn install_npm_update(version: &Version) -> Result<(), String> {
+    let installation = crate::installation::npm_installation()?;
+    let mut command = npm_update_command(&installation, version);
+    let status = command
+        .status()
+        .map_err(|error| format!("could not start npm update: {error}"))?;
+    if !status.success() {
+        return Err(format!("npm update failed with {status}"));
+    }
+    verify_npm_package_version(&installation.package_root, version)?;
+    println!("updated: {version}");
+    Ok(())
+}
+
+fn npm_update_command(
+    installation: &crate::installation::NpmInstallation,
+    version: &Version,
+) -> Command {
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let package = format!("pentect@{version}");
+    let mut command = Command::new(npm);
+    command.arg("install");
+    match &installation.scope {
+        crate::installation::NpmScope::Global => {
+            command.arg("--global");
+        }
+        crate::installation::NpmScope::Local(project) => {
+            command.current_dir(project);
+        }
+    }
+    command.arg(&package);
+    command
+}
+
+fn verify_npm_package_version(package_root: &Path, version: &Version) -> Result<(), String> {
+    let metadata = std::fs::read(package_root.join("package.json")).map_err(|error| {
+        format!("npm updated Pentect but its package metadata is unreadable: {error}")
+    })?;
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata).map_err(|error| {
+        format!("npm updated Pentect but its package metadata is invalid: {error}")
+    })?;
+    let installed = metadata.get("version").and_then(serde_json::Value::as_str);
+    let expected = version.to_string();
+    if installed != Some(expected.as_str()) {
+        return Err(format!(
+            "npm completed but installed version {} does not match {version}",
+            installed.unwrap_or("unknown")
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn download_latest_release_asset(
@@ -570,6 +627,7 @@ Remove-Item -LiteralPath $PSCommandPath -Force
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::installation::{NpmInstallation, NpmScope};
 
     #[test]
     fn parses_update_flags() {
@@ -630,5 +688,31 @@ mod tests {
             _ => None,
         });
         assert_eq!(token.as_deref(), Some("preferred"));
+    }
+
+    #[test]
+    fn builds_global_and_local_npm_updates_without_a_shell() {
+        let version = Version::new(1, 2, 3);
+        let global = NpmInstallation {
+            package_root: PathBuf::from("/npm/pentect"),
+            scope: NpmScope::Global,
+        };
+        let command = npm_update_command(&global, &version);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["install", "--global", "pentect@1.2.3"]
+        );
+        assert!(command.get_current_dir().is_none());
+
+        let local = NpmInstallation {
+            package_root: PathBuf::from("/project/node_modules/pentect"),
+            scope: NpmScope::Local(PathBuf::from("/project")),
+        };
+        let command = npm_update_command(&local, &version);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["install", "pentect@1.2.3"]
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/project")));
     }
 }

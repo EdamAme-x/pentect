@@ -75,7 +75,9 @@ workflow. A Nix flake lock file keeps the selected revision.
 
 ## Update
 
-Use the package manager that installed Pentect:
+Run `pentect update`. Pentect uses its installation record to update through
+the original package manager when required, including global and project-local
+npm installations.
 
 For AUR installations, select the update command matching the package you
 installed.
@@ -90,7 +92,7 @@ pentect update X.Y.Z
 ```
 
 ```sh [npm]
-npm update -g pentect
+pentect update
 ```
 
 ```sh [Homebrew]
