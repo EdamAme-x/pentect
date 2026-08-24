@@ -14,6 +14,7 @@ impl Detector for ExplicitSecretDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
         let bytes = text.as_bytes();
+        let closes = matching_parentheses(bytes);
         let mut spans = Vec::new();
         let mut cursor = 0usize;
 
@@ -22,28 +23,13 @@ impl Detector for ExplicitSecretDetector {
                 break;
             };
             let value_start = marker_start + prefix.len();
-            let mut depth = 1usize;
-            let mut close = value_start;
-            while close < bytes.len() {
-                match bytes[close] {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                close += 1;
-            }
-            if depth != 0 {
+            let Some(close) = closes[value_start - 1] else {
                 // A malformed marker must not disable explicit protection for
                 // the rest of the input. Resume after this prefix so a later
                 // complete pentect()/mask() marker can still be detected.
                 cursor = value_start;
                 continue;
-            }
+            };
 
             let raw_marker = view.to_raw(ByteRange::new(marker_start, value_start));
             let raw_close = view.to_raw(ByteRange::new(close, close + 1));
@@ -64,6 +50,23 @@ impl Detector for ExplicitSecretDetector {
 
         spans
     }
+}
+
+fn matching_parentheses(bytes: &[u8]) -> Vec<Option<usize>> {
+    let mut closes = vec![None; bytes.len()];
+    let mut opens = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => opens.push(index),
+            b')' => {
+                if let Some(open) = opens.pop() {
+                    closes[open] = Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    closes
 }
 
 fn next_explicit_marker(text: &str, cursor: usize) -> Option<(usize, &'static str)> {
@@ -125,6 +128,17 @@ mod tests {
     fn continues_after_an_unclosed_marker() {
         let text = "pentect(unclosed then mask(protect-me)";
         let spans = detect(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            &text[spans[0].range.start..spans[0].range.end],
+            "protect-me"
+        );
+    }
+
+    #[test]
+    fn many_unclosed_markers_do_not_hide_a_later_complete_marker() {
+        let text = format!("{}mask(protect-me)", "pentect(".repeat(10_000));
+        let spans = detect(&text);
         assert_eq!(spans.len(), 1);
         assert_eq!(
             &text[spans[0].range.start..spans[0].range.end],
