@@ -345,6 +345,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueEntropyBase36Check"
             | "ValueEntropyBase64Check"
             | "ValueFilePathCheck"
+            | "ValueHexNumberCheck"
             | "ValueMorphemesCheck"
             | "ValueNumberCheck"
             | "ValuePatternCheck"
@@ -2067,6 +2068,9 @@ fn accept_value(
         if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
             return false;
         }
+        if filter == "ValueHexNumberCheck" && value_hex_number_filtered(value) {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2216,6 +2220,16 @@ fn value_blocklist_filtered(value: &str) -> bool {
     NOT_ALLOWED
         .iter()
         .any(|word| lower.contains(word) && (*word).len() as f64 / lower.len().max(1) as f64 >= 0.7)
+}
+
+fn value_hex_number_filtered(value: &str) -> bool {
+    let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    else {
+        return false;
+    };
+    (1..=16).contains(&hex.len()) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -2811,7 +2825,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 29, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 28, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3235,6 +3249,22 @@ mod tests {
         assert!(value_array_dictionary_filtered("root", &array_wrap));
         let call_wrap = test_candidate("root", Some("values("), None, None);
         assert!(value_array_dictionary_filtered("root", &call_wrap));
+    }
+
+    #[test]
+    fn value_hex_number_check_matches_upstream_examples_and_boundaries() {
+        for value in ["0xaBcd1234", "0xAbCd098765432137", "0x0", "0XfF"] {
+            assert!(value_hex_number_filtered(value), "{value:?}");
+        }
+        for value in [
+            "0xabcdI234",
+            "0xabcd0987654321371",
+            "abcd1234",
+            "0x",
+            "-0x1",
+        ] {
+            assert!(!value_hex_number_filtered(value), "{value:?}");
+        }
     }
 
     fn test_candidate<'a>(
