@@ -2111,11 +2111,17 @@ where
         if let Some(object) = value.as_object_mut() {
             for key in ["command", "script", "code"] {
                 if let Some(Value::String(text)) = object.get_mut(key) {
-                    *text = resolve_shell_text_safely_with_context(
+                    *text = match pentect_agent::wrap_shell_command_from_active_memory_store(
+                        tool_name.unwrap_or("shell"),
                         text,
-                        allow_direct_posix_secrets,
-                        resolve,
-                    )?;
+                    )? {
+                        Some(wrapped) => wrapped,
+                        None => resolve_shell_text_safely_with_context(
+                            text,
+                            allow_direct_posix_secrets,
+                            resolve,
+                        )?,
+                    };
                 }
             }
             // Non-command metadata is structured data and remains safe to
@@ -2144,6 +2150,11 @@ pub(crate) fn resolve_shell_text_safely<R>(text: &str, resolve: &mut R) -> Resul
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    if let Some(wrapped) =
+        pentect_agent::wrap_shell_command_from_active_memory_store("exec_command", text)?
+    {
+        return Ok(wrapped);
+    }
     resolve_shell_text_safely_with_context(text, !cfg!(windows), resolve)
 }
 
@@ -3045,8 +3056,12 @@ mod tests {
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
-        assert!(openai_response.contains(&format!("python hash.py {secret}")));
+        assert!(
+            !openai_response.contains(secret.as_str()),
+            "{openai_response}"
+        );
         assert!(!openai_response.contains("<<PENTECT_E2E_TOKEN_"));
+        assert!(openai_response.contains("script-b64"), "{openai_response}");
         drop(openai_proxy);
         openai_thread.join().unwrap();
 
@@ -3078,11 +3093,12 @@ mod tests {
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
-        assert!(chat_response.contains(secret.as_str()), "{chat_response}");
+        assert!(!chat_response.contains(secret.as_str()), "{chat_response}");
         assert!(
             first_valid_handle(&chat_response).is_none(),
             "{chat_response}"
         );
+        assert!(chat_response.contains("script-b64"), "{chat_response}");
         drop(chat_proxy);
         chat_thread.join().unwrap();
 
@@ -3154,11 +3170,13 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
-        let (_, media_type, filename) = first_openai_file(&provider_body)
+        let (handle, media_type, filename) = first_openai_file(&provider_body)
             .expect("provider should receive the sanitized file and metadata");
         assert_eq!(media_type, "text/plain");
         assert_eq!(filename, "notes.txt");
-        assert!(file_response.contains(&format!("python hash.py {secret}")));
+        assert!(!file_response.contains(secret.as_str()), "{file_response}");
+        assert!(!file_response.contains(&handle), "{file_response}");
+        assert!(file_response.contains("script-b64"), "{file_response}");
         drop(file_proxy);
         file_thread.join().unwrap();
     }
