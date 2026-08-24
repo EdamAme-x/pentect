@@ -1714,7 +1714,14 @@ fn push_match(
     if range.is_empty() {
         return;
     }
-    if !accept_value(sanitized_value.value, rule, candidate) {
+    if !accept_value(
+        sanitized_value.value,
+        rule,
+        candidate,
+        line,
+        sanitized_value.start,
+        sanitized_value.end,
+    ) {
         return;
     }
     let sanitized_variable = candidate
@@ -1897,12 +1904,25 @@ fn rule_available_for_code_scan(rule: &NativeRule) -> bool {
     rule.targets.iter().any(|target| target == "code")
 }
 
-fn accept_value(value: &str, rule: &NativeRule, candidate: &Candidate<'_>) -> bool {
+fn accept_value(
+    value: &str,
+    rule: &NativeRule,
+    candidate: &Candidate<'_>,
+    line: &str,
+    value_start: usize,
+    value_end: usize,
+) -> bool {
     let value = value.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
     if value.len() < 4 || is_obvious_placeholder(value) || is_repeated_symbol(value) {
         return false;
     }
     for filter in &rule.filter_types {
+        if filter == "GeneralPattern"
+            && (line_specific_key_filtered(line, value_start, value_end)
+                || value_pattern_filtered(value, None))
+        {
+            return false;
+        }
         if filter == "ValueAllowlistCheck"
             && value_allowlist_filtered(value, candidate_is_well_quoted(candidate))
         {
@@ -2681,7 +2701,11 @@ mod tests {
 
     #[test]
     fn detects_compatible_credsweeper_rule_without_python() {
-        let token = format!("github_pat_{}", "A".repeat(80));
+        let token = concat!(
+            "github_pat_",
+            "rOtEBPV4Es4QuKKticlQTRBHdyjljMqognRzUEQT65E6B6lEbvdMHVYqwEXsxuwu",
+            "RnOhkMFGCsCyfNgn",
+        );
         let raw = format!("token={token}\n");
         let region = region(&raw);
         let view = NormalizedView::build(&region, &raw);
@@ -2693,6 +2717,16 @@ mod tests {
         assert!(spans
             .iter()
             .all(|span| span.source == DetectorId::CredSweeper));
+    }
+
+    #[test]
+    fn general_pattern_filters_repeated_fixture_tokens_like_official_credsweeper() {
+        let token = format!("github_pat_{}", "A".repeat(80));
+        let raw = format!("token={token}\n");
+        let region = region(&raw);
+        let view = NormalizedView::build(&region, &raw);
+        let spans = CredSweeperNativeDetector::builtin().detect(&view);
+        assert!(spans.is_empty(), "{spans:?}");
     }
 
     #[test]

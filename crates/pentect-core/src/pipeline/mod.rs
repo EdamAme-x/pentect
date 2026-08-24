@@ -4,11 +4,10 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
-    CredSweeperNativeDetector, DecodeConfig, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, ExplicitSecretDetector, KeyValueDetector, PemDetector, PhoneDetector,
-    RuleDetector, SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
-    SECRET_VALUE_HINT,
+    AuthCodeDetector, Bip39Detector, CliCredentialDetector, CredSweeperNativeDetector,
+    DecodeConfig, DecodeDetector, Detector, EntropyDetector, EnvValueDetector,
+    ExplicitSecretDetector, KeyValueDetector, PemDetector, RuleDetector, SensitiveKeyDetector,
+    StructuralDetector, UrlDetector, SECRET_VALUE_HINT,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -709,12 +708,10 @@ impl EngineBuilder {
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
-            .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(RuleDetector::builtin_without_pii()))
             .detector(Box::new(KeyValueDetector))
-            .detector(Box::new(UuidDetector))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
-            .detector(Box::new(CardDetector))
             .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::with(
                 knobs.entropy_min_len,
@@ -724,7 +721,6 @@ impl EngineBuilder {
             .detector(Box::new(SensitiveKeyDetector))
             .detector(Box::new(EnvValueDetector))
             .detector(Box::new(StructuralDetector))
-            .detector(Box::new(PhoneDetector))
     }
 
     pub fn secret_scan_stack(self, knobs: ProfileKnobs) -> Self {

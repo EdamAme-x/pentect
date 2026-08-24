@@ -18,6 +18,8 @@ pub struct RuleDetector {
 }
 
 static BUILTIN_RULE_DETECTOR: LazyLock<RuleDetector> = LazyLock::new(RuleDetector::build_builtin);
+static BUILTIN_NON_PII_RULE_DETECTOR: LazyLock<RuleDetector> =
+    LazyLock::new(RuleDetector::build_builtin_without_pii);
 
 impl RuleDetector {
     /// Compile data-form rules into a detector; errors if any pattern is invalid.
@@ -31,12 +33,24 @@ impl RuleDetector {
         BUILTIN_RULE_DETECTOR.clone()
     }
 
+    pub fn builtin_without_pii() -> Self {
+        BUILTIN_NON_PII_RULE_DETECTOR.clone()
+    }
+
     #[cfg(test)]
     fn labels(&self) -> impl Iterator<Item = &str> {
         self.inner.labels()
     }
 
     fn build_builtin() -> Self {
+        Self::build_builtin_filtered(false)
+    }
+
+    fn build_builtin_without_pii() -> Self {
+        Self::build_builtin_filtered(true)
+    }
+
+    fn build_builtin_filtered(exclude_personal_data: bool) -> Self {
         use Category::{Endpoint, Identifier, Pii, Secret};
         use Confidence::{High, Low, Medium};
         // Conventions, so new rules stay consistent:
@@ -467,6 +481,10 @@ impl RuleDetector {
                     prefilter: builtin_prefilter(label, pattern),
                 },
             ))
+            .filter(|spec| {
+                !exclude_personal_data
+                    || matches!(spec.category, Category::Secret | Category::Endpoint)
+            })
             .collect();
         Self::from_specs(specs).expect("builtin regexes compile")
     }

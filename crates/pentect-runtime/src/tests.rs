@@ -747,14 +747,16 @@ fn active_prompt_masks_keyed_and_vendor_secrets_in_prose() {
 }
 
 #[test]
-fn mask_command_and_agent_prompt_use_the_same_canonical_detectors() {
+fn mask_command_and_agent_prompt_use_the_same_credsweeper_detectors() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-pii-detectors");
 
     let phone = "+81 90-9876-5432";
     let email = "hanako.suzuki@example.co.jp";
     let card = "4242 4242 4242 4242";
-    let prompt = format!("Call {phone}, email {email}, and verify card {card}.");
+    let api_key = "cosmo_66ebe5a6121b52c86058ecd8803ce4bb";
+    let prompt =
+        format!("Credential {api_key}. Call {phone}, email {email}, and verify card {card}.");
     let client = MemoryStoreClient::from_env().unwrap();
     let (key, identity_key) = client.keys().unwrap();
     let command_result = masking::mask_read_input_with_profile_and_identity(
@@ -773,11 +775,16 @@ fn mask_command_and_agent_prompt_use_the_same_canonical_detectors() {
 
     assert_eq!(masked, command_result.masked);
     for plaintext in [phone, email, card] {
-        assert!(!masked.contains(plaintext), "PII was not masked: {masked}");
+        assert!(
+            masked.contains(plaintext),
+            "independent PII detector remains: {masked}"
+        );
     }
-    assert!(masked.contains("<<PHONE_NUMBER_"), "{masked}");
-    assert!(masked.contains("<<CARD_"), "{masked}");
-    assert!(masked.contains("<<IDENTITY_"), "{masked}");
+    assert!(
+        !masked.contains(&api_key),
+        "credential was not masked: {masked}"
+    );
+    assert!(masked.contains("<<WUNDERGRAPH_API_KEY_"), "{masked}");
 }
 
 #[test]
