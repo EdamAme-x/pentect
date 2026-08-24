@@ -170,8 +170,9 @@ restore = false
 This affects supported JSON and streaming responses for Codex, Claude,
 OpenCode, and Pi. It does not send plaintext back to the model provider, but it
 does place the restored value in the client UI and may place it in terminal
-scrollback, screenshots, or client logs. Unknown and expired handles remain
-unchanged.
+scrollback, screenshots, or user-visible client conversation history. Pentect's
+persistent logs, diagnostics, and telemetry do not record the restored response
+body. Unknown and expired handles remain unchanged.
 
 A `false` in either scope wins, so a project cannot override a user-level
 opt-out. Set `output.restore = true` explicitly only when recording the desired

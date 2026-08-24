@@ -52,7 +52,8 @@ Assistant prose restores known handles locally by default. Environments that
 need opaque output can set
 [`output.restore = false`](/reference/configuration/#assistant-output-restoration).
 Restoration applies only to handles known to the active session and can expose the
-value to terminal scrollback or client logs.
+value to terminal scrollback or user-visible client conversation history.
+Pentect's persistent logs, diagnostics, and telemetry remain value-free.
 
 ## Supported surfaces
 
