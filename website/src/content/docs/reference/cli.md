@@ -125,6 +125,7 @@ stateful.
 | `pentect exec "COMMAND"` | Run through the native shell |
 | `pentect exec -- PROGRAM ARG...` | Run a program directly; restored secrets in arguments are refused by default |
 | `pentect exec --allow-secret-argv -- PROGRAM ARG...` | Explicitly allow restored secrets in process arguments |
+| `pentect exec --secret-stdin HANDLE -- PROGRAM ARG...` | Write one restored handle directly to the program's stdin |
 | `pentect exec --stdin` | Read the shell script from UTF-8 stdin |
 | `pentect exec --live "COMMAND"` | Stream masked output instead of buffering it |
 | `--script-shell native\|bash\|powershell` | Choose the shell for script forms |
@@ -140,6 +141,19 @@ process argument. Use `--allow-secret-argv` only when the target program
 requires a secret argument and you have reviewed that exposure. `--live` keeps
 interactive progress visible but still masks output in chunks before it is
 written.
+
+For programs that accept a credential on stdin, `--secret-stdin` avoids both
+secret arguments and environment inheritance:
+
+```sh
+pentect exec --secret-stdin '<<SUDO_PASSWORD_...>>' -- sudo -S -p '' cat ./ROOT_ONLY.txt
+```
+
+The handle must be one complete known handle from the active session. Pentect
+writes the recovered bytes exactly once and closes stdin; it does not append a
+newline. stdout and stderr are still masked. The target program can still use
+or forward bytes it intentionally reads, so this narrows local exposure but is
+not network-destination authorization.
 
 ### `view`
 

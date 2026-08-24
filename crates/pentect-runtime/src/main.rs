@@ -568,6 +568,7 @@ pub fn preflight_exec_server_process_start_from_active_memory_store(
         session: session_name,
         live: false,
         allow_secret_argv: false,
+        secret_stdin: None,
         script_shell: ScriptShell::Native,
         mode: argv_mode,
     };
@@ -999,10 +1000,12 @@ fn exec_help() {
         concat!(
             "pentect exec \"<command>\"\n",
             "pentect exec --stdin\n",
+            "pentect exec --secret-stdin <HANDLE> -- PROGRAM...\n",
             "pentect exec --live \"<command>\"\n\n",
             "stdout/stderr: masked\n",
             "handles: in memory\n",
             "env: $env:KEY or $KEY\n",
+            "secret stdin: restored locally, never added to program arguments\n",
         )
     );
 }
@@ -1510,9 +1513,14 @@ fn run_resolved_command(
             let mut command = Command::new(program);
             command.args(command_args);
             apply_child_env_overlays(&mut command, &env, &opts.session);
-            command
-                .output()
-                .map_err(|e| format!("could not execute command: {e}"))
+            let secret_stdin = resolve_secret_stdin(store, opts)?;
+            if let Some(secret) = secret_stdin.as_deref() {
+                run_command_with_stdin(command, secret)
+            } else {
+                command
+                    .output()
+                    .map_err(|e| format!("could not execute command: {e}"))
+            }
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
@@ -1537,7 +1545,12 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
             let mut command = Command::new(program);
             command.args(command_args);
             apply_child_env_overlays(&mut command, &env, &opts.session);
-            run_live_command(command, None, store.clone())
+            let secret_stdin = resolve_secret_stdin(store, opts)?;
+            run_live_command(
+                command,
+                secret_stdin.as_ref().map(|value| value.as_str()),
+                store.clone(),
+            )
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
@@ -1549,6 +1562,43 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
         }
         ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
+}
+
+fn resolve_secret_stdin(
+    store: &MemoryStore,
+    opts: &ExecOpts,
+) -> Result<Option<Zeroizing<String>>, String> {
+    let Some(handle) = opts.secret_stdin.as_deref() else {
+        return Ok(None);
+    };
+    let resolved = resolve_command_text(store, handle)?;
+    if resolved == handle {
+        return Err("secret stdin requires a known handle from the active session".to_string());
+    }
+    Ok(Some(Zeroizing::new(resolved)))
+}
+
+fn run_command_with_stdin(
+    mut command: Command,
+    stdin_payload: &str,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not execute command: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "could not open command stdin".to_string())?;
+    stdin
+        .write_all(stdin_payload.as_bytes())
+        .map_err(|e| format!("could not write command stdin: {e}"))?;
+    drop(stdin);
+    child
+        .wait_with_output()
+        .map_err(|e| format!("could not read command output: {e}"))
 }
 
 fn resolve_command_args(
@@ -1913,11 +1963,11 @@ enum StreamTarget {
 
 fn run_live_command(
     mut command: Command,
-    stdin_script: Option<&str>,
+    stdin_payload: Option<&str>,
     store: MemoryStore,
 ) -> Result<ExitStatus, String> {
     live_status("streaming masked command output");
-    if stdin_script.is_some() {
+    if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
     } else {
         command.stdin(Stdio::null());
@@ -1926,14 +1976,14 @@ fn run_live_command(
     let mut child = command
         .spawn()
         .map_err(|e| format!("could not execute command: {e}"))?;
-    if let Some(script) = stdin_script {
+    if let Some(payload) = stdin_payload {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| "could not open command stdin".to_string())?;
         stdin
-            .write_all(script.as_bytes())
-            .map_err(|e| format!("could not write shell script to stdin: {e}"))?;
+            .write_all(payload.as_bytes())
+            .map_err(|e| format!("could not write command stdin: {e}"))?;
     }
     let stdout = child
         .stdout
@@ -2375,6 +2425,7 @@ struct ExecOpts {
     session: String,
     live: bool,
     allow_secret_argv: bool,
+    secret_stdin: Option<String>,
     script_shell: ScriptShell,
     mode: ExecMode,
 }
@@ -2531,6 +2582,7 @@ impl ExecOpts {
         let mut session = default_session_name()?;
         let mut live = false;
         let mut allow_secret_argv = false;
+        let mut secret_stdin = None;
         let mut stdin = false;
         let mut script_shell = ScriptShell::Native;
         let mut i = 2;
@@ -2547,6 +2599,13 @@ impl ExecOpts {
                     allow_secret_argv = true;
                     i += 1;
                 }
+                "--secret-stdin" => {
+                    let handle = value(args, &mut i, "--secret-stdin")?;
+                    parse_placeholder(&handle).map_err(|_| {
+                        "exec --secret-stdin requires exactly one masked handle".to_string()
+                    })?;
+                    secret_stdin = Some(handle);
+                }
                 "--stdin" => {
                     stdin = true;
                     i += 1;
@@ -2560,6 +2619,11 @@ impl ExecOpts {
                             "exec --stdin does not accept a base64 script argument".to_string()
                         );
                     }
+                    if secret_stdin.is_some() {
+                        return Err(
+                            "exec --script-b64 cannot be combined with --secret-stdin".to_string()
+                        );
+                    }
                     let script = decode_script_base64(&value(args, &mut i, "--script-b64")?)?;
                     if i < args.len() {
                         return Err(
@@ -2570,6 +2634,7 @@ impl ExecOpts {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
                         allow_secret_argv,
+                        secret_stdin: None,
                         script_shell,
                         mode: ExecMode::Shell(script),
                     });
@@ -2591,6 +2656,7 @@ impl ExecOpts {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
                         allow_secret_argv,
+                        secret_stdin,
                         script_shell: ScriptShell::Native,
                         mode: ExecMode::Program(command),
                     });
@@ -2600,10 +2666,14 @@ impl ExecOpts {
                     if stdin {
                         return Err("exec --stdin does not accept a command argument".to_string());
                     }
+                    if secret_stdin.is_some() {
+                        return Err("exec --secret-stdin requires a program after `--`".to_string());
+                    }
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
                         allow_secret_argv,
+                        secret_stdin: None,
                         script_shell,
                         mode: ExecMode::Shell(args[i..].join(" ")),
                     });
@@ -2611,10 +2681,14 @@ impl ExecOpts {
             }
         }
         if stdin {
+            if secret_stdin.is_some() {
+                return Err("exec --stdin cannot be combined with --secret-stdin".to_string());
+            }
             return Ok(Self {
                 session: checked_session_name(&session).map_err(|e| e.to_string())?,
                 live,
                 allow_secret_argv,
+                secret_stdin: None,
                 script_shell,
                 mode: ExecMode::Stdin,
             });
