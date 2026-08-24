@@ -347,6 +347,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueFilePathCheck"
             | "ValueHexNumberCheck"
             | "ValueLastWordCheck"
+            | "ValueMethodCheck"
             | "ValueMorphemesCheck"
             | "ValueNumberCheck"
             | "ValuePatternCheck"
@@ -2075,6 +2076,9 @@ fn accept_value(
         if filter == "ValueLastWordCheck" && value_last_word_filtered(value, candidate) {
             return false;
         }
+        if filter == "ValueMethodCheck" && value_method_filtered(value, candidate) {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2238,6 +2242,16 @@ fn value_hex_number_filtered(value: &str) -> bool {
 
 fn value_last_word_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
     value.chars().count() < 16 && !candidate_is_well_quoted(candidate) && value.ends_with(':')
+}
+
+fn value_method_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
+    if candidate_is_well_quoted(candidate) {
+        return false;
+    }
+    static METHOD: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"^[~.\->:0-9A-Za-z_]+\(.*\)").expect("CredSweeper method-call regex")
+    });
+    value.contains("function") || METHOD.is_match(value)
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -2833,7 +2847,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 27, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 26, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3290,6 +3304,20 @@ mod tests {
 
         let unicode = test_candidate("秘密:", None, None, None);
         assert!(value_last_word_filtered(unicode.value, &unicode));
+    }
+
+    #[test]
+    fn value_method_check_matches_upstream_examples() {
+        for value in ["Crac.method()", "Crac_function", "object->method(arg)"] {
+            let item = test_candidate(value, None, None, None);
+            assert!(value_method_filtered(value, &item), "{value:?}");
+        }
+        for value in ["CracFunction", "method(", " method()"] {
+            let item = test_candidate(value, None, None, None);
+            assert!(!value_method_filtered(value, &item), "{value:?}");
+        }
+        let quoted = test_candidate("Crac.method()", None, Some("\""), Some("\""));
+        assert!(!value_method_filtered(quoted.value, &quoted));
     }
 
     fn test_candidate<'a>(
