@@ -47,6 +47,9 @@ pub struct CredSweeperNativeStats {
     pub enabled_patterns: usize,
     pub ml_gated_patterns: usize,
     pub unsupported_patterns: usize,
+    pub total_filter_invocations: usize,
+    pub unsupported_filter_invocations: usize,
+    pub unsupported_filter_types: Vec<String>,
     pub ml_rules: usize,
     pub rules_yaml_bytes: usize,
     pub secret_config_json_bytes: usize,
@@ -241,6 +244,9 @@ fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
         enabled_patterns: 0,
         ml_gated_patterns: 0,
         unsupported_patterns: 0,
+        total_filter_invocations: 0,
+        unsupported_filter_invocations: 0,
+        unsupported_filter_types: Vec::new(),
         ml_rules: raw_rules
             .iter()
             .filter(|rule| rule.use_ml.unwrap_or(false))
@@ -251,6 +257,20 @@ fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
         ml_model_onnx_bytes: ML_MODEL_ONNX.len(),
     };
     for raw in &raw_rules {
+        for filter in raw
+            .filter_type
+            .as_ref()
+            .map(FilterList::items)
+            .unwrap_or_default()
+        {
+            stats.total_filter_invocations += 1;
+            if !filter_has_native_handler(&filter) {
+                stats.unsupported_filter_invocations += 1;
+                stats
+                    .unsupported_filter_types
+                    .push(filter_name(&filter).to_string());
+            }
+        }
         let values = raw.values.as_deref().unwrap_or_default();
         stats.total_patterns += values.len();
         let mut enabled_for_rule = 0;
@@ -303,7 +323,32 @@ fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
             stats.ml_gated_patterns += enabled_for_rule;
         }
     }
+    stats.unsupported_filter_types.sort();
+    stats.unsupported_filter_types.dedup();
     Ok(stats)
+}
+
+fn filter_name(filter: &str) -> &str {
+    filter.split_once('(').map_or(filter, |(name, _)| name)
+}
+
+fn filter_has_native_handler(filter: &str) -> bool {
+    matches!(
+        filter_name(filter),
+        "LineSpecificKeyCheck"
+            | "ValueAllowlistCheck"
+            | "ValueBasicAuthCheck"
+            | "ValueBlocklistCheck"
+            | "ValueCamelCaseCheck"
+            | "ValueDictionaryKeywordCheck"
+            | "ValueEntropyBase36Check"
+            | "ValueEntropyBase64Check"
+            | "ValueFilePathCheck"
+            | "ValueMorphemesCheck"
+            | "ValueNumberCheck"
+            | "ValuePatternCheck"
+            | "ValueSealedSecretCheck"
+    )
 }
 
 impl CredSweeperNativeDetector {
@@ -2727,6 +2772,20 @@ mod tests {
         assert_eq!(
             stats.total_patterns,
             stats.compiled_patterns + stats.translated_patterns + stats.unsupported_patterns
+        );
+    }
+
+    #[test]
+    fn unsupported_filter_coverage_is_explicit() {
+        let stats = CredSweeperNativeDetector::builtin_stats();
+        assert!(stats.total_filter_invocations > 0, "{stats:?}");
+        assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 30, "{stats:?}");
+        assert!(
+            stats
+                .unsupported_filter_types
+                .contains(&"ValueTokenBase36Check".to_string()),
+            "{stats:?}"
         );
     }
 
