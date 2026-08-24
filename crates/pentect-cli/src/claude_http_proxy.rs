@@ -1005,6 +1005,9 @@ fn warn_provider_mcp_credentials(value: &Value) {
 }
 
 fn inject_handle_contract(value: &mut Value) {
+    if !request_contains_masked_handle(value) {
+        return;
+    }
     let contract = serde_json::json!({
         "type": "text",
         "text": HANDLE_CONTRACT,
@@ -1032,6 +1035,15 @@ fn inject_handle_contract(value: &mut Value) {
         // Preserve unknown future system representations rather than making
         // an otherwise valid request unusable.
         Some(_) => {}
+    }
+}
+
+fn request_contains_masked_handle(value: &Value) -> bool {
+    match value {
+        Value::String(text) => pentect_agent::contains_pentect_masked_handle(text),
+        Value::Array(values) => values.iter().any(request_contains_masked_handle),
+        Value::Object(object) => object.values().any(request_contains_masked_handle),
+        _ => false,
     }
 }
 
@@ -3248,7 +3260,10 @@ mod tests {
 
     #[test]
     fn handle_contract_is_stable_preserves_system_and_is_not_duplicated() {
-        let mut request = serde_json::json!({"system": "existing", "messages": []});
+        let mut request = serde_json::json!({
+            "system": "existing",
+            "messages": [{"role": "user", "content": "use <<SECRET_0123456789abcdef>>"}]
+        });
         inject_handle_contract(&mut request);
         assert_eq!(request["system"][0]["text"], "existing");
         assert_eq!(request["system"][1]["text"], HANDLE_CONTRACT);
@@ -3257,18 +3272,17 @@ mod tests {
 
         let mut empty = serde_json::json!({"messages": []});
         inject_handle_contract(&mut empty);
-        assert_eq!(empty["system"][0]["text"], HANDLE_CONTRACT);
+        assert!(empty.get("system").is_none());
     }
 
     #[test]
-    fn handle_contract_is_added_to_every_protected_request() {
+    fn handle_contract_is_added_only_when_a_handle_is_present() {
         let mut clean = serde_json::json!({
             "system": "existing",
             "messages": [{"role": "user", "content": "hello"}]
         });
         inject_handle_contract(&mut clean);
-        assert_eq!(clean["system"][0]["text"], "existing");
-        assert_eq!(clean["system"][1]["text"], HANDLE_CONTRACT);
+        assert_eq!(clean["system"], "existing");
 
         let mut protected = serde_json::json!({
             "system": "existing",
@@ -3304,7 +3318,7 @@ mod tests {
         let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
         let original: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(allowed["messages"], original["messages"]);
-        assert_eq!(allowed["system"][0]["text"], HANDLE_CONTRACT);
+        assert!(allowed.get("system").is_none());
     }
 
     #[test]
