@@ -13,7 +13,7 @@ use openssl::rsa::Padding;
 use regex::Regex as RustRegex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 const SECRET_CONFIG_JSON: &str =
@@ -537,8 +537,7 @@ impl CredSweeperNativeDetector {
             for pattern in &rule.patterns {
                 if let PatternMatcher::Special(matcher) = &pattern.matcher {
                     for candidate in matcher.find_whole_text(text) {
-                        push_match(
-                            &mut out,
+                        let _ = push_match(
                             &mut ml_pending,
                             &push_ctx,
                             rule,
@@ -585,27 +584,37 @@ impl CredSweeperNativeDetector {
                     }
                     match &pattern.matcher {
                         PatternMatcher::Deferred(regex) => {
-                            for candidate in regex.find(line_body, pattern.value_capture) {
-                                push_match(
-                                    &mut out,
-                                    &mut ml_pending,
-                                    &push_ctx,
-                                    rule,
-                                    &line_ctx,
-                                    &candidate,
-                                );
+                            let mut offsets = vec![0usize];
+                            let mut seen_offsets = BTreeSet::new();
+                            while let Some(offset) = offsets.pop() {
+                                if !seen_offsets.insert(offset) || offset >= line_body.len() {
+                                    continue;
+                                }
+                                for mut candidate in
+                                    regex.find(&line_body[offset..], pattern.value_capture)
+                                {
+                                    candidate.shift(offset);
+                                    if !push_match(
+                                        &mut ml_pending,
+                                        &push_ctx,
+                                        rule,
+                                        &line_ctx,
+                                        &candidate,
+                                    ) {
+                                        let retry = candidate
+                                            .variable_end
+                                            .filter(|end| offset < *end)
+                                            .unwrap_or(candidate.end);
+                                        if offset < retry && retry < line_body.len() {
+                                            offsets.push(retry);
+                                        }
+                                    }
+                                }
                             }
                         }
                         PatternMatcher::Special(matcher) => {
                             for m in matcher.find(line_body) {
-                                push_match(
-                                    &mut out,
-                                    &mut ml_pending,
-                                    &push_ctx,
-                                    rule,
-                                    &line_ctx,
-                                    &m,
-                                );
+                                let _ = push_match(&mut ml_pending, &push_ctx, rule, &line_ctx, &m);
                             }
                         }
                     }
@@ -679,6 +688,8 @@ impl DeferredRegex {
             out.extend(keyword_set_call_candidates(text, keyword));
             out.extend(keyword_directive_candidates(text, keyword));
             out.extend(keyword_percent_bracket_candidates(text, keyword));
+            let structured = keyword_structured_candidates(text, keyword, &out);
+            out.extend(structured);
         }
         out
     }
@@ -1041,6 +1052,218 @@ fn keyword_percent_bracket_candidates<'a>(
     out
 }
 
+fn keyword_structured_candidates<'a>(
+    text: &'a str,
+    keyword: &FancyRegex,
+    existing: &[Candidate<'a>],
+) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let existing_for_keyword = existing.iter().filter(|candidate| {
+            candidate
+                .variable_start
+                .zip(candidate.variable_end)
+                .is_some_and(|(start, end)| start <= matched.start() && matched.end() <= end)
+        });
+        let has_existing = existing_for_keyword.clone().next().is_some();
+        if existing_for_keyword
+            .clone()
+            .any(|candidate| !candidate.value.is_empty())
+        {
+            continue;
+        }
+
+        let mut variable_start = matched.start();
+        while let Some(index) = variable_start.checked_sub(1) {
+            let byte = text.as_bytes()[index];
+            if byte.is_ascii_whitespace() || matches!(byte, b',' | b'{' | b'(' | b':' | b'=') {
+                break;
+            }
+            if byte == b'['
+                && text
+                    .as_bytes()
+                    .get(variable_start)
+                    .is_some_and(|next| matches!(*next, b'\'' | b'"' | b'`'))
+            {
+                break;
+            }
+            variable_start = index;
+        }
+        if let Some((quote_start, _)) = text[..matched.start()]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| matches!(ch, '\'' | '"' | '`'))
+        {
+            let quoted_prefix = &text[quote_start + 1..matched.start()];
+            if quoted_prefix.chars().all(|ch| {
+                ch.is_alphanumeric()
+                    || ch.is_whitespace()
+                    || matches!(ch, '_' | '[' | ']' | '$' | '.' | '-')
+            }) {
+                variable_start = quote_start;
+            }
+        }
+        let mut separator_start = matched.end();
+        while text
+            .as_bytes()
+            .get(separator_start)
+            .is_some_and(|byte| !matches!(*byte, b':' | b'=' | b'\n' | b';' | b',' | b'{' | b'('))
+            && separator_start.saturating_sub(matched.end()) <= 80
+        {
+            separator_start += 1;
+        }
+        if !text
+            .as_bytes()
+            .get(separator_start)
+            .is_some_and(|byte| matches!(*byte, b':' | b'='))
+        {
+            continue;
+        }
+        let variable_end = separator_start;
+        let mut cursor = separator_start + 1;
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+
+        let prefix_start = cursor;
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        {
+            cursor += 1;
+        }
+        let prefix = &text[prefix_start..cursor];
+        let valid_prefix = matches!(
+            prefix.to_ascii_lowercase().as_str(),
+            "" | "b" | "r" | "br" | "rb" | "u" | "t" | "f" | "rf" | "fr" | "l"
+        );
+        if valid_prefix && !prefix.is_empty() && !has_existing {
+            if let Some(&quote) = text
+                .as_bytes()
+                .get(cursor)
+                .filter(|byte| matches!(byte, b'\'' | b'"' | b'`'))
+            {
+                let quote_start = cursor;
+                cursor += 1;
+                let value_start = cursor;
+                let mut escaped = false;
+                while let Some(&byte) = text.as_bytes().get(cursor) {
+                    if byte == quote && !escaped {
+                        break;
+                    }
+                    escaped = byte == b'\\' && !escaped;
+                    if byte != b'\\' {
+                        escaped = false;
+                    }
+                    cursor += 1;
+                }
+                if text.as_bytes().get(cursor) == Some(&quote) && cursor > value_start {
+                    out.push(Candidate {
+                        start: value_start,
+                        end: cursor,
+                        value: &text[value_start..cursor],
+                        variable_start: Some(variable_start),
+                        variable_end: Some(variable_end),
+                        variable: Some(&text[variable_start..variable_end]),
+                        separator: Some(&text[separator_start..separator_start + 1]),
+                        wrap: None,
+                        value_leftquote: Some(&text[quote_start..quote_start + 1]),
+                        value_rightquote: Some(&text[cursor..cursor + 1]),
+                        line_data: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        cursor = prefix_start;
+        let wrap_start = cursor;
+        let mut last_open = None;
+        loop {
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                cursor += 1;
+            }
+            if text.as_bytes().get(cursor) == Some(&b'[')
+                && text.as_bytes().get(cursor + 1) == Some(&b']')
+            {
+                cursor += 2;
+                continue;
+            }
+            if let Some(&open) = text
+                .as_bytes()
+                .get(cursor)
+                .filter(|byte| matches!(byte, b'[' | b'(' | b'{'))
+            {
+                last_open = Some(open);
+                cursor += 1;
+                continue;
+            }
+            let word_start = cursor;
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                cursor += 1;
+            }
+            if word_start < cursor
+                && last_open.is_none()
+                && matches!(
+                    text[word_start..cursor].to_ascii_lowercase().as_str(),
+                    "new" | "byte" | "char" | "string"
+                )
+            {
+                continue;
+            }
+            cursor = word_start;
+            break;
+        }
+        let Some(open) = last_open else {
+            continue;
+        };
+        let close = match open {
+            b'[' => b']',
+            b'(' => b')',
+            b'{' => b'}',
+            _ => unreachable!(),
+        };
+        let value_start = cursor;
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(|byte| *byte != close)
+        {
+            cursor += 1;
+        }
+        if cursor.saturating_sub(value_start) < 16 || text.as_bytes().get(cursor) != Some(&close) {
+            continue;
+        }
+        out.push(Candidate {
+            start: value_start,
+            end: cursor,
+            value: &text[value_start..cursor],
+            variable_start: Some(variable_start),
+            variable_end: Some(variable_end),
+            variable: Some(&text[variable_start..variable_end]),
+            separator: Some(&text[separator_start..separator_start + 1]),
+            wrap: Some(&text[wrap_start..value_start]),
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        });
+    }
+    out
+}
+
 fn rust_candidate<'a>(
     captures: &regex::Captures<'a>,
     value_capture: bool,
@@ -1179,6 +1402,21 @@ struct Candidate<'a> {
     value_leftquote: Option<&'a str>,
     value_rightquote: Option<&'a str>,
     line_data: Vec<CandidateLineData<'a>>,
+}
+
+impl Candidate<'_> {
+    fn shift(&mut self, offset: usize) {
+        self.start += offset;
+        self.end += offset;
+        self.variable_start = self.variable_start.map(|start| start + offset);
+        self.variable_end = self.variable_end.map(|end| end + offset);
+        for line_data in &mut self.line_data {
+            line_data.start += offset;
+            line_data.end += offset;
+            line_data.variable_start = line_data.variable_start.map(|start| start + offset);
+            line_data.variable_end = line_data.variable_end.map(|end| end + offset);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2267,6 +2505,7 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
 struct PendingMlFinding {
     finding: CredSweeperNativeFinding,
     input: MlInput,
+    requires_ml: bool,
 }
 
 struct PushMatchCtx<'view, 'data> {
@@ -2590,20 +2829,19 @@ fn clean_tag_parameters<'a>(line: &str, mut value: SanitizedValue<'a>) -> Saniti
 }
 
 fn push_match(
-    out: &mut Vec<CredSweeperNativeFinding>,
     ml_pending: &mut Vec<PendingMlFinding>,
     ctx: &PushMatchCtx<'_, '_>,
     rule: &NativeRule,
     line_ctx: &CandidateLineContext<'_>,
     candidate: &Candidate<'_>,
-) {
+) -> bool {
     let sanitized_value = sanitize_value_capture(line_ctx.line, ctx.file_type, candidate);
     let range = ctx.view.to_raw(ByteRange::new(
         line_ctx.start + sanitized_value.start,
         line_ctx.start + sanitized_value.end,
     ));
     if range.is_empty() {
-        return;
+        return false;
     }
     let sanitized_variable = candidate
         .variable
@@ -2655,7 +2893,7 @@ fn push_match(
         sanitized_value.start,
         sanitized_value.end,
     ) {
-        return;
+        return false;
     }
     let finding = CredSweeperNativeFinding {
         range,
@@ -2689,36 +2927,35 @@ fn push_match(
             })
             .collect(),
     };
-    if rule.ml_validated {
-        let variable = sanitized_variable
-            .as_ref()
-            .map(|(variable, _, _)| variable.as_str())
-            .unwrap_or_default();
-        ml_pending.push(PendingMlFinding {
-            finding,
-            input: MlInput {
-                line: line_ctx.line.to_string(),
-                value: sanitized_value.value.to_string(),
-                variable: variable.to_string(),
-                value_start: sanitized_value.start,
-                value_end: sanitized_value.end,
-                variable_start: sanitized_variable
-                    .as_ref()
-                    .map(|(_, start, _)| *start as isize)
-                    .unwrap_or(-2),
-                variable_end: sanitized_variable
-                    .as_ref()
-                    .map(|(_, _, end)| *end as isize)
-                    .unwrap_or(-2),
-                path: ctx.path.to_string(),
-                file_type: ctx.file_type.to_string(),
-                rule_name: rule.rule_name.clone(),
-                severity: rule.severity,
-            },
-        });
-    } else {
-        out.push(finding);
-    }
+    let variable = sanitized_variable
+        .as_ref()
+        .map(|(variable, _, _)| variable.as_str())
+        .unwrap_or_default();
+    ml_pending.push(PendingMlFinding {
+        finding,
+        input: MlInput {
+            line: line_ctx.line.to_string(),
+            value: sanitized_value.value.to_string(),
+            variable: variable.to_string(),
+            value_start: sanitized_value.start,
+            value_end: sanitized_value.end,
+            variable_start: sanitized_variable
+                .as_ref()
+                .map(|(_, start, _)| *start as isize)
+                .unwrap_or(-2),
+            variable_end: sanitized_variable
+                .as_ref()
+                .map(|(_, _, end)| *end as isize)
+                .unwrap_or(-2),
+            path: ctx.path.to_string(),
+            line_num: line_ctx.line_index + 1,
+            file_type: ctx.file_type.to_string(),
+            rule_name: rule.rule_name.clone(),
+            severity: rule.severity,
+        },
+        requires_ml: rule.ml_validated,
+    });
+    true
 }
 
 fn push_ml_accepted(out: &mut Vec<CredSweeperNativeFinding>, pending: &[PendingMlFinding]) {
@@ -2736,8 +2973,10 @@ fn push_ml_accepted(out: &mut Vec<CredSweeperNativeFinding>, pending: &[PendingM
                 group_inputs.push(&pending[j].input);
             }
         }
-        if credsweeper_ml::accept_group(&group_inputs) {
-            for idx in group_indices {
+        let has_ml = group_indices.iter().any(|idx| pending[*idx].requires_ml);
+        let accepted = !has_ml || credsweeper_ml::accept_group(&group_inputs);
+        for idx in group_indices {
+            if !pending[idx].requires_ml || accepted {
                 out.push(pending[idx].finding.clone());
             }
         }
@@ -2746,8 +2985,7 @@ fn push_ml_accepted(out: &mut Vec<CredSweeperNativeFinding>, pending: &[PendingM
 
 fn same_ml_group(a: &MlInput, b: &MlInput) -> bool {
     a.path == b.path
-        && a.line == b.line
-        && a.value == b.value
+        && a.line_num == b.line_num
         && a.value_start == b.value_start
         && a.value_end == b.value_end
 }
@@ -5495,6 +5733,7 @@ mod tests {
                 variable_start: 8,
                 variable_end: 21,
                 path: path.to_string(),
+                line_num: 1,
                 file_type: ".py".to_string(),
                 rule_name: "Password".to_string(),
                 severity: RuleSeverity::High,
@@ -5542,6 +5781,7 @@ mod tests {
             variable_start: 0,
             variable_end: 8,
             path: "samples/nonce.py".to_string(),
+            line_num: 7,
             file_type: ".py".to_string(),
             rule_name: "Key".to_string(),
             severity: RuleSeverity::High,
@@ -5566,8 +5806,77 @@ mod tests {
     }
 
     #[test]
+    fn shared_auth_password_value_matches_official_ml_group() {
+        let line = r#"            "password : Password for authorization\n        BAIT: bace4d59-fa7e-beef-cafe-9129474bcd81","#;
+        let common = |rule_name: &str, variable: &str, start: isize| {
+            MlInput {
+            line: line.to_string(),
+            value: "bace4d59-fa7e-beef-cafe-9129474bcd81".to_string(),
+            variable: variable.to_string(),
+            value_start: 66,
+            value_end: 102,
+            variable_start: start,
+            variable_end: 64,
+            path: "crates/pentect-core/vendors/CredSweeper/tests/file_handler/test_text_content_provider.py".to_string(),
+            line_num: 42,
+            file_type: ".py".to_string(),
+            rule_name: rule_name.to_string(),
+            severity: RuleSeverity::Medium,
+        }
+        };
+        let auth = common("Auth", r"authorization\n        BAIT", 37);
+        let password = common("Password", r"Password for authorization\n        BAIT", 24);
+        let uuid = MlInput {
+            variable: String::new(),
+            variable_start: -2,
+            variable_end: -2,
+            rule_name: "UUID".to_string(),
+            severity: RuleSeverity::Info,
+            ..common("UUID", "", -2)
+        };
+        let (score, threshold) = credsweeper_ml::score_group_for_test(&[&uuid, &auth, &password]);
+        assert!(score >= threshold, "score={score} threshold={threshold}");
+    }
+
+    #[test]
     fn keyword_rules_match_official_nested_fixture_literals() {
         for (path, raw, rule_name, expected) in [
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/test_app.py",
+                r#"            ("c.go", b'Credential: []byte{351, 266,    ,1,2,7,4,010, 100, 114, 157},', "Credential","#,
+                "Credential",
+                "351, 266,    ,1,2,7,4,010, 100, 114, 157",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"                '{"PWD":[{"kty":"oct","kid":"25b58GCM","k":"Xc_2A"},{"kty":"oct","kid":"09b51KW","k":"KG6wlB-6sIVQ"}]',"#,
+                "Password",
+                r#""kty":"oct","kid":"25b58GCM","k":"Xc_2A""#,
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/common/test_keyword_pattern.py",
+                r#"            ["byte[]password=new byte[]{0x3,0x5,0x8,0x3,0x5,0x8};", "0x3,0x5,0x8,0x3,0x5,0x8"],"#,
+                "Password",
+                "0x3,0x5,0x8,0x3,0x5,0x8",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/deep_scanner/test_struct_scanner.py",
+                r#"            'salt': b"\t'\xDE\xAD\xBE\xEF,1\012\0","#,
+                "Salt",
+                r#"\t'\xDE\xAD\xBE\xEF,1\012\0"#,
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/file_handler/test_text_content_provider.py",
+                r#"            "password : Password for authorization\n        BAIT: bace4d59-fa7e-beef-cafe-9129474bcd81","#,
+                "Auth",
+                "bace4d59-fa7e-beef-cafe-9129474bcd81",
+            ),
+            (
+                "crates/pentect-core/vendors/CredSweeper/tests/file_handler/test_text_content_provider.py",
+                r#"            "password : Password for authorization\n        BAIT: bace4d59-fa7e-beef-cafe-9129474bcd81","#,
+                "Password",
+                "bace4d59-fa7e-beef-cafe-9129474bcd81",
+            ),
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/samples/nonce.py",
                 "key_wrap = 'KJHhJKhKU7yguyuyfrtsdESffhjgkhYT\\",
@@ -5742,10 +6051,13 @@ mod tests {
             },
         };
         let view = NormalizedView::build(&region, raw);
-        assert!(CredSweeperNativeDetector::builtin()
-            .detect_findings(&view)
-            .iter()
-            .all(|finding| finding.rule_name != "Password"));
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_name != "Password"),
+            "{findings:?}"
+        );
     }
 
     #[test]

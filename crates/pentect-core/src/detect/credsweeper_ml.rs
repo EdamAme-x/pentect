@@ -45,6 +45,7 @@ pub(super) struct MlInput {
     pub variable_start: isize,
     pub variable_end: isize,
     pub path: String,
+    pub line_num: usize,
     pub file_type: String,
     pub rule_name: String,
     pub severity: RuleSeverity,
