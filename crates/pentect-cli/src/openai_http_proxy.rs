@@ -341,6 +341,8 @@ async fn proxy_request_inner(
     }
     let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
     let chat_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::ChatCompletions;
+    let standalone_search_path =
+        method == hyper::Method::POST && endpoint == OpenAiEndpoint::StandaloneSearch;
     let responses_response = matches!(
         endpoint,
         OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
@@ -352,6 +354,7 @@ async fn proxy_request_inner(
             OpenAiEndpoint::Responses
                 | OpenAiEndpoint::InputTokens
                 | OpenAiEndpoint::ChatCompletions
+                | OpenAiEndpoint::StandaloneSearch
         );
     let files_upload = method == hyper::Method::POST && endpoint == OpenAiEndpoint::FilesCollection;
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
@@ -461,6 +464,8 @@ async fn proxy_request_inner(
                     &files,
                     if chat_path {
                         OpenAiRequestDialect::ChatCompletions
+                    } else if standalone_search_path {
+                        OpenAiRequestDialect::StandaloneSearch
                     } else {
                         OpenAiRequestDialect::Responses
                     },
@@ -786,6 +791,7 @@ fn decode_openai_request_body(
 enum OpenAiRequestDialect {
     Responses,
     ChatCompletions,
+    StandaloneSearch,
 }
 
 fn protect_openai_request_body(
@@ -868,7 +874,9 @@ fn protect_openai_request_body(
             local_response: None,
         });
     }
-    inject_handle_contract(&mut value);
+    if dialect != OpenAiRequestDialect::StandaloneSearch {
+        inject_handle_contract(&mut value);
+    }
     serde_json::to_vec(&value)
         .map(|body| ProtectedJsonBody {
             body: Bytes::from(body),
@@ -1313,7 +1321,66 @@ fn openai_request_unknown_content_kind(
             .get("messages")
             .map(visit_chat_messages)
             .unwrap_or(Some("missing messages")),
+        OpenAiRequestDialect::StandaloneSearch => standalone_search_unknown_shape(value, visit),
     }
+}
+
+fn standalone_search_unknown_shape<'a>(
+    value: &'a Value,
+    visit_input: impl Fn(&'a Value) -> Option<&'a str>,
+) -> Option<&'a str> {
+    let Some(object) = value.as_object() else {
+        return Some("non-object search request");
+    };
+    const TOP_LEVEL_FIELDS: &[&str] = &[
+        "id",
+        "model",
+        "reasoning",
+        "input",
+        "commands",
+        "settings",
+        "max_output_tokens",
+    ];
+    if object
+        .keys()
+        .any(|field| !TOP_LEVEL_FIELDS.contains(&field.as_str()))
+    {
+        return Some("unknown search field");
+    }
+    if !object.get("id").is_some_and(Value::is_string)
+        || !object.get("model").is_some_and(Value::is_string)
+    {
+        return Some("invalid search identity");
+    }
+    if !object.contains_key("input") && !object.contains_key("commands") {
+        return Some("missing search input");
+    }
+    if let Some(input) = object.get("input") {
+        if let Some(kind) = visit_input(input) {
+            return Some(kind);
+        }
+    }
+    let commands_value = object.get("commands")?;
+    let Some(commands) = commands_value.as_object() else {
+        return Some("invalid search commands");
+    };
+    const COMMAND_FIELDS: &[&str] = &[
+        "search_query",
+        "image_query",
+        "open",
+        "click",
+        "find",
+        "screenshot",
+        "finance",
+        "weather",
+        "sports",
+        "time",
+        "response_length",
+    ];
+    commands
+        .keys()
+        .any(|field| !COMMAND_FIELDS.contains(&field.as_str()))
+        .then_some("unknown search command")
 }
 
 fn visit_chat_messages(value: &Value) -> Option<&str> {
@@ -1441,7 +1508,51 @@ fn mask_openai_request(
             mask_model_definition(definition, 0, &mut nodes, masker)?;
         }
     }
+    // Standalone search commands are derived from the current user request.
+    // Scan every string because queries and location/filter values do not use
+    // Responses content blocks.
+    for field in ["commands", "settings", "reasoning"] {
+        if let Some(search_value) = value.get_mut(field) {
+            let mut nodes = 0_usize;
+            mask_search_value(search_value, 0, &mut nodes, masker)?;
+        }
+    }
     Ok(())
+}
+
+fn mask_search_value(
+    value: &mut Value,
+    depth: usize,
+    nodes: &mut usize,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    const MAX_SEARCH_DEPTH: usize = 64;
+    const MAX_SEARCH_NODES: usize = 65_536;
+    if depth > MAX_SEARCH_DEPTH {
+        return Err("OpenAI search request exceeds nesting limit".to_string());
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or_else(|| "OpenAI search request is too large".to_string())?;
+    if *nodes > MAX_SEARCH_NODES {
+        return Err("OpenAI search request exceeds item limit".to_string());
+    }
+    match value {
+        Value::String(text) => mask_text(text, false, masker),
+        Value::Array(items) => {
+            for item in items {
+                mask_search_value(item, depth + 1, nodes, masker)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                mask_search_value(item, depth + 1, nodes, masker)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn mask_model_definition(
@@ -2784,6 +2895,7 @@ enum OpenAiEndpoint {
     Responses,
     ResponsesResource,
     InputTokens,
+    StandaloneSearch,
     ChatCompletions,
     FilesCollection,
     Files,
@@ -2798,6 +2910,7 @@ impl OpenAiEndpoint {
             Self::Responses => "responses",
             Self::ResponsesResource => "responses-resource",
             Self::InputTokens => "input-tokens",
+            Self::StandaloneSearch => "standalone-search",
             Self::ChatCompletions => "chat-completions",
             Self::FilesCollection => "files-collection",
             Self::Files => "files",
@@ -2816,6 +2929,11 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         .collect::<Vec<_>>();
     if path.ends_with("/responses/input_tokens") {
         OpenAiEndpoint::InputTokens
+    } else if matches!(
+        segments.as_slice(),
+        ["v1", "alpha", "search"] | ["backend-api", "codex", "alpha", "search"]
+    ) {
+        OpenAiEndpoint::StandaloneSearch
     } else if path.ends_with("/responses") {
         OpenAiEndpoint::Responses
     } else if is_known_openai_resource_path(&segments, "responses") {
@@ -3300,7 +3418,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         thread.join().unwrap();
-        assert!(!request.contains(&secret));
+        assert!(!request.contains(&secret), "{request}");
         let handle = first_handle(&request).unwrap();
         assert!(request.matches(&handle).count() >= 3);
         let protected_request: Value = serde_json::from_str(&request).unwrap();
@@ -3488,6 +3606,14 @@ mod tests {
             OpenAiEndpoint::InputTokens
         );
         assert_eq!(
+            classify_openai_endpoint("/v1/alpha/search"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
+            classify_openai_endpoint("/backend-api/codex/alpha/search?client=codex"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/chat/completions"),
             OpenAiEndpoint::ChatCompletions
         );
@@ -3515,6 +3641,8 @@ mod tests {
             "/v1/unknown/responses/resp_123",
             "/v1/unknown/files/file_123",
             "/v1/unknown/models/model_123",
+            "/v1/unknown/alpha/search",
+            "/backend-api/unknown/alpha/search",
         ] {
             assert_eq!(
                 classify_openai_endpoint(disguised),
@@ -3767,6 +3895,124 @@ mod tests {
         let original: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(allowed["input"], original["input"]);
         assert!(allowed.get("instructions").is_none());
+    }
+
+    #[test]
+    fn standalone_codex_search_shape_is_protected_without_response_instructions() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = [
+            "sk-or-v1-",
+            "fedcba9876543210fedcba9876543210",
+            "fedcba9876543210fedcba9876543210",
+        ]
+        .concat();
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "search-session",
+                "model": "gpt-test",
+                "input": "Find official documentation",
+                "commands": {
+                    "search_query": [{
+                        "q": format!("OpenAI docs; OPENROUTER_API_KEY={secret}"),
+                        "domains": ["openai.com"]
+                    }],
+                    "response_length": "short"
+                },
+                "settings": {"search_context_size": "low"},
+                "max_output_tokens": 2500
+            }))
+            .unwrap(),
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let protected = protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::StandaloneSearch,
+            true,
+        )
+        .unwrap();
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        let query = protected["commands"]["search_query"][0]["q"]
+            .as_str()
+            .unwrap();
+        assert!(!query.contains(&secret), "{query}");
+        assert!(query.contains("<<KEYED_SECRET_"), "{query}");
+        assert!(protected.get("instructions").is_none());
+    }
+
+    #[test]
+    fn provider_boundary_forwards_codex_standalone_search_after_masking() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = [
+            "sk-or-v1-",
+            "fedcba9876543210fedcba9876543210",
+            "fedcba9876543210fedcba9876543210",
+        ]
+        .concat();
+        let (upstream, captured, thread) = mock_chat_upstream();
+        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+
+        let response = reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/backend-api/codex/alpha/search",
+                proxy.base_url()
+            ))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "id": "search-session",
+                    "model": "gpt-test",
+                    "commands": {"search_query": [{
+                        "q": format!("OpenAI docs; OPENROUTER_API_KEY={secret}")
+                    }]}
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(response.headers()["x-pentect-coverage"], "full");
+
+        let (headers, request) = captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(
+            headers.starts_with("POST /backend-api/codex/alpha/search "),
+            "{headers}"
+        );
+        assert!(!request.contains(&secret), "{request}");
+        assert!(request.contains("<<KEYED_SECRET_"), "{request}");
+    }
+
+    #[test]
+    fn unknown_standalone_search_commands_remain_fail_closed() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let body = Bytes::from_static(
+            br#"{"id":"search-session","model":"gpt-test","commands":{"future_search":[]}}"#,
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let error = match protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::StandaloneSearch,
+            true,
+        ) {
+            Ok(_) => panic!("unknown standalone search command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unknown search command"), "{error}");
     }
 
     #[test]
