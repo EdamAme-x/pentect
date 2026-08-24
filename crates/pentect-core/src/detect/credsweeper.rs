@@ -388,6 +388,8 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueEntropyBase64Check"
             | "ValueFilePathCheck"
             | "ValueHexNumberCheck"
+            | "ValueJsonWebKeyCheck"
+            | "ValueJsonWebTokenCheck"
             | "ValueLastWordCheck"
             | "ValueLengthCheck"
             | "ValueMethodCheck"
@@ -2166,6 +2168,12 @@ fn accept_value(
         if filter == "ValueHexNumberCheck" && value_hex_number_filtered(value) {
             return false;
         }
+        if filter == "ValueJsonWebKeyCheck" && value_json_web_key_filtered(value) {
+            return false;
+        }
+        if filter == "ValueJsonWebTokenCheck" && value_json_web_token_filtered(value) {
+            return false;
+        }
         if filter == "ValueLastWordCheck" && value_last_word_filtered(value, candidate) {
             return false;
         }
@@ -2482,6 +2490,83 @@ fn value_hex_number_filtered(value: &str) -> bool {
         return false;
     };
     (1..=16).contains(&hex.len()) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn decode_base64_like_upstream(value: &str) -> Option<Vec<u8>> {
+    let mut value = value
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+        .collect::<String>();
+    while value.ends_with('=') {
+        value.pop();
+    }
+    if !value.len().is_multiple_of(4) {
+        value.extend(std::iter::repeat_n('=', 4 - value.len() % 4));
+    }
+    if value.contains(['-', '_']) {
+        BASE64URL.decode(value.as_bytes()).ok()
+    } else {
+        BASE64.decode(value.as_bytes()).ok()
+    }
+}
+
+fn value_json_web_key_filtered(value: &str) -> bool {
+    let Some(data) = decode_base64_like_upstream(value) else {
+        return true;
+    };
+    !(data.windows(6).any(|window| window == br#""kty":"#)
+        && ((data.windows(5).any(|window| window == br#""oct""#)
+            && data.windows(4).any(|window| window == br#""k":"#))
+            || ((data.windows(4).any(|window| window == br#""EC""#)
+                || data.windows(5).any(|window| window == br#""RSA""#))
+                && data.windows(4).any(|window| window == br#""d":"#))))
+}
+
+fn value_json_web_token_filtered(value: &str) -> bool {
+    const HEADER_KEYS: &[&str] = &[
+        "kid", "x5u", "x5t", "x5t#S256", "typ", "cty", "crit", "alg", "enc", "zip", "jku", "jwk",
+        "x5c", "epk", "apu", "apv", "iv", "tag", "p2s", "p2c", "iss", "sub", "aud", "b64", "ppt",
+        "url", "nonce", "svt",
+    ];
+    const PAYLOAD_KEYS: &[&str] = &[
+        "iss", "sub", "aud", "exp", "nbf", "iat", "jti", "kty", "use", "key_ops", "alg", "enc",
+        "zip", "jku", "jwk", "kid", "x5u", "x5c", "x5t", "x5t#S256", "x", "y", "d", "n", "e", "p",
+        "q", "dp", "dq", "qi", "oth", "k", "crv", "ext", "crit", "keys", "id", "role", "token",
+        "secret", "password", "nonce",
+    ];
+    let (mut header, mut payload, mut signature) = (false, false, false);
+    for part in value.split('.') {
+        let Some(data) = decode_base64_like_upstream(part) else {
+            return true;
+        };
+        if part.starts_with("eyJ") {
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+                return true;
+            };
+            let Some(object) = json.as_object() else {
+                return true;
+            };
+            if !header {
+                header = object.keys().any(|key| HEADER_KEYS.contains(&key.as_str()));
+            } else if !payload {
+                payload = object
+                    .keys()
+                    .any(|key| PAYLOAD_KEYS.contains(&key.as_str()));
+            }
+        } else if header && payload && !signature {
+            let bit_length = part.len().checked_ilog2().map_or(0, |value| value + 1);
+            let threshold = if bit_length <= 4 {
+                1
+            } else {
+                bit_length as usize - 3
+            };
+            signature = !ascii_entropy_filtered(&data)
+                && !morphemes_filtered_with_threshold(&part.to_lowercase(), threshold);
+        } else {
+            break;
+        }
+    }
+    !(header && payload && signature)
 }
 
 fn value_last_word_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
@@ -3589,11 +3674,11 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 13, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 11, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
-                .contains(&"ValueJsonWebTokenCheck".to_string()),
+                .contains(&"ValueJfrogTokenCheck".to_string()),
             "{stats:?}"
         );
     }
@@ -4324,6 +4409,42 @@ mod tests {
             "bc1qpzry6fjyzh ",
         ] {
             assert!(value_bech32_filtered(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn value_json_web_key_check_matches_upstream_examples() {
+        for value in [
+            "eyJrdHkiOiAib2N0IiwiayI6ICJXck13UWZvTmFIVGdYVTVmWnZSR0FEIn0=",
+            "eyJrdHkiOiJSU0EiLCJkIjoiYWJjIn0=",
+        ] {
+            assert!(!value_json_web_key_filtered(value), "{value:?}");
+        }
+        for value in [
+            ".",
+            "eyJungle",
+            "eyJrdHkiOiAib2N0IiwieCI6ICJXck13UWZvTmFIVGdYVTVmWnZSR0FEIn0=",
+        ] {
+            assert!(value_json_web_key_filtered(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn value_json_web_token_check_matches_upstream_examples() {
+        let valid = concat!(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+            ".e30.GFsFyGiCUIP5VHI9CEJL9thWsGjSZf1fJfarNk-LGTM"
+        );
+        assert!(!value_json_web_token_filtered(valid));
+        for value in [
+            ".",
+            "eyJungle",
+            "1234567890qwertyuiopasdfghjklzxc",
+            "eyJhbGciOiJSUzI1NiJ9Cg.eyJleHAiOjY1NTM2fQo.eyJleHAiOjY1NTM2fQo",
+            "eyJhbGciOiJSUzI1NiJ9Cg.eyJleHAiOjY1NTM2fQo.AAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(value_json_web_token_filtered(value), "{value:?}");
         }
     }
 
