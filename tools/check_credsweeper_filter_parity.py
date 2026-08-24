@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import logging
+import random
+import string
 import subprocess
 import sys
 from pathlib import Path
@@ -119,6 +123,99 @@ def exercise_filters_missing_upstream_tests() -> None:
     run(ValueJfrogTokenCheck(), f"{api_key[:-1]}0")
 
 
+def exercise_generated_inputs(filter_names: set[str], case_count: int) -> int:
+    """Run deterministic shape/boundary probes through every official class."""
+    import credsweeper.filters as filters
+    from credsweeper.file_handler.analysis_target import AnalysisTarget
+    from credsweeper.file_handler.descriptor import Descriptor
+    from tests.test_utils.dummy_line_data import get_line_data
+
+    rng = random.Random(0xC0ED5EE9)
+    alphabet = string.ascii_letters + string.digits + "+/=_-. :\\[]{}()$%*"
+    values = [
+        "a",
+        "abc",
+        "abcd",
+        "A1b2C3d4",
+        "秘密鍵",
+        "pässwörd",
+        "../secret/key",
+        "C:\\secret\\key",
+        "https://example.invalid/token",
+        "${SECRET_NAME}",
+        "ENC(secret)",
+        "A" * 64,
+        "A1" * 128,
+    ]
+    boundary_lengths = [1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 15, 16, 17, 18, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256]
+    for length in boundary_lengths:
+        values.append("".join(rng.choice(alphabet) for _ in range(length)))
+    while len(values) < case_count:
+        length = rng.randrange(1, 321)
+        raw = bytes(rng.randrange(256) for _ in range(max(1, length * 3 // 4)))
+        if len(values) % 4 == 0:
+            values.append(base64.b64encode(raw).decode("ascii")[:length])
+        elif len(values) % 4 == 1:
+            values.append(base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")[:length])
+        elif len(values) % 4 == 2:
+            values.append("".join(rng.choice(alphabet) for _ in range(length)))
+        else:
+            values.append("秘密" + "".join(rng.choice(string.ascii_letters) for _ in range(length)))
+
+    instances: list[Any] = []
+    for name in sorted(filter_names):
+        cls = getattr(filters, name)
+        instances.append(cls())
+        if name == "ValueLengthCheck":
+            instances.extend([cls(None, 4, 64), cls(None, 4, 80)])
+        elif name == "ValuePatternCheck":
+            instances.append(cls(None, 5))
+        elif name == "ValueMorphemesCheck":
+            instances.extend([cls(None, 0), cls(None, 1), cls(None, 9)])
+
+    exceptions = 0
+    previous_logging_level = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        for instance_index, instance in enumerate(instances):
+            for value_index, value in enumerate(values):
+                mode = (instance_index + value_index) % 3
+                if mode == 0:
+                    line = value
+                    start = 0
+                    variable = separator = wrap = left = right = None
+                elif mode == 1:
+                    line = f'secret = "{value}"'
+                    start = len('secret = "')
+                    variable, separator, wrap, left, right = "secret", "=", None, '"', '"'
+                else:
+                    line = f"prefix({value})"
+                    start = len("prefix(")
+                    variable, separator, wrap, left, right = None, None, "prefix(", None, None
+                line_data = get_line_data(line=line)
+                line_data.value = value
+                line_data.value_start = start
+                line_data.value_end = start + len(value)
+                line_data.variable = variable
+                line_data.separator = separator
+                line_data.wrap = wrap
+                line_data.value_leftquote = left
+                line_data.value_rightquote = right
+                line_data.line_pos = 1
+                line_data.line_num = 2
+                extension = [".py", ".php", ".json", ".txt"][value_index % 4]
+                line_data.file_type = extension
+                lines = ["A1b2" * 16, line, "C3d4" * 4]
+                target = AnalysisTarget(1, lines, [1, 2, 3], Descriptor("", extension, ""))
+                try:
+                    instance.run(line_data, target)
+                except Exception:
+                    exceptions += 1
+    finally:
+        logging.disable(previous_logging_level)
+    return exceptions
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rust", type=Path, required=True)
@@ -128,6 +225,8 @@ def main() -> int:
     )
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--allow-missing", action="store_true")
+    parser.add_argument("--generated-cases", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=16_384)
     args = parser.parse_args()
 
     inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
@@ -140,6 +239,7 @@ def main() -> int:
         status = pytest.main([str(args.tests), "-q", "--disable-warnings"])
         if status == 0:
             exercise_filters_missing_upstream_tests()
+            generated_exceptions = exercise_generated_inputs(expected_filters, args.generated_cases)
     finally:
         recorder.restore()
     if status != 0:
@@ -157,20 +257,34 @@ def main() -> int:
 
     args.work.mkdir(parents=True, exist_ok=True)
     probes_path = args.work / "filter-probes.json"
-    probes_path.write_text(
-        json.dumps([probe for probe, _ in records], ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    completed = subprocess.run(
-        [str(args.rust), "credsweeper-filter-probe", str(probes_path)],
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        raise SystemExit(
-            f"Rust filter probe failed with status {completed.returncode}: {completed.stderr.strip()}"
-        )
-    actual = json.loads(completed.stdout)
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be positive")
+    actual: list[bool] = []
+    try:
+        for start in range(0, len(records), args.batch_size):
+            batch = records[start : start + args.batch_size]
+            probes_path.write_text(
+                json.dumps(
+                    [probe for probe, _ in batch],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [str(args.rust), "credsweeper-filter-probe", str(probes_path)],
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                raise SystemExit(
+                    f"Rust filter probe failed with status {completed.returncode}: "
+                    f"{completed.stderr.strip()}"
+                )
+            actual.extend(json.loads(completed.stdout))
+    finally:
+        probes_path.unlink(missing_ok=True)
     if len(actual) != len(records):
         raise SystemExit(f"Rust returned {len(actual)} results for {len(records)} probes")
     mismatches = [
@@ -180,7 +294,8 @@ def main() -> int:
     ]
     print(
         f"CredSweeper filter parity: {len(records)} probes, "
-        f"{len(covered)}/{len(expected_filters)} classes, {len(mismatches)} mismatches"
+        f"{len(covered)}/{len(expected_filters)} classes, {len(mismatches)} mismatches, "
+        f"{generated_exceptions} generated inputs outside official filter contracts"
     )
     if mismatches:
         print(json.dumps(mismatches[:50], ensure_ascii=False, indent=2), file=sys.stderr)

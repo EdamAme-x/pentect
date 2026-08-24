@@ -61,6 +61,17 @@ pub(super) fn accept_group(group: &[&MlInput]) -> bool {
 }
 
 #[cfg(test)]
+pub(super) fn score_group_for_test(group: &[&MlInput]) -> (f32, f32) {
+    VALIDATOR.with(|validator| {
+        let mut validator = validator.borrow_mut();
+        let score = validator
+            .score_group(group)
+            .expect("embedded CredSweeper ONNX model runs");
+        (score, validator.threshold)
+    })
+}
+
+#[cfg(test)]
 pub(super) fn feature_width_matches_model_for_test() -> bool {
     VALIDATOR.with(|validator| {
         let validator = validator.borrow();

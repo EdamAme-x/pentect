@@ -412,7 +412,7 @@ fn filter_name(filter: &str) -> &str {
 fn line_git_binary_filtered(line: &str) -> bool {
     let line = line.trim();
     let bytes = line.as_bytes();
-    if bytes.len() > 66 || bytes.len() < 6 || !(bytes.len() - 1).is_multiple_of(5) {
+    if bytes.len() > 66 || bytes.len() < 7 || !(bytes.len() - 1).is_multiple_of(5) {
         return false;
     }
     let size = match bytes[0] {
@@ -653,7 +653,7 @@ impl DeferredRegex {
             Some(CompiledRegex::Fancy(regex)) => regex
                 .captures_iter(text)
                 .filter_map(Result::ok)
-                .filter_map(|captures| fancy_candidate(&captures, value_capture))
+                .filter_map(|captures| fancy_candidate(&captures, text, value_capture))
                 .collect(),
             None => Vec::new(),
         }
@@ -691,6 +691,7 @@ fn rust_candidate<'a>(
 
 fn fancy_candidate<'a>(
     captures: &fancy_regex::Captures<'a>,
+    text: &'a str,
     value_capture: bool,
 ) -> Option<Candidate<'a>> {
     let value = if value_capture {
@@ -703,6 +704,17 @@ fn fancy_candidate<'a>(
     let wrap = captures.name("wrap");
     let value_leftquote = captures.name("value_leftquote");
     let value_rightquote = captures.name("value_rightquote");
+    // Python's `re` returns the closing backreference captured by the official
+    // keyword pattern. `fancy_regex` can match the same conditional expression
+    // while leaving that nested capture unset. Recover it only for keyword
+    // matches when the exact left-quote bytes follow the value in the input.
+    let recovered_rightquote = value_rightquote.map(|m| m.as_str()).or_else(|| {
+        captures.name("keyword")?;
+        let left = value_leftquote.as_ref()?.as_str();
+        text.get(value.end()..)?
+            .strip_prefix(left)
+            .map(|_| &text[value.end()..value.end() + left.len()])
+    });
     Some(Candidate {
         start: value.start(),
         end: value.end(),
@@ -713,7 +725,7 @@ fn fancy_candidate<'a>(
         separator: separator.map(|m| m.as_str()),
         wrap: wrap.map(|m| m.as_str()),
         value_leftquote: value_leftquote.map(|m| m.as_str()),
-        value_rightquote: value_rightquote.map(|m| m.as_str()),
+        value_rightquote: recovered_rightquote,
         line_data: Vec::new(),
     })
 }
@@ -3486,10 +3498,8 @@ fn value_token_filtered(value: &str, well_quoted: bool) -> bool {
             return Some(index);
         }
         if *ch == ' '
-            && 0 < index
-            && index + 1 < chars.len()
-            && python_word_char(chars[index - 1])
-            && python_word_char(chars[index + 1])
+            && (index == 0 || python_word_char(chars[index - 1]))
+            && (index + 1 == chars.len() || python_word_char(chars[index + 1]))
         {
             return Some(index);
         }
@@ -3959,7 +3969,9 @@ fn value_pattern_filtered(value: &str, pattern_len: Option<usize>) -> bool {
     if repeated_or_sequence_pattern(value, threshold, MIN_DATA_LEN <= threshold) {
         return true;
     }
-    if 2 * threshold <= value_len && duple_pattern_filtered(value, threshold) {
+    if 2 * threshold <= value_len
+        && duple_pattern_filtered(value, threshold, MIN_DATA_LEN <= threshold)
+    {
         return true;
     }
     false
@@ -4000,13 +4012,13 @@ fn repeated_or_sequence_pattern(
     false
 }
 
-fn duple_pattern_filtered(value: &str, threshold: usize) -> bool {
+fn duple_pattern_filtered(value: &str, threshold: usize, ignore_base64_a_slash: bool) -> bool {
     let even = value
         .chars()
         .enumerate()
         .filter_map(|(idx, ch)| (idx % 2 == 0).then_some(ch))
         .collect::<String>();
-    if !repeated_or_sequence_pattern(&even, threshold, false) {
+    if !repeated_or_sequence_pattern(&even, threshold, ignore_base64_a_slash) {
         return false;
     }
     let odd = value
@@ -4014,13 +4026,14 @@ fn duple_pattern_filtered(value: &str, threshold: usize) -> bool {
         .enumerate()
         .filter_map(|(idx, ch)| (idx % 2 == 1).then_some(ch))
         .collect::<String>();
-    repeated_or_sequence_pattern(&odd, threshold, false)
+    repeated_or_sequence_pattern(&odd, threshold, ignore_base64_a_slash)
 }
 
 fn entropy_base36_filtered(value: &str) -> bool {
-    let min = match value.len() {
+    let len = value.chars().count();
+    let min = match len {
         15 => 3.374,
-        10..=25 => 0.731_566_857 * (value.len() as f64).log2() + 0.474_132,
+        10..=25 => 0.731_566_857 * (len as f64).log2() + 0.474_132,
         26.. => 3.9,
         _ => 0.0,
     };
@@ -4050,7 +4063,7 @@ fn minimum_base64_entropy(len: usize) -> f64 {
 }
 
 fn entropy_base64_filtered(value: &str) -> bool {
-    let min = minimum_base64_entropy(value.len());
+    let min = minimum_base64_entropy(value.chars().count());
     min == 0.0 || shannon_entropy(value) < min
 }
 
@@ -4846,7 +4859,8 @@ mod tests {
             "n7fzJc3_WG59VEOBTkayzuSMM780OJQuZjN_KbH8lOZG25ZoA7T4Bxcc0xQn5oZE5uSCI",
             "wg91oCt0JvxPcpmqzaJZg1nirjcWZ-oBtVk7gCAWq-B3qhfF3izlbkosrzjHajIcY33HBh",
         );
-        let base64_key = format!("MII{}", "A".repeat(180));
+        let rsa = openssl::rsa::Rsa::generate(1024).unwrap();
+        let base64_key = BASE64.encode(&rsa.private_key_to_der().unwrap());
         let raw = format!(
             "aws {aws_id} {aws_secret}\n\
              google 123-abcdeabcdeabcdeabcdeabcdeabcdeab.apps.googleusercontent.com {google_secret}\n\
@@ -4901,6 +4915,112 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.rule_name == "Key" && finding.variable.as_deref() == Some("DJANGO_SECRET_KEY")
         }));
+    }
+
+    #[test]
+    fn password_ml_matches_official_creddata_candidates() {
+        for (path, raw, expected) in [
+            (
+                "benchmarks/CredData/data/02dfa7ec/test/a5c0c9aa.py",
+                "        self.password = 'ouywdakchdmtjjva'\n",
+                "ouywdakchdmtjjva",
+            ),
+            (
+                "benchmarks/CredData/data/02dfa7ec/test/setting/e43ec22b.py",
+                "        self.password = 'ufnlbbavawsdeecn'\n",
+                "ufnlbbavawsdeecn",
+            ),
+        ] {
+            let region = crate::model::Region {
+                span: ByteRange::new(0, raw.len()),
+                ctx: crate::model::Context {
+                    path: Some(path.to_string()),
+                    key: None,
+                    hints: Vec::new(),
+                    kind: crate::model::RegionKind::PlainText,
+                    format: crate::model::Kind::Text,
+                },
+            };
+            let view = NormalizedView::build(&region, raw);
+            let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+            let detector = CredSweeperNativeDetector::builtin();
+            let rule = detector
+                .rules
+                .iter()
+                .find(|rule| rule.rule_name == "Password")
+                .unwrap();
+            let candidate = rule
+                .patterns
+                .iter()
+                .flat_map(|pattern| match &pattern.matcher {
+                    PatternMatcher::Deferred(regex) => {
+                        regex.find(raw.trim_end(), pattern.value_capture)
+                    }
+                    PatternMatcher::Special(_) => Vec::new(),
+                })
+                .find(|candidate| candidate.value == expected)
+                .unwrap();
+            let line_ctx = CandidateLineContext {
+                start: 0,
+                line: raw.trim_end(),
+                previous: None,
+                next: None,
+                file_type: ".py",
+                target: raw,
+                line_index: 0,
+            };
+            assert_eq!(candidate.value_leftquote, Some("'"));
+            assert_eq!(candidate.value_rightquote, Some("'"));
+            assert!(accept_value(
+                candidate.value,
+                rule,
+                &candidate,
+                &line_ctx,
+                candidate.start,
+                candidate.end,
+            ));
+            let input = MlInput {
+                line: raw.trim_end().to_string(),
+                value: expected.to_string(),
+                variable: "self.password".to_string(),
+                value_start: 25,
+                value_end: 41,
+                variable_start: 8,
+                variable_end: 21,
+                path: path.to_string(),
+                file_type: ".py".to_string(),
+                rule_name: "Password".to_string(),
+                severity: RuleSeverity::High,
+            };
+            let (score, threshold) = credsweeper_ml::score_group_for_test(&[&input]);
+            assert!(
+                score >= threshold,
+                "{path}: score={score} threshold={threshold}"
+            );
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_name == "Password" && finding.value == expected
+                }),
+                "{path}: score={score} threshold={threshold} findings={findings:?}"
+            );
+        }
+
+        let raw = "        self.password = ouywdakchdmtjjva\n";
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("benchmarks/CredData/data/02dfa7ec/test/a5c0c9aa.py".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, raw);
+        assert!(CredSweeperNativeDetector::builtin()
+            .detect_findings(&view)
+            .iter()
+            .all(|finding| finding.value != "ouywdakchdmtjjva"));
     }
 
     #[test]
@@ -5152,7 +5272,7 @@ mod tests {
         for value in ["passwords['user1']", "passwords('user1')", "{'root'}"] {
             let item = test_candidate(value, None, Some("'"), Some("'"));
             assert!(
-                !value_array_dictionary_filtered(value, &item, false),
+                !value_array_dictionary_filtered(value, &item, true),
                 "{value:?}"
             );
         }
@@ -5523,6 +5643,7 @@ mod tests {
             r#"{"test":1,"pw":"sn2e8dgWwW","payload":"EYlS}b+C(YT)lWLGxNdj7Pw=w"}"#,
             "XcmV?d00001",
             "HcmV?d0000/",
+            "DY8Vzw",
         ] {
             assert!(!line_git_binary_filtered(line), "{line:?}");
         }
