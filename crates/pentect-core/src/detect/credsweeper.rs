@@ -354,6 +354,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueNumberCheck"
             | "ValuePatternCheck"
             | "ValueSealedSecretCheck"
+            | "ValueSimilarityCheck"
     )
 }
 
@@ -2092,6 +2093,10 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueSimilarityCheck" && value_similarity_filtered(value, candidate.variable)
+        {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -2291,6 +2296,116 @@ fn value_not_allowed_pattern_filtered(value: &str, candidate: &Candidate<'_>) ->
         .expect("CredSweeper not-allowed value regex")
     });
     NOT_ALLOWED.is_match(value)
+}
+
+fn value_similarity_filtered(value: &str, variable: Option<&str>) -> bool {
+    let Some(variable) = variable.filter(|variable| !variable.is_empty()) else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+    let variable = variable.to_lowercase();
+    let value = value.to_lowercase();
+    let variable_len = variable.chars().count();
+    let value_len = value.chars().count();
+    if value_len <= variable_len {
+        if variable.contains(&value) {
+            return true;
+        }
+    } else if 4 <= variable_len && value.contains(&variable) {
+        return true;
+    }
+    0.75 < sequence_matcher_ratio(&variable, &value)
+}
+
+fn sequence_matcher_ratio(a: &str, b: &str) -> f64 {
+    let a = a.chars().collect::<Vec<_>>();
+    let b = b.chars().collect::<Vec<_>>();
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let mut b2j = BTreeMap::<char, Vec<usize>>::new();
+    for (index, ch) in b.iter().copied().enumerate() {
+        b2j.entry(ch).or_default().push(index);
+    }
+    if b.len() >= 200 {
+        let popularity_limit = b.len() / 100 + 1;
+        b2j.retain(|_, positions| positions.len() <= popularity_limit);
+    }
+
+    let mut pending = vec![(0usize, a.len(), 0usize, b.len())];
+    let mut blocks = Vec::new();
+    while let Some((alo, ahi, blo, bhi)) = pending.pop() {
+        let (i, j, size) = sequence_longest_match(&a, &b, &b2j, alo, ahi, blo, bhi);
+        if size == 0 {
+            continue;
+        }
+        blocks.push((i, j, size));
+        if alo < i && blo < j {
+            pending.push((alo, i, blo, j));
+        }
+        if i + size < ahi && j + size < bhi {
+            pending.push((i + size, ahi, j + size, bhi));
+        }
+    }
+    blocks.sort_unstable();
+    let mut merged: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, j, size) in blocks {
+        if let Some((last_i, last_j, last_size)) = merged.last_mut() {
+            if *last_i + *last_size == i && *last_j + *last_size == j {
+                *last_size += size;
+                continue;
+            }
+        }
+        merged.push((i, j, size));
+    }
+    let matched = merged.iter().map(|(_, _, size)| size).sum::<usize>();
+    2.0 * matched as f64 / (a.len() + b.len()) as f64
+}
+
+fn sequence_longest_match(
+    a: &[char],
+    b: &[char],
+    b2j: &BTreeMap<char, Vec<usize>>,
+    alo: usize,
+    ahi: usize,
+    blo: usize,
+    bhi: usize,
+) -> (usize, usize, usize) {
+    let (mut best_i, mut best_j, mut best_size) = (alo, blo, 0usize);
+    let mut previous = BTreeMap::<usize, usize>::new();
+    for (i, ch) in a.iter().enumerate().take(ahi).skip(alo) {
+        let mut current = BTreeMap::new();
+        if let Some(positions) = b2j.get(ch) {
+            for &j in positions {
+                if j < blo {
+                    continue;
+                }
+                if bhi <= j {
+                    break;
+                }
+                let size = previous.get(&j.wrapping_sub(1)).copied().unwrap_or(0) + 1;
+                current.insert(j, size);
+                if size > best_size {
+                    (best_i, best_j, best_size) = (i + 1 - size, j + 1 - size, size);
+                }
+            }
+        }
+        previous = current;
+    }
+    while best_i > alo && best_j > blo && a[best_i - 1] == b[best_j - 1] {
+        best_i -= 1;
+        best_j -= 1;
+        best_size += 1;
+    }
+    while best_i + best_size < ahi
+        && best_j + best_size < bhi
+        && a[best_i + best_size] == b[best_j + best_size]
+    {
+        best_size += 1;
+    }
+    (best_i, best_j, best_size)
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -2886,7 +3001,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 24, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 23, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3395,6 +3510,41 @@ mod tests {
         }
         let quoted = test_candidate("\\n", None, Some("\""), Some("\""));
         assert!(!value_not_allowed_pattern_filtered(quoted.value, &quoted));
+    }
+
+    #[test]
+    fn value_similarity_check_matches_upstream_examples() {
+        for (variable, value) in [
+            ("password", "password1"),
+            ("password", "password123"),
+            ("pwd", "PWD"),
+            ("password", "password=`$vc1rQ5eBW*S`"),
+        ] {
+            assert!(
+                value_similarity_filtered(value, Some(variable)),
+                "{variable:?} {value:?}"
+            );
+        }
+        assert!(!value_similarity_filtered(
+            "unrelated-secret",
+            Some("password")
+        ));
+        assert!(!value_similarity_filtered("secret", None));
+    }
+
+    #[test]
+    fn sequence_matcher_ratio_matches_python_reference_vectors() {
+        for (a, b, expected) in [
+            ("password", "password1", 0.941_176_470_588_235_3),
+            ("password", "password123", 0.842_105_263_157_894_7),
+            ("abcd", "abxcd", 0.888_888_888_888_888_8),
+            ("tide", "diet", 0.25),
+        ] {
+            assert!((sequence_matcher_ratio(a, b) - expected).abs() < f64::EPSILON);
+        }
+        let a = format!("{}b", "a".repeat(210));
+        let b = format!("{}c", "a".repeat(210));
+        assert!((sequence_matcher_ratio(&a, &b) - 0.995_260_663_507_109).abs() < f64::EPSILON);
     }
 
     fn test_candidate<'a>(
