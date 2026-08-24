@@ -1476,7 +1476,6 @@ struct ClaudeCallerSettings {
     effective_env: serde_json::Map<String, serde_json::Value>,
     settings_at: Option<usize>,
     inline: bool,
-    source_path: Option<PathBuf>,
 }
 
 impl ClaudeCallerSettings {
@@ -1502,7 +1501,7 @@ impl ClaudeCallerSettings {
             }
         }
 
-        let (value, source_path) = if let Some(index) = settings_at {
+        let (value, _) = if let Some(index) = settings_at {
             let raw = if inline {
                 args[index]
                     .split_once('=')
@@ -1535,7 +1534,6 @@ impl ClaudeCallerSettings {
             effective_env,
             settings_at,
             inline,
-            source_path,
         })
     }
 
@@ -1575,21 +1573,14 @@ impl ClaudeCallerSettings {
             );
         }
 
-        let directory = self
-            .source_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .map(Ok)
-            .unwrap_or_else(|| {
-                std::env::current_dir().map_err(|error| {
-                    format!("could not locate the working directory for Claude settings: {error}")
-                })
-            })?;
+        let directory = secure_temp::SecureTempDirectory::create(
+            "pentect-claude-settings-",
+            "Claude settings",
+        )?;
         let encoded = serde_json::to_vec(&settings)
             .map_err(|error| format!("could not encode protected Claude settings: {error}"))?;
         let file = secure_temp::SecureTempFile::create(
-            &directory,
+            directory.path(),
             ".pentect-claude-settings-",
             ".json",
             &encoded,
@@ -1610,6 +1601,7 @@ impl ClaudeCallerSettings {
         Ok(ClaudeGatewaySettings {
             args: out,
             _file: file,
+            _directory: directory,
         })
     }
 }
@@ -1618,6 +1610,7 @@ impl ClaudeCallerSettings {
 struct ClaudeGatewaySettings {
     args: Vec<String>,
     _file: secure_temp::SecureTempFile,
+    _directory: secure_temp::SecureTempDirectory,
 }
 
 impl ClaudeGatewaySettings {
@@ -3402,5 +3395,55 @@ mod tests {
         let (reason, action) = classify_memory_store_startup_stderr(b"unexpected child crash");
         assert_eq!(reason, "child-exited");
         assert!(action.contains("pentect log"));
+    }
+
+    #[test]
+    fn claude_gateway_settings_use_and_remove_a_private_temp_directory() {
+        let settings = ClaudeCallerSettings {
+            value: serde_json::json!({}),
+            effective_env: serde_json::Map::new(),
+            settings_at: None,
+            inline: false,
+        };
+        let gateway = settings
+            .with_gateway(&[], "http://127.0.0.1:1234", false)
+            .unwrap();
+        let path = PathBuf::from(&gateway.args()[1]);
+        let directory = path.parent().unwrap().to_path_buf();
+        assert!(path.is_file());
+        assert!(directory.starts_with(std::env::temp_dir()));
+
+        drop(gateway);
+        assert!(!path.exists());
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_gateway_settings_do_not_write_beside_a_read_only_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_directory = command_test_directory("claude-read-only-settings");
+        std::fs::create_dir(&source_directory).unwrap();
+        let source = source_directory.join("settings.json");
+        std::fs::write(&source, b"{}").unwrap();
+        std::fs::set_permissions(&source_directory, std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let args = vec![
+            "--settings".to_string(),
+            source.to_string_lossy().into_owned(),
+        ];
+        let settings = ClaudeCallerSettings::from_args(&args).unwrap();
+        let gateway = settings
+            .with_gateway(&args, "http://127.0.0.1:1234", false)
+            .unwrap();
+        let generated = PathBuf::from(&gateway.args()[1]);
+        assert_ne!(generated.parent(), Some(source_directory.as_path()));
+
+        drop(gateway);
+        std::fs::set_permissions(&source_directory, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(source_directory).unwrap();
     }
 }
