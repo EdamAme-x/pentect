@@ -120,6 +120,10 @@ stateful.
 
 `exec` restores known handles before execution and masks stdout and stderr:
 
+It requires a command name. It does not interpret arbitrary text as a secret,
+file path, or value to resolve. See the [task-oriented command guide](/start/commands/)
+for POSIX shell and PowerShell examples.
+
 | Form | Behavior |
 | --- | --- |
 | `pentect exec "COMMAND"` | Run through the native shell |
