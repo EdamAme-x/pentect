@@ -337,6 +337,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
         filter_name(filter),
         "LineSpecificKeyCheck"
             | "ValueAllowlistCheck"
+            | "ValueArrayDictionaryCheck"
             | "ValueBasicAuthCheck"
             | "ValueBlocklistCheck"
             | "ValueCamelCaseCheck"
@@ -504,6 +505,7 @@ fn rust_candidate<'a>(
     }?;
     let variable = captures.name("variable");
     let separator = captures.name("separator");
+    let wrap = captures.name("wrap");
     let value_leftquote = captures.name("value_leftquote");
     let value_rightquote = captures.name("value_rightquote");
     Some(Candidate {
@@ -514,6 +516,7 @@ fn rust_candidate<'a>(
         variable_end: variable.as_ref().map(|m| m.end()),
         variable: variable.map(|m| m.as_str()),
         separator: separator.map(|m| m.as_str()),
+        wrap: wrap.map(|m| m.as_str()),
         value_leftquote: value_leftquote.map(|m| m.as_str()),
         value_rightquote: value_rightquote.map(|m| m.as_str()),
         line_data: Vec::new(),
@@ -531,6 +534,7 @@ fn fancy_candidate<'a>(
     }?;
     let variable = captures.name("variable");
     let separator = captures.name("separator");
+    let wrap = captures.name("wrap");
     let value_leftquote = captures.name("value_leftquote");
     let value_rightquote = captures.name("value_rightquote");
     Some(Candidate {
@@ -541,6 +545,7 @@ fn fancy_candidate<'a>(
         variable_end: variable.as_ref().map(|m| m.end()),
         variable: variable.map(|m| m.as_str()),
         separator: separator.map(|m| m.as_str()),
+        wrap: wrap.map(|m| m.as_str()),
         value_leftquote: value_leftquote.map(|m| m.as_str()),
         value_rightquote: value_rightquote.map(|m| m.as_str()),
         line_data: Vec::new(),
@@ -555,6 +560,7 @@ struct Candidate<'a> {
     variable_end: Option<usize>,
     variable: Option<&'a str>,
     separator: Option<&'a str>,
+    wrap: Option<&'a str>,
     value_leftquote: Option<&'a str>,
     value_rightquote: Option<&'a str>,
     line_data: Vec<CandidateLineData<'a>>,
@@ -972,6 +978,7 @@ fn multi_pattern_candidates<'a>(
                 variable_end: main.variable_end,
                 variable: main.variable,
                 separator: None,
+                wrap: None,
                 value_leftquote: None,
                 value_rightquote: None,
                 line_data,
@@ -1072,6 +1079,7 @@ fn jwk_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
                 variable_end: main.variable_end,
                 variable: main.variable,
                 separator: None,
+                wrap: None,
                 value_leftquote: None,
                 value_rightquote: None,
                 line_data,
@@ -1194,6 +1202,7 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
             variable_end: None,
             variable: None,
             separator: None,
+            wrap: None,
             value_leftquote: None,
             value_rightquote: None,
             line_data: Vec::new(),
@@ -1245,6 +1254,7 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
                 variable_end: None,
                 variable: None,
                 separator: None,
+                wrap: None,
                 value_leftquote: None,
                 value_rightquote: None,
                 line_data: Vec::new(),
@@ -1404,6 +1414,7 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
                 variable_end: None,
                 variable: None,
                 separator: None,
+                wrap: None,
                 value_leftquote: None,
                 value_rightquote: None,
                 line_data: Vec::new(),
@@ -1419,6 +1430,7 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
             variable_end: None,
             variable: None,
             separator: None,
+            wrap: None,
             value_leftquote: None,
             value_rightquote: None,
             line_data: Vec::new(),
@@ -2047,6 +2059,11 @@ fn accept_value(
         {
             return false;
         }
+        if filter == "ValueArrayDictionaryCheck"
+            && value_array_dictionary_filtered(value, candidate)
+        {
+            return false;
+        }
         if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
             return false;
         }
@@ -2100,6 +2117,20 @@ fn candidate_is_well_quoted(candidate: &Candidate<'_>) -> bool {
         (candidate.value_leftquote, candidate.value_rightquote),
         (Some(left), Some(right)) if left == right
     )
+}
+
+fn value_array_dictionary_filtered(value: &str, candidate: &Candidate<'_>) -> bool {
+    if candidate_is_well_quoted(candidate) {
+        return false;
+    }
+    let wrap = candidate.wrap.unwrap_or_default();
+    if wrap.to_ascii_lowercase().contains("byte") {
+        return false;
+    }
+    static ARRAY_OR_DICTIONARY_CALL: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r#"\[['\"]?[^,]+['\"]?]"#).expect("CredSweeper array/dictionary call regex")
+    });
+    ARRAY_OR_DICTIONARY_CALL.is_match(value) || wrap.ends_with('[') || wrap.ends_with('(')
 }
 
 fn value_allowlist_filtered(value: &str, is_well_quoted: bool) -> bool {
@@ -2780,7 +2811,7 @@ mod tests {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert!(stats.total_filter_invocations > 0, "{stats:?}");
         assert!(stats.unsupported_filter_invocations > 0, "{stats:?}");
-        assert_eq!(stats.unsupported_filter_types.len(), 30, "{stats:?}");
+        assert_eq!(stats.unsupported_filter_types.len(), 29, "{stats:?}");
         assert!(
             stats
                 .unsupported_filter_types
@@ -3022,6 +3053,7 @@ mod tests {
             variable_end: Some(variable_start + "oauth_token".len()),
             variable: Some("oauth_token"),
             separator: Some("="),
+            wrap: None,
             value_leftquote: None,
             value_rightquote: None,
             line_data: Vec::new(),
@@ -3046,6 +3078,7 @@ mod tests {
             variable_end: Some(variable_start + "X-Amz-Credential".len()),
             variable: Some("X-Amz-Credential"),
             separator: Some("="),
+            wrap: None,
             value_leftquote: None,
             value_rightquote: None,
             line_data: Vec::new(),
@@ -3179,6 +3212,50 @@ mod tests {
             expand_filter_group("ValueGitHubCheck"),
             ["ValueGitHubCheck"]
         );
+    }
+
+    #[test]
+    fn value_array_dictionary_check_matches_upstream_examples() {
+        for value in [
+            "values[k+1:j]",
+            "values[i]",
+            "values[145]",
+            "values[token_id]",
+        ] {
+            let item = test_candidate(value, None, None, None);
+            assert!(value_array_dictionary_filtered(value, &item), "{value:?}");
+        }
+        for value in ["passwords['user1']", "passwords('user1')", "{'root'}"] {
+            let item = test_candidate(value, None, Some("'"), Some("'"));
+            assert!(!value_array_dictionary_filtered(value, &item), "{value:?}");
+        }
+        let byte_wrap = test_candidate("values[i]", Some("byte["), None, None);
+        assert!(!value_array_dictionary_filtered("values[i]", &byte_wrap));
+        let array_wrap = test_candidate("root", Some("values["), None, None);
+        assert!(value_array_dictionary_filtered("root", &array_wrap));
+        let call_wrap = test_candidate("root", Some("values("), None, None);
+        assert!(value_array_dictionary_filtered("root", &call_wrap));
+    }
+
+    fn test_candidate<'a>(
+        value: &'a str,
+        wrap: Option<&'a str>,
+        left: Option<&'a str>,
+        right: Option<&'a str>,
+    ) -> Candidate<'a> {
+        Candidate {
+            start: 0,
+            end: value.len(),
+            value,
+            variable_start: None,
+            variable_end: None,
+            variable: None,
+            separator: None,
+            wrap,
+            value_leftquote: left,
+            value_rightquote: right,
+            line_data: Vec::new(),
+        }
     }
 
     #[test]
