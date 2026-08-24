@@ -45,6 +45,8 @@ const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_UPLOADS: usize = 256;
 const MAX_IDS_PER_UPLOAD: usize = 16;
+#[cfg(windows)]
+const PACKAGED_APP_STARTUP_GRACE: Duration = Duration::from_secs(2);
 
 pub(crate) fn cmd_claude_app(args: &[String]) -> i32 {
     match run_claude_app(args) {
@@ -109,23 +111,42 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     )?;
     let proxy = ClaudeAppProxyGuard::start()?;
     let user_data_dir = claude_user_data_dir()?;
-    eprintln!(
-        "[pentect] Claude App gateway ready at {}",
-        proxy.proxy_url()
-    );
-    eprintln!(
-        "[pentect] Chat, supported attachments, and Claude Code model traffic are protected; bodies are not logged"
-    );
+    #[cfg(windows)]
+    if let Some(package) = find_windows_claude_package()
+        .filter(|package| paths_equal_case_insensitive(&package.executable, &app))
+    {
+        let arguments = claude_chromium_arguments(&proxy, &user_data_dir);
+        let environment =
+            ScopedPackageEnvironment::install(anthropic.base_url(), &options.upstream_header_env);
+        let process = activate_windows_package(&package.aumid, &arguments)?;
+        drop(environment);
+        let process_id = process.id();
+        if let Err(error) = ctrlc::set_handler(move || {
+            terminate_child_process(process_id);
+            std::process::exit(130);
+        }) {
+            terminate_child_process(process_id);
+            return Err(format!(
+                "could not install Claude Desktop shutdown handler: {error}"
+            ));
+        }
+        thread::sleep(PACKAGED_APP_STARTUP_GRACE);
+        if let Some(status) = process.try_wait()? {
+            return Err(format!(
+                "Claude Desktop package exited before protection attached ({status}); update Claude Desktop or pass --app PATH to a non-MSIX installation"
+            ));
+        }
+        print_gateway_ready(&proxy);
+        let status = process.wait()?;
+        drop(proxy);
+        drop(anthropic);
+        return Ok(status);
+    }
 
     let mut command = Command::new(&app);
     crate::upstream::hide_header_source_env(&mut command, &options.upstream_header_env);
     command
-        .arg(format!("--proxy-server={}", proxy.proxy_url()))
-        .arg(format!(
-            "--ignore-certificate-errors-spki-list={}",
-            proxy.spki_hash()
-        ))
-        .arg(format!("--user-data-dir={}", user_data_dir.display()))
+        .args(claude_chromium_arguments(&proxy, &user_data_dir))
         .env("ANTHROPIC_BASE_URL", anthropic.base_url())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -135,6 +156,7 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .spawn()
         .map_err(|error| format!("could not start Claude Desktop: {error}"))?;
     let child_id = child.id();
+    print_gateway_ready(&proxy);
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
         std::process::exit(130);
@@ -151,6 +173,192 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     drop(proxy);
     drop(anthropic);
     Ok(status)
+}
+
+fn claude_chromium_arguments(proxy: &ClaudeAppProxyGuard, user_data_dir: &Path) -> Vec<String> {
+    vec![
+        format!("--proxy-server={}", proxy.proxy_url()),
+        format!(
+            "--ignore-certificate-errors-spki-list={}",
+            proxy.spki_hash()
+        ),
+        format!("--user-data-dir={}", user_data_dir.display()),
+    ]
+}
+
+fn print_gateway_ready(proxy: &ClaudeAppProxyGuard) {
+    eprintln!(
+        "[pentect] Claude App gateway ready at {}",
+        proxy.proxy_url()
+    );
+    eprintln!(
+        "[pentect] Chat, supported attachments, and Claude Code model traffic are protected; bodies are not logged"
+    );
+}
+
+#[cfg(windows)]
+struct ScopedPackageEnvironment {
+    previous: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(windows)]
+impl ScopedPackageEnvironment {
+    fn install(anthropic_base_url: &str, hidden: &[String]) -> Self {
+        let mut changes = vec![(
+            "ANTHROPIC_BASE_URL".to_string(),
+            Some(std::ffi::OsString::from(anthropic_base_url)),
+        )];
+        changes.extend(hidden.iter().map(|name| (name.clone(), None)));
+        let mut previous = Vec::with_capacity(changes.len());
+        for (name, value) in changes {
+            previous.push((name.clone(), std::env::var_os(&name)));
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ScopedPackageEnvironment {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ActivatedWindowsProcess {
+    id: u32,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl ActivatedWindowsProcess {
+    fn id(&self) -> u32 {
+        self.id
+    }
+
+    fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, String> {
+        use std::os::windows::process::ExitStatusExt;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, WaitForSingleObject, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        let result = unsafe { WaitForSingleObject(self.handle, 0) };
+        if result == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if result != WAIT_OBJECT_0 {
+            return Err("could not observe activated Claude Desktop process".to_string());
+        }
+        let mut code = 0u32;
+        if unsafe { GetExitCodeProcess(self.handle, &mut code) } == 0 {
+            return Err("could not read Claude Desktop exit status".to_string());
+        }
+        Ok(Some(std::process::ExitStatus::from_raw(code)))
+    }
+
+    fn wait(&self) -> Result<std::process::ExitStatus, String> {
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE, WAIT_OBJECT_0};
+        if unsafe { WaitForSingleObject(self.handle, INFINITE) } != WAIT_OBJECT_0 {
+            return Err("could not wait for activated Claude Desktop process".to_string());
+        }
+        self.try_wait()?.ok_or_else(|| {
+            "Claude Desktop process remained active after its wait completed".to_string()
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ActivatedWindowsProcess {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn activate_windows_package(
+    aumid: &str,
+    arguments: &[String],
+) -> Result<ActivatedWindowsProcess, String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        ApplicationActivationManager, IApplicationActivationManager, AO_NONE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+    };
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    initialized
+        .ok()
+        .map_err(|error| format!("could not initialize Windows app activation: {error}"))?;
+    let result = (|| {
+        let manager: IApplicationActivationManager = unsafe {
+            CoCreateInstance(
+                &ApplicationActivationManager,
+                None::<&windows::core::IUnknown>,
+                CLSCTX_LOCAL_SERVER,
+            )
+        }
+        .map_err(|error| format!("could not create Windows app activation manager: {error}"))?;
+        let aumid = wide_null(aumid);
+        let command_line = arguments
+            .iter()
+            .map(|argument| quote_windows_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command_line = wide_null(&command_line);
+        let id = unsafe {
+            manager.ActivateApplication(
+                PCWSTR(aumid.as_ptr()),
+                PCWSTR(command_line.as_ptr()),
+                AO_NONE,
+            )
+        }
+        .map_err(|error| format!("could not activate Claude Desktop package: {error}"))?;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, id) };
+        if handle.is_null() {
+            return Err(
+                "Claude Desktop activated but its process could not be observed".to_string(),
+            );
+        }
+        Ok(ActivatedWindowsProcess { id, handle })
+    })();
+    unsafe { CoUninitialize() };
+    result
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn quote_windows_argument(value: &str) -> String {
+    if !value
+        .chars()
+        .any(|ch| ch.is_ascii_whitespace() || ch == '"')
+    {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 #[cfg(windows)]
@@ -2089,6 +2297,18 @@ fn claude_user_data_dir() -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 fn find_windows_claude_app() -> Option<PathBuf> {
+    find_windows_claude_package().map(|package| package.executable)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsClaudePackage {
+    executable: PathBuf,
+    aumid: String,
+}
+
+#[cfg(windows)]
+fn find_windows_claude_package() -> Option<WindowsClaudePackage> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const PACKAGES_KEY: &str = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
@@ -2132,13 +2352,86 @@ fn find_windows_claude_app() -> Option<PathBuf> {
                 })?
                 .to_string();
             let executable = PathBuf::from(root).join("app").join("Claude.exe");
-            executable
-                .is_file()
-                .then(|| (windows_package_version(&package_name), executable))
+            let aumid = windows_package_aumid(&package_name, &executable).ok()?;
+            executable.is_file().then(|| {
+                (
+                    windows_package_version(&package_name),
+                    WindowsClaudePackage { executable, aumid },
+                )
+            })
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
-    candidates.pop().map(|(_, path)| path)
+    candidates.pop().map(|(_, package)| package)
+}
+
+#[cfg(windows)]
+fn windows_package_aumid(package_name: &str, executable: &Path) -> Result<String, String> {
+    let (qualified, publisher_id) = package_name
+        .rsplit_once("__")
+        .ok_or_else(|| "Claude package identity has no publisher ID".to_string())?;
+    let identity = qualified
+        .split('_')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Claude package identity name is unavailable".to_string())?;
+    let package_root = executable
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "Claude package root is unavailable".to_string())?;
+    let application_id = appx_application_id(&package_root.join("AppxManifest.xml"))?;
+    Ok(format!("{identity}_{publisher_id}!{application_id}"))
+}
+
+#[cfg(windows)]
+fn appx_application_id(path: &Path) -> Result<String, String> {
+    use quick_xml::events::Event;
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("could not inspect Claude AppxManifest.xml: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return Err("Claude AppxManifest.xml is not a bounded regular file".to_string());
+    }
+    let source = std::fs::read(path)
+        .map_err(|error| format!("could not read Claude AppxManifest.xml: {error}"))?;
+    let mut reader = quick_xml::Reader::from_reader(source.as_slice());
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if element.local_name().as_ref() == b"Application" =>
+            {
+                for attribute in element.attributes().flatten() {
+                    if attribute.key.local_name().as_ref() == b"Id" {
+                        let value = attribute
+                            .unescape_value()
+                            .map_err(|_| "Claude application ID is invalid".to_string())?
+                            .into_owned();
+                        if !value.is_empty()
+                            && value.len() <= 128
+                            && value
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+                        {
+                            return Ok(value);
+                        }
+                        return Err("Claude application ID contains invalid characters".to_string());
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return Err("Claude AppxManifest.xml is invalid".to_string()),
+            _ => {}
+        }
+    }
+    Err("Claude AppxManifest.xml has no application ID".to_string())
+}
+
+#[cfg(windows)]
+fn paths_equal_case_insensitive(left: &Path, right: &Path) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
 #[cfg(windows)]
@@ -2682,5 +2975,39 @@ mod tests {
                 "Claude_1.10.0.0_x64__id"
             }
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn appx_manifest_builds_the_claude_aumid() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-claude-appx-test-{}", std::process::id()));
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Claude.exe"), b"fixture").unwrap();
+        std::fs::write(
+            root.join("AppxManifest.xml"),
+            br#"<Package><Applications><Application Id="Claude" Executable="app\Claude.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            windows_package_aumid(
+                "Claude_1.34493.1.0_x64__publisher123",
+                &app.join("Claude.exe")
+            )
+            .unwrap(),
+            "Claude_publisher123!Claude"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_arguments_quote_paths_with_spaces() {
+        assert_eq!(quote_windows_argument("--flag=value"), "--flag=value");
+        assert_eq!(
+            quote_windows_argument("--user-data-dir=C:\\Users\\Test User\\Claude"),
+            "\"--user-data-dir=C:\\Users\\Test User\\Claude\""
+        );
     }
 }
