@@ -57,5 +57,5 @@ jobs:
               --base "$BASE_BRANCH" \
               --head "$branch" \
               --title "chore: update CredSweeper to $version" \
-              --body "Automated CredSweeper release sync. Embedded assets, generated Rust rules, and native compatibility checks have passed."
+              --body "Automated CredSweeper release sync. The CredSweeper regression workflow must pass before this update is merged."
           fi

@@ -164,7 +164,8 @@ fn explicit_wrapper_bounds(raw: &str, span: &Span) -> Option<(usize, usize)> {
 }
 
 fn should_split_email(span: &Span) -> bool {
-    !(span.source == DetectorId::Plugin && span.label == "EMAIL")
+    !((span.source == DetectorId::Plugin && span.label == "EMAIL")
+        || (span.source == DetectorId::Alcatraz && span.label == "EMAIL_ADDRESS"))
 }
 
 fn push_literal(segments: &mut Vec<RenderSegment>, masked: &mut String, text: &str) {

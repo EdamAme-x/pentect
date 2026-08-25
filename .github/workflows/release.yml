@@ -23,6 +23,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/alcatraz-helper/go.mod
+          cache-dependency-path: tools/alcatraz-helper/go.sum
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -135,11 +139,32 @@ jobs:
           submodules: recursive
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/alcatraz-helper/go.mod
+          cache-dependency-path: tools/alcatraz-helper/go.sum
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-${{ matrix.asset }}
       - name: Build release binary
+        env:
+          PENTECT_REQUIRE_ALCATRAZ: "1"
         run: cargo build --release --locked -p pentect-cli
+      - name: Verify bundled Alcatraz without an external Go runtime
+        shell: pwsh
+        run: |
+          $env:PATH = if ($IsWindows) { "$env:WINDIR\System32;$env:WINDIR" } else { '/usr/bin:/bin' }
+          $sample = 'Contact alice@example.com or +1 415-555-2671. Card 4111 1111 1111 1111.'
+          $masked = $sample | & '${{ matrix.binary }}' mask --kind text 2>$null
+          if ($LASTEXITCODE -ne 0) { throw 'Pentect mask failed' }
+          if ($masked -match 'alice@example.com|415-555-2671|4111 1111 1111 1111') {
+            throw "Alcatraz leaked test PII: $masked"
+          }
+          foreach ($label in @('EMAIL_ADDRESS', 'PHONE_NUMBER', 'CREDIT_CARD')) {
+            if ($masked -notmatch "<<${label}_[0-9a-f]{16}>>") {
+              throw "Missing $label handle: $masked"
+            }
+          }
       - name: Package binary and checksum
         shell: pwsh
         run: |
