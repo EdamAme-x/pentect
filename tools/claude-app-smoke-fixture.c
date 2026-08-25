@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
     if (!proxy || !certificate || !user_data) {
         return 64;
     }
-    struct timespec delay = {1, 0};
+    struct timespec delay = {5, 0};
     nanosleep(&delay, 0);
     return 0;
 }
