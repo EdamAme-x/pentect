@@ -1,6 +1,8 @@
 use super::credsweeper_ml::{self, MlInput, RuleSeverity};
 use super::Detector;
-use crate::model::{ByteRange, Category, Confidence, DetectorId, Span};
+use crate::model::{
+    ByteRange, Category, Confidence, Context, DetectorId, Kind, Region, RegionKind, Span,
+};
 use crate::normalize::NormalizedView;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use data_encoding::{BASE32, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
@@ -252,6 +254,33 @@ enum SpecialMatcher {
 impl CredSweeperNativeDetector {
     pub fn builtin() -> Self {
         BUILTIN.clone()
+    }
+
+    /// Compile deferred upstream patterns before a caller starts a bounded
+    /// operation timer. Clones of the built-in detector share these caches.
+    pub fn warm_up(&self) {
+        for rule in &self.rules {
+            for pattern in &rule.patterns {
+                if let PatternMatcher::Deferred(regex) = &pattern.matcher {
+                    let _ = regex.compiled();
+                    let _ = regex.compiled_keyword();
+                }
+            }
+        }
+        credsweeper_ml::warm_up();
+        let sample = "AKIACSVC3FV5KQHYWH8A";
+        let region = Region {
+            span: ByteRange::new(0, sample.len()),
+            ctx: Context {
+                path: None,
+                key: None,
+                hints: Vec::new(),
+                kind: RegionKind::PlainText,
+                format: Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, sample);
+        let _ = self.detect_findings(&view);
     }
 
     pub fn builtin_stats() -> &'static CredSweeperNativeStats {

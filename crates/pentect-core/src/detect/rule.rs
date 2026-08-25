@@ -264,11 +264,7 @@ impl RuleDetector {
                 "HEROKU_API_KEY",
                 Medium,
             ),
-            // Phone: no checksum, so only the distinctive forms are enabled — an
-            // International `+CC...` numbers are handled by PhoneDetector (the
-            // libphonenumber crate, validated). This rule covers a NANP number
-            // with real separators (so a bare 10-digit order number is not
-            // masked) for the common no-country-code US case.
+            // Legacy PII rule retained only outside the default non-PII rule set.
             (
                 r"(?:\+?1[ .-])?\(?[2-9][0-9]{2}\)?[ .-][2-9][0-9]{2}[ .-][0-9]{4}",
                 Pii,
@@ -359,8 +355,7 @@ impl RuleDetector {
         // This is how we match/exceed Presidio's recognizers deterministically.
         #[rustfmt::skip]
         let checked: &[(&str, Category, &str, Confidence, Validator)] = &[
-            // Separator-formatted cards (CardDetector handles contiguous digits;
-            // these handle the common "4242 4242 4242 4242" grouping). Luhn-gated.
+            // Legacy card rules retained only outside the default non-PII rule set.
             (r"\b\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
             (r"\b\d{4}[ -]\d{6}[ -]\d{5}\b", Pii, "CARD", High, V::Luhn),
             (r"\b\d{4}[ -]\d{6}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),

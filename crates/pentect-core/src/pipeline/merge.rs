@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn context_free_placeholder_adjacent_spans_are_dropped() {
         let out = merge(
-            vec![entropy_span(5, 10), entropy_span(11, 16)],
+            vec![opaque_span(5, 10), opaque_span(11, 16)],
             &[ByteRange::new(0, 5), ByteRange::new(16, 20)],
         );
         assert!(out.is_empty(), "{out:?}");
@@ -212,19 +212,19 @@ mod tests {
         assert_eq!(out[0].range, ByteRange::new(8, 11));
     }
 
-    fn entropy_span(start: usize, end: usize) -> Span {
+    fn opaque_span(start: usize, end: usize) -> Span {
         Span {
             range: ByteRange::new(start, end),
             category: Category::Secret,
             label: "LIKELY_SECRET".into(),
             confidence: Confidence::Low,
-            source: DetectorId::Entropy,
+            source: DetectorId::DecodeOpaque,
         }
     }
 
     #[test]
     fn overlapping_spans_become_one_handle_for_the_full_union() {
-        let out = merge(vec![span(0, 6, Confidence::High), entropy_span(4, 30)], &[]);
+        let out = merge(vec![span(0, 6, Confidence::High), opaque_span(4, 30)], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].range, ByteRange::new(0, 30));
         assert_eq!(out[0].confidence, Confidence::High);

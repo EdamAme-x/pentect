@@ -5,9 +5,8 @@ mod sweep;
 
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CliCredentialDetector, CredSweeperNativeDetector,
-    DecodeConfig, DecodeDetector, Detector, EntropyDetector, EnvValueDetector,
-    ExplicitSecretDetector, KeyValueDetector, PemDetector, RuleDetector, SensitiveKeyDetector,
-    StructuralDetector, UrlDetector, SECRET_VALUE_HINT,
+    DecodeConfig, DecodeDetector, Detector, EnvValueDetector, ExplicitSecretDetector,
+    KeyValueDetector, SensitiveKeyDetector, StructuralDetector, UrlDetector, SECRET_VALUE_HINT,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -698,7 +697,7 @@ impl EngineBuilder {
         )
     }
 
-    pub fn standard_stack_with_decode(self, knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
+    pub fn standard_stack_with_decode(self, _knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
@@ -708,15 +707,9 @@ impl EngineBuilder {
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
-            .detector(Box::new(RuleDetector::builtin_without_pii()))
             .detector(Box::new(KeyValueDetector))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
-            .detector(Box::new(PemDetector::default()))
-            .detector(Box::new(EntropyDetector::with(
-                knobs.entropy_min_len,
-                knobs.entropy_threshold,
-            )))
             .detector(Box::new(DecodeDetector::builtin_with_config(decode)))
             .detector(Box::new(SensitiveKeyDetector))
             .detector(Box::new(EnvValueDetector))
@@ -727,7 +720,7 @@ impl EngineBuilder {
         self.secret_scan_stack_with_decode(knobs, profile_decode_config(knobs))
     }
 
-    pub fn secret_scan_stack_with_decode(self, knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
+    pub fn secret_scan_stack_with_decode(self, _knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
@@ -736,13 +729,8 @@ impl EngineBuilder {
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
             .detector(Box::new(KeyValueDetector))
-            .detector(Box::new(PemDetector::default()))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(Bip39Detector))
-            .detector(Box::new(EntropyDetector::with(
-                knobs.entropy_min_len,
-                knobs.entropy_threshold,
-            )))
             .detector(Box::new(DecodeDetector::builtin_with_config(decode)))
             .detector(Box::new(EnvValueDetector))
             .detector(Box::new(SensitiveKeyDetector))
@@ -2310,41 +2298,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn encoded_entropy_blob_masks_under_default_profile() {
-        use data_encoding::BASE64;
-        let bytes: Vec<u8> = (0u8..24)
-            .map(|n| n.wrapping_mul(37).wrapping_add(11))
-            .collect();
-        let enc = BASE64.encode(&bytes);
-        let input = format!("payload {enc} end");
-        let out = mp(Profile::Strict, &input).masked;
-        assert!(!out.contains(&enc), "{out}");
-        assert!(out.contains("<<LIKELY_SECRET_"), "{out}");
-    }
-
-    #[test]
-    fn unguarded_entropy_respects_detector_shape_gate() {
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let engine = Engine::builder()
-            .detector(Box::new(EntropyDetector::with(20, 2.8)))
-            .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
-            .guard(Box::new(crate::policy::guard::NoGuard))
-            .build();
-        let r = engine.mask(
-            Input::text(format!("id {uuid} x")),
-            &Config::insecure_testing(),
-        );
-        assert!(r.masked.contains(uuid), "{}", r.masked);
-
-        let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
-        let r = engine.mask(
-            Input::text(format!("blob {blob} x")),
-            &Config::insecure_testing(),
-        );
-        assert!(!r.masked.contains(blob), "{}", r.masked);
-    }
-
     #[cfg(feature = "rand-key")]
     #[test]
     fn generated_keys_differ_and_are_nonzero() {
@@ -2479,7 +2432,8 @@ mod tests {
 
     #[test]
     fn unguarded_keeps_full_stack_parsers_and_detectors() {
-        // Regression: the unguarded path must not drop EnvParser or PemDetector.
+        // Regression: the unguarded path must not drop environment parsing or
+        // CredSweeper's private-key rules.
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBVAIBADANBgkqh\nkiG9w0BAQEFAASCAT\n-----END RSA PRIVATE KEY-----";
         let r = Engine::with_profile_unguarded(Profile::Strict)
             .mask(Input::text(pem), &Config::insecure_testing());

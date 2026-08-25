@@ -5,10 +5,10 @@ use crate::plugin_middleware::PluginMiddleware;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
-    EntropyDetector, EnvParser, EnvValueDetector, ExplicitSecretDetector, Input, JsonParser,
-    KeyValueDetector, Kind, MaskResult, NdjsonParser, PemDetector, Profile, ProfilePolicy,
-    Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine, EnvParser,
+    EnvValueDetector, ExplicitSecretDetector, Input, JsonParser, KeyValueDetector, Kind,
+    MaskResult, NdjsonParser, Profile, ProfilePolicy, Recovery, Region, RegionKind,
+    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -1047,8 +1047,6 @@ fn build_pentect_engine_with_prompt_detectors(prompt: bool) -> Result<Engine, St
     }
     builder = builder
         .detector(Box::new(EnvValueDetector))
-        .detector(Box::new(PemDetector::default()))
-        .detector(Box::new(EntropyDetector::default()))
         .detector(Box::new(SensitiveKeyDetector));
     for config_pack in plugin_configs_from_env()? {
         builder = builder

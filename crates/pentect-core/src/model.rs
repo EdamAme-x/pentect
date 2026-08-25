@@ -192,7 +192,12 @@ mod tests {
     #[test]
     fn confidence_dominates_then_length_then_category() {
         let high = span(6, Category::Secret, Confidence::High, DetectorId::Rule);
-        let low = span(20, Category::Secret, Confidence::Low, DetectorId::Entropy);
+        let low = span(
+            20,
+            Category::Secret,
+            Confidence::Low,
+            DetectorId::DecodeOpaque,
+        );
         // High wins despite being shorter (confidence dominates).
         assert!(high.cmp_strength(&low).is_gt());
 
@@ -234,11 +239,8 @@ pub enum DetectorId {
     Decode,
     /// A value sensitive by structural position (cookie value, auth header).
     Structural,
-    /// A UUID/GUID value anchored by identifier context.
-    Uuid,
     /// A codec-decoded blob that only "looks encrypted" (no inner secret found).
     DecodeOpaque,
-    Entropy,
     /// Added by the global identity sweep, not a real detector.
     Sweep,
 }
@@ -252,12 +254,10 @@ impl DetectorId {
             DetectorId::Alcatraz => "alcatraz",
             DetectorId::Rule => "rule",
             DetectorId::KeyValue => "key_value",
-            DetectorId::Entropy => "entropy",
             DetectorId::Decode => "decode",
             DetectorId::DecodeOpaque => "decode_opaque",
             DetectorId::Pem => "pem",
             DetectorId::Structural => "structural",
-            DetectorId::Uuid => "uuid",
             DetectorId::Sweep => "sweep",
         }
     }

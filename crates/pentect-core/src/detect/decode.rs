@@ -1,5 +1,5 @@
 use super::util::token_runs;
-use super::{AuthCodeDetector, Bip39Detector, Detector, RuleDetector};
+use super::{AuthCodeDetector, Bip39Detector, CredSweeperNativeDetector, Detector};
 use crate::codec::{
     is_rfc1924_base85_byte, is_z85_byte, Ascii85Codec, Base32Codec, Base32HexCodec, Base58Codec,
     Base64Codec, Base85Codec, BinaryCodec, Codec, HexCodec, OctalCodec, PercentCodec, Z85Codec,
@@ -22,7 +22,10 @@ const BINARY_NONPRINT_RATIO: f64 = 0.3;
 const MAX_DECODE_CANDIDATES: usize = 256;
 const MAX_TOTAL_DECODED_BYTES: usize = 1024 * 1024;
 const MAX_DECODE_EXPANSION_RATIO: usize = 32;
-const MAX_DECODE_ELAPSED: Duration = Duration::from_millis(100);
+// The authoritative CredSweeper filter/ML path is deliberately heavier than
+// the retired local regex rules. Candidate, byte, and expansion budgets remain
+// the primary hard bounds; allow enough wall time for deeply nested input.
+const MAX_DECODE_ELAPSED: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeLimitReason {
@@ -198,6 +201,11 @@ impl DecodeDetector {
     }
 
     pub fn builtin_with_config(config: DecodeConfig) -> Self {
+        let credsweeper = CredSweeperNativeDetector::builtin();
+        // Regex compilation is initialization, not input processing. Keep it
+        // outside DecodeDetector's per-input safety deadline so the first
+        // encoded secret receives the same coverage as subsequent inputs.
+        credsweeper.warm_up();
         Self::new(
             vec![
                 Box::new(BinaryCodec),
@@ -213,7 +221,7 @@ impl DecodeDetector {
                 Box::new(Z85Codec),
             ],
             vec![
-                Box::new(RuleDetector::builtin()),
+                Box::new(credsweeper),
                 Box::new(AuthCodeDetector),
                 Box::new(Bip39Detector),
             ],
@@ -836,18 +844,18 @@ mod tests {
             ..DecodeConfig::default()
         };
         assert!(detects_with_config(
-            &nested_base64("AKIAIOSFODNN7EXAMPLE", 3),
+            &nested_base64("AKIACSVC3FV5KQHYWH8A", 3),
             config
         ));
         assert!(!detects_with_config(
-            &nested_base64("AKIAIOSFODNN7EXAMPLE", 4),
+            &nested_base64("AKIACSVC3FV5KQHYWH8A", 4),
             config
         ));
     }
 
     #[test]
     fn detects_base64url_percent_and_hex_layers() {
-        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let secret = "AKIACSVC3FV5KQHYWH8A";
         let base64url = data_encoding::BASE64URL_NOPAD.encode(secret.as_bytes());
         assert!(detects_with_config(&base64url, DecodeConfig::default()));
 
@@ -860,7 +868,7 @@ mod tests {
 
     #[test]
     fn mixed_encoded_secret_recovers_exact_outer_source() {
-        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let secret = "AKIACSVC3FV5KQHYWH8A";
         let percent_hex = percent_encode(&hex_encode(secret));
         let mixed = data_encoding::BASE64URL_NOPAD.encode(percent_hex.as_bytes());
         let engine = crate::Engine::with_profile_and_decode_config(
@@ -899,7 +907,7 @@ mod tests {
         let _guard = LIMIT_TEST_LOCK.lock().unwrap();
         LIMIT_REPORTS.store(0, Ordering::SeqCst);
         LIMIT_REASON.store(0, Ordering::SeqCst);
-        let encoded = data_encoding::BASE64.encode(b"AKIAIOSFODNN7EXAMPLE");
+        let encoded = data_encoding::BASE64.encode(b"AKIACSVC3FV5KQHYWH8A");
         let input = std::iter::repeat_n(encoded, MAX_DECODE_CANDIDATES + 32)
             .collect::<Vec<_>>()
             .join(" ");
@@ -982,7 +990,7 @@ mod tests {
             ..DecodeConfig::default()
         };
         assert!(detects_with_config(
-            &nested_base64("AKIAIOSFODNN7EXAMPLE", 12),
+            &nested_base64("AKIACSVC3FV5KQHYWH8A", 12),
             config
         ));
     }
@@ -994,7 +1002,7 @@ mod tests {
             ..DecodeConfig::default()
         };
         assert!(!detects_with_config(
-            &nested_base64("AKIAIOSFODNN7EXAMPLE", 1),
+            &nested_base64("AKIACSVC3FV5KQHYWH8A", 1),
             config
         ));
     }
