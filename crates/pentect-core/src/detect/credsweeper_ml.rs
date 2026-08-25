@@ -45,19 +45,25 @@ pub(super) struct MlInput {
     pub variable_start: isize,
     pub variable_end: isize,
     pub path: String,
+    pub line_num: usize,
     pub file_type: String,
     pub rule_name: String,
     pub severity: RuleSeverity,
 }
 
-pub(super) fn accept_group(group: &[&MlInput]) -> bool {
+pub(super) fn score_group(group: &[&MlInput]) -> (f32, f32) {
     VALIDATOR.with(|validator| {
         let mut validator = validator.borrow_mut();
         let score = validator
             .score_group(group)
             .expect("embedded CredSweeper ONNX model runs");
-        score >= validator.threshold
+        (score, validator.threshold)
     })
+}
+
+#[cfg(test)]
+pub(super) fn score_group_for_test(group: &[&MlInput]) -> (f32, f32) {
+    score_group(group)
 }
 
 #[cfg(test)]
