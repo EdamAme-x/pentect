@@ -2900,9 +2900,7 @@ fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Result<
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
     let decode = pentect_agent::load_decode_config(profile)?;
-    Ok(Engine::with_profile_and_packs_and_decode_config(
-        profile, packs, aggressive, decode,
-    ))
+    pentect_agent::build_masking_engine(profile, packs, aggressive, decode)
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,

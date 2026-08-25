@@ -5,10 +5,9 @@ use crate::plugin_middleware::PluginMiddleware;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine, EnvParser,
-    EnvValueDetector, ExplicitSecretDetector, Input, JsonParser, KeyValueDetector, Kind,
-    MaskResult, NdjsonParser, Profile, ProfilePolicy, Recovery, Region, RegionKind,
-    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    load_pack, ByteRange, Category, Config, Context, DecodeConfig, Engine, Input, Kind, MaskResult,
+    NoGuard, OverMaskGuard, Pack, Profile, ProfilePolicy, Recovery, Region, RegionKind, ShapeGuard,
+    ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -1020,27 +1019,37 @@ fn pentect_prompt_engine() -> Result<&'static Engine, String> {
 }
 
 fn build_pentect_engine() -> Result<Engine, String> {
+    canonical_masking_engine(
+        Profile::Strict,
+        plugin_configs_from_env()?,
+        false,
+        crate::config::decode_config(Profile::Strict)?,
+    )
+}
+
+pub(crate) fn canonical_masking_engine(
+    profile: Profile,
+    packs: Vec<Pack>,
+    aggressive: bool,
+    decode: DecodeConfig,
+) -> Result<Engine, String> {
     let mut builder = Engine::builder()
-        .parser(Kind::Json, Box::new(JsonParser))
-        .parser(Kind::Ndjson, Box::new(NdjsonParser))
-        .parser(Kind::Env, Box::new(EnvParser))
-        .structured_parsers()
-        .parser(Kind::Har, Box::new(JsonParser))
+        .standard_stack_with_decode(profile.knobs(), decode)
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
-        .detector(Box::new(CredSweeperNativeDetector::builtin()))
-        .detector(Box::new(crate::alcatraz::AlcatrazDetector))
-        .detector(Box::new(ExplicitSecretDetector))
-        .detector(Box::new(KeyValueDetector))
-        .detector(Box::new(EnvValueDetector))
-        .detector(Box::new(SensitiveKeyDetector));
-    for config_pack in plugin_configs_from_env()? {
+        .detector(Box::new(crate::alcatraz::AlcatrazDetector));
+    for config_pack in packs {
         builder = builder
             .detector(Box::new(config_pack.rules))
             .disable_labels(config_pack.disable);
     }
+    let guard: Box<dyn OverMaskGuard> = if aggressive {
+        Box::new(NoGuard)
+    } else {
+        Box::new(ShapeGuard::builtin())
+    };
     Ok(builder
-        .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
-        .guard(Box::new(ShapeGuard::builtin()))
+        .policy(Box::new(ProfilePolicy::new(profile)))
+        .guard(guard)
         .build())
 }
 
