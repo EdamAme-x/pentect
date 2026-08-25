@@ -2225,7 +2225,6 @@ fn resize_for_barcode(img: image::DynamicImage, max_edge: u32) -> image::Dynamic
     img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
 }
 
-#[cfg(any(feature = "ocr", test))]
 fn image_ocr_secret_engine() -> Result<&'static pentect_core::Engine, String> {
     crate::masking::pentect_engine()
 }
