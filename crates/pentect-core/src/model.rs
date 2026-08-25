@@ -224,6 +224,8 @@ pub enum DetectorId {
     Plugin,
     /// Native Rust port of embedded CredSweeper rule/model assets.
     CredSweeper,
+    /// PII detected by the bundled Alcatraz helper.
+    Alcatraz,
     Rule,
     /// A plaintext key/value assignment whose key and value features are secret-like.
     KeyValue,
@@ -247,6 +249,7 @@ impl DetectorId {
             DetectorId::Explicit => "explicit",
             DetectorId::Plugin => "plugin",
             DetectorId::CredSweeper => "credsweeper",
+            DetectorId::Alcatraz => "alcatraz",
             DetectorId::Rule => "rule",
             DetectorId::KeyValue => "key_value",
             DetectorId::Entropy => "entropy",

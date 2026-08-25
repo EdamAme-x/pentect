@@ -8,6 +8,7 @@
 //! recovery material.
 
 mod activity_log;
+mod alcatraz;
 mod config;
 mod delegated_process_host;
 mod file_pointer_manager;

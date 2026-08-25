@@ -888,6 +888,19 @@ fn mask_read_input_with_engine_plugins_and_identity(
         },
         &cfg,
     );
+    let alcatraz_input = result.masked.clone();
+    let alcatraz_spans = crate::alcatraz::detect_text(&alcatraz_input);
+    if !alcatraz_spans.is_empty() {
+        let alcatraz_result = engine.mask_spans(
+            Input {
+                kind: kind.clone(),
+                data: alcatraz_input,
+            },
+            alcatraz_spans,
+            &cfg,
+        );
+        merge_final_mask_result(&mut result, alcatraz_result);
+    }
     let data = run_read_text_plugin_stage(
         plugins,
         crate::plugin_middleware::MiddlewareStage::Prepare,
@@ -1027,6 +1040,7 @@ fn build_pentect_engine_with_prompt_detectors(prompt: bool) -> Result<Engine, St
         .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(CredSweeperNativeDetector::builtin()))
+        .detector(Box::new(crate::alcatraz::AlcatrazDetector))
         .detector(Box::new(ExplicitSecretDetector));
     if prompt {
         builder = builder.detector(Box::new(KeyValueDetector));

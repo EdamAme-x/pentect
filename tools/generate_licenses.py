@@ -213,6 +213,10 @@ def generate() -> str:
             ROOT / "crates/pentect-core/vendors/credsweeper-assets/LICENSE",
         ),
         (
+            "Alcatraz 0.20.2 bundled PII helper (MIT)",
+            ROOT / "tools/alcatraz-helper/LICENSE",
+        ),
+        (
             "Ocrs bundled RTen models (CC-BY-SA-4.0 attribution)",
             ROOT / "crates/pentect-runtime/assets/ocr/NOTICE.txt",
         ),
@@ -238,6 +242,12 @@ def generate() -> str:
         f"Version: {credsweeper_version} (commit {credsweeper_commit})",
         "Copyright (c) 2021 SAMSUNG",
         "License: MIT. The full MIT text appears below in the Cargo license documents.",
+        "",
+        "Alcatraz bundled PII helper",
+        "Source: https://github.com/hoophq/alcatraz",
+        "Version: 0.20.2 (commit cd2e19b7d0f08b113c52ef52d3485c64a0871455)",
+        "Copyright (c) 2026 hoop.dev",
+        "License: MIT. The full MIT text appears below.",
         "",
         "Ocrs RTen text detection and recognition models",
         "Creator and source: Robert Knight, https://huggingface.co/robertknight/ocrs",

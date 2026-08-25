@@ -87,6 +87,7 @@ jobs:
               - 'crates/**/Cargo.toml'
               - 'rust-toolchain*'
               - 'crates/**/*.rs'
+              - 'tools/alcatraz-helper/**'
             manifests:
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -133,6 +134,9 @@ jobs:
               - 'sdk/**'
             detector:
               - 'crates/pentect-core/**'
+              - 'crates/pentect-runtime/src/alcatraz.rs'
+              - 'crates/pentect-runtime/src/masking.rs'
+              - 'tools/alcatraz-helper/**'
             ocr:
               - 'crates/pentect-runtime/assets/ocr/**'
               - 'crates/pentect-runtime/src/image_ocr.rs'
@@ -342,6 +346,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      PENTECT_REQUIRE_ALCATRAZ: "1"
     steps:
       - name: Require change detection
         if: needs.changes.result != 'success'
@@ -353,6 +359,10 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/alcatraz-helper/go.mod
+          cache-dependency-path: tools/alcatraz-helper/go.sum
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:

@@ -45,6 +45,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 sha2 = { workspace = true }
+zstd = { workspace = true }
 hmac = { workspace = true }
 chacha20 = { workspace = true }
 toml = { workspace = true }
@@ -106,3 +107,7 @@ libc = "0.2"
 [dev-dependencies]
 rxing = { workspace = true, features = ["encoders"] }
 wat = "1"
+
+[build-dependencies]
+sha2 = { workspace = true }
+zstd = { workspace = true }
