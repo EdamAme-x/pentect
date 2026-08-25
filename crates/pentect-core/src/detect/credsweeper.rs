@@ -167,6 +167,7 @@ pub struct CredSweeperNativeFinding {
     pub severity: String,
     pub confidence: Confidence,
     pub confidence_name: String,
+    pub ml_probability: Option<f64>,
     pub value: String,
     pub value_start: usize,
     pub value_end: usize,
@@ -4244,6 +4245,7 @@ fn push_match(
         severity: severity_name(rule.severity).to_string(),
         confidence: rule.confidence,
         confidence_name: confidence_name(rule.confidence).to_string(),
+        ml_probability: None,
         value: sanitized_value.value.to_string(),
         value_start: sanitized_value.start,
         value_end: sanitized_value.end,
@@ -4414,10 +4416,17 @@ fn push_ml_accepted(out: &mut Vec<CredSweeperNativeFinding>, pending: &[PendingM
             }
         }
         let has_ml = group_indices.iter().any(|idx| pending[*idx].requires_ml);
-        let accepted = !has_ml || credsweeper_ml::accept_group(&group_inputs);
+        let ml_score = has_ml.then(|| credsweeper_ml::score_group(&group_inputs));
+        let accepted = ml_score
+            .map(|(score, threshold)| score >= threshold)
+            .unwrap_or(true);
         for idx in group_indices {
             if !pending[idx].requires_ml || accepted {
-                out.push(pending[idx].finding.clone());
+                let mut finding = pending[idx].finding.clone();
+                if pending[idx].requires_ml {
+                    finding.ml_probability = ml_score.map(|(score, _)| f64::from(score));
+                }
+                out.push(finding);
             }
         }
     }

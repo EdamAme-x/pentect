@@ -93,7 +93,10 @@ fn cmd_bench(args: &[String]) {
                 println!("extra {}", example);
             }
         }
-        if report.precision < opts.min_precision || report.recall < opts.min_recall {
+        if report.precision < opts.min_precision
+            || report.recall < opts.min_recall
+            || !report.ml_probability_within_tolerance
+        {
             std::process::exit(1);
         }
         return;
@@ -838,7 +841,7 @@ fn detect_credsweeper_json(
                 rule: finding.rule_name,
                 severity: finding.severity,
                 confidence: finding.confidence_name,
-                ml_probability: None,
+                ml_probability: finding.ml_probability,
                 line_data_list,
             })
         })
@@ -865,9 +868,16 @@ fn save_credsweeper_paths(path: &Path, paths: &[String]) -> Result<(), String> {
 fn run_credsweeper_parity(opts: &CredSweeperParityOpts) -> Result<CredSweeperParityReport, String> {
     let rust_credentials = load_credsweeper_json(&opts.rust_json)?;
     let oracle_credentials = load_credsweeper_json(&opts.oracle_json)?;
+    let ml_probability_max_delta =
+        credsweeper_ml_probability_max_delta(&rust_credentials, &oracle_credentials);
     let rust = credsweeper_parity_multiset(&rust_credentials);
     let oracle = credsweeper_parity_multiset(&oracle_credentials);
-    Ok(CredSweeperParityReport::build(rust, oracle, opts.examples))
+    Ok(CredSweeperParityReport::build(
+        rust,
+        oracle,
+        opts.examples,
+        ml_probability_max_delta,
+    ))
 }
 
 fn load_credsweeper_json(path: &Path) -> Result<Vec<CredSweeperJsonCredential>, String> {
@@ -889,6 +899,50 @@ fn credsweeper_parity_multiset(
         }
     }
     out
+}
+
+const CREDSWEEPER_ML_PROBABILITY_TOLERANCE: f64 = 0.0001;
+
+fn credsweeper_ml_probability_max_delta(
+    rust: &[CredSweeperJsonCredential],
+    oracle: &[CredSweeperJsonCredential],
+) -> f64 {
+    fn probabilities(
+        credentials: &[CredSweeperJsonCredential],
+    ) -> BTreeMap<CredSweeperParityKey, Vec<f64>> {
+        let mut out = BTreeMap::<_, Vec<_>>::new();
+        for credential in credentials {
+            let Some(probability) = credential.ml_probability else {
+                continue;
+            };
+            for line_data in &credential.line_data_list {
+                out.entry(CredSweeperParityKey::new(credential, line_data))
+                    .or_default()
+                    .push(probability);
+            }
+        }
+        for values in out.values_mut() {
+            values.sort_by(f64::total_cmp);
+        }
+        out
+    }
+
+    let rust = probabilities(rust);
+    let oracle = probabilities(oracle);
+    let mut max_delta = 0.0_f64;
+    for (key, rust_values) in &rust {
+        let Some(oracle_values) = oracle.get(key) else {
+            continue;
+        };
+        for (rust_value, oracle_value) in rust_values.iter().zip(oracle_values) {
+            let delta = (rust_value - oracle_value).abs();
+            if !delta.is_finite() {
+                return f64::INFINITY;
+            }
+            max_delta = max_delta.max(delta);
+        }
+    }
+    max_delta
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1259,28 +1313,40 @@ fn shannon_entropy(value: &str) -> f64 {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct CredSweeperParityKey {
     rule: String,
+    severity: String,
+    confidence: String,
+    has_ml_probability: bool,
     path: String,
+    line: String,
     line_num: usize,
+    info: String,
     value_start: usize,
     value_end: usize,
     variable_start: isize,
     variable_end: isize,
     variable: Option<String>,
     value: String,
+    entropy_bits: u64,
 }
 
 impl CredSweeperParityKey {
     fn new(credential: &CredSweeperJsonCredential, line_data: &CredSweeperJsonLineData) -> Self {
         Self {
             rule: credential.rule.clone(),
+            severity: credential.severity.clone(),
+            confidence: credential.confidence.clone(),
+            has_ml_probability: credential.ml_probability.is_some(),
             path: normalize_parity_path(&line_data.path),
+            line: line_data.line.clone(),
             line_num: line_data.line_num,
+            info: line_data.info.clone(),
             value_start: line_data.value_start,
             value_end: line_data.value_end,
             variable_start: line_data.variable_start,
             variable_end: line_data.variable_end,
             variable: line_data.variable.clone(),
             value: line_data.value.clone(),
+            entropy_bits: line_data.entropy.to_bits(),
         }
     }
 
@@ -1346,6 +1412,9 @@ struct CredSweeperParityReport {
     precision: f64,
     recall: f64,
     f1: f64,
+    ml_probability_max_delta: f64,
+    ml_probability_tolerance: f64,
+    ml_probability_within_tolerance: bool,
     missing_examples: Vec<CredSweeperParityExample>,
     extra_examples: Vec<CredSweeperParityExample>,
 }
@@ -1355,6 +1424,7 @@ impl CredSweeperParityReport {
         rust: BTreeMap<CredSweeperParityKey, usize>,
         oracle: BTreeMap<CredSweeperParityKey, usize>,
         example_limit: usize,
+        ml_probability_max_delta: f64,
     ) -> Self {
         let rust_count = multiset_len(&rust);
         let oracle_count = multiset_len(&oracle);
@@ -1404,6 +1474,10 @@ impl CredSweeperParityReport {
             precision,
             recall,
             f1,
+            ml_probability_max_delta,
+            ml_probability_tolerance: CREDSWEEPER_ML_PROBABILITY_TOLERANCE,
+            ml_probability_within_tolerance: ml_probability_max_delta
+                <= CREDSWEEPER_ML_PROBABILITY_TOLERANCE,
             missing_examples,
             extra_examples,
         }
@@ -1787,7 +1861,7 @@ mod tests {
         )];
         let rust = credsweeper_parity_multiset(&credentials);
         let oracle = credsweeper_parity_multiset(&credentials);
-        let report = CredSweeperParityReport::build(rust, oracle, 10);
+        let report = CredSweeperParityReport::build(rust, oracle, 10, 0.0);
 
         assert_eq!(report.rust_count, 1);
         assert_eq!(report.oracle_count, 1);
@@ -1796,6 +1870,62 @@ mod tests {
         assert_eq!(report.extra, 0);
         assert_eq!(report.precision, 1.0);
         assert_eq!(report.recall, 1.0);
+    }
+
+    #[test]
+    fn credsweeper_parity_uses_the_official_cross_platform_ml_delta() {
+        let mut rust = vec![sample_credsweeper_credential(
+            "Password",
+            "src/app.env",
+            7,
+            "PASSWORD",
+            "value-one",
+        )];
+        let mut oracle = rust.clone();
+        rust[0].ml_probability = Some(0.999_733_626_842_498_8);
+        oracle[0].ml_probability = Some(0.999_733_686_447_143_6);
+        let delta = credsweeper_ml_probability_max_delta(&rust, &oracle);
+        let report = CredSweeperParityReport::build(
+            credsweeper_parity_multiset(&rust),
+            credsweeper_parity_multiset(&oracle),
+            10,
+            delta,
+        );
+        assert_eq!(report.common, 1);
+        assert!(report.ml_probability_within_tolerance);
+        assert!(report.ml_probability_max_delta < 0.0001);
+
+        oracle[0].ml_probability = Some(0.9995);
+        let delta = credsweeper_ml_probability_max_delta(&rust, &oracle);
+        let report = CredSweeperParityReport::build(
+            credsweeper_parity_multiset(&rust),
+            credsweeper_parity_multiset(&oracle),
+            10,
+            delta,
+        );
+        assert!(!report.ml_probability_within_tolerance);
+    }
+
+    #[test]
+    fn credsweeper_parity_rejects_missing_ml_probability() {
+        let rust = vec![sample_credsweeper_credential(
+            "Password",
+            "src/app.env",
+            7,
+            "PASSWORD",
+            "value-one",
+        )];
+        let mut oracle = rust.clone();
+        oracle[0].ml_probability = Some(0.9);
+        let report = CredSweeperParityReport::build(
+            credsweeper_parity_multiset(&rust),
+            credsweeper_parity_multiset(&oracle),
+            10,
+            credsweeper_ml_probability_max_delta(&rust, &oracle),
+        );
+        assert_eq!(report.common, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.extra, 1);
     }
 
     #[test]
@@ -1818,6 +1948,7 @@ mod tests {
             credsweeper_parity_multiset(&rust_credentials),
             credsweeper_parity_multiset(&oracle_credentials),
             10,
+            0.0,
         );
 
         assert_eq!(report.common, 0);

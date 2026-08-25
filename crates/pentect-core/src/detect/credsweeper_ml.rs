@@ -51,18 +51,7 @@ pub(super) struct MlInput {
     pub severity: RuleSeverity,
 }
 
-pub(super) fn accept_group(group: &[&MlInput]) -> bool {
-    VALIDATOR.with(|validator| {
-        let mut validator = validator.borrow_mut();
-        let score = validator
-            .score_group(group)
-            .expect("embedded CredSweeper ONNX model runs");
-        score >= validator.threshold
-    })
-}
-
-#[cfg(test)]
-pub(super) fn score_group_for_test(group: &[&MlInput]) -> (f32, f32) {
+pub(super) fn score_group(group: &[&MlInput]) -> (f32, f32) {
     VALIDATOR.with(|validator| {
         let mut validator = validator.borrow_mut();
         let score = validator
@@ -70,6 +59,11 @@ pub(super) fn score_group_for_test(group: &[&MlInput]) -> (f32, f32) {
             .expect("embedded CredSweeper ONNX model runs");
         (score, validator.threshold)
     })
+}
+
+#[cfg(test)]
+pub(super) fn score_group_for_test(group: &[&MlInput]) -> (f32, f32) {
+    score_group(group)
 }
 
 #[cfg(test)]
