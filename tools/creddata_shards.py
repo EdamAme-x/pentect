@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -23,14 +24,43 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def metadata_weight(root: Path, repo_id: str) -> int:
+    """Estimate scan work from unique files, with one unit for empty metadata."""
+    path = root / "meta" / f"{short_id(repo_id)}.csv"
+    try:
+        with path.open(encoding="utf-8", newline="") as stream:
+            rows = csv.DictReader(stream)
+            return max(1, len({row["FilePath"] for row in rows}))
+    except FileNotFoundError as error:
+        raise SystemExit(f"CredData metadata missing: {path}") from error
+
+
+def partition(root: Path, repository_ids: list[str], count: int) -> list[list[str]]:
+    """Greedily balance deterministic shards by CredData metadata volume."""
+    shards: list[list[str]] = [[] for _ in range(count)]
+    weights = [0] * count
+    weighted = sorted(
+        ((metadata_weight(root, repo_id), repo_id) for repo_id in repository_ids),
+        key=lambda item: (-item[0], short_id(item[1]), item[1]),
+    )
+    for weight, repo_id in weighted:
+        shard_index = min(range(count), key=lambda value: (weights[value], value))
+        shards[shard_index].append(repo_id)
+        weights[shard_index] += weight
+    for shard in shards:
+        shard.sort(key=lambda repo_id: (short_id(repo_id), repo_id))
+    return shards
+
+
 def prepare(root: Path, index: int, count: int, manifest: Path, version: str) -> None:
     if count < 1 or not 0 <= index < count:
         raise SystemExit(f"invalid shard {index}/{count}")
     snapshot_path = root / "snapshot.json"
     snapshot: dict[str, str] = load_json(snapshot_path)
-    entries = sorted(snapshot.items(), key=lambda item: (short_id(item[0]), item[0]))
-    selected = entries[index::count]
-    if not selected:
+    shards = partition(root, list(snapshot), count)
+    selected_ids = shards[index]
+    selected = [(repo_id, snapshot[repo_id]) for repo_id in selected_ids]
+    if not selected_ids:
         raise SystemExit(f"shard {index}/{count} is empty")
 
     selected_short_ids = {short_id(repo_id) for repo_id, _ in selected}
@@ -50,6 +80,7 @@ def prepare(root: Path, index: int, count: int, manifest: Path, version: str) ->
             "index": index,
             "count": count,
             "credsweeper_version": version,
+            "metadata_files": sum(metadata_weight(root, repo_id) for repo_id in selected_ids),
             "repositories": [
                 {"id": repo_id, "short_id": short_id(repo_id)}
                 for repo_id, _ in selected
@@ -72,6 +103,7 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
     seen_repositories: set[str] = set()
     totals = {key: 0 for key in ("rust", "oracle", "common", "missing", "extra")}
     versions: set[str] = set()
+    metadata_files = 0
     for manifest_path in manifests:
         manifest = load_json(manifest_path)
         index = int(manifest["index"])
@@ -79,6 +111,7 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
             raise SystemExit(f"invalid or duplicate manifest: {manifest_path}")
         seen_indices.add(index)
         versions.add(str(manifest["credsweeper_version"]))
+        metadata_files += int(manifest["metadata_files"])
         for repository in manifest["repositories"]:
             repo_id = repository["id"]
             if repo_id in seen_repositories:
@@ -110,6 +143,7 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
         "schema": 1,
         "shards": count,
         "repositories": len(seen_repositories),
+        "metadata_files": metadata_files,
         "credsweeper_version": versions.pop(),
         **totals,
     }

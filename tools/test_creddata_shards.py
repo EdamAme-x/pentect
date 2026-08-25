@@ -60,6 +60,25 @@ class CredDataShardsTest(unittest.TestCase):
             self.assertEqual(summary["missing"], 0)
             self.assertEqual(summary["extra"], 0)
 
+    def test_partition_balances_metadata_weight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "meta").mkdir()
+            repository_ids = [f"{value:064x}" for value in range(1, 7)]
+            weights = [10, 9, 8, 3, 2, 1]
+            for repo_id, weight in zip(repository_ids, weights, strict=True):
+                (root / "meta" / f"{creddata_shards.short_id(repo_id)}.csv").write_text(
+                    "FilePath\n"
+                    + "".join(f"file-{index}\n" for index in range(weight)),
+                    encoding="utf-8",
+                )
+            shards = creddata_shards.partition(root, repository_ids, count=3)
+            totals = sorted(
+                sum(creddata_shards.metadata_weight(root, repo_id) for repo_id in shard)
+                for shard in shards
+            )
+            self.assertEqual(totals, [11, 11, 11])
+
     @staticmethod
     def copy_dataset(source: Path, destination: Path) -> None:
         (destination / "meta").mkdir(parents=True)
