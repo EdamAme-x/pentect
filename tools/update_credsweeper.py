@@ -41,28 +41,43 @@ def run(*args: str, cwd: Path, capture: bool = False) -> str:
     return completed.stdout.strip() if capture else ""
 
 
-def latest_tag(repo: Path) -> str:
+def remote_tag(repo: Path, requested: str | None = None) -> tuple[str, str]:
     output = run(
-        "git", "ls-remote", "--tags", "--refs", UPSTREAM, cwd=repo, capture=True
+        "git",
+        "ls-remote",
+        "--tags",
+        "--refs",
+        UPSTREAM,
+        *([f"refs/tags/{requested}"] if requested else []),
+        cwd=repo,
+        capture=True,
     )
     tags = []
     for line in output.splitlines():
+        commit = line.split(maxsplit=1)[0]
         tag = line.rsplit("refs/tags/", 1)[-1]
         match = TAG_RE.fullmatch(tag)
         if match:
-            tags.append((tuple(map(int, match.groups())), tag))
+            tags.append((tuple(map(int, match.groups())), tag, commit))
     if not tags:
-        raise RuntimeError("CredSweeper did not publish any semantic-version tags")
-    return max(tags)[1]
+        suffix = f" {requested}" if requested else ""
+        raise RuntimeError(f"CredSweeper did not publish semantic-version tag{suffix}")
+    _, tag, commit = max(tags)
+    return tag, commit
 
 
-def current_tag(submodule: Path) -> str:
+def installed_release(submodule: Path, assets: Path) -> tuple[str, str]:
+    """Return the pinned release without relying on locally fetched git tags."""
+    head = run("git", "rev-parse", "HEAD", cwd=submodule, capture=True)
     try:
-        return run(
-            "git", "describe", "--tags", "--exact-match", cwd=submodule, capture=True
-        )
-    except subprocess.CalledProcessError:
-        return run("git", "rev-parse", "--short", "HEAD", cwd=submodule, capture=True)
+        source = json.loads((assets / "SOURCE.json").read_text(encoding="utf-8"))
+        version = source["version"]
+        commit = source["commit"]
+    except (FileNotFoundError, KeyError, json.JSONDecodeError, TypeError):
+        return head[:7], head
+    if TAG_RE.fullmatch(version) and commit == head:
+        return version, commit
+    return f"{version}@{head[:7]}", head
 
 
 def atomic_copy(source: Path, destination: Path) -> None:
@@ -180,9 +195,15 @@ def main() -> int:
     submodule = repo / "crates/pentect-core/vendors/CredSweeper"
     assets = repo / "crates/pentect-core/vendors/credsweeper-assets"
     runtime_requirements = repo / "tools/credsweeper-sidecar/runtime-requirements.txt"
-    requested = latest_tag(repo) if args.version == "latest" else args.version
+    if args.version == "latest":
+        requested, requested_commit = remote_tag(repo)
+    else:
+        requested = args.version
+        requested_commit = ""
     if not TAG_RE.fullmatch(requested):
         raise RuntimeError(f"invalid CredSweeper version: {requested!r}")
+    if not requested_commit:
+        _, requested_commit = remote_tag(repo, requested)
 
     if not args.check or not (submodule / ".git").exists():
         run(
@@ -194,10 +215,10 @@ def main() -> int:
             "crates/pentect-core/vendors/CredSweeper",
             cwd=repo,
         )
-    installed = current_tag(submodule)
+    installed, installed_commit = installed_release(submodule, assets)
     print(f"CredSweeper: installed={installed} requested={requested}")
     if args.check:
-        return 0 if installed == requested else 2
+        return 0 if (installed, installed_commit) == (requested, requested_commit) else 2
     if run("git", "status", "--porcelain", cwd=submodule, capture=True):
         raise RuntimeError("CredSweeper submodule has local changes")
 
