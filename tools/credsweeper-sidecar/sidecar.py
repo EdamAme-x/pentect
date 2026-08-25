@@ -104,7 +104,12 @@ def scan_paths(paths: list[Path], use_filters: bool, use_ml: bool, batch_size: i
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="pentect-credsweeper-sidecar")
-    parser.add_argument("paths", nargs="+", type=Path)
+    parser.add_argument("paths", nargs="*", type=Path)
+    parser.add_argument(
+        "--paths-file",
+        type=Path,
+        help="newline-delimited paths (avoids platform command-line length limits)",
+    )
     parser.add_argument("--no-filters", action="store_true")
     parser.add_argument("--no-ml", action="store_true")
     parser.add_argument("--ml-batch-size", type=int, default=16)
@@ -114,8 +119,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    paths = list(args.paths)
+    if args.paths_file:
+        paths.extend(
+            Path(line)
+            for line in args.paths_file.read_text(encoding="utf-8").splitlines()
+            if line
+        )
+    if not paths:
+        raise SystemExit("at least one path or --paths-file is required")
     credentials = scan_paths(
-        args.paths,
+        paths,
         use_filters=not args.no_filters,
         use_ml=not args.no_ml,
         batch_size=max(1, args.ml_batch_size),
