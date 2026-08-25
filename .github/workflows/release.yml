@@ -770,7 +770,14 @@ jobs:
           test "$(gh pr view "$pull" --repo "$GITHUB_REPOSITORY" --json state --jq .state)" = MERGED
           gh workflow run package-tags.yml --repo "$GITHUB_REPOSITORY" --ref main
           gh workflow run nix.yml --repo "$GITHUB_REPOSITORY" --ref main
-          gh workflow run aur.yml --repo "$GITHUB_REPOSITORY" --ref main -f publish=true
+          aur_state=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/aur.yml" \
+            --jq .state)
+          if [ "$aur_state" = active ]; then
+            gh workflow run aur.yml --repo "$GITHUB_REPOSITORY" --ref main -f publish=true
+          else
+            echo "AUR workflow is $aur_state; skipping publication"
+          fi
 
   apt-pages:
     name: Publish signed APT repository
