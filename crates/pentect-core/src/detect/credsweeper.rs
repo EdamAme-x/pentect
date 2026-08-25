@@ -9,6 +9,7 @@ use openssl::encrypt::{Decrypter, Encrypter};
 use openssl::hash::MessageDigest;
 use openssl::pkcs12::Pkcs12;
 use openssl::pkey::{Id, PKey, Private};
+use openssl::provider::Provider;
 use openssl::rsa::Padding;
 use regex::Regex as RustRegex;
 use std::borrow::Cow;
@@ -42,6 +43,20 @@ static CREDSWEEPER_BASE64: LazyLock<data_encoding::Encoding> = LazyLock::new(|| 
     specification
         .encoding()
         .expect("CredSweeper-compatible base64 specification")
+});
+static CREDSWEEPER_BASE32: LazyLock<data_encoding::Encoding> = LazyLock::new(|| {
+    let mut specification = BASE32.specification();
+    // Python's base64.b32decode, used by CredSweeper, accepts non-zero unused
+    // trailing bits after otherwise valid alphabet and padding checks.
+    specification.check_trailing_bits = false;
+    specification
+        .encoding()
+        .expect("CredSweeper-compatible base32 specification")
+});
+static OPENSSL_PKCS12_PROVIDERS: LazyLock<Option<(Provider, Provider)>> = LazyLock::new(|| {
+    let default = Provider::load(None, "default").ok()?;
+    let legacy = Provider::load(None, "legacy").ok()?;
+    Some((default, legacy))
 });
 
 #[derive(Clone)]
@@ -108,6 +123,7 @@ impl CredSweeperFilterProbe {
         let candidate = Candidate {
             start: self.value_start,
             end: self.value_end,
+            match_end: self.value_end,
             value,
             variable_start: None,
             variable_end: None,
@@ -229,6 +245,7 @@ enum SpecialMatcher {
     Jwk,
     PemPrivateKey,
     Base64PrivateKey,
+    Uuid,
 }
 
 impl CredSweeperNativeDetector {
@@ -533,6 +550,7 @@ impl CredSweeperNativeDetector {
             target: text,
             line_index: 0,
         };
+        let lines = LineRanges::new(text).collect::<Vec<_>>();
         for rule in &self.rules {
             if !rule_available_for_code_scan(rule) {
                 continue;
@@ -546,18 +564,33 @@ impl CredSweeperNativeDetector {
             for pattern in &rule.patterns {
                 if let PatternMatcher::Special(matcher) = &pattern.matcher {
                     for candidate in matcher.find_whole_text(text) {
-                        let _ = push_match(
-                            &mut ml_pending,
-                            &push_ctx,
-                            rule,
-                            &whole_text_ctx,
-                            &candidate,
-                        );
+                        if candidate.line_data.is_empty() {
+                            let _ = push_match(
+                                &mut ml_pending,
+                                &push_ctx,
+                                rule,
+                                &whole_text_ctx,
+                                &candidate,
+                            );
+                        } else {
+                            let (localized, physical_ctx) = localize_whole_text_candidate(
+                                &candidate,
+                                &lines,
+                                &ml_file_type,
+                                &whole_text_ctx,
+                            );
+                            let _ = push_match(
+                                &mut ml_pending,
+                                &push_ctx,
+                                rule,
+                                &physical_ctx,
+                                &localized,
+                            );
+                        }
                     }
                 }
             }
         }
-        let lines = LineRanges::new(text).collect::<Vec<_>>();
         for (line_index, &(line_start, line)) in lines.iter().enumerate() {
             let line_body = line.trim_end_matches(['\r', '\n']);
             let previous_line = line_index
@@ -593,30 +626,79 @@ impl CredSweeperNativeDetector {
                     }
                     match &pattern.matcher {
                         PatternMatcher::Deferred(regex) => {
-                            let mut offsets = vec![0usize];
+                            const MIN_DATA_LEN: usize = 8;
+                            let mut offsets = vec![(0usize, line_body.len())];
                             let mut seen_offsets = BTreeSet::new();
-                            while let Some(offset) = offsets.pop() {
-                                if !seen_offsets.insert(offset) || offset >= line_body.len() {
+                            while let Some((offset_start, offset_end)) = offsets.pop() {
+                                if !seen_offsets.insert((offset_start, offset_end))
+                                    || offset_start >= offset_end
+                                    || offset_end > line_body.len()
+                                {
                                     continue;
                                 }
-                                for mut candidate in
-                                    regex.find(&line_body[offset..], pattern.value_capture)
-                                {
-                                    candidate.shift(offset);
-                                    if !push_match(
+                                let mut candidates = regex.find(
+                                    &line_body[offset_start..offset_end],
+                                    pattern.value_capture,
+                                );
+                                for candidate in &mut candidates {
+                                    candidate.shift(offset_start);
+                                }
+                                candidates.sort_by_key(|candidate| {
+                                    (
+                                        candidate.variable_start.unwrap_or(candidate.start),
+                                        candidate.start,
+                                        candidate.end,
+                                    )
+                                });
+                                let mut bypass = None;
+                                for candidate in candidates {
+                                    let had_bypass = bypass.is_some();
+                                    if let Some((bypass_start, _)) = bypass.take() {
+                                        let bypass_end = candidate
+                                            .variable_start
+                                            .filter(|start| 0 < *start)
+                                            .unwrap_or(candidate.start);
+                                        if bypass_start < bypass_end
+                                            && MIN_DATA_LEN < bypass_end - bypass_start
+                                        {
+                                            offsets.push((bypass_start, bypass_end));
+                                        }
+                                    }
+                                    let sanitized_value = sanitize_value_capture(
+                                        line_ctx.line,
+                                        push_ctx.file_type,
+                                        &candidate,
+                                    );
+                                    let accepted = push_match(
                                         &mut ml_pending,
                                         &push_ctx,
                                         rule,
                                         &line_ctx,
                                         &candidate,
-                                    ) {
-                                        let retry = candidate
+                                    );
+                                    if !accepted {
+                                        let bypass_start = candidate
                                             .variable_end
-                                            .filter(|end| offset < *end)
+                                            .filter(|end| offset_start < *end)
                                             .unwrap_or(candidate.end);
-                                        if offset < retry && retry < line_body.len() {
-                                            offsets.push(retry);
-                                        }
+                                        bypass = Some((bypass_start, offset_end));
+                                    } else if !had_bypass
+                                        && MIN_DATA_LEN < sanitized_value.end
+                                        && candidate
+                                            .match_end
+                                            .checked_sub(sanitized_value.end)
+                                            .is_some_and(|remaining| MIN_DATA_LEN < remaining)
+                                    {
+                                        // CredSweeper retries the tail of a successful regex
+                                        // match when the match consumed another potentially
+                                        // valuable assignment (for example, two OAuth fields
+                                        // in one quoted response body).
+                                        bypass = Some((sanitized_value.end, offset_end));
+                                    }
+                                }
+                                if let Some((bypass_start, bypass_end)) = bypass {
+                                    if bypass_start < bypass_end {
+                                        offsets.push((bypass_start, bypass_end));
                                     }
                                 }
                             }
@@ -693,12 +775,130 @@ impl DeferredRegex {
                 .collect(),
             None => Vec::new(),
         };
+        if self.source.contains("IDENTIFIED") && self.source.contains(r"SET\s{1,8}PASSWORD") {
+            out.extend(sql_identified_password_candidates(text));
+        }
         if let Some(keyword) = self.compiled_keyword() {
+            // Python's `regex` engine starts the keyword variable capture at
+            // the later unquoted alternative in constructs such as
+            // `String("id"), Key: String("secret")`. `fancy_regex` can keep
+            // the earlier closing quote and produce `"), Key` instead. Use
+            // the trailing identifier when the capture contains one unmatched
+            // quote; a genuinely quoted variable contains both quote marks.
+            for index in 0..out.len() {
+                let reused_previous_rightquote = out[index]
+                    .variable_start
+                    .is_some_and(|start| out[..index].iter().any(|previous| previous.end == start));
+                if reused_previous_rightquote {
+                    repair_fancy_keyword_variable(&mut out[index]);
+                }
+                repair_nested_keyword_assignment(text, &mut out[index], keyword);
+                repair_fancy_unquoted_method_preference(&mut out[index]);
+                repair_quoted_comparison_variable(text, &mut out[index]);
+                repair_percent_bracket_variable(&mut out[index]);
+                repair_auth_scheme_value(&mut out[index]);
+                repair_dictionary_key_value(&mut out[index]);
+                repair_unquoted_escaped_tail(text, &mut out[index]);
+            }
+            out.retain(|candidate| keyword_key_right_within_upstream_limit(candidate, keyword));
+            let initial_len = out.len();
+            let initial_ranges = out
+                .iter()
+                .map(|candidate| (candidate.start, candidate.end))
+                .collect::<BTreeSet<_>>();
+            let initial_nonempty_variables = out
+                .iter()
+                .filter(|candidate| {
+                    !candidate.value.is_empty()
+                        && candidate.separator == Some(":")
+                        && (candidate.wrap.is_none()
+                            && !matches!(
+                                candidate.separator,
+                                Some("!=") | Some("==") | Some("!==") | Some("===") | Some("=~")
+                            )
+                            || keyword_candidate_is_complete(text, candidate))
+                })
+                .filter_map(|candidate| candidate.variable_start.zip(candidate.variable_end))
+                .collect::<BTreeSet<_>>();
+            let initial_consumed_ranges = out
+                .iter()
+                .filter(|candidate| {
+                    !candidate.value.is_empty()
+                        && candidate
+                            .variable
+                            .is_none_or(|variable| !variable.to_ascii_lowercase().contains("%5d"))
+                })
+                .filter_map(|candidate| {
+                    candidate.variable_start.map(|start| (start, candidate.end))
+                })
+                .collect::<Vec<_>>();
             out.extend(keyword_set_call_candidates(text, keyword));
+            out.extend(keyword_set_directive_candidates(text, keyword));
+            out.extend(keyword_define_call_candidates(text, keyword));
             out.extend(keyword_directive_candidates(text, keyword));
             out.extend(keyword_percent_bracket_candidates(text, keyword));
-            let structured = keyword_structured_candidates(text, keyword, &out);
+            out.extend(keyword_url_candidates(text, keyword));
+            let structured = keyword_structured_candidates(text, keyword, &out)
+                .into_iter()
+                .filter(|candidate| {
+                    !out.iter().any(|existing| {
+                        existing.start == candidate.start && existing.end == candidate.end
+                    })
+                })
+                .collect::<Vec<_>>();
+            let repaired_empty_matches = structured
+                .iter()
+                .filter(|repaired| {
+                    out.iter().any(|existing| {
+                        existing.value.is_empty()
+                            && existing.variable_start == repaired.variable_start
+                            && existing.variable_end == repaired.variable_end
+                    })
+                })
+                .map(|candidate| (candidate.start, candidate.end, candidate.variable_start))
+                .collect::<Vec<_>>();
+            out.retain(|candidate| {
+                !repaired_empty_matches
+                    .iter()
+                    .any(|(start, end, variable_start)| {
+                        (candidate.variable_start == *variable_start && candidate.value.is_empty())
+                            || (candidate.variable_start != *variable_start
+                                && candidate
+                                    .variable_start
+                                    .is_some_and(|nested| *start <= nested)
+                                && candidate.end <= *end)
+                    })
+            });
             out.extend(structured);
+            for candidate in &mut out {
+                repair_nested_keyword_assignment(text, candidate, keyword);
+                repair_quoted_comparison_variable(text, candidate);
+                repair_percent_bracket_variable(candidate);
+                repair_auth_scheme_value(candidate);
+                repair_dictionary_key_value(candidate);
+                repair_unquoted_escaped_tail(text, candidate);
+            }
+            out = out
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| {
+                    (index < initial_len
+                        || (!initial_ranges.contains(&(candidate.start, candidate.end))
+                            && !candidate
+                                .variable_start
+                                .zip(candidate.variable_end)
+                                .is_some_and(|range| initial_nonempty_variables.contains(&range))
+                            && !candidate.variable_start.is_some_and(|start| {
+                                initial_consumed_ranges.iter().any(
+                                    |(initial_start, initial_end)| {
+                                        *initial_start < start && candidate.end <= *initial_end
+                                    },
+                                )
+                            })))
+                    .then_some(candidate)
+                })
+                .collect();
+            out.retain(|candidate| keyword_key_right_within_upstream_limit(candidate, keyword));
         }
         out
     }
@@ -709,6 +909,703 @@ impl DeferredRegex {
             .get_or_init(|| FancyRegex::new(&format!("(?is:{source})")).ok())
             .as_ref()
     }
+}
+
+fn repair_percent_bracket_variable(candidate: &mut Candidate<'_>) {
+    let Some(variable) = candidate.variable else {
+        return;
+    };
+    let lower = variable.to_ascii_lowercase();
+    let Some(relative) = lower.rfind("%5b") else {
+        return;
+    };
+    let shift = relative + 3;
+    candidate.variable = variable.get(shift..);
+    candidate.variable_start = candidate.variable_start.map(|start| start + shift);
+}
+
+fn repair_quoted_comparison_variable<'a>(text: &'a str, candidate: &mut Candidate<'a>) {
+    if !matches!(
+        candidate.separator,
+        Some("!=") | Some("==") | Some("!==") | Some("===") | Some("=~")
+    ) {
+        return;
+    }
+    let Some(variable_start) = candidate.variable_start else {
+        return;
+    };
+    let Some((quote_start, _)) = text[..variable_start]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| matches!(ch, '\'' | '"' | '`'))
+    else {
+        return;
+    };
+    let expanded_start = quote_start + 1;
+    let Some(expanded) = text.get(expanded_start..candidate.variable_end.unwrap_or(variable_start))
+    else {
+        return;
+    };
+    let prefix = &expanded[..variable_start.saturating_sub(expanded_start)];
+    if !prefix.contains(')')
+        || !prefix.contains('(')
+        || expanded.len() > 80
+        || expanded.chars().any(|ch| {
+            matches!(
+                ch,
+                ':' | '=' | '"' | '\'' | '`' | '}' | '<' | '>' | '\\' | '/' | '&' | '?'
+            )
+        })
+    {
+        return;
+    }
+    candidate.variable_start = Some(expanded_start);
+    candidate.variable = Some(expanded);
+}
+
+fn repair_dictionary_key_value(candidate: &mut Candidate<'_>) {
+    if candidate.wrap.is_none_or(|wrap| wrap.trim() != "{") {
+        return;
+    }
+    let Some(quote) = candidate.value.chars().next() else {
+        return;
+    };
+    if !matches!(quote, '\'' | '"' | '`') {
+        return;
+    }
+    let quote_len = quote.len_utf8();
+    let quote_slice = &candidate.value[..quote_len];
+    let Some(relative_end) = candidate.value[quote_len..].find(quote) else {
+        return;
+    };
+    // CredSweeper's quoted-value branch requires at least four characters.
+    // Short dictionary keys such as JWK's `kty` therefore backtrack into the
+    // wrapped-value branch and keep the complete object.
+    if relative_end < 4 {
+        return;
+    }
+    let local_end = quote_len + relative_end;
+    if !candidate.value[local_end + quote_len..]
+        .trim_start()
+        .starts_with(':')
+    {
+        return;
+    }
+    candidate.start += quote_len;
+    candidate.end = candidate.start + relative_end;
+    candidate.value = &candidate.value[quote_len..local_end];
+    candidate.value_leftquote = Some(quote_slice);
+    candidate.value_rightquote = Some(quote_slice);
+}
+
+fn repair_unquoted_escaped_tail<'a>(text: &'a str, candidate: &mut Candidate<'a>) {
+    if candidate.value_leftquote.is_some() || candidate.value_rightquote.is_some() {
+        return;
+    }
+    let mut end = candidate.end;
+    loop {
+        let slash_start = end;
+        while text.as_bytes().get(end) == Some(&b'\\') && end - slash_start < 8 {
+            end += 1;
+        }
+        if end == slash_start {
+            break;
+        }
+        let Some(ch) = text.get(end..).and_then(|tail| tail.chars().next()) else {
+            break;
+        };
+        if matches!(ch, '\'' | '"' | '`') {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    if candidate.end < end {
+        candidate.end = end;
+        candidate.value = &text[candidate.start..end];
+    }
+}
+
+fn repair_auth_scheme_value(candidate: &mut Candidate<'_>) {
+    let lower = candidate.value.to_ascii_lowercase();
+    for scheme in [
+        "oauth ",
+        "bot ",
+        "basic ",
+        "bearer ",
+        "apikey ",
+        "accesskey ",
+        "ssws ",
+        "ntlm ",
+        "token ",
+    ] {
+        if lower.starts_with(scheme) && candidate.value.len() > scheme.len() + 3 {
+            candidate.start += scheme.len();
+            candidate.value = &candidate.value[scheme.len()..];
+            return;
+        }
+    }
+}
+
+fn repair_nested_keyword_assignment<'a>(
+    text: &'a str,
+    candidate: &mut Candidate<'a>,
+    keyword: &FancyRegex,
+) {
+    let Some(current_variable_end) = candidate.variable_end else {
+        return;
+    };
+    let Some(prefix) = text.get(current_variable_end..candidate.start) else {
+        return;
+    };
+    let Some(separator_relative) = prefix.rfind('=') else {
+        return;
+    };
+    let separator_start = current_variable_end + separator_relative;
+    if separator_start <= current_variable_end {
+        return;
+    }
+    let mut variable_start = separator_start;
+    while let Some(index) = variable_start.checked_sub(1) {
+        let byte = text.as_bytes()[index];
+        if matches!(byte, b':' | b'"' | b'\'' | b'`' | b',' | b';') {
+            break;
+        }
+        variable_start = index;
+    }
+    while text
+        .as_bytes()
+        .get(variable_start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        variable_start += 1;
+    }
+    let mut variable_end = separator_start;
+    while variable_end > variable_start && text.as_bytes()[variable_end - 1].is_ascii_whitespace() {
+        variable_end -= 1;
+    }
+    let Some(variable) = text.get(variable_start..variable_end) else {
+        return;
+    };
+    let lower = variable.to_ascii_lowercase();
+    let has_auth_scheme = [
+        "oauth ",
+        "basic ",
+        "bearer ",
+        "apikey ",
+        "accesskey ",
+        "ssws ",
+        "ntlm ",
+        "token ",
+    ]
+    .iter()
+    .any(|scheme| lower.starts_with(scheme));
+    let Some(keyword_match) = keyword.find(variable).ok().flatten() else {
+        return;
+    };
+    if variable.is_empty() || !has_auth_scheme {
+        return;
+    }
+    let scheme_end = variable.find(char::is_whitespace).unwrap_or(variable.len());
+    if keyword_match.start() >= scheme_end {
+        let local_start = variable[..keyword_match.start()]
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| ch.is_whitespace().then_some(index + ch.len_utf8()))
+            .unwrap_or(0);
+        variable_start += local_start;
+    }
+    let variable = &text[variable_start..variable_end];
+    candidate.variable_start = Some(variable_start);
+    candidate.variable_end = Some(variable_end);
+    candidate.variable = Some(variable);
+    candidate.separator = text.get(separator_start..separator_start + 1);
+}
+
+fn keyword_key_right_within_upstream_limit(
+    candidate: &Candidate<'_>,
+    keyword: &FancyRegex,
+) -> bool {
+    let Some(variable) = candidate.variable else {
+        return true;
+    };
+    if variable.trim_end().ends_with('%')
+        && variable.contains('/')
+        && variable.contains(['\'', '"', '`'])
+    {
+        return false;
+    }
+    keyword
+        .find_iter(variable)
+        .filter_map(Result::ok)
+        .any(|matched| variable.len().saturating_sub(matched.end()) <= 80)
+}
+
+fn repair_fancy_unquoted_method_preference(candidate: &mut Candidate<'_>) {
+    if candidate.value_leftquote.is_some() || candidate.value_rightquote.is_some() {
+        return;
+    }
+    let Some(wrap) = candidate.wrap else {
+        return;
+    };
+    if wrap.as_ptr() as usize + wrap.len() != candidate.value.as_ptr() as usize {
+        return;
+    }
+    let method = wrap.trim();
+    if !method.ends_with('(')
+        || !method[..method.len() - 1]
+            .chars()
+            .any(|ch| ch.is_ascii_alphabetic())
+        || candidate.start < wrap.len()
+    {
+        return;
+    }
+    let method_start =
+        candidate.start - wrap.len() + wrap.len().saturating_sub(wrap.trim_start().len());
+    candidate.start = method_start;
+    candidate.end = method_start + method.len();
+    candidate.value = method;
+    candidate.wrap = None;
+}
+
+fn keyword_define_call_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<Candidate<'a>> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let Some(define_start) = lower[..matched.start()].rfind("define(") else {
+            continue;
+        };
+        if define_start > 0 && text.as_bytes()[define_start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let variable_start = define_start + "define(".len();
+        let Some(comma_relative) = text[matched.end()..].find(',') else {
+            continue;
+        };
+        let variable_end = matched.end() + comma_relative;
+        if variable_end.saturating_sub(variable_start) > 80 {
+            continue;
+        }
+        let separator_start = variable_end;
+        let mut separator_end = separator_start + 1;
+        while text
+            .as_bytes()
+            .get(separator_end)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            separator_end += 1;
+        }
+        let Some(&quote) = text
+            .as_bytes()
+            .get(separator_end)
+            .filter(|byte| matches!(byte, b'\'' | b'"' | b'`'))
+        else {
+            continue;
+        };
+        let quote_start = separator_end;
+        let value_start = quote_start + 1;
+        let mut value_end = value_start;
+        let mut escaped = false;
+        while let Some(&byte) = text.as_bytes().get(value_end) {
+            if byte == quote && !escaped {
+                break;
+            }
+            escaped = byte == b'\\' && !escaped;
+            if byte != b'\\' {
+                escaped = false;
+            }
+            value_end += 1;
+        }
+        if text.as_bytes().get(value_end) != Some(&quote)
+            || value_end.saturating_sub(value_start) < 4
+        {
+            continue;
+        }
+        out.push(Candidate {
+            start: value_start,
+            end: value_end,
+            match_end: value_end,
+            value: &text[value_start..value_end],
+            variable_start: Some(variable_start),
+            variable_end: Some(variable_end),
+            variable: Some(&text[variable_start..variable_end]),
+            separator: Some(&text[separator_start..separator_end]),
+            wrap: None,
+            value_leftquote: Some(&text[quote_start..quote_start + 1]),
+            value_rightquote: Some(&text[value_end..value_end + 1]),
+            line_data: Vec::new(),
+        });
+    }
+    out
+}
+
+fn sql_identified_password_candidates(text: &str) -> Vec<Candidate<'_>> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(relative) = lower[search..].find("identified") {
+        let identified = search + relative;
+        let Some(variable_start) = ["create", "alter", "insert", "update", "set"]
+            .into_iter()
+            .filter_map(|verb| lower[..identified].rfind(verb))
+            .max()
+        else {
+            search = identified + "identified".len();
+            continue;
+        };
+        let mut cursor = identified + "identified".len();
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if lower[cursor..].starts_with("with") {
+            cursor += "with".len();
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                cursor += 1;
+            }
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+            {
+                cursor += 1;
+            }
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                cursor += 1;
+            }
+        }
+        let keyword_len = if lower[cursor..].starts_with("by") || lower[cursor..].starts_with("as")
+        {
+            2
+        } else {
+            search = identified + "identified".len();
+            continue;
+        };
+        let variable_end = cursor + keyword_len;
+        cursor = variable_end;
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        let wrap_start = cursor;
+        let wrap = if text.as_bytes().get(cursor) == Some(&b'(') {
+            cursor += 1;
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                cursor += 1;
+            }
+            Some(&text[wrap_start..cursor])
+        } else {
+            None
+        };
+        let (value_start, value_end, left, right) = if let Some(&quote) = text
+            .as_bytes()
+            .get(cursor)
+            .filter(|byte| matches!(byte, b'\'' | b'"' | b'`'))
+        {
+            if cursor > 0 && text.as_bytes().get(cursor - 1) == Some(&b'\\') {
+                search = identified + "identified".len();
+                continue;
+            }
+            let quote_start = cursor;
+            cursor += 1;
+            let value_start = cursor;
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(|byte| *byte != quote)
+            {
+                cursor += 1;
+            }
+            if text.as_bytes().get(cursor) != Some(&quote) {
+                search = identified + "identified".len();
+                continue;
+            }
+            (
+                value_start,
+                cursor,
+                Some(&text[quote_start..quote_start + 1]),
+                Some(&text[cursor..cursor + 1]),
+            )
+        } else {
+            let value_start = cursor;
+            while let Some(&byte) = text.as_bytes().get(cursor) {
+                if byte == b'\\'
+                    && text
+                        .as_bytes()
+                        .get(cursor + 1)
+                        .is_some_and(|next| !matches!(*next, b'\'' | b'"' | b'`'))
+                {
+                    cursor += 2;
+                    continue;
+                }
+                if byte.is_ascii_whitespace()
+                    || matches!(byte, b'\'' | b'"' | b'`' | b',' | b';' | b'\\')
+                {
+                    break;
+                }
+                cursor += 1;
+            }
+            (value_start, cursor, None, None)
+        };
+        if (3..=80).contains(&value_end.saturating_sub(value_start)) {
+            out.push(Candidate {
+                start: value_start,
+                end: value_end,
+                match_end: value_end,
+                value: &text[value_start..value_end],
+                variable_start: Some(variable_start),
+                variable_end: Some(variable_end),
+                variable: Some(&text[variable_start..variable_end]),
+                separator: None,
+                wrap,
+                value_leftquote: left,
+                value_rightquote: right,
+                line_data: Vec::new(),
+            });
+        }
+        search = identified + "identified".len();
+    }
+    out
+}
+
+fn keyword_set_directive_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let before_keyword = &text[..matched.start()];
+        let lower = before_keyword.to_ascii_lowercase();
+        let Some(variable_start) = lower
+            .rmatch_indices("set")
+            .find_map(|(directive_start, _)| {
+                let directive_end = directive_start + 3;
+                if (directive_start > 0
+                    && text.as_bytes()[directive_start - 1].is_ascii_alphanumeric())
+                    || !text
+                        .as_bytes()
+                        .get(directive_end)
+                        .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'-')
+                {
+                    return None;
+                }
+                let between = &text[directive_end..matched.start()];
+                if !between.chars().all(|ch| {
+                    ch.is_alphanumeric()
+                        || ch.is_whitespace()
+                        || matches!(ch, '_' | '[' | ']' | '$' | '.' | '-')
+                }) {
+                    return None;
+                }
+                let variable_start = if between.starts_with('-') {
+                    directive_end
+                } else {
+                    directive_end + between.len().saturating_sub(between.trim_start().len())
+                };
+                if text[variable_start..matched.start()]
+                    .chars()
+                    .any(char::is_whitespace)
+                {
+                    return None;
+                }
+                (variable_start <= matched.start()).then_some(variable_start)
+            })
+        else {
+            continue;
+        };
+
+        let tail_end = text[matched.end()..]
+            .find(['\r', '\n'])
+            .map_or(text.len(), |relative| matched.end() + relative);
+        let tail = text[matched.end()..tail_end].trim_end();
+        let Some(separator_relative) = tail.rfind(char::is_whitespace) else {
+            continue;
+        };
+        let separator_start = matched.end() + separator_relative;
+        let separator_end = separator_start
+            + tail[separator_relative..]
+                .len()
+                .saturating_sub(tail[separator_relative..].trim_start().len());
+        let value_start = separator_end;
+        let mut value_end = value_start;
+        while text.as_bytes().get(value_end).is_some_and(|byte| {
+            !byte.is_ascii_whitespace()
+                && !matches!(*byte, b'"' | b'\'' | b'`' | b',' | b';' | b'\\')
+        }) {
+            value_end += 1;
+        }
+        if value_end.saturating_sub(value_start) < 4 {
+            continue;
+        }
+        out.push(Candidate {
+            start: value_start,
+            end: value_end,
+            match_end: value_end,
+            value: &text[value_start..value_end],
+            variable_start: Some(variable_start),
+            variable_end: Some(separator_start),
+            variable: Some(&text[variable_start..separator_start]),
+            separator: Some(&text[separator_start..separator_end]),
+            wrap: None,
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        });
+    }
+    out
+}
+
+fn keyword_url_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<Candidate<'a>> {
+    let mut out = Vec::new();
+    for matched in keyword.find_iter(text).filter_map(Result::ok) {
+        let mut separator_start = matched.end();
+        while separator_start.saturating_sub(matched.end()) <= 80 {
+            if text.as_bytes().get(separator_start) == Some(&b'=')
+                || text
+                    .get(separator_start..separator_start.saturating_add(3))
+                    .is_some_and(|value| value.eq_ignore_ascii_case("%3D"))
+            {
+                break;
+            }
+            if text
+                .get(separator_start..separator_start.saturating_add(3))
+                .is_some_and(|value| value.eq_ignore_ascii_case("%26"))
+            {
+                separator_start = text.len();
+                break;
+            }
+            if text.as_bytes().get(separator_start).is_none_or(|byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(
+                        *byte,
+                        b'&' | b';' | b'?' | b'"' | b'\'' | b'`' | b',' | b'\\'
+                    )
+            }) {
+                separator_start = text.len();
+                break;
+            }
+            separator_start += 1;
+        }
+        if separator_start >= text.len() {
+            continue;
+        }
+        if separator_start.saturating_sub(matched.end()) > 80 {
+            continue;
+        }
+        let separator_end = if text.as_bytes().get(separator_start) == Some(&b'=') {
+            separator_start + 1
+        } else {
+            separator_start + 3
+        };
+        if text
+            .as_bytes()
+            .get(separator_end)
+            .is_some_and(|byte| matches!(*byte, b'[' | b'(' | b'{'))
+        {
+            continue;
+        }
+        let mut value_end = separator_end;
+        while value_end < text.len() {
+            if text.as_bytes().get(value_end).is_some_and(|byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(*byte, b';' | b'"' | b'\'' | b'`' | b',' | b'\\')
+            }) {
+                break;
+            }
+            value_end += 1;
+        }
+        if value_end.saturating_sub(separator_end) < 4 {
+            continue;
+        }
+
+        let mut variable_start = matched.start();
+        while let Some(index) = variable_start.checked_sub(1) {
+            if variable_start >= 3
+                && text
+                    .get(variable_start - 3..variable_start)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("%26"))
+            {
+                break;
+            }
+            let byte = text.as_bytes()[index];
+            if byte.is_ascii_whitespace() || matches!(byte, b'&' | b';' | b'?' | b':' | b'=') {
+                break;
+            }
+            variable_start = index;
+        }
+        if text.as_bytes().get(separator_start) == Some(&b'=')
+            && variable_start != 0
+            && !text
+                .as_bytes()
+                .get(variable_start)
+                .is_some_and(|byte| matches!(*byte, b'\'' | b'"' | b'`'))
+        {
+            continue;
+        }
+        out.push(Candidate {
+            start: separator_end,
+            end: value_end,
+            match_end: value_end,
+            value: &text[separator_end..value_end],
+            variable_start: Some(variable_start),
+            variable_end: Some(separator_start),
+            variable: Some(&text[variable_start..separator_start]),
+            separator: Some(&text[separator_start..separator_end]),
+            wrap: None,
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        });
+    }
+    out
+}
+
+fn repair_fancy_keyword_variable(candidate: &mut Candidate<'_>) {
+    let Some(variable) = candidate.variable else {
+        return;
+    };
+    let Some(quote) = variable.chars().next() else {
+        return;
+    };
+    if !matches!(quote, '\'' | '"' | '`') || variable.matches(quote).count() != 1 {
+        return;
+    }
+    let Some(variable_start) = candidate.variable_start else {
+        return;
+    };
+    let Some(local_end) = variable.char_indices().rev().find_map(|(index, ch)| {
+        (ch.is_alphanumeric() || ch == '_').then_some(index + ch.len_utf8())
+    }) else {
+        return;
+    };
+    let local_start = variable[..local_end]
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| {
+            (!(ch.is_alphanumeric() || ch == '_')).then_some(index + ch.len_utf8())
+        })
+        .unwrap_or(0);
+    if local_start == 0 || local_start == local_end {
+        return;
+    }
+    let start = variable_start + local_start;
+    candidate.variable_start = Some(start);
+    candidate.variable_end = Some(start + local_end - local_start);
+    candidate.variable = Some(&variable[local_start..local_end]);
 }
 
 fn keyword_get_default_candidate<'a>(text: &'a str, candidate: Candidate<'a>) -> Candidate<'a> {
@@ -755,7 +1652,26 @@ fn keyword_get_default_candidate<'a>(text: &'a str, candidate: Candidate<'a>) ->
         return candidate;
     };
     if !matches!(quote, '\'' | '"' | '`') {
-        return candidate;
+        let value_end_local = tail
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | ',' | ';'))
+            .unwrap_or(tail.len());
+        if value_end_local == 0 {
+            return candidate;
+        }
+        return Candidate {
+            start: prefix_len,
+            end: prefix_len + value_end_local,
+            match_end: prefix_len + candidate.match_end,
+            value: &text[prefix_len..prefix_len + value_end_local],
+            variable_start: candidate.variable_start,
+            variable_end: candidate.variable_end,
+            variable: candidate.variable,
+            separator: candidate.separator,
+            wrap: candidate.wrap,
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: candidate.line_data,
+        };
     }
     let value_start_local = quote.len_utf8();
     let mut escaped = false;
@@ -778,6 +1694,7 @@ fn keyword_get_default_candidate<'a>(text: &'a str, candidate: Candidate<'a>) ->
     Candidate {
         start: value_start,
         end: value_end,
+        match_end: candidate.match_end,
         value: &text[value_start..value_end],
         variable_start: candidate.variable_start,
         variable_end: candidate.variable_end,
@@ -851,6 +1768,7 @@ fn keyword_set_call_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<C
         out.push(Candidate {
             start: value_start,
             end: cursor,
+            match_end: cursor,
             value: &text[value_start..cursor],
             variable_start: Some(matched.start()),
             variable_end: Some(variable_end),
@@ -986,6 +1904,7 @@ fn keyword_directive_candidates<'a>(text: &'a str, keyword: &FancyRegex) -> Vec<
         out.push(Candidate {
             start: value_start,
             end: value_end,
+            match_end: value_end,
             value: &text[value_start..value_end],
             variable_start: Some(matched.start()),
             variable_end: Some(variable_end),
@@ -1047,6 +1966,7 @@ fn keyword_percent_bracket_candidates<'a>(
         out.push(Candidate {
             start: value_start,
             end: value_end,
+            match_end: value_end,
             value: &text[value_start..value_end],
             variable_start: Some(matched.start()),
             variable_end: Some(variable_end),
@@ -1068,23 +1988,33 @@ fn keyword_structured_candidates<'a>(
 ) -> Vec<Candidate<'a>> {
     let mut out = Vec::new();
     for matched in keyword.find_iter(text).filter_map(Result::ok) {
-        let existing_for_keyword = existing.iter().filter(|candidate| {
-            candidate
-                .variable_start
-                .zip(candidate.variable_end)
-                .is_some_and(|(start, end)| start <= matched.start() && matched.end() <= end)
-        });
-        let has_existing = existing_for_keyword.clone().next().is_some();
-        if existing_for_keyword
-            .clone()
-            .any(|candidate| !candidate.value.is_empty())
-        {
+        if existing.iter().any(|candidate| {
+            let Some(variable_start) = candidate.variable_start else {
+                return false;
+            };
+            let variable_end = candidate.variable_end.unwrap_or(variable_start);
+            if variable_end <= matched.start() && matched.end() <= candidate.end {
+                return true;
+            }
+            variable_start <= matched.start()
+                && matched.end() <= variable_end
+                && keyword_candidate_is_complete(text, candidate)
+        }) {
             continue;
         }
 
         let mut variable_start = matched.start();
         while let Some(index) = variable_start.checked_sub(1) {
             let byte = text.as_bytes()[index];
+            if byte == b'\\'
+                && text
+                    .as_bytes()
+                    .get(variable_start)
+                    .is_some_and(|next| matches!(*next, b'n' | b'r' | b't'))
+            {
+                variable_start += 1;
+                break;
+            }
             if byte.is_ascii_whitespace() || matches!(byte, b',' | b'{' | b'(' | b':' | b'=') {
                 break;
             }
@@ -1113,23 +2043,72 @@ fn keyword_structured_candidates<'a>(
             }
         }
         let mut separator_start = matched.end();
-        while text
-            .as_bytes()
-            .get(separator_start)
-            .is_some_and(|byte| !matches!(*byte, b':' | b'=' | b'\n' | b';' | b',' | b'{' | b'('))
-            && separator_start.saturating_sub(matched.end()) <= 80
+        while text.as_bytes().get(separator_start).is_some_and(|byte| {
+            !matches!(
+                *byte,
+                b':' | b'=' | b'!' | b'\n' | b';' | b',' | b'{' | b'('
+            )
+        }) && separator_start.saturating_sub(matched.end()) <= 80
         {
             separator_start += 1;
         }
         if !text
             .as_bytes()
             .get(separator_start)
-            .is_some_and(|byte| matches!(*byte, b':' | b'='))
+            .is_some_and(|byte| matches!(*byte, b':' | b'=' | b'!' | b'('))
+            || separator_start.saturating_sub(matched.end()) > 80
         {
             continue;
         }
-        let variable_end = separator_start;
+        if text.as_bytes().get(separator_start) == Some(&b'!')
+            && text.as_bytes().get(separator_start + 1) != Some(&b'=')
+        {
+            continue;
+        }
+        if text.as_bytes().get(separator_start) == Some(&b':')
+            && text.as_bytes().get(separator_start + 1) == Some(&b':')
+        {
+            continue;
+        }
+        let key_right = &text[matched.end()..separator_start];
+        if let Some(quote_index) = key_right.find(['\'', '"', '`']) {
+            let after_quote = key_right[quote_index..].trim();
+            if !after_quote.chars().all(|ch| matches!(ch, '\'' | '"' | '`')) {
+                continue;
+            }
+        }
+        let mut variable_end = separator_start;
+        if text.as_bytes().get(separator_start) == Some(&b'(') {
+            let mut method_start = separator_start;
+            while let Some(index) = method_start.checked_sub(1) {
+                if !text.as_bytes()[index].is_ascii_alphanumeric() && text.as_bytes()[index] != b'_'
+                {
+                    break;
+                }
+                method_start = index;
+            }
+            let method = &text[method_start..separator_start];
+            if method.len() <= 3 || !method[..3].eq_ignore_ascii_case("set") {
+                continue;
+            }
+            {
+                // Python's keyword regex cannot cross the opening parenthesis before a
+                // setter name.  Therefore `auth` in `appAuthData.setAppKey(...)` is not
+                // a candidate for the Key match that begins in `setAppKey`.
+                if matched.start() < method_start + 3 {
+                    continue;
+                }
+                variable_start = method_start + 3;
+                variable_end = separator_start;
+            }
+        }
         let mut typed_annotation = false;
+        let mut separator_end = ["!==", "===", ":=", "!=", "==", "=~", "=>", ":", "="]
+            .into_iter()
+            .find(|operator| text[separator_start..].starts_with(operator))
+            .map_or(separator_start + 1, |operator| {
+                separator_start + operator.len()
+            });
         if text.as_bytes().get(separator_start) == Some(&b':') {
             let annotation_start = separator_start + 1;
             if let Some(relative) = text[annotation_start..].find('=') {
@@ -1143,18 +2122,32 @@ fn keyword_structured_candidates<'a>(
                     })
                 {
                     separator_start = assignment;
+                    separator_end = assignment + 1;
                     typed_annotation = true;
                 }
             }
         }
-        let mut cursor = separator_start + 1;
-        while text
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            cursor += 1;
+        if text.as_bytes().get(separator_start) == Some(&b'=') {
+            let mut escaped = separator_end;
+            while text.as_bytes().get(escaped) == Some(&b'\\')
+                && escaped.saturating_sub(separator_end) < 8
+            {
+                escaped += 1;
+            }
+            if text
+                .get(escaped..escaped.saturating_add(8))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case("u0026gt;"))
+            {
+                separator_end = escaped + 8;
+            } else if text
+                .get(separator_end..separator_end.saturating_add(6))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case("%26gt;"))
+            {
+                separator_end += 6;
+            }
         }
+        let mut cursor = separator_end;
+        skip_keyword_whitespace(text, &mut cursor);
 
         let prefix_start = cursor;
         while text
@@ -1169,56 +2162,153 @@ fn keyword_structured_candidates<'a>(
             prefix.to_ascii_lowercase().as_str(),
             "" | "b" | "r" | "br" | "rb" | "u" | "t" | "f" | "rf" | "fr" | "l"
         );
-        if valid_prefix && !has_existing {
+        if valid_prefix {
+            let mut quote_index = cursor;
+            while text.as_bytes().get(quote_index) == Some(&b'\\')
+                && quote_index.saturating_sub(cursor) < 8
+            {
+                quote_index += 1;
+            }
             if let Some(&quote) = text
                 .as_bytes()
-                .get(cursor)
+                .get(quote_index)
                 .filter(|byte| matches!(byte, b'\'' | b'"' | b'`'))
             {
                 let quote_start = cursor;
-                cursor += 1;
+                let quote_end = quote_index + 1;
+                cursor = quote_end;
                 let value_start = cursor;
-                let mut escaped = false;
-                while let Some(&byte) = text.as_bytes().get(cursor) {
-                    if byte == quote && !escaped {
-                        break;
-                    }
-                    escaped = byte == b'\\' && !escaped;
-                    if byte != b'\\' {
-                        escaped = false;
-                    }
-                    cursor += 1;
+                if quote_index == quote_start
+                    && text.as_bytes().get(value_start) == Some(&b'\\')
+                    && text.as_bytes().get(value_start + 1) == Some(&quote)
+                {
+                    continue;
                 }
-                let plain_quote_has_safe_tail = if prefix.is_empty() && !typed_annotation {
-                    let tail = text
-                        .get(cursor.saturating_add(1)..)
-                        .unwrap_or_default()
-                        .trim_start();
-                    tail.is_empty()
+                if quote_index > quote_start {
+                    let left_quote = &text[quote_start..quote_end];
+                    cursor = text[value_start..]
+                        .find(left_quote)
+                        .map_or(text.len(), |relative| value_start + relative);
+                } else {
+                    let mut escaped = false;
+                    while let Some(&byte) = text.as_bytes().get(cursor) {
+                        if byte == quote && !escaped {
+                            break;
+                        }
+                        escaped = byte == b'\\' && !escaped;
+                        if byte != b'\\' {
+                            escaped = false;
+                        }
+                        cursor += 1;
+                    }
+                }
+                let tail = text
+                    .get(cursor.saturating_add(quote_end - quote_start)..)
+                    .unwrap_or_default()
+                    .trim_start();
+                let method_chain_tail = tail.strip_prefix('.').is_some_and(|tail| {
+                    let method_end = tail
+                        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .unwrap_or(tail.len());
+                    method_end > 0 && tail[method_end..].starts_with('(')
+                });
+                let comparison_block_tail = matches!(
+                    text.get(separator_start..separator_end),
+                    Some("!=") | Some("==") | Some("!==") | Some("===") | Some("=~")
+                ) && tail.starts_with('{');
+                let plain_quote_has_safe_tail = prefix.is_empty()
+                    && (tail.is_empty()
                         || tail.starts_with([';', ',', ')', ']', '}'])
                         || tail.starts_with("//")
                         || tail.starts_with('#')
-                } else {
-                    true
-                };
-                if text.as_bytes().get(cursor) == Some(&quote)
+                        || method_chain_tail
+                        || comparison_block_tail)
+                    || !prefix.is_empty()
+                    || typed_annotation;
+                if text
+                    .get(cursor..)
+                    .is_some_and(|tail| tail.starts_with(&text[quote_start..quote_end]))
                     && cursor > value_start
                     && plain_quote_has_safe_tail
                 {
                     out.push(Candidate {
                         start: value_start,
                         end: cursor,
+                        match_end: cursor,
                         value: &text[value_start..cursor],
                         variable_start: Some(variable_start),
                         variable_end: Some(variable_end),
                         variable: Some(&text[variable_start..variable_end]),
-                        separator: Some(&text[separator_start..separator_start + 1]),
+                        separator: Some(&text[separator_start..separator_end]),
                         wrap: None,
-                        value_leftquote: Some(&text[quote_start..quote_start + 1]),
-                        value_rightquote: Some(&text[cursor..cursor + 1]),
+                        value_leftquote: Some(&text[quote_start..quote_end]),
+                        value_rightquote: Some(&text[cursor..cursor + quote_end - quote_start]),
                         line_data: Vec::new(),
                     });
                     continue;
+                }
+            }
+        }
+
+        {
+            if let Some((quote_start, quote)) = text[prefix_start..]
+                .char_indices()
+                .take_while(|(index, _)| *index <= 256)
+                .find_map(|(index, ch)| {
+                    matches!(ch, '\'' | '"' | '`').then_some((prefix_start + index, ch))
+                })
+            {
+                let wrap = &text[prefix_start..quote_start];
+                let safe_wrap = wrap.trim_end().ends_with('(')
+                    && wrap.chars().all(|ch| {
+                        ch.is_alphanumeric()
+                            || ch.is_whitespace()
+                            || matches!(
+                                ch,
+                                '_' | '.'
+                                    | '$'
+                                    | ':'
+                                    | '-'
+                                    | '<'
+                                    | '>'
+                                    | '['
+                                    | ']'
+                                    | '('
+                                    | ')'
+                                    | '{'
+                            )
+                    });
+                if safe_wrap {
+                    let value_start = quote_start + quote.len_utf8();
+                    let mut value_end = value_start;
+                    let mut escaped = false;
+                    while let Some(ch) = text[value_end..].chars().next() {
+                        if ch == quote && !escaped {
+                            break;
+                        }
+                        escaped = ch == '\\' && !escaped;
+                        if ch != '\\' {
+                            escaped = false;
+                        }
+                        value_end += ch.len_utf8();
+                    }
+                    if text[value_end..].starts_with(quote) && value_start < value_end {
+                        out.push(Candidate {
+                            start: value_start,
+                            end: value_end,
+                            match_end: value_end,
+                            value: &text[value_start..value_end],
+                            variable_start: Some(variable_start),
+                            variable_end: Some(variable_end),
+                            variable: Some(&text[variable_start..variable_end]),
+                            separator: Some(&text[separator_start..separator_end]),
+                            wrap: Some(wrap),
+                            value_leftquote: Some(&text[quote_start..value_start]),
+                            value_rightquote: Some(&text[value_end..value_end + quote.len_utf8()]),
+                            line_data: Vec::new(),
+                        });
+                        continue;
+                    }
                 }
             }
         }
@@ -1250,20 +2340,12 @@ fn keyword_structured_candidates<'a>(
                 continue;
             }
             let word_start = cursor;
-            while text
-                .as_bytes()
-                .get(cursor)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            {
+            while text.as_bytes().get(cursor).is_some_and(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b':' | b'-' | b'>')
+            }) {
                 cursor += 1;
             }
-            if word_start < cursor
-                && last_open.is_none()
-                && matches!(
-                    text[word_start..cursor].to_ascii_lowercase().as_str(),
-                    "new" | "byte" | "char" | "string"
-                )
-            {
+            if word_start < cursor && last_open.is_none() {
                 continue;
             }
             cursor = word_start;
@@ -1286,17 +2368,18 @@ fn keyword_structured_candidates<'a>(
         {
             cursor += 1;
         }
-        if cursor.saturating_sub(value_start) < 16 || text.as_bytes().get(cursor) != Some(&close) {
+        if cursor.saturating_sub(value_start) < 16 {
             continue;
         }
         out.push(Candidate {
             start: value_start,
             end: cursor,
+            match_end: cursor,
             value: &text[value_start..cursor],
             variable_start: Some(variable_start),
             variable_end: Some(variable_end),
             variable: Some(&text[variable_start..variable_end]),
-            separator: Some(&text[separator_start..separator_start + 1]),
+            separator: Some(&text[separator_start..separator_end]),
             wrap: Some(&text[wrap_start..value_start]),
             value_leftquote: None,
             value_rightquote: None,
@@ -1304,6 +2387,76 @@ fn keyword_structured_candidates<'a>(
         });
     }
     out
+}
+
+fn keyword_candidate_is_complete(text: &str, candidate: &Candidate<'_>) -> bool {
+    if candidate.value.is_empty() {
+        return false;
+    }
+    if let Some(rightquote) = candidate.value_rightquote {
+        let tail = text
+            .get(candidate.end.saturating_add(rightquote.len())..)
+            .unwrap_or_default()
+            .trim_start();
+        let method_chain_tail = tail.strip_prefix('.').is_some_and(|tail| {
+            let method_end = tail
+                .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .unwrap_or(tail.len());
+            method_end > 0 && tail[method_end..].starts_with('(')
+        });
+        return tail.is_empty()
+            || tail.starts_with([';', ',', ')', ']', '}'])
+            || tail.starts_with("//")
+            || tail.starts_with('#')
+            || method_chain_tail;
+    }
+    if candidate.wrap.is_none() {
+        return false;
+    }
+    let Some(open) = candidate
+        .wrap
+        .and_then(|wrap| wrap.chars().rev().find(|ch| matches!(ch, '[' | '(' | '{')))
+    else {
+        return true;
+    };
+    let close = match open {
+        '[' => ']',
+        '(' => ')',
+        '{' => '}',
+        _ => unreachable!(),
+    };
+    candidate.value.trim_end().ends_with(close)
+        || text
+            .get(candidate.end..)
+            .is_some_and(|tail| tail.trim_start().starts_with(close))
+}
+
+fn skip_keyword_whitespace(text: &str, cursor: &mut usize) {
+    loop {
+        let before = *cursor;
+        while text
+            .as_bytes()
+            .get(*cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            *cursor += 1;
+        }
+        let mut escaped = *cursor;
+        while text.as_bytes().get(escaped) == Some(&b'\\') && escaped.saturating_sub(*cursor) < 8 {
+            escaped += 1;
+        }
+        if escaped > *cursor
+            && text
+                .as_bytes()
+                .get(escaped)
+                .is_some_and(|byte| matches!(*byte, b'n' | b'r' | b't'))
+        {
+            *cursor = escaped + 1;
+        }
+        if *cursor == before {
+            break;
+        }
+    }
 }
 
 fn rust_candidate<'a>(
@@ -1323,6 +2476,7 @@ fn rust_candidate<'a>(
     Some(Candidate {
         start: value.start(),
         end: value.end(),
+        match_end: captures.get(0).map_or(value.end(), |matched| matched.end()),
         value: value.as_str(),
         variable_start: variable.as_ref().map(|m| m.start()),
         variable_end: variable.as_ref().map(|m| m.end()),
@@ -1420,6 +2574,7 @@ fn fancy_candidate<'a>(
     Some(Candidate {
         start: value.start(),
         end: value_end,
+        match_end: captures.get(0).map_or(value.end(), |matched| matched.end()),
         value: &text[value.start()..value_end],
         variable_start: variable.as_ref().map(|m| m.start()),
         variable_end: variable.as_ref().map(|m| m.end()),
@@ -1432,9 +2587,11 @@ fn fancy_candidate<'a>(
     })
 }
 
+#[derive(Clone)]
 struct Candidate<'a> {
     start: usize,
     end: usize,
+    match_end: usize,
     value: &'a str,
     variable_start: Option<usize>,
     variable_end: Option<usize>,
@@ -1450,6 +2607,7 @@ impl Candidate<'_> {
     fn shift(&mut self, offset: usize) {
         self.start += offset;
         self.end += offset;
+        self.match_end += offset;
         self.variable_start = self.variable_start.map(|start| start + offset);
         self.variable_end = self.variable_end.map(|end| end + offset);
         for line_data in &mut self.line_data {
@@ -1599,6 +2757,7 @@ impl SpecialMatcher {
             Self::AwsMulti | Self::AlibabaMulti | Self::GoogleMulti | Self::Jwk => Vec::new(),
             Self::PemPrivateKey => pem_private_key_candidates(line),
             Self::Base64PrivateKey => base64_private_key_candidates(line),
+            Self::Uuid => uuid_candidates(line),
         }
     }
 
@@ -1646,8 +2805,47 @@ fn has_line_matcher(rule: &NativeRule) -> bool {
 fn translated_pattern(rule_name: &str) -> Option<SpecialMatcher> {
     match rule_name {
         "BASE64 Private Key" => Some(SpecialMatcher::Base64PrivateKey),
+        "UUID" => Some(SpecialMatcher::Uuid),
         _ => None,
     }
+}
+
+fn uuid_candidates(line: &str) -> Vec<Candidate<'_>> {
+    static UUID: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+        )
+        .expect("linear CredSweeper UUID regex")
+    });
+    static LEFT_BOUNDARY: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)$",
+        )
+        .expect("CredSweeper UUID left boundary")
+    });
+    UUID.find_iter(line)
+        .filter(|matched| {
+            let prefix_start = clamp_to_char_boundary(line, matched.start().saturating_sub(96));
+            (matched.start() == 0 || LEFT_BOUNDARY.is_match(&line[prefix_start..matched.start()]))
+                && line.as_bytes().get(matched.end()).is_none_or(|byte| {
+                    !byte.is_ascii_alphanumeric() && !matches!(*byte, b'_' | b'+' | b'-')
+                })
+        })
+        .map(|matched| Candidate {
+            start: matched.start(),
+            end: matched.end(),
+            match_end: matched.end(),
+            value: matched.as_str(),
+            variable_start: None,
+            variable_end: None,
+            variable: None,
+            separator: None,
+            wrap: None,
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        })
+        .collect()
 }
 
 fn translated_rule(raw: &RawRule) -> Option<SpecialMatcher> {
@@ -1872,6 +3070,7 @@ fn multi_pattern_candidates<'a>(
             out.push(Candidate {
                 start: main.start,
                 end: main.end,
+                match_end: main.end,
                 value: main.value,
                 variable_start: main.variable_start,
                 variable_end: main.variable_end,
@@ -1973,6 +3172,7 @@ fn jwk_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
             out.push(Candidate {
                 start: main.start,
                 end: main.end,
+                match_end: main.end,
                 value: main.value,
                 variable_start: main.variable_start,
                 variable_end: main.variable_end,
@@ -2096,6 +3296,7 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
         vec![Candidate {
             start: begin,
             end,
+            match_end: end,
             value,
             variable_start: None,
             variable_end: None,
@@ -2149,6 +3350,7 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
             out.push(Candidate {
                 start: begin,
                 end,
+                match_end: end,
                 value: block,
                 variable_start: None,
                 variable_end: None,
@@ -2203,6 +3405,25 @@ fn pem_private_key_line_data(
 
         let line = &text[line_start..line_end.min(end)];
         let sanitized = sanitize_pem_line(line, 5);
+        if sanitized.contains("-----END") {
+            if let Some(marker_start) = line.find("-----END") {
+                let payload = sanitize_pem_line(&line[..marker_start], 5);
+                if !payload.is_empty() && payload.bytes().all(is_pem_base64_byte) {
+                    if let Some(local_start) = line[..marker_start].find(&payload) {
+                        let start = line_start + local_start;
+                        out.push(CandidateLineData {
+                            start,
+                            end: start + payload.len(),
+                            value: &text[start..start + payload.len()],
+                            variable_start: None,
+                            variable_end: None,
+                            variable: None,
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
         let valuable = sanitized.contains("-----END")
             || (!sanitized.is_empty() && sanitized.bytes().all(is_pem_base64_byte));
         let (start, value_end) = if valuable {
@@ -2339,9 +3560,10 @@ fn value_base64_encoded_pem_filtered(value: &str) -> bool {
 }
 
 fn load_der_private_key(data: &[u8]) -> Option<PKey<Private>> {
-    PKey::private_key_from_der(data)
-        .ok()
-        .or_else(|| Pkcs12::from_der(data).ok()?.parse2("").ok()?.pkey)
+    PKey::private_key_from_der(data).ok().or_else(|| {
+        LazyLock::force(&OPENSSL_PKCS12_PROVIDERS).as_ref()?;
+        Pkcs12::from_der(data).ok()?.parse2("").ok()?.pkey
+    })
 }
 
 fn rsa_private_key_roundtrip(key: &PKey<Private>) -> bool {
@@ -2429,7 +3651,14 @@ fn value_base64_key_filtered(value: &str) -> bool {
 }
 
 fn decode_base64_standard_like_upstream(value: &str) -> Option<Vec<u8>> {
-    let mut value = value.to_string();
+    // Python's base64.b64decode(validate=False), used by
+    // ValueBase64KeyCheck, discards bytes outside the standard alphabet.
+    // The rule's broad capture intentionally includes source punctuation.
+    let mut value = value
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        .map(char::from)
+        .collect::<String>();
     while value.ends_with('=') {
         value.pop();
     }
@@ -2567,6 +3796,7 @@ fn base64_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
         out.push(Candidate {
             start,
             end,
+            match_end: end,
             value: &line[start..end],
             variable_start: None,
             variable_end: None,
@@ -2602,6 +3832,7 @@ struct PushMatchCtx<'view, 'data> {
     file_type: &'data str,
 }
 
+#[derive(Clone)]
 struct CandidateLineContext<'a> {
     start: usize,
     line: &'a str,
@@ -2669,6 +3900,28 @@ fn sanitize_value_capture<'a>(
     };
     if out.value.is_empty() {
         return out;
+    }
+
+    // Python's conditional right-quote capture may use a terminal backslash
+    // as the closing delimiter when an escaped source line is rescanned in a
+    // bounded offset. `fancy_regex` can leave that delimiter in `value`; it is
+    // syntax, not part of the credential.
+    if candidate.value_rightquote == Some("\\") && out.value.ends_with('\\') {
+        out.end -= 1;
+        out.value = &out.value[..out.value.len() - 1];
+    } else if candidate.value_leftquote.is_none()
+        && candidate.value_rightquote.is_none()
+        && out.value.ends_with('\\')
+        && line
+            .get(out.end..)
+            .and_then(|tail| tail.chars().next())
+            .is_some_and(|next| matches!(next, '\'' | '"' | '`'))
+    {
+        // The supplemental matcher can leave the escape prefix of an encoded
+        // closing quote in the value. Python's keyword regex assigns it to the
+        // conditional right-quote capture instead.
+        out.end -= 1;
+        out.value = &out.value[..out.value.len() - 1];
     }
 
     if candidate.value_leftquote.is_none() && candidate.value_rightquote.is_none() {
@@ -2961,6 +4214,7 @@ fn push_match(
     let filter_candidate = Candidate {
         start: sanitized_value.start,
         end: sanitized_value.end,
+        match_end: candidate.match_end,
         value: sanitized_value.value,
         variable_start: sanitized_variable.as_ref().map(|(_, start, _)| *start),
         variable_end: sanitized_variable.as_ref().map(|(_, _, end)| *end),
@@ -3002,10 +4256,12 @@ fn push_match(
             .line_data
             .iter()
             .map(|line_data| CredSweeperNativeRelatedFinding {
-                range: ctx.view.to_raw(ByteRange::new(
-                    line_ctx.start + line_data.start,
-                    line_ctx.start + line_data.end,
-                )),
+                // Multi-pattern matchers retain whole-text coordinates for
+                // every related physical line. Adding the primary line start
+                // here would shift both the anchor and secondary value twice.
+                range: ctx
+                    .view
+                    .to_raw(ByteRange::new(line_data.start, line_data.end)),
                 value: line_data.value.to_string(),
                 value_start: line_data.start,
                 value_end: line_data.end,
@@ -3096,6 +4352,50 @@ fn push_match(
         requires_ml: rule.ml_validated,
     });
     true
+}
+
+fn localize_whole_text_candidate<'a>(
+    candidate: &Candidate<'a>,
+    lines: &[(usize, &'a str)],
+    file_type: &'a str,
+    fallback: &CandidateLineContext<'a>,
+) -> (Candidate<'a>, CandidateLineContext<'a>) {
+    let Some((line_index, &(line_start, line))) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (start, _))| *start <= candidate.start)
+    else {
+        return (candidate.clone(), fallback.clone());
+    };
+    let previous = line_index
+        .checked_sub(1)
+        .and_then(|index| lines.get(index))
+        .map(|(_, line)| line.trim_end_matches(['\r', '\n']));
+    let next = lines
+        .get(line_index + 1)
+        .map(|(_, line)| line.trim_end_matches(['\r', '\n']));
+    let mut localized = candidate.clone();
+    localized.start = localized.start.saturating_sub(line_start);
+    localized.end = localized.end.saturating_sub(line_start);
+    localized.variable_start = localized
+        .variable_start
+        .map(|start| start.saturating_sub(line_start));
+    localized.variable_end = localized
+        .variable_end
+        .map(|end| end.saturating_sub(line_start));
+    (
+        localized,
+        CandidateLineContext {
+            start: line_start,
+            line: line.trim_end_matches(['\r', '\n']),
+            previous,
+            next,
+            file_type,
+            target: fallback.target,
+            line_index,
+        },
+    )
 }
 
 fn push_ml_accepted(out: &mut Vec<CredSweeperNativeFinding>, pending: &[PendingMlFinding]) {
@@ -3546,7 +4846,7 @@ fn value_base32_data_filtered(value: &str) -> bool {
     if !padded.len().is_multiple_of(8) {
         padded.extend(std::iter::repeat_n('=', 8 - padded.len() % 8));
     }
-    BASE32
+    CREDSWEEPER_BASE32
         .decode(padded.as_bytes())
         .map_or(true, |decoded| ascii_entropy_filtered(&decoded))
 }
@@ -4526,6 +5826,9 @@ fn candidate_url_part(candidate: &Candidate<'_>, line: &str) -> bool {
     scheme
         || query_variable
         || URL_VALUE.is_match(candidate.value)
+        || line
+            .get(candidate.start..)
+            .is_some_and(|tail| URL_VALUE.is_match(tail))
         || candidate
             .separator
             .is_some_and(|separator| separator.eq_ignore_ascii_case("%3D"))
@@ -4896,7 +6199,10 @@ fn repeated_or_sequence_pattern(
     let mut ascending = 1usize;
     let mut descending = 1usize;
     for pair in chars.windows(2) {
-        if pair[0] == pair[1] && !(ignore_base64_a_slash && matches!(pair[0], 'A' | '/' | '_')) {
+        if pair[0] == pair[1]
+            && !pair[0].is_whitespace()
+            && !(ignore_base64_a_slash && matches!(pair[0], 'A' | '/' | '_'))
+        {
             equal += 1;
         } else {
             equal = 1;
@@ -5569,6 +6875,21 @@ mod tests {
     }
 
     #[test]
+    fn pem_line_data_keeps_payload_before_an_inline_end_marker() {
+        let raw = concat!(
+            "String key = \"-----BEGIN RSA PRIVATE KEY-----\\n\"\n",
+            "+ \"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\\n\" + \"-----END RSA PRIVATE KEY-----\";\n",
+        );
+        let begin = raw.find("-----BEGIN").expect("begin");
+        let header_end = begin + "-----BEGIN RSA PRIVATE KEY-----".len();
+        let end = raw.find("-----END").expect("end") + "-----END RSA PRIVATE KEY-----".len();
+        let lines = pem_private_key_line_data(raw, begin, header_end, end);
+        assert!(lines
+            .iter()
+            .any(|line| line.value == "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="));
+    }
+
+    #[test]
     fn pem_line_data_keeps_a_single_physical_line_as_one_value() {
         let text = r#"const key = "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----";"#;
         let begin = text.find("-----BEGIN").unwrap();
@@ -5640,6 +6961,257 @@ mod tests {
 
         let ambiguous = format!(r#"const api_token = "{value}"[continued]"#);
         assert!(keyword_structured_candidates(&ambiguous, &keyword, &[]).is_empty());
+
+        let password_keyword = FancyRegex::new("(?is:password)").unwrap();
+        let array = r#"byte[]password=new byte[]{0x3,0x5,0x8,0x3,0x5,0x8};"#;
+        let array_candidates = keyword_structured_candidates(array, &password_keyword, &[]);
+        assert_eq!(
+            array_candidates.len(),
+            1,
+            "{array_candidates_len}",
+            array_candidates_len = array_candidates.len()
+        );
+        assert_eq!(array_candidates[0].value, "0x3,0x5,0x8,0x3,0x5,0x8");
+
+        let secret_keyword = FancyRegex::new("(?is:secret)").unwrap();
+        let wrapped = r#"secret := splitHexString("8ea332e7f666980cdd51651661ba02c9 3137b50508c57c1676e719f45c21635d")"#;
+        let wrapped_candidates = keyword_structured_candidates(wrapped, &secret_keyword, &[]);
+        assert_eq!(wrapped_candidates.len(), 1);
+        assert_eq!(
+            wrapped_candidates[0].value,
+            "8ea332e7f666980cdd51651661ba02c9 3137b50508c57c1676e719f45c21635d"
+        );
+    }
+
+    #[test]
+    fn structured_keyword_does_not_reinterpret_an_escaped_opening_quote() {
+        let key = FancyRegex::new("(?is:key(?!word|board|pad|name))").expect("key keyword");
+        let escaped = r#"keyWithAuds := "\"\xf7\xac\xcd\x12\xf5\x83""#;
+        assert!(keyword_structured_candidates(escaped, &key, &[]).is_empty());
+        let region = crate::model::Region {
+            span: ByteRange::new(0, escaped.len()),
+            ctx: crate::model::Context {
+                path: Some("test/server/key.go".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, escaped);
+        assert!(!CredSweeperNativeDetector::builtin()
+            .detect_findings(&view)
+            .iter()
+            .any(|finding| finding.rule_name == "Key"));
+        let ordinary = r#"keyWithoutAuds := "\x810r-valid-secret""#;
+        assert_eq!(1, keyword_structured_candidates(ordinary, &key, &[]).len());
+    }
+
+    #[test]
+    fn keyword_url_candidates_match_literal_and_percent_encoded_parameters() {
+        let keyword = FancyRegex::new("(?is:auth(?!ors?(?!i[tz])))").unwrap();
+        let literal = r#"oauth_token=firstvalue123&oauth_token=secondvalue456&next=value"#;
+        let candidates = keyword_url_candidates(literal, &keyword);
+        // Literal URL tails are handled by the upstream regex retry path. The
+        // supplement only starts at a line/quoted value, otherwise it would
+        // scan arbitrary `?key=` text that upstream never matched.
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].variable, Some("oauth_token"));
+        assert_eq!(
+            sanitize_value_capture(literal, ".txt", &candidates[0]).value,
+            "firstvalue123"
+        );
+
+        let encoded = "x%26oauth_nonce%3Dlqaw2384lq4946nd%26oauth_token%3Dkgwv659s32kh9kot%26y";
+        let candidates = keyword_url_candidates(encoded, &keyword);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].variable, Some("oauth_nonce"));
+        assert_eq!(candidates[0].separator, Some("%3D"));
+        assert_eq!(
+            sanitize_value_capture(encoded, ".txt", &candidates[0]).value,
+            "lqaw2384lq4946nd"
+        );
+        assert_eq!(candidates[1].variable, Some("oauth_token"));
+        assert_eq!(
+            sanitize_value_capture(encoded, ".txt", &candidates[1]).value,
+            "kgwv659s32kh9kot"
+        );
+    }
+
+    #[test]
+    fn keyword_url_candidate_does_not_cross_an_encoded_parameter_boundary() {
+        let keyword = FancyRegex::new("(?is:key(?!word|board|pad|name))").expect("key keyword");
+        let tail = "consumer-key%26oauth_nonce%3D0df9f35f-c894-0346-78d3-909023eb72a0";
+        assert!(keyword_url_candidates(tail, &keyword).is_empty());
+    }
+
+    #[test]
+    fn auth_password_url_candidate_matches_official_creddata_result() {
+        let line = "\t\t\t\tquery: `auth-password=cjBxbsGugiddvw&domain-name=bar.com&host=value`,";
+        let keyword = FancyRegex::new("(?is:auth(?!ors?(?!i[tz])))").unwrap();
+        let candidates = keyword_url_candidates(line, &keyword);
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.value.starts_with("cjBxbsGugiddvw&"))
+            .expect("official Auth URL candidate");
+        assert_eq!(candidate.variable, Some("`auth-password"));
+        let sanitized = sanitize_value_capture(line, ".go", candidate);
+        assert_eq!((sanitized.start, sanitized.end), (26, 40));
+        let line_ctx = CandidateLineContext {
+            start: 0,
+            line,
+            previous: None,
+            next: None,
+            file_type: ".go",
+            target: line,
+            line_index: 0,
+        };
+        let rejected_by = expand_filter_group("GeneralKeyword")
+            .into_iter()
+            .filter(|filter| {
+                !accept_filter_list(
+                    candidate.value,
+                    std::slice::from_ref(filter),
+                    candidate,
+                    &line_ctx,
+                    candidate.start,
+                    candidate.end,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let region = crate::model::Region {
+            span: ByteRange::new(0, line.len()),
+            ctx: crate::model::Context {
+                path: Some("test/internal/client/56575ef0.go".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, line);
+        let input = MlInput {
+            line: line.to_string(),
+            value: "cjBxbsGugiddvw".to_string(),
+            variable: "`auth-password".to_string(),
+            value_start: 26,
+            value_end: 40,
+            variable_start: 11,
+            variable_end: 25,
+            path: "test/internal/client/56575ef0.go".to_string(),
+            line_num: 417,
+            file_type: ".go".to_string(),
+            rule_name: "Auth".to_string(),
+            severity: RuleSeverity::Medium,
+        };
+        let (score, threshold) = credsweeper_ml::score_group_for_test(&[&input]);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_name == "Auth"
+                    && finding.value == "cjBxbsGugiddvw"
+                    && finding.variable.as_deref() == Some("`auth-password")
+            }),
+            "score={score} threshold={threshold} rejected_by={rejected_by:?} {findings:?}"
+        );
+    }
+
+    #[test]
+    fn set_directive_candidate_matches_official_auth_comment() {
+        let line = "// Example: To set auth token BC428392331C8B5CBF09CE69A885B68FDC930261582F8B8EEB43FA98C648A49A";
+        let keyword = FancyRegex::new("(?is:auth(?!ors?(?!i[tz])))").unwrap();
+        let candidates = keyword_set_directive_candidates(line, &keyword);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].variable, Some("auth token"));
+        assert_eq!(candidates[0].separator, Some(" "));
+        assert_eq!(
+            candidates[0].value,
+            "BC428392331C8B5CBF09CE69A885B68FDC930261582F8B8EEB43FA98C648A49A"
+        );
+    }
+
+    #[test]
+    fn set_directive_does_not_start_a_second_keyword_after_variable_whitespace() {
+        let token = FancyRegex::new("(?is:token(?!ize))").expect("token keyword");
+        let line = "// Example: To set auth token BC428392331C8B5CBF09CE69A885B68FDC930261582F8B8EEB43FA98C648A49A";
+        assert!(keyword_set_directive_candidates(line, &token).is_empty());
+    }
+
+    #[test]
+    fn structured_keyword_parser_matches_escaped_html_separator_and_quotes() {
+        let line = r#"\"authenticity_token\"=\u0026gt;\n      \"jydi0opu6JsE0gfgzqzUkFtqeZLBhu1CvezGHV8LOfcbNtJRjjuui07mnuUggC31LVoCIXzyiSBzLLFMKHOj==\""#;
+        let keyword = FancyRegex::new("(?is:auth(?!ors?(?!i[tz])))").unwrap();
+        let candidates = keyword_structured_candidates(line, &keyword, &[]);
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.value.starts_with("jydi0opu6"))
+            .expect("escaped official Auth candidate");
+        assert_eq!(candidate.separator, Some(r#"=\u0026gt;"#));
+        assert_eq!(candidate.value_leftquote, Some(r#"\""#));
+        assert_eq!(candidate.value_rightquote, Some(r#"\""#));
+    }
+
+    #[test]
+    fn deferred_keyword_matcher_keeps_escaped_authenticity_token_candidate() {
+        let line = r#"ate as HTML\n  Parameters: {\"utf8\"=\u0026gt;\"✓\", \"authenticity_token\"=\u0026gt;\n      \"jydi0opu6JsE0gfgzqzUkFtqeZLBhu1CvezG\n       HV8LOfcbNtJRj/juui07mnuUggC31LVoCIXzyiS+BzLLFMKHOj==\",\n       \"user\"=\u0026g"#;
+        let keyword = r"auth(?!ors?(?!i[tz]))";
+        let matcher = DeferredRegex {
+            source: keyword_pattern(keyword),
+            keyword_source: Some(keyword.to_string()),
+            compiled: OnceLock::new(),
+            compiled_keyword: OnceLock::new(),
+        };
+        let candidates = matcher.find(line, true);
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.value.starts_with("jydi0opu6")
+                    && candidate
+                        .variable
+                        .is_some_and(|variable| variable.contains("authenticity_token"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    candidates
+                        .iter()
+                        .map(|candidate| (candidate.variable, candidate.value))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let sanitized = sanitize_value_capture(line, ".ndjson", candidate);
+        let line_ctx = CandidateLineContext {
+            start: 0,
+            line,
+            previous: None,
+            next: None,
+            file_type: ".ndjson",
+            target: line,
+            line_index: 0,
+        };
+        let rejected_by = expand_filter_group("GeneralKeyword")
+            .into_iter()
+            .filter(|filter| {
+                !accept_filter_list(
+                    sanitized.value,
+                    std::slice::from_ref(filter),
+                    candidate,
+                    &line_ctx,
+                    sanitized.start,
+                    sanitized.end,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rejected_by.is_empty(),
+            "rejected_by={rejected_by:?} variable={:?} separator={:?} left={:?} right={:?} value={:?}",
+            candidate.variable,
+            candidate.separator,
+            candidate.value_leftquote,
+            candidate.value_rightquote,
+            candidate.value
+        );
     }
 
     #[test]
@@ -5694,6 +7266,13 @@ mod tests {
     }
 
     #[test]
+    fn value_base64_key_ignores_captured_source_punctuation_like_python() {
+        let rsa = openssl::rsa::Rsa::generate(1024).expect("RSA fixture");
+        let encoded = BASE64.encode(&rsa.private_key_to_der().expect("DER fixture"));
+        assert!(!value_base64_key_filtered(&format!("{encoded}\"`,")));
+    }
+
+    #[test]
     fn value_file_path_matches_official_fixtures() {
         for value in [
             "/u5r/d3v/f1le",
@@ -5739,6 +7318,56 @@ mod tests {
                     .iter()
                     .any(|part| part.value == "LTAI1234567890ABCDEF")
         }));
+    }
+
+    #[test]
+    fn aws_multi_pairs_adjacent_yaml_fields_like_official_creddata() {
+        let first_id = ["AKIA", "LJDBECWDLOOWXROV"].concat();
+        let first_secret = ["Lplsx2J0OaHPJoG7U7kp", "bhGUvnQ7Yv3O7zN3XXus"].concat();
+        let second_id = ["AKIA", "MFSEYJMNHBGBFMOZ"].concat();
+        let second_secret = ["Omfzc3O7SqEDVpV7A5gc", "snRZceT4Ls7X9pL1FVxa"].concat();
+        let raw = format!(
+            "    accessKeyId: {first_id}\n\
+             secretAccessKey: {first_secret}\n\
+             mock: true\n\n\
+             accessKeyId: {second_id}\n\
+             secretAccessKey: {second_secret}\n",
+        );
+        let candidates = aws_multi_candidates(&raw);
+        assert_eq!(2, candidates.len());
+        assert_eq!(2, candidates[0].line_data.len());
+        assert_eq!(first_id, candidates[0].line_data[0].value);
+        assert_eq!(first_secret, candidates[0].line_data[1].value);
+
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("mock/connectors.yaml".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, &raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert_eq!(
+            2,
+            findings
+                .iter()
+                .filter(|finding| finding.rule_name == "AWS Multi")
+                .count(),
+            "{:?}",
+            findings
+                .iter()
+                .map(|finding| (
+                    &finding.rule_name,
+                    &finding.value,
+                    finding.value_start,
+                    finding.value_end
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -5794,6 +7423,155 @@ mod tests {
         assert!(spans
             .iter()
             .all(|span| span.source == DetectorId::CredSweeper));
+    }
+
+    #[test]
+    fn detects_nkey_seed_like_official_credsweeper() {
+        let seed = "SODOJNLHRLOMANBDDQMI3D4MW5IVBAR6ERSVYTFP2QU3EIC4JKI3MLU3OT";
+        let raw = format!(r#"var oSeed = []byte("{seed}")"#);
+        let detector = CredSweeperNativeDetector::builtin();
+        let rule = detector
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == "NKEY Seed")
+            .unwrap();
+        assert_eq!(rule.patterns.len(), 1);
+        let PatternMatcher::Deferred(regex) = &rule.patterns[0].matcher else {
+            panic!("NKEY Seed must use its upstream regex");
+        };
+        let candidates = regex.find(&raw, true);
+        assert_eq!(candidates.len(), 1, "upstream pattern candidate");
+        let candidate = &candidates[0];
+        assert_eq!(candidate.value, seed);
+        let line_ctx = CandidateLineContext {
+            start: 0,
+            line: &raw,
+            previous: None,
+            next: None,
+            file_type: ".go",
+            target: &raw,
+            line_index: 0,
+        };
+        let rejected = rule
+            .filter_types
+            .iter()
+            .filter(|filter| {
+                !accept_filter_list(
+                    candidate.value,
+                    std::slice::from_ref(filter),
+                    candidate,
+                    &line_ctx,
+                    candidate.start,
+                    candidate.end,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rejected.is_empty(),
+            "upstream filter differences: {rejected:?}"
+        );
+        assert!(
+            accept_value(
+                candidate.value,
+                rule,
+                candidate,
+                &line_ctx,
+                candidate.start,
+                candidate.end
+            ),
+            "upstream filters"
+        );
+        let mut seen = vec![false; detector.rules.len()];
+        let mut selected = Vec::new();
+        detector
+            .line_prefilter
+            .collect(&LazyLower::new(&raw), &mut seen, &mut selected);
+        assert!(
+            selected
+                .iter()
+                .any(|index| detector.rules[*index].rule_name == "NKEY Seed"),
+            "line prefilter"
+        );
+
+        let region = region(&raw);
+        let view = NormalizedView::build(&region, &raw);
+        let findings = detector.detect_findings(&view);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_name == "NKEY Seed"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_regex_keeps_wrapped_numeric_auth_data() {
+        let raw = "authData := []byte{18, 170, 22, 142, 90, 59, 56, 77, 8, 65, 225, 157, 53,";
+        let detector = CredSweeperNativeDetector::builtin();
+        let rule = detector
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == "Auth")
+            .unwrap();
+        let PatternMatcher::Deferred(regex) = &rule.patterns[0].matcher else {
+            panic!("Auth must use its upstream keyword regex");
+        };
+        let compiled = regex.compiled().unwrap();
+        let CompiledRegex::Fancy(compiled) = compiled else {
+            panic!("Auth keyword regex requires fancy-regex");
+        };
+        let results = compiled.captures_iter(raw).collect::<Vec<_>>();
+        assert!(
+            results.iter().all(Result::is_ok),
+            "keyword regex runtime error: {results:?}"
+        );
+        assert_eq!(results.len(), 1, "upstream keyword candidate");
+        let candidates = regex.find(raw, true);
+        let candidate = candidates
+            .iter()
+            .find(|candidate| !candidate.value.is_empty())
+            .expect("structured fallback candidate");
+        let line_ctx = CandidateLineContext {
+            start: 0,
+            line: raw,
+            previous: None,
+            next: None,
+            file_type: ".go",
+            target: raw,
+            line_index: 0,
+        };
+        let filtered_value = candidate
+            .value
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
+        let rejected = rule
+            .filter_types
+            .iter()
+            .filter(|filter| {
+                !accept_filter_list(
+                    filtered_value,
+                    std::slice::from_ref(filter),
+                    candidate,
+                    &line_ctx,
+                    candidate.start,
+                    candidate.end,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rejected.is_empty(),
+            "upstream filter differences: {rejected:?}; value={filtered_value:?}"
+        );
+        assert!(
+            accept_value(
+                candidate.value,
+                rule,
+                candidate,
+                &line_ctx,
+                candidate.start,
+                candidate.end
+            ),
+            "upstream filters rejected candidate"
+        );
     }
 
     #[test]
@@ -5892,6 +7670,38 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.rule_name == "Key" && finding.variable.as_deref() == Some("DJANGO_SECRET_KEY")
         }));
+    }
+
+    #[test]
+    fn keyword_rules_rescan_multiple_assignments_in_one_regex_match() {
+        let raw = "final String responseBody = \"oauth_token=vt2q56n7zhfksqaw&oauth_token_secret=lghm7395e8t6yv01\";\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        for rule in ["Auth", "Token"] {
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_name == rule
+                        && finding.variable.as_deref() == Some("oauth_token_secret")
+                        && finding.value == "lghm7395e8t6yv01"
+                }),
+                "{rule}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyword_rule_keeps_method_wrapped_key_value_like_upstream() {
+        let raw = "key = Base64.decode64('IxXGeq5fLHv=')\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.rule_name == "Key" && finding.value == "IxXGeq5fLHv=" }),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -6073,6 +7883,72 @@ mod tests {
     #[test]
     fn keyword_rules_match_official_nested_fixture_literals() {
         for (path, raw, rule_name, expected) in [
+            (
+                "benchmarks/CredData/891ea546/test/internal/b0187704.go",
+                "\taesKey := lorawan.AES128Key{39, 156, 136, 85, 44, 13, 73, 133, 53, 33, 241, 130, 175, 21, 67, 162}",
+                "Key",
+                "39, 156, 136, 85, 44, 13, 73, 133, 53, 33, 241, 130, 175, 21, 67, 162",
+            ),
+            (
+                "benchmarks/CredData/fc8343f4/test/src/conf/rest/client/a9119ede.go",
+                "KeyData:[]uint8{0x5f, 0x8d, 0x8d, 0x14, 0x21, 0x49, 0x07, 0x84, 0x90, 0x54, 0x75, 0x94, 0x08, 0x5e, 0x5b, 0x3e}",
+                "Key",
+                "0x5f, 0x8d, 0x8d, 0x14, 0x21, 0x49, 0x07, 0x84, 0x90, 0x54, 0x75, 0x94, 0x08, 0x5e, 0x5b, 0x3e",
+            ),
+            (
+                "benchmarks/CredData/f5e5719b/test/0204df43.go",
+                "Token: protocol.StatelessResetToken{0x79, 0x18, 0x30, 0x56, 0x56, 0x76, 0x46, 0x40, 0x21, 0x25, 0xaa, 0xae, 0xdf, 0xaa, 0xab, 0xdc},",
+                "Token",
+                "0x79, 0x18, 0x30, 0x56, 0x56, 0x76, 0x46, 0x40, 0x21, 0x25, 0xaa, 0xae, 0xdf, 0xaa, 0xab, 0xdc",
+            ),
+            (
+                "benchmarks/CredData/41659445/test/c7cb0c45.js",
+                "    const secret = 'itnc ptx8 wk2t m3mk q4lx 7bcx vdes wrwh'.replace(/ /g, '');",
+                "Secret",
+                "itnc ptx8 wk2t m3mk q4lx 7bcx vdes wrwh",
+            ),
+            (
+                "benchmarks/CredData/8f4427e8/test/internal/app/87ecff12.go",
+                r#"if aws.ToString(opsapp.SslConfiguration.PrivateKey) != "-----BEGIN RSA PRIVATE KEY-----\nMIICXQIBAAKBgQCikCm00x/ybpc9esWOwK2JcyWAj3nUwsdW6Kbq8gsf/ndYAveD\n-----END RSA PRIVATE KEY-----" {"#,
+                "Key",
+                "-----BEGIN RSA PRIVATE KEY-----\\nMIICXQIBAAKBgQCikCm00x/ybpc9esWOwK2JcyWAj3nUwsdW6Kbq8gsf/ndYAveD\\n-----END RSA PRIVATE KEY-----",
+            ),
+            (
+                "benchmarks/CredData/a0cd6261/resource/7f6a3252.md",
+                "aquatone-discover --set-key shodan i7bly5bt40yHHyxVY7Qws2GYfrS56xgF",
+                "Key",
+                "i7bly5bt40yHHyxVY7Qws2GYfrS56xgF",
+            ),
+            (
+                "benchmarks/CredData/e72eb979/_/d272f92a.php",
+                r#"define('SECRET_KEY', 'nEsh9GjtZ03|\/|g79t70k5a6zfNk71k');"#,
+                "Secret",
+                r#"nEsh9GjtZ03|\/|g79t70k5a6zfNk71k"#,
+            ),
+            (
+                "benchmarks/CredData/f5e5719b/test/internal/9ebaf615.go",
+                r#"secret := splitHexString("8ea332e7f666980cdd51651661ba02c9 3137b50508c57c1676e719f45c21635d")"#,
+                "Secret",
+                "8ea332e7f666980cdd51651661ba02c9 3137b50508c57c1676e719f45c21635d",
+            ),
+            (
+                "benchmarks/CredData/850c2319/doc/3245bad3.md",
+                r#"CREATE USER root@'hostname' IDENTIFIED BY "5q'jK3d7ca";"#,
+                "SQL Password",
+                "5q'jK3d7ca",
+            ),
+            (
+                "benchmarks/CredData/efb4b495/init/c08cf4d6.sql",
+                r#"\set POSTGRES_PASS L9hdg7rz"#,
+                "Password",
+                "L9hdg7rz",
+            ),
+            (
+                "benchmarks/CredData/057480bf/_/16cf9f2f.cpp",
+                r#"  byte Key128[16]={0x7a,0x8c,0x51,0x86,0x68,0xac,0xf5,0xe0,0xdd,0xe6,0x07,0x21,0x66,0xae,0x6d,0x8f};"#,
+                "Key",
+                "0x7a,0x8c,0x51,0x86,0x68,0xac,0xf5,0xe0,0xdd,0xe6,0x07,0x21,0x66,0xae,0x6d,0x8f",
+            ),
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/test_app.py",
                 r#"            ("c.go", b'Credential: []byte{351, 266,    ,1,2,7,4,010, 100, 114, 157},', "Credential","#,
@@ -6264,6 +8140,226 @@ mod tests {
     }
 
     #[test]
+    fn keyword_variable_capture_matches_python_regex_after_a_quoted_value() {
+        let keyword = r"key(?!word|board|pad|name)";
+        let matcher = DeferredRegex {
+            source: keyword_pattern(keyword),
+            keyword_source: Some(keyword.to_string()),
+            compiled: OnceLock::new(),
+            compiled_keyword: OnceLock::new(),
+        };
+        for (line, expected_value, expected_variable) in [
+            (
+                r#"wantPublicKey: PublicKey{KeyID: String("1234"), Key: String("1Zf8zJfDerdO3PeLLzDeaLdXbETXc8v+wH0HDvuc5554")}"#,
+                "1Zf8zJfDerdO3PeLLzDeaLdXbETXc8v+wH0HDvuc5554",
+                "Key",
+            ),
+            (
+                r#"if key != "fully_quantize" and key != "ygyke_44k8""#,
+                "ygyke_44k8",
+                "key",
+            ),
+        ] {
+            let candidates = matcher.find(line, true);
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.value == expected_value)
+                .expect("official keyword value");
+            assert_eq!(candidate.variable, Some(expected_variable));
+        }
+    }
+
+    #[test]
+    fn setter_candidates_do_not_reuse_keywords_from_the_receiver() {
+        let auth = FancyRegex::new("(?i)auth(?!ors?(?!i[tz]))").expect("auth keyword");
+        let key = FancyRegex::new("(?i)key(?!word|board|pad|name)").expect("key keyword");
+        let line = r#"appAuthData.setAppKey("C4BE64C410A8854BF9573397A89D3C83");"#;
+
+        assert!(keyword_structured_candidates(line, &auth, &[]).is_empty());
+        let candidates = keyword_structured_candidates(line, &key, &[]);
+        assert_eq!(1, candidates.len());
+        assert_eq!(Some("AppKey"), candidates[0].variable);
+        assert_eq!("C4BE64C410A8854BF9573397A89D3C83", candidates[0].value);
+
+        let constructor = r#"accessToken = new DefaultOAuth2AccessToken("HqGX44nwSZ");"#;
+        assert!(keyword_structured_candidates(constructor, &auth, &[]).is_empty());
+    }
+
+    #[test]
+    fn structured_keyword_does_not_cross_a_quoted_expression_before_separator() {
+        let api = FancyRegex::new("(?is:api(?!tal))").expect("api keyword");
+        let key = FancyRegex::new("(?is:key(?!word|board|pad|name))").expect("key keyword");
+        let expression = concat!(
+            "bootstrapapi.JWSSignatureKeyPrefix + \"abcdef\": ",
+            "\"eyJhbGciOiJIUzI1NiJ9..signature\""
+        );
+        assert!(keyword_structured_candidates(expression, &api, &[]).is_empty());
+        assert!(keyword_structured_candidates(expression, &key, &[]).is_empty());
+
+        let json = r#"\"api_key\": \"0123456789abcdef\""#;
+        assert_eq!(1, keyword_structured_candidates(json, &key, &[]).len());
+    }
+
+    #[test]
+    fn structured_keyword_enforces_the_upstream_eighty_character_key_right_limit() {
+        let api = FancyRegex::new("(?is:api(?!tal))").expect("api keyword");
+        let accepted = format!("api{}=\"secret-value\"", "x".repeat(80));
+        let rejected = format!("api{}=\"secret-value\"", "x".repeat(81));
+        assert_eq!(1, keyword_structured_candidates(&accepted, &api, &[]).len());
+        assert!(keyword_structured_candidates(&rejected, &api, &[]).is_empty());
+    }
+
+    #[test]
+    fn structured_keyword_does_not_restart_inside_an_existing_regex_match() {
+        let key = FancyRegex::new("(?is:key(?!word|board|pad|name))").expect("key keyword");
+        let line = r#"wantPublicKey: PublicKey{KeyID: nil, Key: String("2Sg8iYjAxxmI2LvUXpJjkYrMxURPc8r+dB7TJyvv1234")}"#;
+        let value_start = line.find("nil").expect("outer value");
+        let existing = Candidate {
+            start: value_start,
+            end: line.len(),
+            match_end: line.len(),
+            value: &line[value_start..],
+            variable_start: Some(0),
+            variable_end: Some("wantPublicKey".len()),
+            variable: Some("wantPublicKey"),
+            separator: Some(":"),
+            wrap: Some(" PublicKey{"),
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        };
+        let candidates = keyword_structured_candidates(line, &key, &[existing]);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.variable != Some("Key")));
+
+        let detector = CredSweeperNativeDetector::builtin();
+        let rule = detector
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == "Key")
+            .expect("Key rule");
+        let PatternMatcher::Deferred(regex) = &rule.patterns[0].matcher else {
+            panic!("Key must use its upstream keyword regex");
+        };
+        let final_candidates = regex.find(line, true);
+        assert!(final_candidates
+            .iter()
+            .all(|candidate| candidate.variable != Some("Key")));
+    }
+
+    #[test]
+    fn fancy_keyword_match_prefers_unquoted_method_value_like_python_regex() {
+        let detector = CredSweeperNativeDetector::builtin();
+        let rule = detector
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == "Password")
+            .expect("Password rule");
+        let PatternMatcher::Deferred(pattern) = &rule.patterns[0].matcher else {
+            panic!("Password must use a deferred keyword regex");
+        };
+        let candidates = pattern.find("\t\tpassword: function( elem ) {", true);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.value == "function("),
+            "{:?}",
+            candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.value,
+                    candidate.start,
+                    candidate.end,
+                    candidate.wrap,
+                    candidate.value_leftquote,
+                    candidate.value_rightquote
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(!candidates.iter().any(|candidate| candidate.value == "elem"));
+    }
+
+    #[test]
+    fn get_password_does_not_promote_a_short_unquoted_default() {
+        let detector = CredSweeperNativeDetector::builtin();
+        let rule = detector
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == "Password")
+            .expect("Password rule");
+        let PatternMatcher::Deferred(pattern) = &rule.patterns[0].matcher else {
+            panic!("Password must use a deferred keyword regex");
+        };
+        let line = r#"passwd = keyring.get_password("pgcli", key)"#;
+        let candidates = pattern.find(line, true);
+        let retry = pattern.find(&line["passwd".len()..], true);
+        assert!(
+            !retry.iter().any(|candidate| candidate.value == "key"),
+            "retry: {:?}",
+            retry
+                .iter()
+                .map(|candidate| (candidate.value, candidate.wrap, candidate.value_leftquote))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate.value == "key"),
+            "{:?}",
+            candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.value,
+                    candidate.wrap,
+                    candidate.value_leftquote,
+                    candidate.value_rightquote
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.value == "pgcli"));
+        let region = crate::model::Region {
+            span: ByteRange::new(0, line.len()),
+            ctx: crate::model::Context {
+                path: Some("pgcli/main.py".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, line);
+        let findings = detector.detect_findings(&view);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_name == "Password"),
+            "candidates={:?}; findings={:?}",
+            candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.value,
+                    candidate.start,
+                    candidate.end,
+                    candidate.variable,
+                    candidate.variable_start,
+                    candidate.variable_end,
+                    candidate.wrap
+                ))
+                .collect::<Vec<_>>(),
+            findings
+                .iter()
+                .map(|finding| (
+                    &finding.rule_name,
+                    &finding.value,
+                    finding.value_start,
+                    finding.value_end
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn keyword_directive_probe_is_unicode_safe() {
         let keyword = FancyRegex::new("(?is:pass)").expect("keyword regex");
         assert!(keyword_directive_candidates("“password = secret-value", &keyword).is_empty());
@@ -6385,6 +8481,7 @@ mod tests {
         let candidate = Candidate {
             start: value_start,
             end: value_end,
+            match_end: value_end,
             value: &line[value_start..value_end],
             variable_start: Some(variable_start),
             variable_end: Some(variable_start + "oauth_token".len()),
@@ -6410,6 +8507,7 @@ mod tests {
         let candidate = Candidate {
             start: value_start,
             end: url.len(),
+            match_end: url.len(),
             value: &url[value_start..],
             variable_start: Some(variable_start),
             variable_end: Some(variable_start + "X-Amz-Credential".len()),
@@ -6425,6 +8523,72 @@ mod tests {
             "AKIACSVC3FV5KQHYWH8A%2F70855094%2Ffd-oiik-3",
             sanitized.value
         );
+    }
+
+    #[test]
+    fn escaped_closing_quote_prefix_is_not_part_of_unquoted_value() {
+        let line = r#"X-Auth-Token: 785b0e8aabf9222712ee7fb471a26014d09b4a86\""#;
+        let value_start = line.find("785b0e8a").unwrap();
+        let candidate = Candidate {
+            start: value_start,
+            end: line.len() - 1,
+            match_end: line.len() - 1,
+            value: &line[value_start..line.len() - 1],
+            variable_start: Some(0),
+            variable_end: Some("X-Auth-Token".len()),
+            variable: Some("X-Auth-Token"),
+            separator: Some(":"),
+            wrap: None,
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        };
+        let sanitized = sanitize_value_capture(line, ".txt", &candidate);
+        assert_eq!("785b0e8aabf9222712ee7fb471a26014d09b4a86", sanitized.value);
+        assert_eq!(line.len() - 2, sanitized.end);
+    }
+
+    #[test]
+    fn dictionary_repair_backtracks_like_keyword_pattern_minimum_value_length() {
+        let short_key = r#"signingKey: {"kty":"oct","k":"long-secret-value"}"#;
+        let start = short_key.find('"').unwrap();
+        let end = short_key.rfind('}').unwrap();
+        let mut candidate = Candidate {
+            start,
+            end,
+            match_end: end,
+            value: &short_key[start..end],
+            variable_start: Some(0),
+            variable_end: Some("signingKey".len()),
+            variable: Some("signingKey"),
+            separator: Some(":"),
+            wrap: Some(" {"),
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        };
+        repair_dictionary_key_value(&mut candidate);
+        assert_eq!(&short_key[start..end], candidate.value);
+
+        let long_key = r#"authn_state: {"authn_request_id":"secret-value"}"#;
+        let start = long_key.find('"').unwrap();
+        let end = long_key.rfind('}').unwrap();
+        let mut candidate = Candidate {
+            start,
+            end,
+            match_end: end,
+            value: &long_key[start..end],
+            variable_start: Some(0),
+            variable_end: Some("authn_state".len()),
+            variable: Some("authn_state"),
+            separator: Some(":"),
+            wrap: Some(" {"),
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        };
+        repair_dictionary_key_value(&mut candidate);
+        assert_eq!("authn_request_id", candidate.value);
     }
 
     #[test]
@@ -6515,6 +8679,75 @@ mod tests {
             );
         }
         assert!(value_pattern_filtered("��������", Some(8)));
+    }
+
+    #[test]
+    fn uuid_rule_matches_official_github_request_ids() {
+        for value in [
+            "07f5721e-b221-8d07-d3c2-ee771b7275bc",
+            "5dc3f631-8908-9127-9ce5-530060a551b8",
+            "01f9504e-f228-4e00-d3a0-fc686a1322be",
+            "51a4031d-c037-2b59-f6d3-ca160e0730df",
+        ] {
+            let raw = format!("x-github-request-id: {value}\n");
+            let region = crate::model::Region {
+                span: ByteRange::new(0, raw.len()),
+                ctx: crate::model::Context {
+                    path: Some("replay.txt".to_string()),
+                    key: None,
+                    hints: Vec::new(),
+                    kind: crate::model::RegionKind::PlainText,
+                    format: crate::model::Kind::Text,
+                },
+            };
+            let view = NormalizedView::build(&region, &raw);
+            assert!(
+                CredSweeperNativeDetector::builtin()
+                    .detect_findings(&view)
+                    .iter()
+                    .any(|finding| finding.rule_name == "UUID" && finding.value == value),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn uuid_rule_scans_official_request_id_beyond_a_hundred_kilobytes() {
+        let value = "07f5721e-b221-8d07-d3c2-ee771b7275bc";
+        let mut raw = "x".repeat(116_900);
+        raw.push_str(" x-github-request-id: ");
+        raw.push_str(value);
+        raw.push('\n');
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("replay.txt".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, &raw);
+        let detector = CredSweeperNativeDetector::builtin();
+        let uuid_rule = detector
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == "UUID")
+            .expect("UUID rule");
+        let PatternMatcher::Special(SpecialMatcher::Uuid) = &uuid_rule.patterns[0].matcher else {
+            panic!("UUID must use the linear special matcher");
+        };
+        let candidates = uuid_candidates(raw.trim_end());
+        assert!(
+            candidates.iter().any(|candidate| candidate.value == value),
+            "regex candidates: {}",
+            candidates.len()
+        );
+        assert!(detector
+            .detect_findings(&view)
+            .iter()
+            .any(|finding| finding.rule_name == "UUID" && finding.value == value));
     }
 
     #[test]
@@ -6977,6 +9210,7 @@ mod tests {
         Candidate {
             start: 0,
             end: value.len(),
+            match_end: value.len(),
             value,
             variable_start: None,
             variable_end: None,
