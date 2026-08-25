@@ -9,6 +9,11 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 const VERSION: &str = "0.20.2";
+// A JSON string can expand one input byte to six bytes (for example `\u0000`).
+// Four MiB therefore stays below the helper's 32 MiB Scanner limit even in the
+// worst case. The overlap preserves recognizers spanning a chunk boundary.
+const REQUEST_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const REQUEST_OVERLAP_BYTES: usize = 4 * 1024;
 const EXPECTED_SHA256: &str = env!("PENTECT_ALCATRAZ_SHA256");
 const UNCOMPRESSED_SIZE: usize = parse_size(env!("PENTECT_ALCATRAZ_SIZE"));
 static COMPRESSED: &[u8] = include_bytes!(env!("PENTECT_ALCATRAZ_ZST"));
@@ -177,6 +182,26 @@ impl Helper {
 }
 
 fn detect(text: &str) -> Result<Vec<Finding>, String> {
+    let mut findings = Vec::new();
+    for (start, end) in chunk_ranges(text) {
+        for mut finding in request(&text[start..end])? {
+            finding.start += start;
+            finding.end += start;
+            findings.push(finding);
+        }
+    }
+    findings.sort_by(|left, right| {
+        (&left.entity, left.start, left.end)
+            .cmp(&(&right.entity, right.start, right.end))
+            .then_with(|| right.score.total_cmp(&left.score))
+    });
+    findings.dedup_by(|right, left| {
+        right.entity == left.entity && right.start == left.start && right.end == left.end
+    });
+    Ok(findings)
+}
+
+fn request(text: &str) -> Result<Vec<Finding>, String> {
     let process = PROCESS.get_or_init(|| Mutex::new(None));
     let mut process = process.lock().map_err(|_| "Alcatraz lock poisoned")?;
     if process.is_none() {
@@ -193,6 +218,33 @@ fn detect(text: &str) -> Result<Vec<Finding>, String> {
                 .map_err(|second| format!("{first}; restart failed: {second}"))
         }
     }
+}
+
+fn chunk_ranges(text: &str) -> Vec<(usize, usize)> {
+    if text.len() <= REQUEST_CHUNK_BYTES {
+        return vec![(0, text.len())];
+    }
+    let mut ranges = Vec::with_capacity(text.len().div_ceil(REQUEST_CHUNK_BYTES));
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + REQUEST_CHUNK_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        ranges.push((start, end));
+        if end == text.len() {
+            break;
+        }
+        let mut next = end.saturating_sub(REQUEST_OVERLAP_BYTES);
+        while !text.is_char_boundary(next) {
+            next += 1;
+        }
+        start = next.max(start + 1);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    ranges
 }
 
 fn ensure_extracted() -> Result<PathBuf, String> {
@@ -306,4 +358,41 @@ fn make_executable(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn make_executable(_: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_ranges_are_bounded_overlapping_and_utf8_aligned() {
+        let text = format!(
+            "{}é{}",
+            "a".repeat(REQUEST_CHUNK_BYTES - 1),
+            "b".repeat(9000)
+        );
+        let ranges = chunk_ranges(&text);
+        assert!(ranges.len() >= 2);
+        assert_eq!(ranges.first().copied().unwrap().0, 0);
+        assert_eq!(ranges.last().copied().unwrap().1, text.len());
+        for &(start, end) in &ranges {
+            assert!(end - start <= REQUEST_CHUNK_BYTES);
+            assert!(text.is_char_boundary(start));
+            assert!(text.is_char_boundary(end));
+        }
+        for pair in ranges.windows(2) {
+            assert!(pair[1].0 < pair[0].1);
+        }
+    }
+
+    #[test]
+    fn detects_pii_after_the_helper_line_limit() {
+        let mut text = "a".repeat(33 * 1024 * 1024);
+        text.push_str("\nemail: alice@example.com\n");
+        let spans = detect_text(&text);
+        assert!(spans.iter().any(|span| {
+            span.label == "EMAIL_ADDRESS"
+                && text.get(span.range.start..span.range.end) == Some("alice@example.com")
+        }));
+    }
 }

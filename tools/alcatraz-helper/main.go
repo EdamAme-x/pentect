@@ -4,9 +4,19 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"regexp"
 
 	"github.com/hoophq/alcatraz"
+	"github.com/hoophq/alcatraz/entities"
 )
+
+var uuidPattern = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
+
+var piiEntities = []string{
+	entities.EmailAddress,
+	entities.PhoneNumber,
+	entities.CreditCard,
+}
 
 type request struct {
 	ID   uint64 `json:"id"`
@@ -27,6 +37,7 @@ type response struct {
 
 func main() {
 	engine := alcatraz.NewEngine()
+	threshold := 0.4
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	encoder := json.NewEncoder(os.Stdout)
@@ -35,9 +46,16 @@ func main() {
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			os.Exit(2)
 		}
-		results := engine.Analyze(req.Text, alcatraz.Options{})
+		results := engine.Analyze(req.Text, alcatraz.Options{
+			Entities:  piiEntities,
+			Threshold: &threshold,
+		})
+		uuidRanges := uuidPattern.FindAllStringIndex(req.Text, -1)
 		findings := make([]finding, 0, len(results))
 		for _, result := range results {
+			if containedInAny(result.Start, result.End, uuidRanges) {
+				continue
+			}
 			findings = append(findings, finding{
 				Entity: result.EntityType,
 				Start:  result.Start,
@@ -52,4 +70,13 @@ func main() {
 	if scanner.Err() != nil {
 		os.Exit(2)
 	}
+}
+
+func containedInAny(start, end int, ranges [][]int) bool {
+	for _, span := range ranges {
+		if span[0] <= start && end <= span[1] {
+			return true
+		}
+	}
+	return false
 }
