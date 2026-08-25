@@ -2050,11 +2050,14 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "request": {
                     "contents": [{"role": "user", "parts": [{
-                        "executableCode": {"language": "shell", "code": format!("echo {secret}")}
+                        "executableCode": {
+                            "language": "shell",
+                            "code": format!("RUNPOD_API_KEY={secret} command")
+                        }
                     }]}],
                     "tools": [{"functionDeclarations": [{
                         "name": "lookup",
-                        "description": format!("Use {secret}")
+                        "description": format!("Use RUNPOD_API_KEY={secret}")
                     }]}]
                 }
             }))
