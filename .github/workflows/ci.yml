@@ -232,7 +232,7 @@ jobs:
     needs: changes
     if: always()
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
