@@ -1754,6 +1754,14 @@ mod tests {
 
     #[test]
     fn removed_general_pii_corpus_is_not_claimed_as_credential_coverage() {
+        let retired_fixture_count = IBAN_VALID.len()
+            + CARD_VALID.len()
+            + PHONE_VALID.len()
+            + CRYPTO_VALID.len()
+            + FORMATTED_VALID.len()
+            + NATIONAL_ID_VALID.len()
+            + EMBEDDED_VALID.len();
+        assert!(retired_fixture_count >= 40);
         for sample in [
             "DE15804319371058294617",
             "4242424242424242",
@@ -2149,6 +2157,12 @@ mod tests {
         }
         let supported = m("key AKIAIOSFODNN7EXAMPLE");
         assert!(supported.items.iter().any(|item| item.label == "AWS_AKID"));
+        let observed_exclusive = EXCLUSIVE
+            .iter()
+            .filter(|(_, sample)| caught_exclusive(sample))
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>();
+        eprintln!("legacy exclusive observations (not a coverage claim): {observed_exclusive:?}");
     }
 
     fn caught_exclusive(s: &str) -> bool {
