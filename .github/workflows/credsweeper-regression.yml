@@ -210,7 +210,9 @@ jobs:
           python-version: "3.12"
 
       - name: Sync latest CredSweeper release
-        run: python tools/update_credsweeper.py latest
+        # The parity build and exact oracle comparison below are the validation.
+        # Avoid compiling and testing the same Rust code twice in every shard.
+        run: python tools/update_credsweeper.py latest --skip-validation
 
       - name: Install official CredSweeper oracle dependencies
         run: |
