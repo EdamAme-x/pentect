@@ -199,8 +199,8 @@ impl ClaudeHttpProxyGuard {
             });
         });
         let base_url = ready_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "Claude HTTP proxy did not start within 5 seconds".to_string())??;
+            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
+            .map_err(|_| "Claude HTTP proxy did not start within 30 seconds".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),

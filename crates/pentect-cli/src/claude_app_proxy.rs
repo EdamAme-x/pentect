@@ -39,7 +39,6 @@ use crate::handle_contract::HANDLE_CONTRACT;
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 128;
 const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -509,8 +508,8 @@ impl ClaudeAppProxyGuard {
             });
         });
         let proxy_url = ready_rx
-            .recv_timeout(STARTUP_TIMEOUT)
-            .map_err(|_| "Claude App proxy did not start within 5 seconds".to_string())??;
+            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
+            .map_err(|_| "Claude App proxy did not start within 30 seconds".to_string())??;
         Ok(Self {
             proxy_url,
             spki_hash,
