@@ -32,7 +32,7 @@ pub mod recovery;
 
 pub use codec::Codec;
 pub use detect::{
-    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
+    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector, CredSweeperFilterProbe,
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats, DecodeConfig, DecodeDetector, DecodeLimitReason, Detector,
     EntropyDetector, EnvValueDetector, ExplicitSecretDetector, KeyValueDetector,

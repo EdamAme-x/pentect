@@ -32,6 +32,7 @@ hmac = "0.12"
 zeroize = "1"
 unicode-normalization = "0.1"
 data-encoding = "2"
+openssl = { version = "0.10.81", features = ["vendored"] }
 chacha20 = "0.10.1"
 bs58 = "0.5"
 bip39 = { version = "2.2.2", features = ["all-languages"] }

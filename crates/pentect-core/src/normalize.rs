@@ -118,6 +118,7 @@ fn quoted_printable_runs(bytes: &[u8]) -> Vec<ByteRange> {
 /// resulting spans are always reported in raw coordinates.
 pub struct NormalizedView<'a> {
     pub region: &'a Region,
+    source: &'a str,
     norm: Cow<'a, str>,
     segs: Vec<Seg>,
     identity: bool,
@@ -139,6 +140,7 @@ impl<'a> NormalizedView<'a> {
         if is_identity_detection_slice(slice) {
             return NormalizedView {
                 region,
+                source: raw,
                 norm: Cow::Borrowed(slice),
                 segs: Vec::new(),
                 identity: true,
@@ -267,10 +269,29 @@ impl<'a> NormalizedView<'a> {
         }
         NormalizedView {
             region,
+            source: raw,
             norm: Cow::Owned(norm),
             segs,
             identity: false,
         }
+    }
+
+    /// Return the same region without detection normalization. This is used by
+    /// detectors whose upstream semantics are explicitly defined over raw
+    /// source text, while the rest of the pipeline keeps its normalized view.
+    pub fn raw_detection_view(&self) -> NormalizedView<'a> {
+        let slice = &self.source[self.region.span.start..self.region.span.end];
+        NormalizedView {
+            region: self.region,
+            source: self.source,
+            norm: Cow::Borrowed(slice),
+            segs: Vec::new(),
+            identity: true,
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.identity
     }
 
     pub fn text(&self) -> &str {

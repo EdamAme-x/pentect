@@ -29,8 +29,8 @@ pub use bip39::Bip39Detector;
 pub use card::CardDetector;
 pub use cli::CliCredentialDetector;
 pub use credsweeper::{
-    CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
-    CredSweeperNativeStats,
+    CredSweeperFilterProbe, CredSweeperNativeDetector, CredSweeperNativeFinding,
+    CredSweeperNativeRelatedFinding, CredSweeperNativeStats,
 };
 pub use decode::{
     DecodeConfig, DecodeDetector, DecodeLimitReason, DEFAULT_DECODE_DEPTH,

@@ -353,18 +353,19 @@ keywords = ["secret"]
     fn pack_disables_a_builtin_label() {
         let off = load_pack(r#"disable = ["IP_ADDRESS_V4"]"#).unwrap();
         assert_eq!(off.disable, ["IP_ADDRESS_V4"]);
-        let input = || Input::text("ping 192.168.1.1 then card 4242424242424242");
+        let input = || Input::text("ping 192.168.1.1 then key AKIAIOSFODNN7EXAMPLE");
         let cfg = Config::insecure_testing();
 
         // Control: by default the IP is masked.
         let base = Engine::with_profile_and_packs(Profile::Strict, vec![], false);
         assert!(!base.mask(input(), &cfg).masked.contains("192.168.1.1"));
 
-        // With the pack, the IP passes through but the card is still masked.
+        // With the pack, the IP passes through but an authoritative
+        // CredSweeper finding remains masked.
         let tuned = Engine::with_profile_and_packs(Profile::Strict, vec![off], false);
         let out = tuned.mask(input(), &cfg).masked;
         assert!(out.contains("192.168.1.1"), "{out}");
-        assert!(out.contains("<<CARD_"), "{out}");
+        assert!(out.contains("<<AWS_AKID_"), "{out}");
     }
 
     #[test]
