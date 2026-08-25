@@ -1007,7 +1007,7 @@ fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
         .find(|delimiter| values.iter().all(|value| !value.contains(delimiter)))
 }
 
-fn pentect_engine() -> Result<&'static Engine, String> {
+pub(crate) fn pentect_engine() -> Result<&'static Engine, String> {
     match PENTECT_ENGINE.get_or_init(build_pentect_engine) {
         Ok(engine) => Ok(engine),
         Err(error) => Err(error.clone()),
