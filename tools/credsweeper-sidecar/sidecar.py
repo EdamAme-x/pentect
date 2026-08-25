@@ -19,6 +19,7 @@ from credsweeper.file_handler.text_content_provider import TextContentProvider
 from credsweeper.ml_model.ml_validator import MlValidator
 from credsweeper.scanner.scanner import Scanner
 from credsweeper.utils.util import Util
+from ml_compat import validate_groups
 
 
 def build_config(use_filters: bool) -> Config:
@@ -78,7 +79,7 @@ def apply_ml(candidates: list[Candidate], batch_size: int) -> list[Candidate]:
         return result
 
     validator = MlValidator(ThresholdPreset.medium)
-    is_cred, probability = validator.validate_groups(ml_groups, batch_size)
+    is_cred, probability = validate_groups(validator, ml_groups, batch_size)
     for index, (_, group_candidates) in enumerate(ml_groups):
         for candidate in group_candidates:
             if candidate.use_ml:
