@@ -2,8 +2,8 @@ name: CredSweeper regression
 
 on:
   schedule:
-    # Compare the native port with the latest upstream release every Monday.
-    - cron: "17 3 * * 1"
+    # Compare every CredData repository with the latest upstream release weekly.
+    - cron: "17 4 * * 1"
   push:
     branches: [main]
     paths:
@@ -17,6 +17,8 @@ on:
       - 'crates/pentect-core/vendors/CredSweeper'
       - 'crates/pentect-core/vendors/credsweeper-assets/**'
       - 'tools/check_credsweeper_regression.py'
+      - 'tools/creddata_shards.py'
+      - 'tools/test_creddata_shards.py'
       - 'tools/credsweeper-sidecar/**'
       - 'tools/pentect-bench/**'
       - 'tools/update_credsweeper.py'
@@ -32,10 +34,17 @@ on:
       - 'crates/pentect-core/vendors/CredSweeper'
       - 'crates/pentect-core/vendors/credsweeper-assets/**'
       - 'tools/check_credsweeper_regression.py'
+      - 'tools/creddata_shards.py'
+      - 'tools/test_creddata_shards.py'
       - 'tools/credsweeper-sidecar/**'
       - 'tools/pentect-bench/**'
       - 'tools/update_credsweeper.py'
   workflow_dispatch:
+    inputs:
+      full:
+        description: Run the full 333-repository parity matrix
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,6 +55,7 @@ concurrency:
 
 jobs:
   regression:
+    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.full)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -94,9 +104,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Sync latest CredSweeper release for weekly parity check
-        if: github.event_name == 'schedule'
-        run: python tools/update_credsweeper.py latest
+      - name: Test CredData shard tooling
+        run: python -m unittest tools/test_creddata_shards.py
 
       - name: Install official CredSweeper oracle dependencies
         run: |
@@ -167,12 +176,127 @@ jobs:
             --save-credsweeper-json "$out/rust.json" \
             --save-credsweeper-paths "$out/paths.txt" \
             --json
-          mapfile -t paths < "$out/paths.txt"
           PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
-            python tools/credsweeper-sidecar/sidecar.py "${paths[@]}" --output "$out/oracle.json"
+            python tools/credsweeper-sidecar/sidecar.py \
+              --paths-file "$out/paths.txt" \
+              --output "$out/oracle.json"
           "$RUNNER_TEMP/pentect-bench-candidate" credsweeper-parity \
             "$out/rust.json" \
             "$out/oracle.json" \
             --min-precision 1 \
             --min-recall 1 \
             --json
+
+  weekly-parity:
+    name: Weekly parity (shard ${{ matrix.shard }})
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: credsweeper-weekly-parity
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync latest CredSweeper release
+        run: python tools/update_credsweeper.py latest
+
+      - name: Install official CredSweeper oracle dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tools/credsweeper-sidecar/runtime-requirements.txt
+
+      - name: Prepare CredData shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: 16
+        run: |
+          mkdir -p "$RUNNER_TEMP/shard-$SHARD_INDEX"
+          version="$(python -c 'import json; print(json.load(open("crates/pentect-core/vendors/credsweeper-assets/SOURCE.json"))["version"])')"
+          python tools/creddata_shards.py prepare \
+            --root benchmarks/CredData \
+            --index "$SHARD_INDEX" \
+            --count "$SHARD_COUNT" \
+            --manifest "$RUNNER_TEMP/shard-$SHARD_INDEX/manifest.json" \
+            --credsweeper-version "$version"
+          (cd benchmarks/CredData && python download_data.py --clean_data --jobs 4)
+
+      - name: Build native benchmark
+        run: |
+          cargo build --release --manifest-path tools/pentect-bench/Cargo.toml \
+            --target-dir "$RUNNER_TEMP/target"
+
+      - name: Compare native port with official CredSweeper
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/shard-$SHARD_INDEX"
+          "$RUNNER_TEMP/target/release/pentect-bench" creddata benchmarks/CredData \
+            --ignore-x \
+            --save-credsweeper-json "$out/rust.json" \
+            --save-credsweeper-paths "$out/paths.txt" \
+            --json
+          PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
+            python tools/credsweeper-sidecar/sidecar.py \
+              --paths-file "$out/paths.txt" \
+              --output "$out/oracle.json"
+          "$RUNNER_TEMP/target/release/pentect-bench" credsweeper-parity \
+            "$out/rust.json" \
+            "$out/oracle.json" \
+            --min-precision 1 \
+            --min-recall 1 \
+            --json | tee "$out/report.json"
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/shard-${{ matrix.shard }}/manifest.json
+            ${{ runner.temp }}/shard-${{ matrix.shard }}/report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  weekly-summary:
+    name: Weekly full CredData parity
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full))
+    needs: weekly-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: shard-*
+          path: ${{ runner.temp }}/weekly-parity
+      - name: Verify complete CredData coverage and parity
+        run: |
+          python tools/creddata_shards.py summarize \
+            --root benchmarks/CredData \
+            --artifacts "$RUNNER_TEMP/weekly-parity" \
+            --count 16 \
+            --output "$RUNNER_TEMP/weekly-parity-summary.json"
+          test '${{ needs.weekly-parity.result }}' = success
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/weekly-parity-summary.json" ]; then
+            cat "$RUNNER_TEMP/weekly-parity-summary.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
