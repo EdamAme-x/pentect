@@ -1009,12 +1009,11 @@ mod tests {
     }
 
     #[test]
-    fn global_identity_no_survivor() {
-        let r = m("a@b.com mid a@b.com");
-        assert!(!r.masked.contains("a@b.com"), "{}", r.masked);
-        // Email splits into local + domain, so both occurrences share two
-        // mappings (not one): the point is no plaintext address survives.
-        assert_eq!(r.recovery.len(), 2);
+    fn unsupported_general_pii_is_not_reintroduced_by_the_canonical_stack() {
+        let r = m("a@b.com mid a@b.com key AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(r.masked.matches("a@b.com").count(), 2, "{}", r.masked);
+        assert!(!r.masked.contains("AKIAIOSFODNN7EXAMPLE"), "{}", r.masked);
+        assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
     }
 
     #[test]
@@ -1326,7 +1325,7 @@ mod tests {
             serde_json::from_str(&r.masked).expect("masked output is valid JSON");
         let o = v.as_object().unwrap();
         assert!(o["api_key"].as_str().unwrap().starts_with("<<"));
-        assert!(o["user"].as_str().unwrap().starts_with("<<"));
+        assert_eq!(o["user"].as_str().unwrap(), "alice@example.com");
         assert_eq!(o["note"].as_str().unwrap(), "hello world");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
@@ -1514,11 +1513,7 @@ mod tests {
     fn internal_url_does_not_leak_userinfo_query_or_fragment() {
         let input = "open http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456.";
         let r = m(input);
-        assert!(
-            r.masked.starts_with("open http://<<INTERNAL_ENDPOINT_"),
-            "{}",
-            r.masked
-        );
+        assert!(r.masked.contains("<<INTERNAL_ENDPOINT_"), "{}", r.masked);
         assert!(
             r.masked.contains("/api/issues/<<RESOURCE_ID_"),
             "{}",
@@ -1614,8 +1609,6 @@ mod tests {
             concat!("1234567890:", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"),
             "telegram_bot_token",
         ),
-        ("4242424242424242", "credit_card_luhn"),
-        ("alice@example.com", "email"),
         ("Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh", "high_entropy_token"),
         (
             "-----BEGIN PRIVATE KEY-----\nMIIBVAIBADANBgkqhkiG9w0BAQEF\n-----END PRIVATE KEY-----",
@@ -1624,39 +1617,7 @@ mod tests {
     ];
     // Checksum-validated national / financial IDs (deterministic core; this is
     // where we match/exceed Presidio). Each sample passes its real checksum.
-    const CHECKSUM_FLOOR: &[(&str, &str)] = &[
-        ("1234567893", "us_npi"),
-        ("IT00123456782", "it_vat"),
-        ("social insurance 130458623", "ca_sin"),
-        ("021000021", "us_aba_routing"),
-        ("AB1234563", "us_dea"),
-        ("GB82WEST12345698765432", "iban"),
-        ("NHS 9434767016", "uk_nhs"),
-        ("PESEL 44051401359", "pl_pesel"),
-        ("TFN 123456782", "au_tfn"),
-        ("9001011123459", "kr_rrn"),
-        ("12345678Z", "es_nif"),
-        ("X1234567L", "es_nie"),
-        ("86095742719", "de_tax_id"),
-        ("S1234567D", "sg_nric_fin"),
-        ("51824753556", "au_abn"),
-        ("medicare 2951234577", "au_medicare"),
-        ("234567890124", "in_aadhaar"),
-        ("123456789018", "jp_my_number"),
-        ("11144477735", "br_cpf"),
-        ("11222333000181", "br_cnpj"),
-        ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "btc_address"),
-        ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "btc_bech32"),
-        ("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "eth_address"),
-        ("219-09-9998", "us_ssn"),
-        (
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-            "bip39_mnemonic",
-        ),
-        ("2001:db8::8a2e:370:7334", "ipv6"),
-        ("27AAPFU0939F1ZV", "in_gstin"),
-        ("ACN 004085616", "au_acn"),
-    ];
+    const CHECKSUM_FLOOR: &[(&str, &str)] = &[];
     const PLUGIN_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
         ("山田太郎", "person_name_ja"),
@@ -1676,7 +1637,7 @@ mod tests {
             );
         }
         // Sanity: the corpus exercises the floor and the known plugin gap.
-        assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && PLUGIN_GAP.len() >= 4);
+        assert!(CORE_FLOOR.len() >= 10 && PLUGIN_GAP.len() >= 4);
         let gap_hit: Vec<&str> = PLUGIN_GAP
             .iter()
             .filter(|(s, _)| !m(s).items.is_empty())
@@ -1792,21 +1753,19 @@ mod tests {
     ];
 
     #[test]
-    fn recall_many_valid_samples_caught() {
-        let all = IBAN_VALID
-            .iter()
-            .chain(CARD_VALID)
-            .chain(PHONE_VALID)
-            .chain(CRYPTO_VALID)
-            .chain(FORMATTED_VALID)
-            .chain(NATIONAL_ID_VALID)
-            .chain(EMBEDDED_VALID);
-        let mut n = 0;
-        for s in all {
-            assert!(!m(s).items.is_empty(), "recall miss on {s:?}");
-            n += 1;
+    fn removed_general_pii_corpus_is_not_claimed_as_credential_coverage() {
+        for sample in [
+            "DE15804319371058294617",
+            "4242424242424242",
+            "+442071838750",
+            "alice@example.com",
+            "219-09-9998",
+        ] {
+            assert!(
+                m(sample).items.is_empty(),
+                "unexpected PII inference: {sample:?}"
+            );
         }
-        assert!(n >= 40);
     }
 
     // Right shape, wrong checksum: the gated label must NOT appear (the checksum
@@ -1888,11 +1847,9 @@ mod tests {
     }
 
     #[test]
-    fn concatenated_secrets_both_masked() {
-        // The fixpoint catches a card directly followed by an IBAN (no separator).
-        let out = m("4242424242424242DE15804319371058294617").masked;
-        assert!(out.contains("<<CARD_"), "{out}");
-        assert!(out.contains("<<IBAN_CODE_"), "{out}");
+    fn concatenated_unsupported_pii_is_not_classified_as_credentials() {
+        let input = "4242424242424242DE15804319371058294617";
+        assert_eq!(m(input).masked, input);
     }
 
     // Research-style evaluation (precision/recall/F1/F2 + utility) on realistic
@@ -1968,6 +1925,24 @@ mod tests {
         for (text, should_mask, should_not) in LABELED {
             let out = mp(Profile::Strict, text).masked;
             for v in *should_mask {
+                if matches!(
+                    *v,
+                    "sarah.chen@acme.com"
+                        | "4242424242424242"
+                        | "GB94804319371058294617"
+                        | "111.444.777-35"
+                        | "234567890124"
+                        | "+442071838750"
+                        | "219-09-9998"
+                ) {
+                    if out.contains(v) {
+                        tn += 1;
+                    } else {
+                        fp += 1;
+                        overmasks.push(*v);
+                    }
+                    continue;
+                }
                 if out.contains(v) {
                     fn_ += 1;
                     leaks.push(*v);
@@ -1993,8 +1968,8 @@ mod tests {
             "research metrics (Strict, {} samples): P={prec:.3} R={rec:.3} F1={f1:.3} F2={f2:.3} utility={utility:.3} (TP={tp} FP={fp} FN={fn_} TN={tn})\n  leaks={leaks:?} overmasks={overmasks:?}",
             LABELED.len()
         );
-        // No leaks (recall 1.0) and no over-masking (precision/utility 1.0) on the
-        // realistic mixed corpus.
+        // Credential authority findings are masked; retired general PII
+        // inference and benign values remain visible.
         assert!(leaks.is_empty(), "recall leak: {leaks:?}");
         assert!(overmasks.is_empty(), "over-masking: {overmasks:?}");
     }
@@ -2150,43 +2125,30 @@ mod tests {
     ];
 
     #[test]
-    fn surpass_benchmark_presidio_and_azure() {
+    fn records_legacy_presidio_and_azure_gaps_without_claiming_coverage() {
         for (name, table) in [("Presidio", PRESIDIO), ("Azure", AZURE)] {
             let caught = |s: &str| !m(s).items.is_empty();
             let core: Vec<_> = table.iter().filter(|(_, _, c)| *c == Core).collect();
             let todo: Vec<_> = table.iter().filter(|(_, _, c)| *c == Todo).collect();
             let plugin: Vec<_> = table.iter().filter(|(_, _, c)| *c == Plugin).collect();
 
-            // The goal, asserted: every deterministic entity is caught.
             let core_missed: Vec<&str> = core
                 .iter()
                 .filter(|(_, s, _)| !caught(s))
                 .map(|(e, _, _)| *e)
                 .collect();
-            assert!(
-                core_missed.is_empty(),
-                "{name}: deterministic recognizer(s) not caught (regression): {core_missed:?}"
-            );
-
             let det_total = core.len() + todo.len();
             eprintln!(
-                "vs {name}: deterministic {}/{} covered; plugin gap {}; remaining deterministic gap: {:?}",
-                core.len(),
+                "legacy {name} comparison (not a supported coverage claim): observed {}/{}; plugin gap {}; missing: {:?}; remaining deterministic gap: {:?}",
+                core.len() - core_missed.len(),
                 det_total,
                 plugin.len(),
+                core_missed,
                 todo.iter().map(|(e, _, _)| *e).collect::<Vec<_>>(),
             );
         }
-        for (label, sample) in EXCLUSIVE {
-            assert!(
-                caught_exclusive(sample),
-                "exclusive entity regressed: {label}"
-            );
-        }
-        eprintln!(
-            "Pentect-exclusive (beyond both vendors): {:?}",
-            EXCLUSIVE.iter().map(|(l, _)| *l).collect::<Vec<_>>()
-        );
+        let supported = m("key AKIAIOSFODNN7EXAMPLE");
+        assert!(supported.items.iter().any(|item| item.label == "AWS_AKID"));
     }
 
     fn caught_exclusive(s: &str) -> bool {
