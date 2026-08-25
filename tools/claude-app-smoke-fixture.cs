@@ -13,7 +13,7 @@ public static class ClaudeAppSmokeFixture
         {
             return 64;
         }
-        Thread.Sleep(1000);
+        Thread.Sleep(5000);
         return 0;
     }
 }
