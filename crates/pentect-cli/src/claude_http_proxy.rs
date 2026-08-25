@@ -3241,14 +3241,17 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_provider_boundary_masks_free_text_pii() {
+    fn anthropic_provider_boundary_does_not_claim_upstream_unsupported_pii() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = TestEnv::install(&store);
         let phone = "+81 90-9876-5432";
         let email = "hanako.suzuki@example.co.jp";
         let card = "4242 4242 4242 4242";
-        let prompt = format!("Call {phone}, email {email}, and verify card {card}.");
+        let supported_secret = ["6FF2FD0652", "DCD53EA929"].concat();
+        let prompt = format!(
+            "Call {phone}, email {email}, and verify card {card}. oauthClientSecret = \"{supported_secret}\""
+        );
 
         let (upstream, request, thread) = mock_upstream(MockProvider::Anthropic);
         let proxy = ClaudeHttpProxyGuard::start(upstream).unwrap();
@@ -3273,16 +3276,24 @@ mod tests {
             .unwrap();
         for plaintext in [phone, email, card] {
             assert!(
-                !provider_body.contains(plaintext),
-                "PII reached the Anthropic upstream: {provider_body}"
+                provider_body.contains(plaintext),
+                "CredSweeper does not classify this PII and Pentect must not claim otherwise: {provider_body}"
             );
         }
         for label in ["PHONE_NUMBER", "IDENTITY", "CARD"] {
             assert!(
-                provider_body.contains(&format!("<<{label}_")),
-                "missing {label} handle: {provider_body}"
+                !provider_body.contains(&format!("<<{label}_")),
+                "legacy custom PII detector unexpectedly remained active: {provider_body}"
             );
         }
+        assert!(
+            !provider_body.contains(&supported_secret),
+            "{provider_body}"
+        );
+        assert!(
+            first_valid_handle(&provider_body).is_some(),
+            "{provider_body}"
+        );
         drop(proxy);
         thread.join().unwrap();
     }
