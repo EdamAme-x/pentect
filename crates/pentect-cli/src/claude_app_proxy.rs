@@ -2818,7 +2818,9 @@ mod tests {
                 "model": "claude-test-model",
                 "organization_uuid": "11111111-2222-3333-4444-555555555555",
                 "prompt": format!("Use this value:\nRUNPOD_API_KEY={secret}\n"),
-                "future_instructions": format!("A future field contains {secret}"),
+                "future_instructions": format!(
+                    "A future field contains RUNPOD_API_KEY={secret}"
+                ),
                 "messages": [{"content": [{
                     "type": "tool_result",
                     "tool_use_id": "tool-stable-id",
