@@ -64,9 +64,3 @@ objc2 = { version = "0.6.3", default-features = false }
 objc2-foundation = { version = "0.3.2", default-features = false }
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 objc2-vision = { version = "0.3.2", default-features = false }
-
-# Test binaries do not need platform debug symbols. In particular, emitting
-# PDBs for each Windows test binary makes the plugin matrix spend most of its
-# 15-minute budget linking the same large detector graph.
-[profile.test]
-debug = 0
