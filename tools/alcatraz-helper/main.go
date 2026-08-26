@@ -16,6 +16,18 @@ var piiEntities = []string{
 	entities.EmailAddress,
 	entities.PhoneNumber,
 	entities.CreditCard,
+	// These identifiers have a constrained shape and, except for IN PAN,
+	// checksum validation in Alcatraz. Broad operational identifiers such as
+	// URLs, IP addresses and dates intentionally remain visible by default.
+	entities.IBANCode,
+	entities.UKNINO,
+	entities.INPAN,
+	entities.ITFiscalCode,
+	entities.ESNIF,
+	entities.ESNIE,
+	entities.SGFIN,
+	entities.KRRRN,
+	entities.FIPersonalIdentityCode,
 }
 
 type request struct {
@@ -46,10 +58,7 @@ func main() {
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			os.Exit(2)
 		}
-		results := engine.Analyze(req.Text, alcatraz.Options{
-			Entities:  piiEntities,
-			Threshold: &threshold,
-		})
+		results := analyze(engine, req.Text, threshold)
 		uuidRanges := uuidPattern.FindAllStringIndex(req.Text, -1)
 		findings := make([]finding, 0, len(results))
 		for _, result := range results {
@@ -70,6 +79,13 @@ func main() {
 	if scanner.Err() != nil {
 		os.Exit(2)
 	}
+}
+
+func analyze(engine *alcatraz.Engine, text string, threshold float64) []alcatraz.Result {
+	return engine.Analyze(text, alcatraz.Options{
+		Entities:  piiEntities,
+		Threshold: &threshold,
+	})
 }
 
 func containedInAny(start, end int, ranges [][]int) bool {

@@ -395,4 +395,23 @@ mod tests {
                 && text.get(span.range.start..span.range.end) == Some("alice@example.com")
         }));
     }
+
+    #[test]
+    fn bundled_helper_detects_expanded_high_precision_pii() {
+        let text = "IBAN DE89 3704 0044 0532 0130 00; NINO AB 12 34 56 C; NIF 12345678Z";
+        let labels: std::collections::HashSet<_> = detect_text(text)
+            .into_iter()
+            .map(|span| span.label)
+            .collect();
+        assert!(labels.contains("IBAN_CODE"));
+        assert!(labels.contains("UK_NINO"));
+        assert!(labels.contains("ES_NIF"));
+    }
+
+    #[test]
+    fn bundled_helper_preserves_common_developer_metadata() {
+        let text = "id=550e8400-e29b-41d4-a716-446655440000 version=10.20.30 \
+                    at=2026-08-26T12:34:56Z url=http://localhost:8080/docs";
+        assert!(detect_text(text).is_empty());
+    }
 }
