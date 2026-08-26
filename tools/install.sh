@@ -50,7 +50,15 @@ case "$os:$arch" in
     ;;
 esac
 
-install_dir=${PENTECT_INSTALL_DIR:-"$HOME/.local/bin"}
+if [ -n "${PENTECT_INSTALL_DIR:-}" ]; then
+  install_dir=$PENTECT_INSTALL_DIR
+else
+  install_dir="$HOME/.local/bin"
+  case ":${PATH:-}:" in
+    *":$HOME/.local/bin:"*) ;;
+    *":$HOME/bin:"*) install_dir="$HOME/bin" ;;
+  esac
+fi
 destination="$install_dir/pentect"
 marker="$install_dir/.pentect-managed-install.json"
 
@@ -127,8 +135,47 @@ printf '%s\n' '{"version":1,"manager":"pentect","path_added":false}' > "$marker"
 
 case ":${PATH:-}:" in
   *":$install_dir:"*) path_status="already on PATH" ;;
-  *) path_status="add $install_dir to PATH" ;;
+  *)
+    path_status="not active in this shell"
+    if [ -z "${PENTECT_INSTALL_DIR:-}" ] && [ "$install_dir" = "$HOME/.local/bin" ]; then
+      add_posix_path_profile() {
+        profile=$1
+        marker_line='# Added by the Pentect installer: user-local executables'
+        if [ -f "$profile" ] && grep -Fq "$marker_line" "$profile"; then
+          return
+        fi
+        {
+          printf '\n%s\n' "$marker_line"
+          printf '%s\n' 'case ":$PATH:" in'
+          printf '%s\n' '  *":$HOME/.local/bin:"*) ;;'
+          printf '%s\n' '  *) export PATH="$HOME/.local/bin:$PATH" ;;'
+          printf '%s\n' 'esac'
+        } >> "$profile"
+      }
+      profile_updated=1
+      if ! add_posix_path_profile "$HOME/.profile"; then
+        profile_updated=0
+      fi
+      case "${SHELL:-}" in
+        */bash) add_posix_path_profile "$HOME/.bashrc" || profile_updated=0 ;;
+        */zsh) add_posix_path_profile "$HOME/.zshrc" || profile_updated=0 ;;
+      esac
+      if [ "$profile_updated" -eq 1 ]; then
+        path_status="added to shell profile (open a new terminal)"
+      else
+        path_status="could not update shell profile"
+      fi
+    fi
+    ;;
 esac
 printf '[4/4] PATH: %s\n\n' "$path_status"
 printf 'Installed Pentect %s\n' "$release_tag"
-printf 'Next: pentect doctor\n'
+case ":${PATH:-}:" in
+  *":$install_dir:"*) printf 'Next: pentect doctor\n' ;;
+  *)
+    printf 'Run now: %s doctor\n' "$destination"
+    if [ "$install_dir" = "$HOME/.local/bin" ]; then
+      printf 'Current shell: export PATH="$HOME/.local/bin:$PATH"\n'
+    fi
+    ;;
+esac

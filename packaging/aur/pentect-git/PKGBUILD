@@ -7,7 +7,7 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/EdamAme-x/pentect'
 license=('MIT')
 depends=('ca-certificates' 'gcc-libs' 'glibc')
-makedepends=('cargo' 'git')
+makedepends=('cargo' 'git' 'perl')
 provides=("pentect=$pkgver")
 conflicts=('pentect')
 options=('!lto')

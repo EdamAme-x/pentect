@@ -64,6 +64,8 @@ def main() -> None:
         )
         assert f"\tpkgver = {vcs_version}\n" in git_srcinfo_text
         assert f"\tprovides = pentect={vcs_version}\n" in git_srcinfo_text
+        assert "makedepends=('cargo' 'git' 'perl')\n" in git_pkgbuild_text
+        assert "\tmakedepends = perl\n" in git_srcinfo_text
 
     release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
         encoding="utf-8"

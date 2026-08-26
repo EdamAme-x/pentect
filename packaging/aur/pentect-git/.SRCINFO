@@ -8,6 +8,7 @@ pkgbase = pentect-git
 	license = MIT
 	makedepends = cargo
 	makedepends = git
+	makedepends = perl
 	depends = ca-certificates
 	depends = gcc-libs
 	depends = glibc
