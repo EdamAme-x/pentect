@@ -145,12 +145,53 @@ jobs:
           go-version-file: tools/alcatraz-helper/go.mod
           cache-dependency-path: tools/alcatraz-helper/go.sum
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        id: rust-cache
         with:
           shared-key: release-${{ matrix.asset }}
+      - name: Report release build environment
+        shell: pwsh
+        run: |
+          "Runner: $env:RUNNER_OS/$env:RUNNER_ARCH"
+          "Processors: $([Environment]::ProcessorCount)"
+          "Rust cache hit: ${{ steps.rust-cache.outputs.cache-hit }}"
+          rustc --version --verbose
+          cargo --version --verbose
+          go version
       - name: Build release binary
+        shell: pwsh
         env:
           PENTECT_REQUIRE_ALCATRAZ: "1"
-        run: cargo build --release --locked -p pentect-cli
+        run: |
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          cargo build --release --locked --timings -p pentect-cli
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          "Release build elapsed: $($timer.Elapsed)"
+          if ($exitCode -ne 0) { exit $exitCode }
+      - name: Summarize release build diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $targetBytes = if (Test-Path target) {
+            (Get-ChildItem target -File -Recurse | Measure-Object Length -Sum).Sum
+          } else { 0 }
+          $targetMiB = [Math]::Round($targetBytes / 1MB, 1)
+          @"
+          ### ${{ matrix.asset }} build diagnostics
+
+          - Runner: `$env:RUNNER_OS/$env:RUNNER_ARCH`
+          - Logical processors: $([Environment]::ProcessorCount)
+          - Rust cache hit: `${{ steps.rust-cache.outputs.cache-hit }}`
+          - Target directory: ${targetMiB} MiB
+          "@ >> $env:GITHUB_STEP_SUMMARY
+      - name: Upload Cargo timing report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-diagnostics-${{ matrix.asset }}
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 14
       - name: Verify bundled Alcatraz without an external Go runtime
         shell: pwsh
         run: |
@@ -298,8 +339,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: pentect-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notices
+          path: dist
       - name: Stage prerelease
         env:
           GH_TOKEN: ${{ github.token }}
