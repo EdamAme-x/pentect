@@ -63,7 +63,7 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const GATEWAY_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const GATEWAY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MEMORY_STORE_STARTUP_STDERR: usize = 64 * 1024;
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
 
