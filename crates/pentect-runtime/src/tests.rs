@@ -16,6 +16,23 @@ impl RecoveringTestMutex {
 static TEST_ENV_LOCK: RecoveringTestMutex = RecoveringTestMutex(std::sync::Mutex::new(()));
 
 #[test]
+fn canonical_engine_construction_stays_off_the_warm_up_path() {
+    let started = std::time::Instant::now();
+    let _engine = build_masking_engine(
+        Profile::Strict,
+        Vec::new(),
+        false,
+        pentect_core::DecodeConfig::default(),
+    )
+    .expect("canonical engine");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "canonical engine construction took {elapsed:?}; detector warm-up must remain lazy"
+    );
+}
+
+#[test]
 fn claude_hook_cli_is_retired_in_favor_of_http_gateway() {
     let error = parse_hook_provider("claude").unwrap_err();
     assert!(error.contains("HTTP gateway"), "{error}");

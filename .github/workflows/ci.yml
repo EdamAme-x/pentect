@@ -242,15 +242,18 @@ jobs:
         if: needs.changes.result != 'success'
         run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.changes.outputs.plugins == 'true'
+        if: needs.changes.outputs.plugins == 'true' || needs.changes.outputs.detector == 'true'
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-        if: needs.changes.outputs.plugins == 'true'
+        if: needs.changes.outputs.plugins == 'true' || needs.changes.outputs.detector == 'true'
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: needs.changes.outputs.plugins == 'true'
+        if: needs.changes.outputs.plugins == 'true' || needs.changes.outputs.detector == 'true'
+      - name: Measure canonical engine cold construction
+        if: needs.changes.outputs.detector == 'true'
+        run: cargo test -p pentect-runtime --lib --locked canonical_engine_construction_stays_off_the_warm_up_path -- --nocapture
       - name: Test plugin runtime
         if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-runtime plugin_middleware::tests --locked
@@ -274,7 +277,7 @@ jobs:
         if: needs.changes.outputs.plugins == 'true'
         run: python -m unittest discover plugins/openai-privacy-filter/tests
       - name: No plugin changes
-        if: needs.changes.outputs.plugins != 'true'
+        if: needs.changes.outputs.plugins != 'true' && needs.changes.outputs.detector != 'true'
         run: echo "No plugin changes"
 
   app-platform:
@@ -434,6 +437,9 @@ jobs:
       - name: Test detector changes
         if: needs.changes.outputs.detector == 'true'
         run: cargo test -p pentect-core --no-default-features --locked
+      - name: Measure canonical engine cold construction
+        if: needs.changes.outputs.detector == 'true'
+        run: cargo test -p pentect-runtime --lib --locked canonical_engine_construction_stays_off_the_warm_up_path -- --nocapture
       - name: Full test on main
         if: github.event_name == 'push'
         run: cargo test --all-features --locked

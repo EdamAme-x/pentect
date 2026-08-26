@@ -202,10 +202,6 @@ impl DecodeDetector {
 
     pub fn builtin_with_config(config: DecodeConfig) -> Self {
         let credsweeper = CredSweeperNativeDetector::builtin();
-        // Regex compilation is initialization, not input processing. Keep it
-        // outside DecodeDetector's per-input safety deadline so the first
-        // encoded secret receives the same coverage as subsequent inputs.
-        credsweeper.warm_up();
         Self::new(
             vec![
                 Box::new(BinaryCodec),
@@ -374,6 +370,27 @@ impl DecodeDetector {
     fn accepts_run(&self, len: usize) -> bool {
         len >= self.config.min_bytes && self.config.max_bytes.is_none_or(|max| len <= max)
     }
+
+    fn candidate_decodes(&self, run: &str) -> bool {
+        self.codecs.iter().any(|codec| codec.decode(run).is_some())
+            || run.split_once('=').is_some_and(|(_, value)| {
+                self.accepts_run(value.len())
+                    && self
+                        .codecs
+                        .iter()
+                        .any(|codec| codec.decode(value).is_some())
+            })
+    }
+
+    fn has_decodable_candidate(&self, text: &str) -> bool {
+        token_runs(text)
+            .chain(encoded85_runs(text, self.config.min_bytes))
+            .chain(wrapped_base64_runs(text, self.config.min_bytes))
+            .chain(percent_encoded_runs(text, self.config.min_bytes))
+            .any(|(start, end)| {
+                self.accepts_run(end - start) && self.candidate_decodes(&text[start..end])
+            })
+    }
 }
 
 fn consume_depth(remaining: Option<usize>) -> Option<Option<usize>> {
@@ -426,6 +443,16 @@ impl Detector for DecodeDetector {
             return Vec::new();
         }
         let s = view.text();
+        if !self.has_decodable_candidate(s) {
+            return Vec::new();
+        }
+        // Engine construction is on every gateway's readiness path. Defer the
+        // expensive process-cached regex compilation and thread-local ML setup
+        // until encoded input is actually scanned. Do this before creating the
+        // per-input deadline so a cold first request gets exactly the same
+        // detector coverage as a warm request instead of timing out halfway
+        // through initialization.
+        CredSweeperNativeDetector::builtin().warm_up();
         let mut out = Vec::new();
         let mut budget = DecodeBudget::new(self.config.limit_reporter);
         for (start, end) in token_runs(s) {

@@ -37,6 +37,7 @@ static BUILTIN: LazyLock<CredSweeperNativeDetector> = LazyLock::new(|| {
 });
 static BUILTIN_STATS: LazyLock<CredSweeperNativeStats> =
     LazyLock::new(|| audit_builtin_stats().expect("embedded CredSweeper assets compile"));
+static REGEX_WARMED: OnceLock<()> = OnceLock::new();
 static CREDSWEEPER_BASE64: LazyLock<data_encoding::Encoding> = LazyLock::new(|| {
     let mut specification = BASE64.specification();
     // Python's base64.b64decode(validate=True), used by CredSweeper, validates
@@ -86,6 +87,14 @@ pub struct CredSweeperNativeStats {
     pub secret_config_json_bytes: usize,
     pub ml_config_json_bytes: usize,
     pub ml_model_onnx_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CredSweeperWarmUpTimings {
+    pub regexes: std::time::Duration,
+    pub ml: std::time::Duration,
+    pub verification: std::time::Duration,
+    pub total: std::time::Duration,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -259,15 +268,59 @@ impl CredSweeperNativeDetector {
     /// Compile deferred upstream patterns before a caller starts a bounded
     /// operation timer. Clones of the built-in detector share these caches.
     pub fn warm_up(&self) {
-        for rule in &self.rules {
-            for pattern in &rule.patterns {
-                if let PatternMatcher::Deferred(regex) = &pattern.matcher {
-                    let _ = regex.compiled();
-                    let _ = regex.compiled_keyword();
-                }
-            }
-        }
-        credsweeper_ml::warm_up();
+        let _ = self.warm_up_timed();
+    }
+
+    /// Warm cached detector state and return value-free phase timings.
+    pub fn warm_up_timed(&self) -> CredSweeperWarmUpTimings {
+        let total_started = std::time::Instant::now();
+        // Regex OnceLocks are process-wide through the shared BUILTIN Arcs.
+        // Compile independent rules in parallel, while the caller initializes
+        // its thread-local ML validator. Cap workers to avoid turning startup
+        // into a memory spike on large CI hosts.
+        let (regexes, ml) = if REGEX_WARMED.get().is_some() {
+            let ml_started = std::time::Instant::now();
+            credsweeper_ml::warm_up();
+            (std::time::Duration::ZERO, ml_started.elapsed())
+        } else {
+            std::thread::scope(|scope| {
+                let regexes = scope.spawn(|| {
+                    let started = std::time::Instant::now();
+                    REGEX_WARMED.get_or_init(|| {
+                        let workers = std::thread::available_parallelism()
+                            .map_or(1, usize::from)
+                            .min(8)
+                            .min(self.rules.len().max(1));
+                        let chunk_size = self.rules.len().div_ceil(workers);
+                        std::thread::scope(|workers_scope| {
+                            for rules in self.rules.chunks(chunk_size) {
+                                workers_scope.spawn(move || {
+                                    for rule in rules {
+                                        for pattern in &rule.patterns {
+                                            if let PatternMatcher::Deferred(regex) =
+                                                &pattern.matcher
+                                            {
+                                                let _ = regex.compiled();
+                                                let _ = regex.compiled_keyword();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    });
+                    started.elapsed()
+                });
+                let ml_started = std::time::Instant::now();
+                credsweeper_ml::warm_up();
+                let ml = ml_started.elapsed();
+                (
+                    regexes.join().expect("CredSweeper regex warm-up worker"),
+                    ml,
+                )
+            })
+        };
+        let verification_started = std::time::Instant::now();
         let sample = "AKIACSVC3FV5KQHYWH8A";
         let region = Region {
             span: ByteRange::new(0, sample.len()),
@@ -281,6 +334,12 @@ impl CredSweeperNativeDetector {
         };
         let view = NormalizedView::build(&region, sample);
         let _ = self.detect_findings(&view);
+        CredSweeperWarmUpTimings {
+            regexes,
+            ml,
+            verification: verification_started.elapsed(),
+            total: total_started.elapsed(),
+        }
     }
 
     pub fn builtin_stats() -> &'static CredSweeperNativeStats {
@@ -6699,6 +6758,18 @@ mod tests {
 
         assert!(!deferred.is_empty());
         assert!(deferred.iter().all(|regex| regex.compiled.get().is_none()));
+    }
+
+    #[test]
+    fn warm_up_reports_value_free_phase_timings() {
+        let timings = CredSweeperNativeDetector::builtin().warm_up_timed();
+        eprintln!(
+            "CredSweeper warm-up: regexes={:?} ml={:?} verification={:?} total={:?}",
+            timings.regexes, timings.ml, timings.verification, timings.total
+        );
+        assert!(timings.total >= timings.regexes);
+        assert!(timings.total >= timings.ml);
+        assert!(timings.total >= timings.verification);
     }
 
     #[test]
