@@ -47,7 +47,8 @@ jobs:
           }
       - name: Validate POSIX installer
         run: |
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
+          sh tools/test_install.sh
           bash -n .github/scripts/publish-aur.sh
           python tools/test_client_smoke_coverage.py
           python tools/test_release_package_metadata.py
