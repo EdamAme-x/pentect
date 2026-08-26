@@ -155,13 +155,13 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = if ($IsWindows) { "$env:WINDIR\System32;$env:WINDIR" } else { '/usr/bin:/bin' }
-          $sample = 'Contact alice@example.com or +1 415-555-2671. Card 4111 1111 1111 1111.'
+          $sample = 'Contact alice@example.com or +1 415-555-2671. Card 4111 1111 1111 1111. IBAN DE89 3704 0044 0532 0130 00. NINO AB 12 34 56 C.'
           $masked = $sample | & '${{ matrix.binary }}' mask --kind text 2>$null
           if ($LASTEXITCODE -ne 0) { throw 'Pentect mask failed' }
           if ($masked -match 'alice@example.com|415-555-2671|4111 1111 1111 1111') {
             throw "Alcatraz leaked test PII: $masked"
           }
-          foreach ($label in @('EMAIL_ADDRESS', 'PHONE_NUMBER', 'CREDIT_CARD')) {
+          foreach ($label in @('EMAIL_ADDRESS', 'PHONE_NUMBER', 'CREDIT_CARD', 'IBAN_CODE', 'UK_NINO')) {
             if ($masked -notmatch "<<${label}_[0-9a-f]{16}>>") {
               throw "Missing $label handle: $masked"
             }

@@ -48,6 +48,16 @@ Pentect checks for secrets and personal data. Supported config formats include
 dotenv, Terraform, Kubernetes Secrets, kubeconfig, AWS, npm, PyPI, JSON, and
 other key/value formats.
 
+The built-in personal-data detector covers email addresses, phone numbers,
+payment cards, IBANs, and selected strongly formatted national identifiers:
+UK NINO, India PAN, Italian fiscal code, Spanish NIF/NIE, Singapore FIN,
+Korean RRN, and Finnish personal identity code. Alcatraz's `PERSON`, `LOCATION`,
+and `NRP` entity types are not provided by the built-in engine, so names,
+street addresses, and those NLP-derived categories are not detected. URLs, IP
+addresses, dates, cryptocurrency addresses, and broad numeric identifiers
+remain visible by default because they commonly occur as non-secret
+operational data in source code and logs.
+
 ## Handles
 
 - Keep a useful label such as `DATABASE_URL` or `KAGGLE_API_TOKEN`.
