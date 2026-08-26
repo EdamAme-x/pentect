@@ -103,9 +103,9 @@ impl CloudCodeHttpProxyGuard {
             });
         });
         let base_url = ready_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
             .map_err(|_| {
-                "Google Cloud Code gateway did not start within 5 seconds".to_string()
+                "Google Cloud Code gateway did not start within 30 seconds".to_string()
             })??;
         Ok(Self {
             base_url,
@@ -2050,11 +2050,14 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "request": {
                     "contents": [{"role": "user", "parts": [{
-                        "executableCode": {"language": "shell", "code": format!("echo {secret}")}
+                        "executableCode": {
+                            "language": "shell",
+                            "code": format!("RUNPOD_API_KEY={secret} command")
+                        }
                     }]}],
                     "tools": [{"functionDeclarations": [{
                         "name": "lookup",
-                        "description": format!("Use {secret}")
+                        "description": format!("Use RUNPOD_API_KEY={secret}")
                     }]}]
                 }
             }))

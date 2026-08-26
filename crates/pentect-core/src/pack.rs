@@ -351,21 +351,21 @@ keywords = ["secret"]
 
     #[test]
     fn pack_disables_a_builtin_label() {
-        let off = load_pack(r#"disable = ["IP_ADDRESS_V4"]"#).unwrap();
-        assert_eq!(off.disable, ["IP_ADDRESS_V4"]);
-        let input = || Input::text("ping 192.168.1.1 then key AKIAIOSFODNN7EXAMPLE");
+        let off = load_pack(r#"disable = ["AWS_CLIENT_ID"]"#).unwrap();
+        assert_eq!(off.disable, ["AWS_CLIENT_ID"]);
+        let input = || Input::text("open http://192.168.1.1/admin then key AKIACSVC3FV5KQHYWH8A");
         let cfg = Config::insecure_testing();
 
-        // Control: by default the IP is masked.
+        // Control: by default the CredSweeper finding is masked.
         let base = Engine::with_profile_and_packs(Profile::Strict, vec![], false);
-        assert!(!base.mask(input(), &cfg).masked.contains("192.168.1.1"));
+        assert!(base.mask(input(), &cfg).masked.contains("<<AWS_CLIENT_ID_"));
 
-        // With the pack, the IP passes through but an authoritative
-        // CredSweeper finding remains masked.
+        // With the pack, that exact canonical label passes through while an
+        // unrelated built-in URL finding remains masked.
         let tuned = Engine::with_profile_and_packs(Profile::Strict, vec![off], false);
         let out = tuned.mask(input(), &cfg).masked;
-        assert!(out.contains("192.168.1.1"), "{out}");
-        assert!(out.contains("<<AWS_AKID_"), "{out}");
+        assert!(out.contains("AKIACSVC3FV5KQHYWH8A"), "{out}");
+        assert!(!out.contains("192.168.1.1"), "{out}");
     }
 
     #[test]

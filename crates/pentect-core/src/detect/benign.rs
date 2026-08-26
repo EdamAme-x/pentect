@@ -4,7 +4,6 @@ use super::documentation::is_documentation_value;
 
 const VALUE_PATTERNS: &str = include_str!("benign_value_patterns.txt");
 const KEY_PATTERNS: &str = include_str!("benign_key_patterns.txt");
-const METADATA_KEY_PATTERNS: &str = include_str!("metadata_key_patterns.txt");
 const CONSTANT_COMPONENT_PATTERNS: &str = include_str!("benign_constant_components.txt");
 const SOURCE_SECRET_NAME_PATTERNS: &str = include_str!("source_secret_name_patterns.txt");
 const SOURCE_FIXTURE_SECRET_PATTERNS: &str = include_str!("source_fixture_secret_patterns.txt");
@@ -12,8 +11,6 @@ const STRUCTURED_KEY_NAME_COMPONENTS: &str = include_str!("structured_key_name_c
 
 static VALUE_MATCHER: LazyLock<PatternSet> = LazyLock::new(|| PatternSet::parse(VALUE_PATTERNS));
 static KEY_MATCHER: LazyLock<PatternSet> = LazyLock::new(|| PatternSet::parse(KEY_PATTERNS));
-static METADATA_KEY_MATCHER: LazyLock<PatternSet> =
-    LazyLock::new(|| PatternSet::parse(METADATA_KEY_PATTERNS));
 static CONSTANT_COMPONENT_MATCHER: LazyLock<PatternSet> =
     LazyLock::new(|| PatternSet::parse(CONSTANT_COMPONENT_PATTERNS));
 static SOURCE_SECRET_NAME_MATCHER: LazyLock<SourceSecretNameSet> =
@@ -476,15 +473,6 @@ fn is_delimited_identifier_placeholder_value(value: &str) -> bool {
 /// data file, so `api_key`, `token`, and `secret` still route to detectors.
 pub(crate) fn is_explicitly_non_sensitive_key_name(key: &str) -> bool {
     KEY_MATCHER.matches(&normalize_identifier(key))
-}
-
-/// True for structured metadata fields whose opaque values are stable IDs.
-///
-/// Rationale: JSON fields like `node_id`, `sha`, and `etag` conventionally store
-/// repository/API metadata identifiers. They are only used to suppress raw
-/// entropy guesses; vendor rules and keyed secret detectors still run.
-pub(crate) fn is_structured_metadata_key(key: &str) -> bool {
-    METADATA_KEY_MATCHER.matches(&normalize_identifier(key))
 }
 
 /// True for source-code sentinel constants, not for arbitrary ALL_CAPS secrets.
@@ -1101,14 +1089,6 @@ mod tests {
         ));
         assert!(!is_explicitly_non_sensitive_key_name("api_key"));
         assert!(!is_explicitly_non_sensitive_key_name("client_secret"));
-    }
-
-    #[test]
-    fn metadata_keys_are_narrow() {
-        assert!(is_structured_metadata_key("node_id"));
-        assert!(is_structured_metadata_key("If-None-Match"));
-        assert!(!is_structured_metadata_key("url"));
-        assert!(!is_structured_metadata_key("token"));
     }
 
     #[test]

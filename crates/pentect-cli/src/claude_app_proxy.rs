@@ -39,7 +39,6 @@ use crate::handle_contract::HANDLE_CONTRACT;
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 128;
 const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -509,8 +508,8 @@ impl ClaudeAppProxyGuard {
             });
         });
         let proxy_url = ready_rx
-            .recv_timeout(STARTUP_TIMEOUT)
-            .map_err(|_| "Claude App proxy did not start within 5 seconds".to_string())??;
+            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
+            .map_err(|_| "Claude App proxy did not start within 30 seconds".to_string())??;
         Ok(Self {
             proxy_url,
             spki_hash,
@@ -2818,7 +2817,9 @@ mod tests {
                 "model": "claude-test-model",
                 "organization_uuid": "11111111-2222-3333-4444-555555555555",
                 "prompt": format!("Use this value:\nRUNPOD_API_KEY={secret}\n"),
-                "future_instructions": format!("A future field contains {secret}"),
+                "future_instructions": format!(
+                    "A future field contains RUNPOD_API_KEY={secret}"
+                ),
                 "messages": [{"content": [{
                     "type": "tool_result",
                     "tool_use_id": "tool-stable-id",

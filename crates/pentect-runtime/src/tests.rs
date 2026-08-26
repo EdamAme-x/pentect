@@ -636,8 +636,8 @@ fn exec_registers_referenced_local_files_as_env_capabilities() {
         "{env:?}"
     );
     assert!(
-        env.iter().any(|(name, value)| name.starts_with("PENTECT_")
-            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        !env.iter()
+            .any(|(_, value)| value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
         "{env:?}"
     );
     let _ = std::fs::remove_dir_all(root);
@@ -1117,7 +1117,7 @@ fn active_image_byte_redaction_returns_opaque_annotation_without_plaintext() {
         protected.note
     );
     assert!(
-        protected.note.contains("<<OPENAI_API_KEY_"),
+        protected.note.contains("<<KEYED_SECRET_"),
         "{}",
         protected.note
     );
@@ -2412,7 +2412,7 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
         "{rendered}"
     );
     assert!(rendered.contains("Masked regions:"), "{rendered}");
-    assert!(rendered.contains("[1] <<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("[1] <<KEYED_SECRET_"), "{rendered}");
     assert!(
         rendered.contains("\"mimeType\":\"image/png\""),
         "{rendered}"
@@ -2557,7 +2557,7 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
 }
 
 #[test]
-fn retired_claude_hook_does_not_apply_browser_mail_otp_policy() {
+fn canonical_claude_hook_applies_otp_detection_to_browser_mail() {
     let (root, session) = empty_session("hook-post-browser-mail-text");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2580,7 +2580,11 @@ fn retired_claude_hook_does_not_apply_browser_mail_otp_policy() {
     });
 
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output, json!({}));
+    let rendered = serde_json::to_string(&output).unwrap();
+    for secret in ["837291", "402118", "483920"] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    assert!(rendered.contains("<<OTP_"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2599,7 +2603,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
                 )
             }],
             "structuredContent": {
-                "ariaSnapshot": format!("textbox API key value {raw}"),
+                "ariaSnapshot": format!("textbox RUNPOD_API_KEY={raw}"),
                 "html": format!(r#"<input aria-label="API key" value="{raw}"><button>Copy</button>"#),
                 "nextStep": "Use this key to call the health endpoint."
             }
@@ -2671,14 +2675,14 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
     for secret in ["837291", "402118", "483920"] {
         assert!(!rendered.contains(secret), "{rendered}");
     }
-    assert!(rendered.contains("729004"), "{rendered}");
+    assert!(!rendered.contains("729004"), "{rendered}");
     assert!(rendered.contains("<<OTP_"), "{rendered}");
     assert!(rendered.contains("ORD-100482"), "{rendered}");
 
     let env = MemoryStore::for_session(&session)
         .auto_env_bindings()
         .unwrap();
-    for secret in ["837291", "402118", "483920"] {
+    for secret in ["837291", "402118", "483920", "729004"] {
         assert!(
             env.iter()
                 .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
@@ -2689,7 +2693,7 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
 }
 
 #[test]
-fn retired_claude_hook_does_not_apply_browser_row_otp_policy() {
+fn canonical_claude_hook_applies_otp_detection_to_browser_rows() {
     let (root, session) = empty_session("hook-post-gmail-row-otp");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2734,12 +2738,16 @@ fn retired_claude_hook_does_not_apply_browser_row_otp_policy() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output, json!({}));
+    let rendered = serde_json::to_string(&output).unwrap();
+    for secret in ["837291", "1234", "7QK4P", "729004", "483920", "7391"] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    assert!(rendered.contains("<<OTP_"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn retired_claude_hook_does_not_apply_browser_wallet_policy() {
+fn canonical_claude_hook_applies_bip39_detection_to_browser_wallets() {
     let (root, session) = empty_session("hook-post-browser-seed-phrase");
     let phrase = concat!(
         "abandon abandon abandon abandon abandon abandon ",
@@ -2766,7 +2774,9 @@ fn retired_claude_hook_does_not_apply_browser_wallet_policy() {
     });
 
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output, json!({}));
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(!rendered.contains(phrase), "{rendered}");
+    assert!(rendered.contains("<<BIP39_MNEMONIC_"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2916,14 +2926,12 @@ fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
 }
 
 #[test]
-fn exec_tool_output_uses_short_handles_without_length() {
+fn generic_entropy_is_not_masked_without_a_supported_detector() {
     let (root, session) = empty_session("exec-short-handle");
     let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
     let masked = mask_tool_output(&session, &format!("payload={blob}\n")).unwrap();
-    assert!(!masked.contains(blob), "{masked}");
-    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
-    assert!(!masked.contains("_length_"), "{masked}");
-    assert!(!masked.contains("_len24"), "{masked}");
+    assert!(masked.contains(blob), "{masked}");
+    assert!(!masked.contains("<<"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3189,7 +3197,7 @@ fn encoded_env_derivatives_do_not_leak() {
     assert!(!masked.contains(&b64), "{masked}");
     assert!(!masked.contains("7270615f46414b"), "{masked}");
     assert!(!masked.contains("68656c6c6f20776f726c64"), "{masked}");
-    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
+    assert!(masked.contains("<<SECRET_"), "{masked}");
     assert!(
         masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
         "{masked}"
@@ -3211,7 +3219,7 @@ fn mixed_env_output_still_masks_encoded_non_env_lines() {
         masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
         "{masked}"
     );
-    assert!(masked.contains("B64_FILE:\n<<LIKELY_SECRET_"), "{masked}");
+    assert!(masked.contains("B64_FILE:\n<<SECRET_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4563,12 +4571,15 @@ fn claude_posttool_masks_raw_output() {
 }
 
 #[test]
-fn hook_text_masks_runpod_token_as_plain_text() {
+fn hook_text_masks_runpod_token_when_keyed() {
     let (root, session) = empty_session("hook-runpod-text");
-    let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
+    let raw = concat!(
+        "RUNPOD_API_KEY=",
+        "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
+    );
     let masked = mask_tool_output(&session, raw).unwrap();
     assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
+    assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 

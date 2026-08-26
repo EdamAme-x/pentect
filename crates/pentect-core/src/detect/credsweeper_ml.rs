@@ -61,6 +61,10 @@ pub(super) fn score_group(group: &[&MlInput]) -> (f32, f32) {
     })
 }
 
+pub(super) fn warm_up() {
+    VALIDATOR.with(|_| {});
+}
+
 #[cfg(test)]
 pub(super) fn score_group_for_test(group: &[&MlInput]) -> (f32, f32) {
     score_group(group)

@@ -122,9 +122,8 @@ fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.eq_ignore_ascii_case(b)
 }
 
-/// Guard that spares nothing: the `--aggressive` escape hatch. Internal — callers
-/// select it via `Engine::with_profile_unguarded`, not by naming the type.
-pub(crate) struct NoGuard;
+/// Guard that spares nothing: the `--aggressive` escape hatch.
+pub struct NoGuard;
 
 impl OverMaskGuard for NoGuard {
     fn benign(&self, _value: &str) -> bool {

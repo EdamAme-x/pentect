@@ -32,12 +32,11 @@ pub mod recovery;
 
 pub use codec::Codec;
 pub use detect::{
-    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector, CredSweeperFilterProbe,
+    AuthCodeDetector, Bip39Detector, CliCredentialDetector, CredSweeperFilterProbe,
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats, DecodeConfig, DecodeDetector, DecodeLimitReason, Detector,
-    EntropyDetector, EnvValueDetector, ExplicitSecretDetector, KeyValueDetector,
-    PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec, SensitiveKeyDetector,
-    StructuralDetector, UrlDetector,
+    EnvValueDetector, ExplicitSecretDetector, KeyValueDetector, PatternMatchDetector, PatternSpec,
+    RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector, UrlDetector,
 };
 pub use model::{
     ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
@@ -51,7 +50,7 @@ pub use pipeline::{
     SpanAnalysisResult, Summary,
 };
 pub use placeholder::{parse_placeholder, LengthHint, PlaceholderParts};
-pub use policy::guard::{OverMaskGuard, ShapeGuard};
+pub use policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use policy::{Action, MaskAll, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RecoveryError, RestoreError};
 

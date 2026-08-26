@@ -128,6 +128,17 @@ pub fn load_decode_config(profile: Profile) -> Result<pentect_core::DecodeConfig
     config::decode_config(profile)
 }
 
+pub fn build_masking_engine(
+    profile: Profile,
+    packs: Vec<Pack>,
+    aggressive: bool,
+    decode: pentect_core::DecodeConfig,
+) -> Result<Engine, String> {
+    // This is the single engine constructor used by both the agent transports
+    // and `pentect mask`; keep detector registration in one place.
+    masking::canonical_masking_engine(profile, packs, aggressive, decode)
+}
+
 pub fn output_restore_enabled() -> Result<bool, String> {
     config::output_restore_enabled()
 }

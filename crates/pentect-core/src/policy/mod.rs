@@ -1,4 +1,4 @@
-use crate::detect::{DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD, DEFAULT_MIN_OPAQUE_RUN};
+use crate::detect::DEFAULT_MIN_OPAQUE_RUN;
 use crate::model::{DetectorId, Span};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -30,12 +30,10 @@ impl Policy for MaskAll {
 
 /// A span we couldn't anchor to a key, vendor rule, or identified decode.
 pub fn is_context_free(s: &Span) -> bool {
-    // Entropy and DecodeOpaque are the only sources that emit unanchored guesses
-    // (always Low confidence), so the variant alone identifies a context-free span.
-    matches!(s.source, DetectorId::Entropy | DetectorId::DecodeOpaque)
+    matches!(s.source, DetectorId::DecodeOpaque)
 }
 
-/// What to do with a context-free opaque/entropy span.
+/// What to do with a context-free opaque decoded span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpaqueStance {
     Mask,
@@ -48,8 +46,6 @@ pub enum OpaqueStance {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProfileKnobs {
     pub context_free: OpaqueStance,
-    pub entropy_min_len: usize,
-    pub entropy_threshold: f64,
     pub mask_unknown_codec: bool,
     pub min_opaque_run: usize,
 }
@@ -73,29 +69,21 @@ impl Profile {
         match self {
             Profile::Strict => ProfileKnobs {
                 context_free: OpaqueStance::Mask,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
             },
             Profile::Balanced => ProfileKnobs {
                 context_free: OpaqueStance::Warn,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
             },
             Profile::Dev => ProfileKnobs {
                 context_free: OpaqueStance::Keep,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN + 4,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD + 0.4,
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN + 4,
             },
             Profile::Paranoid => ProfileKnobs {
                 context_free: OpaqueStance::Mask,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN - 4,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD - 0.4,
                 mask_unknown_codec: true,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN - 4,
             },
@@ -162,8 +150,6 @@ mod tests {
             Profile::Strict.knobs(),
             ProfileKnobs {
                 context_free: OpaqueStance::Mask,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
             }

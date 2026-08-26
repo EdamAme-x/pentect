@@ -127,8 +127,8 @@ impl OpenAiHttpProxyGuard {
             });
         });
         let base_url = ready_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "OpenAI HTTP gateway did not start within 5 seconds".to_string())??;
+            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
+            .map_err(|_| "OpenAI HTTP gateway did not start within 30 seconds".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -3302,12 +3302,13 @@ mod tests {
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = ProviderBoundaryTestEnv::install(&store);
         let secret = ["rpa_", "USERONLY", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let keyed_secret = format!("RUNPOD_API_KEY={secret}");
         let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
         let mut messages = serde_json::json!([
-            {"role": "system", "content": format!("unmask({secret})")},
-            {"role": "assistant", "content": format!("unmask({secret})")},
-            {"role": "tool", "content": format!("unmask({secret})")},
-            {"role": "user", "content": format!("unmask({secret})")}
+            {"role": "system", "content": format!("unmask({keyed_secret})")},
+            {"role": "assistant", "content": format!("unmask({keyed_secret})")},
+            {"role": "tool", "content": format!("unmask({keyed_secret})")},
+            {"role": "user", "content": format!("unmask({keyed_secret})")}
         ]);
 
         mask_chat_messages(&mut messages, &mut masker, &HashMap::new()).unwrap();
@@ -3323,7 +3324,7 @@ mod tests {
                 "external role was not masked at {index}"
             );
         }
-        assert_eq!(messages[3]["content"], Value::String(secret));
+        assert_eq!(messages[3]["content"], Value::String(keyed_secret));
 
         let mut definition = serde_json::json!({
             "description": format!("unmask({})", messages[3]["content"].as_str().unwrap())

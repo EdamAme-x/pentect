@@ -1,5 +1,4 @@
 #[cfg(any(feature = "ocr", test))]
-use crate::config;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
 use crate::config::{ImageOcrConfig, UnscannedImagePolicy};
@@ -199,6 +198,9 @@ pub(crate) fn inspect_tool_images_for_secrets(
     key: &[u8; 32],
     cfg: &ImageOcrConfig,
 ) -> Result<ImageInspection, String> {
+    // Shared engine initialization is process setup, not image scanning. Keep
+    // its one-time cost outside the per-request OCR deadline.
+    image_ocr_secret_engine()?;
     let mut inspection = ImageInspection {
         scanned_images: 0,
         unscanned_images: 0,
@@ -224,6 +226,9 @@ pub(crate) fn redact_tool_images_for_secrets(
     identity_key: &[u8; 32],
     cfg: &ImageOcrConfig,
 ) -> Result<ImageRedaction, String> {
+    // Shared engine initialization is process setup, not image scanning. Keep
+    // its one-time cost outside the per-request OCR deadline.
+    image_ocr_secret_engine()?;
     let mut state = ImageRedactionState {
         scanned_images: 0,
         unscanned_images: 0,
@@ -2220,20 +2225,8 @@ fn resize_for_barcode(img: image::DynamicImage, max_edge: u32) -> image::Dynamic
     img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
 }
 
-#[cfg(any(feature = "ocr", test))]
 fn image_ocr_secret_engine() -> Result<&'static pentect_core::Engine, String> {
-    static ENGINE: std::sync::OnceLock<Result<pentect_core::Engine, String>> =
-        std::sync::OnceLock::new();
-    match ENGINE.get_or_init(|| {
-        let profile = pentect_core::Profile::Strict;
-        let decode = config::decode_config(profile)?;
-        Ok(pentect_core::Engine::with_profile_and_decode_config(
-            profile, decode,
-        ))
-    }) {
-        Ok(engine) => Ok(engine),
-        Err(error) => Err(error.clone()),
-    }
+    crate::masking::pentect_engine()
 }
 
 fn object_marks_image(map: &serde_json::Map<String, Value>) -> bool {
@@ -3337,8 +3330,8 @@ mod tests {
         let entries = secret_entries(text, &hits, &key);
         let (handle, value) = entries
             .iter()
-            .find(|(handle, _)| handle.starts_with("<<OPENAI_API_KEY_"))
-            .expect("missing OpenAI API key placeholder");
+            .find(|(handle, _)| handle.starts_with("<<KEYED_SECRET_"))
+            .expect("missing keyed secret placeholder");
         let handle = handle.clone();
         let value = value.clone();
         assert_eq!(value, "sk-ABCDEFGHIJKLMNOPQRSTUVWX");
@@ -3362,10 +3355,10 @@ mod tests {
 
     #[test]
     fn ocr_unmask_wrappers_do_not_exempt_detectable_external_secrets() {
-        let text = "unmask(sk-ABCDEFGHIJKLMNOPQRSTUVWX)";
+        let text = "unmask(OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX)";
         let hits = image_text_secret_hits(text, &[7; 32]).unwrap();
         assert!(
-            hits.iter().any(|hit| hit.label == "OPENAI_API_KEY"),
+            hits.iter().any(|hit| hit.label == "KEYED_SECRET"),
             "{hits:?}"
         );
     }
@@ -3409,7 +3402,7 @@ mod tests {
     #[cfg(feature = "ocr")]
     #[test]
     fn one_image_separates_visual_and_metadata_handles() {
-        let visual_secret = "AKIAIOSFODNN7EXAMPLE";
+        let visual_secret = "AKIACSVC3FV5KQHYWH8A";
         let metadata_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
         let mut metadata = b"Description\0OPENAI_API_KEY=".to_vec();
         metadata.extend_from_slice(metadata_secret.as_bytes());
@@ -3425,10 +3418,10 @@ mod tests {
         let redaction = redact_tool_images_for_secrets(&value, &key, &key, &test_config()).unwrap();
         let visual = redaction.visual_notes.join("\n");
         let metadata = redaction.metadata_notes.join("\n");
-        assert!(visual.contains("<<AWS_AKID_"), "{visual}");
-        assert!(!visual.contains("<<OPENAI_API_KEY_"), "{visual}");
-        assert!(metadata.contains("<<OPENAI_API_KEY_"), "{metadata}");
-        assert!(!metadata.contains("<<AWS_AKID_"), "{metadata}");
+        assert!(visual.contains("<<AWS_CLIENT_ID_"), "{visual}");
+        assert!(!visual.contains("<<KEYED_SECRET_"), "{visual}");
+        assert!(metadata.contains("<<KEYED_SECRET_"), "{metadata}");
+        assert!(!metadata.contains("<<AWS_CLIENT_ID_"), "{metadata}");
         assert!(
             redaction.recovery.resolve(&visual).contains(visual_secret),
             "{visual}"
@@ -3482,7 +3475,7 @@ mod tests {
         let findings = image_secret_findings(&jpeg, &[7; 32], &metadata_test_config()).unwrap();
         let exif_finding = findings
             .iter()
-            .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
+            .find(|finding| finding.labels.iter().any(|label| label == "KEYED_SECRET"))
             .unwrap_or_else(|| panic!("missing EXIF secret finding: {findings:?}"));
         assert!(!exif_finding.redact_pixels);
     }
@@ -3499,7 +3492,7 @@ mod tests {
 
         assert!(findings
             .iter()
-            .any(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY")));
+            .any(|finding| finding.labels.iter().any(|label| label == "KEYED_SECRET")));
         assert_eq!(findings.scan_failure, Some("limit"));
     }
 
@@ -3527,7 +3520,7 @@ mod tests {
         let findings = image_secret_findings(&png, &[7; 32], &metadata_test_config()).unwrap();
         let text_finding = findings
             .iter()
-            .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
+            .find(|finding| finding.labels.iter().any(|label| label == "KEYED_SECRET"))
             .unwrap_or_else(|| panic!("missing PNG text metadata finding: {findings:?}"));
         assert!(!text_finding.redact_pixels);
     }
@@ -3545,7 +3538,7 @@ mod tests {
             let findings = image_secret_findings(&png, &[7; 32], &metadata_test_config()).unwrap();
             let text_finding = findings
                 .iter()
-                .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
+                .find(|finding| finding.labels.iter().any(|label| label == "KEYED_SECRET"))
                 .unwrap_or_else(|| panic!("missing compressed PNG metadata finding: {findings:?}"));
             assert!(!text_finding.redact_pixels);
         }
