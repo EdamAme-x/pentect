@@ -212,25 +212,29 @@ Remove-Item -LiteralPath $PSCommandPath -Force
     ));
     std::fs::write(&helper, SCRIPT)
         .map_err(|error| format!("could not create uninstall helper: {error}"))?;
-    Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-        ])
-        .arg(&helper)
-        .arg("-ParentPid")
-        .arg(std::process::id().to_string())
-        .arg("-Target")
-        .arg(executable)
-        .arg("-Marker")
-        .arg(marker)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("could not start uninstall helper: {error}"))
+    Command::new(crate::windows_system_executable(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+    ])
+    .arg(&helper)
+    .arg("-ParentPid")
+    .arg(std::process::id().to_string())
+    .arg("-Target")
+    .arg(executable)
+    .arg("-Marker")
+    .arg(marker)
+    .creation_flags(CREATE_NO_WINDOW)
+    .spawn()
+    .map(|_| ())
+    .map_err(|error| format!("could not start uninstall helper: {error}"))
 }
 
 #[cfg(windows)]

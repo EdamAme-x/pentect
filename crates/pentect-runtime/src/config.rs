@@ -210,6 +210,7 @@ fn restrict_identity_file(path: &Path) -> Result<(), String> {
     }
     let system32 = windows_system32()?;
     let identity = std::process::Command::new(system32.join("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
@@ -217,15 +218,11 @@ fn restrict_identity_file(path: &Path) -> Result<(), String> {
     if !identity.status.success() {
         return Err("could not resolve the Windows account for ACL setup".to_string());
     }
-    let identity = String::from_utf8(identity.stdout)
-        .map_err(|_| "Windows account name is not UTF-8".to_string())?;
-    let identity = identity.trim();
-    if identity.is_empty() {
-        return Err("Windows account name is empty".to_string());
-    }
+    let sid = windows_sid_from_whoami_output(&identity.stdout)
+        .ok_or_else(|| "could not parse the Windows account SID".to_string())?;
     let status = std::process::Command::new(system32.join("icacls.exe"))
         .arg(path)
-        .args(["/inheritance:r", "/grant:r", &format!("{identity}:(F)")])
+        .args(["/inheritance:r", "/grant:r", &format!("*{sid}:(F)")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -236,6 +233,25 @@ fn restrict_identity_file(path: &Path) -> Result<(), String> {
     }
     fs::write(&marker, expected_marker)
         .map_err(|error| format!("could not record identity key ACL setup: {error}"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_sid_from_whoami_output(output: &[u8]) -> Option<String> {
+    for start in 0..output.len().saturating_sub(3) {
+        if !output[start..].starts_with(b"S-1-") {
+            continue;
+        }
+        let suffix_start = start + b"S-1-".len();
+        let end = output[suffix_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit() && *byte != b'-')
+            .map_or(output.len(), |length| suffix_start + length);
+        let candidate = std::str::from_utf8(&output[start..end]).ok()?;
+        if candidate.matches('-').count() >= 3 && !candidate.ends_with('-') {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(windows)]
@@ -976,6 +992,15 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_sid_without_decoding_the_account_name() {
+        let output = b"\x8a\xc7\x97\x9d,\"S-1-5-21-123-456-789-1001\"\r\n";
+        assert_eq!(
+            windows_sid_from_whoami_output(output).as_deref(),
+            Some("S-1-5-21-123-456-789-1001")
+        );
+    }
 
     fn temp_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
