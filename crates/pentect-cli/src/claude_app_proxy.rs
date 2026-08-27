@@ -1,9 +1,10 @@
 //! Explicit HTTPS gateway for the unmodified Claude Desktop application.
 //!
-//! The root CA and its signing key exist only in memory. Claude Desktop is
-//! launched with Chromium's SPKI allow-list, so this does not modify the OS
-//! certificate store. Chat completion bodies are protected in memory and are
-//! never logged. Claude Code children inherit the Anthropic HTTP gateway.
+//! The root CA signing key exists only in memory. On Windows, Claude Desktop is
+//! launched after explicit user consent with the public root certificate in the
+//! current-user trust store; the certificate is removed when the session ends.
+//! Other platforms use Chromium's SPKI allow-list. Chat completion bodies are
+//! protected in memory and are never logged.
 
 use futures_util::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
@@ -12,15 +13,22 @@ use hyper::body::{Bytes, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+#[cfg(not(windows))]
+use rcgen::PublicKeyData;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
-    KeyUsagePurpose, PublicKeyData,
+    KeyUsagePurpose,
 };
+#[cfg(windows)]
+use sha1::{Digest as Sha1Digest, Sha1};
+#[cfg(not(windows))]
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::io;
+#[cfg(windows)]
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
@@ -62,6 +70,8 @@ pub(crate) fn check_mode(args: &[String]) -> Result<bool, String> {
 
 fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let options = ClaudeAppOptions::parse(args)?;
+    #[cfg(not(windows))]
+    let _ = options.assume_yes;
     let app = options.app.unwrap_or_else(default_claude_app_path);
     if options.check {
         let installed = app.is_file();
@@ -77,7 +87,7 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         );
         println!("Protection: supported Claude Desktop Chat and attachment routes");
         println!(
-            "Compatibility: the app must accept Pentect's required certificate-pin switch; Claude Desktop 1.34493.1 is known incompatible"
+            "Compatibility: Windows uses an explicitly approved, session-only current-user certificate; other platforms require Chromium's certificate-pin switch"
         );
         let upstream = options
             .upstream
@@ -103,6 +113,16 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         );
     }
 
+    #[cfg(windows)]
+    {
+        cleanup_stale_windows_user_ca()?;
+        if !options.assume_yes && !confirm_windows_user_ca_install()? {
+            return Err(
+                "Claude Desktop protection was cancelled; no certificate was installed".to_string(),
+            );
+        }
+    }
+
     let anthropic = crate::claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
         options
             .upstream
@@ -111,6 +131,9 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         &options.upstream_header_env,
     )?;
     let proxy = ClaudeAppProxyGuard::start()?;
+    #[cfg(windows)]
+    let _trusted_ca =
+        WindowsUserCaGuard::install(proxy.root_certificate_der(), proxy.ca_thumbprint())?;
     let user_data_dir = claude_user_data_dir()?;
     #[cfg(windows)]
     if let Some(package) = find_windows_claude_package()
@@ -122,8 +145,11 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         let process = activate_windows_package(&package.aumid, &arguments)?;
         drop(environment);
         let process_id = process.id();
+        let ca_thumbprint = proxy.ca_thumbprint().to_string();
         if let Err(error) = ctrlc::set_handler(move || {
             terminate_child_process(process_id);
+            let _ = remove_windows_user_ca(&ca_thumbprint);
+            let _ = remove_windows_ca_journal();
             std::process::exit(130);
         }) {
             terminate_child_process(process_id);
@@ -155,8 +181,15 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .spawn()
         .map_err(|error| format!("could not start Claude Desktop: {error}"))?;
     let child_id = child.id();
+    #[cfg(windows)]
+    let ca_thumbprint = proxy.ca_thumbprint().to_string();
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
+        #[cfg(windows)]
+        {
+            let _ = remove_windows_user_ca(&ca_thumbprint);
+            let _ = remove_windows_ca_journal();
+        }
         std::process::exit(130);
     }) {
         terminate_child_process(child_id);
@@ -184,19 +217,29 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
 fn claude_desktop_early_exit_error(status: impl std::fmt::Display, packaged: bool) -> String {
     let installation = if packaged { " package" } else { "" };
     format!(
-        "Claude Desktop{installation} exited while Pentect was attaching its required local-proxy certificate pin ({status}). Claude Desktop 1.34493.1 is known to reject this Chromium switch. Pentect will not bypass certificate verification or install a system CA, so this app build cannot be protected; use `pentect claude` for Claude Code or a Claude Desktop build explicitly listed as compatible"
+        "Claude Desktop{installation} exited before Pentect could attach protection ({status}); the temporary current-user certificate will be removed"
     )
 }
 
 fn claude_chromium_arguments(proxy: &ClaudeAppProxyGuard, user_data_dir: &Path) -> Vec<String> {
-    vec![
+    let arguments = vec![
         format!("--proxy-server={}", proxy.proxy_url()),
-        format!(
-            "--ignore-certificate-errors-spki-list={}",
-            proxy.spki_hash()
-        ),
         format!("--user-data-dir={}", user_data_dir.display()),
-    ]
+    ];
+    #[cfg(not(windows))]
+    {
+        arguments
+            .into_iter()
+            .chain(std::iter::once(format!(
+                "--ignore-certificate-errors-spki-list={}",
+                proxy.spki_hash()
+            )))
+            .collect()
+    }
+    #[cfg(windows)]
+    {
+        arguments
+    }
 }
 
 fn print_gateway_ready(proxy: &ClaudeAppProxyGuard) {
@@ -207,6 +250,388 @@ fn print_gateway_ready(proxy: &ClaudeAppProxyGuard) {
     eprintln!(
         "[pentect] Supported Claude Desktop Chat and attachment traffic is protected; bodies are not logged"
     );
+}
+
+#[cfg(windows)]
+fn confirm_windows_user_ca_install() -> Result<bool, String> {
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "input is not interactive; rerun `pentect claude app --yes` to approve the temporary current-user certificate"
+                .to_string(),
+        );
+    }
+    println!(
+        "Pentect needs to temporarily trust a session-specific certificate for this Windows user so Claude Desktop traffic can be protected."
+    );
+    println!(
+        "The private key stays in this Pentect process. The public certificate is removed when Claude Desktop exits."
+    );
+    print!("Continue? [y/N] ");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("could not show Claude Desktop certificate prompt: {error}"))?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("could not read Claude Desktop certificate prompt: {error}"))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+#[cfg(windows)]
+fn windows_ca_journal_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
+    // The journal lives in its own directory. `write_windows_ca_journal`
+    // restricts the containing directory to the current user, so it must never
+    // be the shared install root: that would strip the inheritable
+    // SYSTEM/Administrators entries from `bin`, `plugins`, and `runtime`.
+    Ok(root
+        .join("Pentect")
+        .join("claude-app-ca")
+        .join("claude-app-temporary-ca.sha1"))
+}
+
+#[cfg(windows)]
+fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
+    let path = windows_ca_journal_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Claude Desktop CA cleanup path has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!("could not create Claude Desktop CA cleanup directory: {error}")
+    })?;
+    crate::secure_temp::restrict_to_current_user(parent)?;
+    let journal = format!("{thumbprint}\n{}\n", std::process::id());
+    std::fs::write(&path, journal)
+        .map_err(|error| format!("could not write Claude Desktop CA cleanup journal: {error}"))?;
+    crate::secure_temp::restrict_to_current_user(&path)
+}
+
+#[cfg(windows)]
+fn remove_windows_ca_journal() -> Result<(), String> {
+    remove_windows_ca_journal_at(&windows_ca_journal_path()?)
+}
+
+#[cfg(windows)]
+fn remove_windows_ca_journal_at(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not remove Claude Desktop CA cleanup journal: {error}"
+            ))
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
+    if thumbprint.len() != 40 || !thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Claude Desktop CA cleanup journal is invalid".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsCaJournal {
+    thumbprint: String,
+    owner: Option<u32>,
+}
+
+#[cfg(windows)]
+fn parse_windows_ca_journal(content: &str) -> Result<WindowsCaJournal, String> {
+    let mut lines = content.lines();
+    let thumbprint = lines
+        .next()
+        .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())?;
+    validate_ca_thumbprint(thumbprint)?;
+    let owner = lines
+        .next()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|owner| *owner != 0)
+                .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())
+        })
+        .transpose()?;
+    if lines.next().is_some() {
+        return Err("Claude Desktop CA cleanup journal is invalid".to_string());
+    }
+    Ok(WindowsCaJournal {
+        thumbprint: thumbprint.to_string(),
+        owner,
+    })
+}
+
+#[cfg(windows)]
+fn windows_ca_owner_is_running(owner: Option<u32>) -> bool {
+    let Some(owner) = owner else {
+        return false;
+    };
+    let pid = sysinfo::Pid::from_u32(owner);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).is_some()
+}
+
+// Releases before the journal moved into its own directory wrote it directly
+// into the install root. Read that location too so a certificate left behind by
+// an older build is still cleaned up after an upgrade.
+#[cfg(windows)]
+fn legacy_windows_ca_journal_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
+    Ok(root.join("Pentect").join("claude-app-temporary-ca.sha1"))
+}
+
+#[cfg(windows)]
+fn read_windows_ca_journals() -> Result<Vec<(PathBuf, WindowsCaJournal)>, String> {
+    let mut journals = Vec::new();
+    for path in [
+        windows_ca_journal_path()?,
+        legacy_windows_ca_journal_path()?,
+    ] {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => journals.push((path, parse_windows_ca_journal(&content)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not read Claude Desktop CA cleanup journal: {error}"
+                ))
+            }
+        }
+    }
+    Ok(journals)
+}
+
+#[cfg(windows)]
+fn open_windows_user_root_store(
+) -> Result<windows::Win32::Security::Cryptography::HCERTSTORE, String> {
+    use windows::Win32::Security::Cryptography::{
+        CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_STORE_MAXIMUM_ALLOWED_FLAG,
+        CERT_STORE_OPEN_EXISTING_FLAG, CERT_STORE_PROV_SYSTEM_REGISTRY_W,
+        CERT_SYSTEM_STORE_CURRENT_USER, X509_ASN_ENCODING,
+    };
+
+    #[cfg(test)]
+    let test_store = std::env::var_os("PENTECT_TEST_WINDOWS_CA_STORE")
+        .map(|name| windows::core::HSTRING::from(name.to_string_lossy().as_ref()));
+    #[cfg(not(test))]
+    let test_store: Option<windows::core::HSTRING> = None;
+    let store_name = test_store
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| windows::core::HSTRING::from("ROOT"));
+    let mut raw_flags = CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_MAXIMUM_ALLOWED_FLAG.0;
+    if test_store.is_none() {
+        raw_flags |= CERT_STORE_OPEN_EXISTING_FLAG.0;
+    }
+    let flags = CERT_OPEN_STORE_FLAGS(raw_flags);
+    unsafe {
+        CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_REGISTRY_W,
+            X509_ASN_ENCODING,
+            None,
+            flags,
+            Some(store_name.as_ptr() as *const std::ffi::c_void),
+        )
+    }
+    .map_err(|error| format!("could not open the current-user Root store: {error}"))
+}
+
+#[cfg(windows)]
+fn find_windows_user_ca(thumbprint: &str) -> Result<bool, String> {
+    use windows::Win32::Security::Cryptography::{
+        CertCloseStore, CertFindCertificateInStore, CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB,
+        X509_ASN_ENCODING,
+    };
+
+    validate_ca_thumbprint(thumbprint)?;
+    let mut hash = data_encoding::HEXUPPER
+        .decode(thumbprint.as_bytes())
+        .map_err(|_| "Claude Desktop CA cleanup journal is invalid".to_string())?;
+    let blob = CRYPT_INTEGER_BLOB {
+        cbData: hash.len() as u32,
+        pbData: hash.as_mut_ptr(),
+    };
+    let store = open_windows_user_root_store()?;
+    let context = unsafe {
+        CertFindCertificateInStore(
+            store,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SHA1_HASH,
+            Some(&blob as *const _ as *const std::ffi::c_void),
+            None,
+        )
+    };
+    let found = !context.is_null();
+    if found {
+        let _ = unsafe {
+            windows::Win32::Security::Cryptography::CertFreeCertificateContext(Some(context))
+        };
+    }
+    let close = unsafe { CertCloseStore(Some(store), 0) };
+    close.map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+    Ok(found)
+}
+
+#[cfg(windows)]
+fn remove_windows_user_ca(thumbprint: &str) -> Result<(), String> {
+    use windows::Win32::Security::Cryptography::{
+        CertCloseStore, CertDeleteCertificateFromStore, CertFindCertificateInStore,
+        CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB, X509_ASN_ENCODING,
+    };
+
+    validate_ca_thumbprint(thumbprint)?;
+    let mut hash = data_encoding::HEXUPPER
+        .decode(thumbprint.as_bytes())
+        .map_err(|_| "Claude Desktop CA cleanup journal is invalid".to_string())?;
+    let blob = CRYPT_INTEGER_BLOB {
+        cbData: hash.len() as u32,
+        pbData: hash.as_mut_ptr(),
+    };
+    let store = open_windows_user_root_store()?;
+    let context = unsafe {
+        CertFindCertificateInStore(
+            store,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SHA1_HASH,
+            Some(&blob as *const _ as *const std::ffi::c_void),
+            None,
+        )
+    };
+    if context.is_null() {
+        unsafe { CertCloseStore(Some(store), 0) }
+            .map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+        return Ok(());
+    }
+    let deleted = unsafe { CertDeleteCertificateFromStore(context) };
+    let closed = unsafe { CertCloseStore(Some(store), 0) };
+    deleted.map_err(|error| {
+        format!("could not remove temporary Claude Desktop certificate: {error}")
+    })?;
+    closed.map_err(|error| format!("could not close the current-user Root store: {error}"))
+}
+
+#[cfg(windows)]
+fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
+    find_windows_user_ca(thumbprint)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
+    Ok(read_windows_ca_journals()?
+        .iter()
+        .any(|(_, journal)| !windows_ca_owner_is_running(journal.owner)))
+}
+
+#[cfg(windows)]
+pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
+    let journals = read_windows_ca_journals()?;
+    if journals.is_empty() {
+        return Ok(());
+    }
+    if journals
+        .iter()
+        .any(|(_, journal)| windows_ca_owner_is_running(journal.owner))
+    {
+        return Err(
+            "Claude Desktop protection is active; refusing to remove its certificate".to_string(),
+        );
+    }
+    for (path, journal) in journals {
+        remove_windows_user_ca(&journal.thumbprint)?;
+        remove_windows_ca_journal_at(&path)?;
+    }
+    eprintln!("[pentect] Removed stale temporary Claude Desktop certificates");
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsUserCaGuard {
+    thumbprint: String,
+}
+
+#[cfg(windows)]
+impl WindowsUserCaGuard {
+    fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
+        use windows::Win32::Security::Cryptography::{
+            CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
+        };
+
+        validate_ca_thumbprint(thumbprint)?;
+        if windows_user_ca_present(thumbprint)? {
+            return Err(
+                "temporary Claude Desktop certificate already exists in CurrentUser Root"
+                    .to_string(),
+            );
+        }
+        #[cfg(test)]
+        eprintln!("windows CA install: writing cleanup journal");
+        write_windows_ca_journal(thumbprint)?;
+        #[cfg(test)]
+        eprintln!("windows CA install: opening current-user certificate store");
+        let store = match open_windows_user_root_store() {
+            Ok(store) => store,
+            Err(error) => {
+                let _ = remove_windows_ca_journal();
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        eprintln!("windows CA install: adding certificate through system store provider");
+        let add = unsafe {
+            CertAddEncodedCertificateToStore(
+                Some(store),
+                X509_ASN_ENCODING,
+                certificate_der,
+                CERT_STORE_ADD_NEW,
+                None,
+            )
+        };
+        let close_store = unsafe { CertCloseStore(Some(store), 0) };
+        if let Err(error) = add {
+            let _ = remove_windows_ca_journal();
+            return Err(format!(
+                "could not trust temporary Claude Desktop certificate: {error}"
+            ));
+        }
+        close_store
+            .map_err(|error| format!("could not close the Root certificate provider: {error}"))?;
+        #[cfg(test)]
+        eprintln!("windows CA install: certificate store update finished");
+        Ok(Self {
+            thumbprint: thumbprint.to_string(),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsUserCaGuard {
+    fn drop(&mut self) {
+        if let Err(error) = remove_windows_user_ca(&self.thumbprint) {
+            eprintln!("[pentect] {error}");
+            return;
+        }
+        if let Err(error) = remove_windows_ca_journal() {
+            eprintln!("[pentect] {error}");
+        }
+        self.thumbprint.zeroize();
+    }
 }
 
 #[cfg(windows)]
@@ -411,6 +836,7 @@ struct ClaudeAppOptions {
     upstream: Option<String>,
     upstream_header_env: Vec<String>,
     check: bool,
+    assume_yes: bool,
 }
 
 impl ClaudeAppOptions {
@@ -419,6 +845,7 @@ impl ClaudeAppOptions {
         let mut upstream = None;
         let mut upstream_header_env = Vec::new();
         let mut check = false;
+        let mut assume_yes = false;
         let mut index = if args.get(1).is_some_and(|arg| arg == "claude")
             && args.get(2).is_some_and(|arg| arg == "app")
         {
@@ -437,6 +864,10 @@ impl ClaudeAppOptions {
                 }
                 "--check" | "--dry-run" => {
                     check = true;
+                    index += 1;
+                }
+                "--yes" => {
+                    assume_yes = true;
                     index += 1;
                 }
                 "--upstream" => {
@@ -470,13 +901,19 @@ impl ClaudeAppOptions {
             upstream,
             upstream_header_env,
             check,
+            assume_yes,
         })
     }
 }
 
 struct ClaudeAppProxyGuard {
     proxy_url: String,
+    #[cfg(not(windows))]
     spki_hash: String,
+    #[cfg(windows)]
+    root_certificate_der: Vec<u8>,
+    #[cfg(windows)]
+    ca_thumbprint: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -484,7 +921,12 @@ struct ClaudeAppProxyGuard {
 impl ClaudeAppProxyGuard {
     fn start() -> Result<Self, String> {
         let authority = CertificateAuthority::new()?;
+        #[cfg(not(windows))]
         let spki_hash = authority.spki_hash.clone();
+        #[cfg(windows)]
+        let root_certificate_der = authority.issuer.der().to_vec();
+        #[cfg(windows)]
+        let ca_thumbprint = authority.thumbprint.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread = thread::spawn(move || {
@@ -512,7 +954,12 @@ impl ClaudeAppProxyGuard {
             .map_err(|_| "Claude App proxy did not start within 30 seconds".to_string())??;
         Ok(Self {
             proxy_url,
+            #[cfg(not(windows))]
             spki_hash,
+            #[cfg(windows)]
+            root_certificate_der,
+            #[cfg(windows)]
+            ca_thumbprint,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -522,8 +969,19 @@ impl ClaudeAppProxyGuard {
         &self.proxy_url
     }
 
+    #[cfg(not(windows))]
     fn spki_hash(&self) -> &str {
         &self.spki_hash
+    }
+
+    #[cfg(windows)]
+    fn root_certificate_der(&self) -> &[u8] {
+        &self.root_certificate_der
+    }
+
+    #[cfg(windows)]
+    fn ca_thumbprint(&self) -> &str {
+        &self.ca_thumbprint
     }
 }
 
@@ -536,21 +994,31 @@ impl Drop for ClaudeAppProxyGuard {
             let _ = thread.join();
         }
         self.proxy_url.zeroize();
+        #[cfg(not(windows))]
         self.spki_hash.zeroize();
+        #[cfg(windows)]
+        {
+            self.root_certificate_der.zeroize();
+            self.ca_thumbprint.zeroize();
+        }
     }
 }
 
 struct CertificateAuthority {
     issuer: CertifiedIssuer<'static, KeyPair>,
+    #[cfg(not(windows))]
     spki_hash: String,
+    #[cfg(windows)]
+    thumbprint: String,
 }
 
 impl CertificateAuthority {
     fn new() -> Result<Self, String> {
         let key = KeyPair::generate()
             .map_err(|error| format!("could not generate Claude App proxy CA key: {error}"))?;
-        let spki = key.subject_public_key_info();
-        let spki_hash = data_encoding::BASE64.encode(&Sha256::digest(spki));
+        #[cfg(not(windows))]
+        let spki_hash =
+            data_encoding::BASE64.encode(&Sha256::digest(key.subject_public_key_info()));
         let mut params = CertificateParams::new(Vec::<String>::new())
             .map_err(|error| format!("could not create Claude App proxy CA: {error}"))?;
         let mut distinguished_name = DistinguishedName::new();
@@ -563,7 +1031,15 @@ impl CertificateAuthority {
         ];
         let issuer = CertifiedIssuer::self_signed(params, key)
             .map_err(|error| format!("could not sign Claude App proxy CA: {error}"))?;
-        Ok(Self { issuer, spki_hash })
+        #[cfg(windows)]
+        let thumbprint = data_encoding::HEXUPPER.encode(&Sha1::digest(issuer.der()));
+        Ok(Self {
+            issuer,
+            #[cfg(not(windows))]
+            spki_hash,
+            #[cfg(windows)]
+            thumbprint,
+        })
     }
 
     fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>, String> {
@@ -2527,13 +3003,12 @@ mod tests {
         for packaged in [false, true] {
             let error = claude_desktop_early_exit_error("exit code: 1", packaged);
             assert!(
-                error.contains("required local-proxy certificate pin"),
+                error.contains("exited before Pentect could attach"),
                 "{error}"
             );
-            assert!(error.contains("1.34493.1 is known to reject"), "{error}");
-            assert!(error.contains("cannot be protected"), "{error}");
-            assert!(error.contains("`pentect claude`"), "{error}");
+            assert!(error.contains("certificate will be removed"), "{error}");
             assert!(!error.contains("update Claude Desktop"), "{error}");
+            assert!(!error.contains("ignore-certificate-errors"), "{error}");
         }
     }
 
@@ -2624,10 +3099,12 @@ mod tests {
             "--app".to_string(),
             "Claude.exe".to_string(),
             "--dry-run".to_string(),
+            "--yes".to_string(),
         ];
         let options = ClaudeAppOptions::parse(&args).unwrap();
         assert_eq!(options.app, Some(PathBuf::from("Claude.exe")));
         assert!(options.check);
+        assert!(options.assume_yes);
     }
 
     #[test]
@@ -3010,8 +3487,190 @@ mod tests {
     #[test]
     fn ephemeral_ca_builds_host_certificate() {
         let authority = CertificateAuthority::new().unwrap();
+        #[cfg(not(windows))]
         assert!(!authority.spki_hash.is_empty());
+        #[cfg(windows)]
+        {
+            assert_eq!(authority.thumbprint.len(), 40);
+            assert!(authority
+                .thumbprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()));
+            assert!(!authority.issuer.der().is_empty());
+        }
         authority.server_config("claude.ai").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ca_journal_accepts_only_sha1_thumbprints() {
+        let thumbprint = "00112233445566778899AABBCCDDEEFF00112233";
+        assert!(validate_ca_thumbprint(thumbprint).is_ok());
+        let current = parse_windows_ca_journal(&format!("{thumbprint}\n1234\n")).unwrap();
+        assert_eq!(current.owner, Some(1234));
+        let legacy = parse_windows_ca_journal(thumbprint).unwrap();
+        assert_eq!(legacy.owner, None);
+        assert!(parse_windows_ca_journal(&format!("{thumbprint}\n1234\nextra")).is_err());
+        for invalid in [
+            "",
+            "0011",
+            "00112233445566778899AABBCCDDEEFF0011223G",
+            "00112233445566778899AABBCCDDEEFF00112233 --force",
+        ] {
+            assert!(validate_ca_thumbprint(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_ca_visibility_in_fresh_process(thumbprint: &str, expected: bool) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "claude_app_proxy::tests::windows_user_ca_presence_probe",
+                "--nocapture",
+            ])
+            .env("PENTECT_TEST_WINDOWS_CA_THUMBPRINT", thumbprint)
+            .env(
+                "PENTECT_TEST_WINDOWS_CA_EXPECTED",
+                if expected { "1" } else { "0" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fresh-process CA visibility probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper launched by windows_user_ca_round_trip"]
+    fn windows_user_ca_presence_probe() {
+        let thumbprint = std::env::var("PENTECT_TEST_WINDOWS_CA_THUMBPRINT").unwrap();
+        let expected = std::env::var("PENTECT_TEST_WINDOWS_CA_EXPECTED").unwrap() == "1";
+        assert_eq!(windows_user_ca_present(&thumbprint).unwrap(), expected);
+    }
+
+    #[cfg(windows)]
+    fn remove_windows_test_ca_store(name: &str) {
+        use windows::Win32::Security::Cryptography::{
+            CertUnregisterSystemStore, CERT_SYSTEM_STORE_CURRENT_USER,
+        };
+
+        let name = windows::core::HSTRING::from(name);
+        let removed = unsafe {
+            CertUnregisterSystemStore(
+                name.as_ptr() as *const std::ffi::c_void,
+                CERT_SYSTEM_STORE_CURRENT_USER,
+            )
+        };
+        assert!(removed.as_bool(), "could not remove temporary test store");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "mutates an ephemeral current-user certificate test store"]
+    fn windows_user_ca_round_trip() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let watchdog = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                std::thread::sleep(Duration::from_millis(100));
+                if watchdog.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+            eprintln!("windows CA round trip exceeded 30 seconds");
+            std::process::abort();
+        });
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("LOCALAPPDATA");
+        let state = std::env::temp_dir().join(format!(
+            "pentect-claude-ca-round-trip-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("LOCALAPPDATA", &state);
+        let previous_store = std::env::var_os("PENTECT_TEST_WINDOWS_CA_STORE");
+        let store_name = format!("PentectClaudeCaTest-{}", std::process::id());
+        std::env::set_var("PENTECT_TEST_WINDOWS_CA_STORE", &store_name);
+
+        let authority = CertificateAuthority::new().unwrap();
+        eprintln!("windows CA round trip: checking initial absence");
+        assert!(!windows_user_ca_present(&authority.thumbprint).unwrap());
+        eprintln!("windows CA round trip: installing");
+        let guard =
+            WindowsUserCaGuard::install(authority.issuer.der(), &authority.thumbprint).unwrap();
+        eprintln!("windows CA round trip: checking presence from a fresh process");
+        assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
+        assert!(windows_ca_journal_path().unwrap().is_file());
+        assert!(!windows_ca_cleanup_pending().unwrap());
+        let active_cleanup = cleanup_stale_windows_user_ca().unwrap_err();
+        assert!(active_cleanup.contains("protection is active"));
+        assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
+        eprintln!("windows CA round trip: removing");
+        drop(guard);
+        eprintln!("windows CA round trip: checking final absence from a fresh process");
+        assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, false);
+        assert!(!windows_ca_cleanup_pending().unwrap());
+
+        // An upgrade can leave a legacy journal while a newer session writes
+        // the current journal. Each journal must remain paired with, and clean
+        // up, its own certificate.
+        let legacy_authority = CertificateAuthority::new().unwrap();
+        let legacy_guard = WindowsUserCaGuard::install(
+            legacy_authority.issuer.der(),
+            &legacy_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::rename(
+            windows_ca_journal_path().unwrap(),
+            legacy_windows_ca_journal_path().unwrap(),
+        )
+        .unwrap();
+        let current_authority = CertificateAuthority::new().unwrap();
+        let current_guard = WindowsUserCaGuard::install(
+            current_authority.issuer.der(),
+            &current_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_windows_ca_journal_path().unwrap(),
+            &legacy_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::write(
+            windows_ca_journal_path().unwrap(),
+            &current_authority.thumbprint,
+        )
+        .unwrap();
+        std::mem::forget(legacy_guard);
+        std::mem::forget(current_guard);
+
+        assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, true);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, true);
+        cleanup_stale_windows_user_ca().unwrap();
+        assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, false);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, false);
+        assert!(!legacy_windows_ca_journal_path().unwrap().exists());
+        assert!(!windows_ca_journal_path().unwrap().exists());
+        remove_windows_test_ca_store(&store_name);
+
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match previous_store {
+            Some(value) => std::env::set_var("PENTECT_TEST_WINDOWS_CA_STORE", value),
+            None => std::env::remove_var("PENTECT_TEST_WINDOWS_CA_STORE"),
+        }
+        let _ = std::fs::remove_dir_all(state);
+        finished.store(true, Ordering::Relaxed);
     }
 
     #[cfg(windows)]

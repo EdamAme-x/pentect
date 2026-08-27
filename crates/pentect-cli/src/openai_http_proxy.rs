@@ -1831,14 +1831,14 @@ fn mask_openai_input(
                 .unwrap_or_default()
                 .to_string();
             match item_type.as_str() {
-                "function_call" => {
-                    if let Some(Value::String(arguments)) = object.get_mut("arguments") {
-                        mask_text(arguments, true, masker)?;
-                    }
-                }
-                "custom_tool_call" => {
-                    if let Some(Value::String(input)) = object.get_mut("input") {
-                        mask_text(input, true, masker)?;
+                "function_call" | "custom_tool_call" => {
+                    // Previous assistant tool calls are sent back to the model as
+                    // conversation history. Their locally restored arguments can
+                    // contain secrets, so protect both Responses API call shapes.
+                    for key in ["arguments", "input"] {
+                        if let Some(Value::String(arguments)) = object.get_mut(key) {
+                            mask_text(arguments, true, masker)?;
+                        }
                     }
                 }
                 "function_call_output" | "custom_tool_call_output" => {
@@ -3699,6 +3699,56 @@ mod tests {
             request.matches("<<").count() >= 2,
             "expected prompt handles did not reach upstream"
         );
+    }
+
+    #[test]
+    fn provider_boundary_masks_responses_tool_call_history() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "TOOLHISTORY", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let (upstream, captured, thread) = mock_chat_upstream();
+        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+
+        reqwest::blocking::Client::new()
+            .post(format!("{}/responses", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "name": "shell",
+                            "arguments": serde_json::json!({
+                                "command": format!("export RUNPOD_API_KEY={secret}")
+                            }).to_string()
+                        },
+                        {
+                            "type": "custom_tool_call",
+                            "name": "exec_command",
+                            "input": format!("curl -H 'Authorization: Bearer {secret}' localhost")
+                        }
+                    ],
+                    "stream": false
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let (_, request) = captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(!request.contains(&secret), "tool history reached upstream");
+        let protected: Value = serde_json::from_str(&request).unwrap();
+        for (index, key) in [(0, "arguments"), (1, "input")] {
+            let value = protected["input"][index][key].as_str().unwrap();
+            assert!(value.contains("<<"), "unmasked {key}: {value}");
+        }
     }
 
     #[test]
