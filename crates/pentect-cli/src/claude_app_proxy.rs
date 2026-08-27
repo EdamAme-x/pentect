@@ -359,7 +359,7 @@ fn open_windows_user_root_registry_store() -> Result<
     String,
 > {
     use windows::Win32::Security::Cryptography::{
-        CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_STORE_PROV_REG,
+        CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_REG,
     };
     use windows::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
@@ -380,7 +380,7 @@ fn open_windows_user_root_registry_store() -> Result<
     let store = unsafe {
         CertOpenStore(
             CERT_STORE_PROV_REG,
-            0,
+            CERT_QUERY_ENCODING_TYPE(0),
             None,
             CERT_OPEN_STORE_FLAGS(0),
             Some(key.0 as *const std::ffi::c_void),
