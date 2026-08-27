@@ -629,7 +629,7 @@ jobs:
           cmp "$RUNNER_TEMP/config.before" "$CODEX_HOME/config.toml"
           claude_fixture="$RUNNER_TEMP/claude-app-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$claude_fixture"
-          "$PENTECT_SMOKE_BINARY" claude app --app "$claude_fixture" --upstream https://api.anthropic.com
+          "$PENTECT_SMOKE_BINARY" claude app --yes --app "$claude_fixture" --upstream https://api.anthropic.com
       - name: Verify persistent diagnostics (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

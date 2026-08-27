@@ -106,7 +106,7 @@ jobs:
           $claudeSource = (Resolve-Path 'tools/claude-app-smoke-fixture.cs').Path
           & $csc /nologo /target:exe "/out:$claudeFixture" $claudeSource
           if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
-          & $env:PENTECT_SMOKE_BINARY claude app --app $claudeFixture --upstream https://api.anthropic.com
+          & $env:PENTECT_SMOKE_BINARY claude app --yes --app $claudeFixture --upstream https://api.anthropic.com
           if ($LASTEXITCODE -ne 0) { throw 'Claude Desktop contract failed' }
       - name: Start both protected desktop app contracts (POSIX)
         if: runner.os != 'Windows'
@@ -124,7 +124,7 @@ jobs:
 
           claude_fixture="$RUNNER_TEMP/claude-app-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$claude_fixture"
-          "$PENTECT_SMOKE_BINARY" claude app --app "$claude_fixture" --upstream https://api.anthropic.com
+          "$PENTECT_SMOKE_BINARY" claude app --yes --app "$claude_fixture" --upstream https://api.anthropic.com
       - name: Verify client diagnostics
         run: >-
           python tools/verify_client_smoke_log.py

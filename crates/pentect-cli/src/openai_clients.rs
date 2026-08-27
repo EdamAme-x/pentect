@@ -15,15 +15,18 @@ pub(crate) fn run(
     opts: &crate::AgentToolOpts,
     pentect: &Path,
 ) -> Result<std::process::ExitStatus, String> {
+    let crate::client_descriptor::Launcher::OpenAi(injection) = tool.launcher else {
+        return Err("internal OpenAI client launcher mismatch".to_string());
+    };
+    if injection == crate::client_descriptor::OpenAiInjection::InlineConfig {
+        return run_opencode(tool, opts, pentect);
+    }
     let upstream = opts
         .upstream
         .clone()
         .or_else(|| configured_upstream(tool))
         .or_else(|| tool.default_upstream.map(str::to_string))
         .ok_or_else(|| format!("{} has no configured upstream", tool.name))?;
-    let crate::client_descriptor::Launcher::OpenAi(injection) = tool.launcher else {
-        return Err("internal OpenAI client launcher mismatch".to_string());
-    };
     let args = opts.tool_args.clone();
     let model = selected_model(opts.model.as_deref())?;
     let api = ClientApi::parse(opts.api.as_deref())?;
@@ -93,10 +96,7 @@ pub(crate) fn run(
 
     match injection {
         crate::client_descriptor::OpenAiInjection::InlineConfig => {
-            let config = opencode_config(proxy.base_url(), &model, api)?;
-            command.env("OPENCODE_CONFIG_CONTENT", config);
-            command.args(args);
-            crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+            unreachable!("OpenCode is handled by run_opencode")
         }
         crate::client_descriptor::OpenAiInjection::TempExtension => {
             let extension = PiProviderFile::create()?;
@@ -150,6 +150,168 @@ pub(crate) fn run(
             )
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenCodeProtocol {
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OpenCodeRoute {
+    provider: String,
+    model: Option<String>,
+    upstream: String,
+    protocol: OpenCodeProtocol,
+    bearer_env: Option<&'static str>,
+}
+
+impl OpenCodeRoute {
+    fn resolve(opts: &crate::AgentToolOpts) -> Result<Self, String> {
+        if let Some(upstream) = opts.upstream.clone() {
+            let model = selected_model(opts.model.as_deref())?;
+            return Ok(Self {
+                provider: "pentect-gateway".to_string(),
+                model: Some(format!("pentect-gateway/{model}")),
+                upstream,
+                protocol: OpenCodeProtocol::OpenAi,
+                bearer_env: Some("OPENAI_API_KEY"),
+            });
+        }
+
+        let Some(model) = opts.model.as_deref() else {
+            return Ok(Self {
+                provider: "opencode".to_string(),
+                model: None,
+                upstream: "https://opencode.ai/zen/v1".to_string(),
+                protocol: OpenCodeProtocol::OpenAi,
+                bearer_env: Some("OPENCODE_API_KEY"),
+            });
+        };
+        validate_model(model)?;
+        let (provider, model_id) = model.split_once('/').unwrap_or(("openai", model));
+        let (upstream, protocol, bearer_env) = match provider {
+            "opencode" => (
+                "https://opencode.ai/zen/v1",
+                OpenCodeProtocol::OpenAi,
+                Some("OPENCODE_API_KEY"),
+            ),
+            "openai" => (
+                "https://api.openai.com/v1",
+                OpenCodeProtocol::OpenAi,
+                Some("OPENAI_API_KEY"),
+            ),
+            "openrouter" => (
+                "https://openrouter.ai/api/v1",
+                OpenCodeProtocol::OpenAi,
+                Some("OPENROUTER_API_KEY"),
+            ),
+            "anthropic" => (
+                "https://api.anthropic.com",
+                OpenCodeProtocol::Anthropic,
+                None,
+            ),
+            "google" => (
+                "https://generativelanguage.googleapis.com",
+                OpenCodeProtocol::Gemini,
+                None,
+            ),
+            _ => {
+                return Err(format!(
+                    "OpenCode provider '{provider}' is not routed yet; use --upstream with an OpenAI-compatible gateway"
+                ))
+            }
+        };
+        if model_id.is_empty() {
+            return Err("OpenCode model ID is empty".to_string());
+        }
+        Ok(Self {
+            provider: provider.to_string(),
+            model: Some(format!("{provider}/{model_id}")),
+            upstream: upstream.to_string(),
+            protocol,
+            bearer_env,
+        })
+    }
+}
+
+enum OpenCodeProxyGuard {
+    OpenAi(crate::openai_http_proxy::OpenAiHttpProxyGuard),
+    Anthropic(crate::claude_http_proxy::ClaudeHttpProxyGuard),
+    Gemini(crate::gemini_http_proxy::GeminiHttpProxyGuard),
+}
+
+impl OpenCodeProxyGuard {
+    fn base_url(&self) -> &str {
+        match self {
+            Self::OpenAi(proxy) => proxy.base_url(),
+            Self::Anthropic(proxy) => proxy.base_url(),
+            Self::Gemini(proxy) => proxy.base_url(),
+        }
+    }
+}
+
+fn run_opencode(
+    _tool: &'static crate::client_descriptor::ClientDescriptor,
+    opts: &crate::AgentToolOpts,
+    pentect: &Path,
+) -> Result<std::process::ExitStatus, String> {
+    let route = OpenCodeRoute::resolve(opts)?;
+    let api = ClientApi::parse(opts.api.as_deref())?;
+    if opts.dry_run {
+        crate::print_dry_run(&opts.command, &opts.tool_args);
+        return Ok(crate::success_status());
+    }
+
+    let active_plugins = crate::agent_tool_plugins(opts)?;
+    let memory_store = crate::start_memory_store(pentect)?;
+    let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let bearer_env = route.bearer_env.filter(|name| {
+        std::env::var_os(name).is_some_and(|value| !value.is_empty())
+            && !has_authorization_override(&opts.upstream_header_env)
+    });
+    let proxy = match route.protocol {
+        OpenCodeProtocol::OpenAi => OpenCodeProxyGuard::OpenAi(
+            crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
+                route.upstream.clone(),
+                &opts.upstream_header_env,
+                bearer_env,
+            )?,
+        ),
+        OpenCodeProtocol::Anthropic => OpenCodeProxyGuard::Anthropic(
+            crate::claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
+                route.upstream.clone(),
+                &opts.upstream_header_env,
+            )?,
+        ),
+        OpenCodeProtocol::Gemini => OpenCodeProxyGuard::Gemini(
+            crate::gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
+                route.upstream.clone(),
+                &opts.upstream_header_env,
+            )?,
+        ),
+    };
+    let package = opts.upstream.as_ref().map(|_| api.opencode_package());
+    let config = opencode_config(
+        proxy.base_url(),
+        &route.provider,
+        route.model.as_deref(),
+        package,
+    )?;
+    let mut command = Command::new(&opts.command);
+    crate::clear_pentect_control_env(&mut command);
+    crate::upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
+    if let Some(name) = bearer_env {
+        command.env(name, "pentect-local");
+    }
+    crate::apply_plugin_env(&mut command, &active_plugins)?;
+    crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
+    crate::apply_memory_store_env(&mut command, Some(&memory_store));
+    command.env("OPENCODE_CONFIG_CONTENT", config);
+    command.args(&opts.tool_args);
+    crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
 }
 
 fn has_authorization_override(specs: &[String]) -> bool {
@@ -249,7 +411,12 @@ fn validate_model(model: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn opencode_config(proxy: &str, model: &str, api: ClientApi) -> Result<String, String> {
+fn opencode_config(
+    proxy: &str,
+    provider: &str,
+    model: Option<&str>,
+    package: Option<&str>,
+) -> Result<String, String> {
     let mut root = match std::env::var("OPENCODE_CONFIG_CONTENT") {
         Ok(existing) if !existing.trim().is_empty() => serde_json::from_str::<Value>(&existing)
             .map_err(|error| format!("OPENCODE_CONFIG_CONTENT is invalid JSON: {error}"))?,
@@ -263,31 +430,35 @@ fn opencode_config(proxy: &str, model: &str, api: ClientApi) -> Result<String, S
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| "OPENCODE_CONFIG_CONTENT.provider must be an object".to_string())?;
-    // Do not copy credentials for unrelated providers into the child process.
-    // This launch intentionally exposes only the ephemeral Pentect provider.
+    // Keep OpenCode's native provider identity and catalog while allowing only
+    // its Pentect-routed endpoint. Never copy provider credentials from config.
     providers.clear();
-    let api_key = "{env:OPENAI_API_KEY}";
-    providers.insert(
-        "pentect".to_string(),
-        json!({
-            "npm": api.opencode_package(),
-            "name": "Pentect",
-            "options": {"baseURL": proxy, "apiKey": api_key},
-            "models": {(model): {"name": model}}
-        }),
-    );
-    root_object.insert(
-        "model".to_string(),
-        Value::String(format!("pentect/{model}")),
-    );
-    root_object.insert(
-        "small_model".to_string(),
-        Value::String(format!("pentect/{model}")),
-    );
+    let mut provider_config = json!({"options": {"baseURL": proxy}});
+    if let Some(package) = package {
+        let provider_object = provider_config
+            .as_object_mut()
+            .expect("provider config is an object");
+        provider_object.insert("npm".to_string(), Value::String(package.to_string()));
+        if let Some(model_id) = model.and_then(|value| value.strip_prefix(&format!("{provider}/")))
+        {
+            provider_object.insert(
+                "models".to_string(),
+                json!({(model_id): {"name": model_id}}),
+            );
+        }
+    }
+    providers.insert(provider.to_string(), provider_config);
+    if let Some(model) = model {
+        root_object.insert("model".to_string(), Value::String(model.to_string()));
+        root_object.insert("small_model".to_string(), Value::String(model.to_string()));
+    } else {
+        root_object.remove("model");
+        root_object.remove("small_model");
+    }
     // OpenCode agents and lightweight background tasks may select a provider
     // independently of the main model. Restrict this launch to the ephemeral
     // provider so those requests cannot bypass the local gateway.
-    root_object.insert("enabled_providers".to_string(), json!(["pentect"]));
+    root_object.insert("enabled_providers".to_string(), json!([provider]));
     root_object.insert("disabled_providers".to_string(), json!([]));
     serde_json::to_string(&root)
         .map_err(|error| format!("could not encode temporary OpenCode config: {error}"))
@@ -371,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_preserves_settings_but_drops_other_providers() {
+    fn opencode_config_preserves_settings_and_native_provider_without_credentials() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
         std::env::set_var(
@@ -381,8 +552,9 @@ mod tests {
         let value: Value = serde_json::from_str(
             &opencode_config(
                 "http://127.0.0.1/token",
-                "openai/gpt-5",
-                ClientApi::ChatCompletions,
+                "openrouter",
+                Some("openrouter/anthropic/claude-sonnet"),
+                None,
             )
             .unwrap(),
         )
@@ -392,15 +564,110 @@ mod tests {
             None => std::env::remove_var("OPENCODE_CONFIG_CONTENT"),
         }
         assert_eq!(value["theme"], "dark");
-        assert_eq!(value["model"], "pentect/openai/gpt-5");
-        assert_eq!(value["small_model"], "pentect/openai/gpt-5");
-        assert_eq!(value["enabled_providers"], serde_json::json!(["pentect"]));
+        assert_eq!(value["model"], "openrouter/anthropic/claude-sonnet");
+        assert_eq!(value["small_model"], "openrouter/anthropic/claude-sonnet");
         assert_eq!(
-            value["provider"]["pentect"]["options"]["baseURL"],
+            value["enabled_providers"],
+            serde_json::json!(["openrouter"])
+        );
+        assert_eq!(
+            value["provider"]["openrouter"]["options"]["baseURL"],
             "http://127.0.0.1/token"
         );
         assert_eq!(value["provider"].as_object().unwrap().len(), 1);
         assert!(!value.to_string().contains("must-not-survive"));
+        assert!(!value.to_string().contains("apiKey"));
+        assert!(!value.to_string().contains("pentect/"));
+    }
+
+    #[test]
+    fn opencode_default_keeps_the_native_picker_unforced() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
+        std::env::set_var(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"model":"other/unsafe","small_model":"other/unsafe"}"#,
+        );
+        let value: Value = serde_json::from_str(
+            &opencode_config("http://127.0.0.1/token", "opencode", None, None).unwrap(),
+        )
+        .unwrap();
+        match old {
+            Some(value) => std::env::set_var("OPENCODE_CONFIG_CONTENT", value),
+            None => std::env::remove_var("OPENCODE_CONFIG_CONTENT"),
+        }
+        assert!(value.get("model").is_none());
+        assert!(value.get("small_model").is_none());
+        assert_eq!(value["enabled_providers"], serde_json::json!(["opencode"]));
+    }
+
+    #[test]
+    fn opencode_custom_gateway_registers_its_arbitrary_model() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        let value: Value = serde_json::from_str(
+            &opencode_config(
+                "http://127.0.0.1/token",
+                "pentect-gateway",
+                Some("pentect-gateway/team/custom-model"),
+                Some("@ai-sdk/openai-compatible"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        match old {
+            Some(value) => std::env::set_var("OPENCODE_CONFIG_CONTENT", value),
+            None => std::env::remove_var("OPENCODE_CONFIG_CONTENT"),
+        }
+        assert_eq!(
+            value["provider"]["pentect-gateway"]["models"]["team/custom-model"]["name"],
+            "team/custom-model"
+        );
+    }
+
+    #[test]
+    fn opencode_routes_supported_native_providers() {
+        let opts = |model: Option<&str>, upstream: Option<&str>| crate::AgentToolOpts {
+            pentect: None,
+            command: "opencode".into(),
+            plugins: Vec::new(),
+            dry_run: false,
+            upstream: upstream.map(str::to_string),
+            model: model.map(str::to_string),
+            api: None,
+            upstream_header_env: Vec::new(),
+            tool_args: Vec::new(),
+        };
+        let default = OpenCodeRoute::resolve(&opts(None, None)).unwrap();
+        assert_eq!(default.provider, "opencode");
+        assert_eq!(default.model, None);
+        assert_eq!(default.upstream, "https://opencode.ai/zen/v1");
+
+        let openrouter =
+            OpenCodeRoute::resolve(&opts(Some("openrouter/anthropic/claude-sonnet"), None))
+                .unwrap();
+        assert_eq!(openrouter.provider, "openrouter");
+        assert_eq!(openrouter.protocol, OpenCodeProtocol::OpenAi);
+        assert_eq!(
+            openrouter.model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet")
+        );
+
+        let anthropic =
+            OpenCodeRoute::resolve(&opts(Some("anthropic/claude-sonnet-4"), None)).unwrap();
+        assert_eq!(anthropic.protocol, OpenCodeProtocol::Anthropic);
+
+        let gateway = OpenCodeRoute::resolve(&opts(
+            Some("anthropic/claude-sonnet"),
+            Some("http://127.0.0.1:8080/openai/v1"),
+        ))
+        .unwrap();
+        assert_eq!(gateway.provider, "pentect-gateway");
+        assert_eq!(
+            gateway.model.as_deref(),
+            Some("pentect-gateway/anthropic/claude-sonnet")
+        );
     }
 
     #[test]
