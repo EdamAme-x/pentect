@@ -351,9 +351,7 @@ fn open_windows_user_root_store(
 }
 
 #[cfg(windows)]
-fn find_windows_user_ca(
-    thumbprint: &str,
-) -> Result<Option<*const windows::Win32::Security::Cryptography::CERT_CONTEXT>, String> {
+fn find_windows_user_ca(thumbprint: &str) -> Result<bool, String> {
     use windows::Win32::Security::Cryptography::{
         CertCloseStore, CertFindCertificateInStore, CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB,
         X509_ASN_ENCODING,
@@ -378,31 +376,59 @@ fn find_windows_user_ca(
             None,
         )
     };
+    let found = !context.is_null();
+    if found {
+        let _ = unsafe {
+            windows::Win32::Security::Cryptography::CertFreeCertificateContext(Some(context))
+        };
+    }
     let close = unsafe { CertCloseStore(Some(store), 0) };
     close.map_err(|error| format!("could not close the current-user Root store: {error}"))?;
-    Ok((!context.is_null()).then_some(context))
+    Ok(found)
 }
 
 #[cfg(windows)]
 fn remove_windows_user_ca(thumbprint: &str) -> Result<(), String> {
-    use windows::Win32::Security::Cryptography::CertDeleteCertificateFromStore;
-
-    let Some(context) = find_windows_user_ca(thumbprint)? else {
-        return Ok(());
+    use windows::Win32::Security::Cryptography::{
+        CertCloseStore, CertDeleteCertificateFromStore, CertFindCertificateInStore,
+        CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB, X509_ASN_ENCODING,
     };
-    unsafe { CertDeleteCertificateFromStore(context) }
-        .map_err(|error| format!("could not remove temporary Claude Desktop certificate: {error}"))
+
+    validate_ca_thumbprint(thumbprint)?;
+    let mut hash = data_encoding::HEXUPPER
+        .decode(thumbprint.as_bytes())
+        .map_err(|_| "Claude Desktop CA cleanup journal is invalid".to_string())?;
+    let blob = CRYPT_INTEGER_BLOB {
+        cbData: hash.len() as u32,
+        pbData: hash.as_mut_ptr(),
+    };
+    let store = open_windows_user_root_store()?;
+    let context = unsafe {
+        CertFindCertificateInStore(
+            store,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SHA1_HASH,
+            Some(&blob as *const _ as *const std::ffi::c_void),
+            None,
+        )
+    };
+    if context.is_null() {
+        unsafe { CertCloseStore(Some(store), 0) }
+            .map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+        return Ok(());
+    }
+    let deleted = unsafe { CertDeleteCertificateFromStore(context) };
+    let closed = unsafe { CertCloseStore(Some(store), 0) };
+    deleted.map_err(|error| {
+        format!("could not remove temporary Claude Desktop certificate: {error}")
+    })?;
+    closed.map_err(|error| format!("could not close the current-user Root store: {error}"))
 }
 
 #[cfg(windows)]
 fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
-    use windows::Win32::Security::Cryptography::CertFreeCertificateContext;
-
-    let Some(context) = find_windows_user_ca(thumbprint)? else {
-        return Ok(false);
-    };
-    let _ = unsafe { CertFreeCertificateContext(Some(context)) };
-    Ok(true)
+    find_windows_user_ca(thumbprint)
 }
 
 #[cfg(windows)]
@@ -443,11 +469,17 @@ impl WindowsUserCaGuard {
         };
 
         validate_ca_thumbprint(thumbprint)?;
+        #[cfg(test)]
+        eprintln!("windows CA install: writing cleanup journal");
         write_windows_ca_journal(thumbprint)?;
+        #[cfg(test)]
+        eprintln!("windows CA install: opening Root store");
         let store = open_windows_user_root_store().map_err(|error| {
             let _ = remove_windows_ca_journal();
             error
         })?;
+        #[cfg(test)]
+        eprintln!("windows CA install: adding certificate");
         let add = unsafe {
             CertAddEncodedCertificateToStore(
                 Some(store),
@@ -457,6 +489,8 @@ impl WindowsUserCaGuard {
                 None,
             )
         };
+        #[cfg(test)]
+        eprintln!("windows CA install: closing Root store");
         let close = unsafe { CertCloseStore(Some(store), 0) };
         if let Err(error) = add {
             let _ = remove_windows_ca_journal();
