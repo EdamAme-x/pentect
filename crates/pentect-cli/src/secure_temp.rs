@@ -180,7 +180,8 @@ fn cleanup_stale(directory: &Path, prefix: &str, suffix: &str) {
 pub(crate) fn restrict_to_current_user(path: &Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
-    let identity = Command::new("whoami.exe")
+    let identity = Command::new(crate::windows_system_executable("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -188,14 +189,10 @@ pub(crate) fn restrict_to_current_user(path: &Path) -> Result<(), String> {
     if !identity.status.success() {
         return Err("could not resolve the Windows account for ACL setup".to_string());
     }
-    let identity = String::from_utf8(identity.stdout)
-        .map_err(|_| "Windows account name is not UTF-8".to_string())?;
-    let identity = identity.trim();
-    if identity.is_empty() {
-        return Err("Windows account name is empty".to_string());
-    }
-    let grant = format!("{identity}:(F)");
-    let status = Command::new("icacls.exe")
+    let sid = windows_sid_from_whoami_output(&identity.stdout)
+        .ok_or_else(|| "could not parse the Windows account SID".to_string())?;
+    let grant = format!("*{sid}:(F)");
+    let status = Command::new(crate::windows_system_executable("icacls.exe"))
         .arg(path)
         .args(["/inheritance:r", "/grant:r", &grant])
         .stdin(Stdio::null())
@@ -209,6 +206,25 @@ pub(crate) fn restrict_to_current_user(path: &Path) -> Result<(), String> {
         .ok_or_else(|| "could not restrict temporary file ACL".to_string())
 }
 
+#[cfg(any(windows, test))]
+fn windows_sid_from_whoami_output(output: &[u8]) -> Option<String> {
+    for start in 0..output.len().saturating_sub(3) {
+        if !output[start..].starts_with(b"S-1-") {
+            continue;
+        }
+        let suffix_start = start + b"S-1-".len();
+        let end = output[suffix_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit() && *byte != b'-')
+            .map_or(output.len(), |length| suffix_start + length);
+        let candidate = std::str::from_utf8(&output[start..end]).ok()?;
+        if candidate.matches('-').count() >= 3 && !candidate.ends_with('-') {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(not(windows))]
 pub(crate) fn restrict_to_current_user(_: &Path) -> Result<(), String> {
     Ok(())
@@ -217,6 +233,15 @@ pub(crate) fn restrict_to_current_user(_: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_sid_without_decoding_the_account_name() {
+        let output = b"\x8a\xc7\x97\x9d,\"S-1-5-21-123-456-789-1001\"\r\n";
+        assert_eq!(
+            windows_sid_from_whoami_output(output).as_deref(),
+            Some("S-1-5-21-123-456-789-1001")
+        );
+    }
 
     fn directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(

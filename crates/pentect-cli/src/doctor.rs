@@ -521,20 +521,24 @@ if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') })) {
     $key.SetValue('Path',$value,$kind)
   }
 } finally { $key.Dispose() }"#;
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            SCRIPT,
-        ])
-        .env("PENTECT_DOCTOR_PATH_DIR", directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("could not update the user PATH: {error}"))?;
+    let output = Command::new(crate::windows_system_executable(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        SCRIPT,
+    ])
+    .env("PENTECT_DOCTOR_PATH_DIR", directory)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .output()
+    .map_err(|error| format!("could not update the user PATH: {error}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if detail.is_empty() {
