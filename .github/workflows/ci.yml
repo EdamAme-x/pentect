@@ -158,6 +158,7 @@ jobs:
               - 'crates/pentect-cli/src/remote_content.rs'
               - 'crates/pentect-cli/src/upstream.rs'
             claude_app:
+              - '.github/workflows/ci.yml'
               - 'crates/pentect-cli/src/claude_app_proxy.rs'
               - 'crates/pentect-cli/src/claude_http_proxy.rs'
               - 'crates/pentect-cli/src/http_files.rs'
