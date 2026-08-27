@@ -106,7 +106,10 @@ jobs:
           $claudeSource = (Resolve-Path 'tools/claude-app-smoke-fixture.cs').Path
           & $csc /nologo /target:exe "/out:$claudeFixture" $claudeSource
           if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
-          & $env:PENTECT_SMOKE_BINARY claude app --yes --app $claudeFixture --upstream https://api.anthropic.com
+          # Windows root-store trust opens an OS confirmation UI. The dedicated
+          # CA lifecycle test covers add/find/remove; this headless smoke checks
+          # the installed CLI and app contract without opening that dialog.
+          & $env:PENTECT_SMOKE_BINARY claude app --check --app $claudeFixture --upstream https://api.anthropic.com
           if ($LASTEXITCODE -ne 0) { throw 'Claude Desktop contract failed' }
       - name: Start both protected desktop app contracts (POSIX)
         if: runner.os != 'Windows'
