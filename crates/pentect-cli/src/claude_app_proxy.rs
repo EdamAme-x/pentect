@@ -464,10 +464,6 @@ struct WindowsUserCaGuard {
 #[cfg(windows)]
 impl WindowsUserCaGuard {
     fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
-        use windows::Win32::Security::Cryptography::{
-            CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
-        };
-
         validate_ca_thumbprint(thumbprint)?;
         if windows_user_ca_present(thumbprint)? {
             return Err(
@@ -475,36 +471,42 @@ impl WindowsUserCaGuard {
                     .to_string(),
             );
         }
+        let directory = crate::secure_temp::SecureTempDirectory::create(
+            "pentect-claude-ca-",
+            "Claude Desktop certificate",
+        )?;
+        let certificate = crate::secure_temp::SecureTempFile::create(
+            directory.path(),
+            "root-",
+            ".cer",
+            certificate_der,
+            "Claude Desktop certificate",
+        )?;
         #[cfg(test)]
         eprintln!("windows CA install: writing cleanup journal");
         write_windows_ca_journal(thumbprint)?;
         #[cfg(test)]
-        eprintln!("windows CA install: opening CurrentUser Root store");
-        let store = open_windows_user_root_store().map_err(|error| {
-            let _ = remove_windows_ca_journal();
-            error
-        });
-        let store = store?;
-
-        #[cfg(test)]
-        eprintln!("windows CA install: adding certificate through certificate store API");
-        let add = unsafe {
-            CertAddEncodedCertificateToStore(
-                Some(store),
-                X509_ASN_ENCODING,
-                certificate_der,
-                CERT_STORE_ADD_NEW,
-                None,
-            )
+        eprintln!("windows CA install: importing certificate with certutil");
+        let status = Command::new(crate::windows_system_executable("certutil.exe"))
+            .args(["-f", "-user", "-addstore", "Root"])
+            .arg(certificate.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = remove_windows_ca_journal();
+                return Err(format!(
+                    "could not trust temporary Claude Desktop certificate: {error}"
+                ));
+            }
         };
-        let close = unsafe { CertCloseStore(Some(store), 0) };
-        if let Err(error) = add {
+        if !status.success() {
             let _ = remove_windows_ca_journal();
-            return Err(format!(
-                "could not trust temporary Claude Desktop certificate: {error}"
-            ));
+            return Err("Windows rejected the temporary Claude Desktop certificate".to_string());
         }
-        close.map_err(|error| format!("could not close the current-user Root store: {error}"))?;
         #[cfg(test)]
         eprintln!("windows CA install: certificate store update finished");
         Ok(Self {
