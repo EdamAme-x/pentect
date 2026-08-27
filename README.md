@@ -38,4 +38,4 @@ providers. Start with the [documentation](https://pentect.dev/).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) 
