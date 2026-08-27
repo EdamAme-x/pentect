@@ -486,12 +486,15 @@ impl WindowsUserCaGuard {
         })?;
         #[cfg(test)]
         eprintln!("windows CA install: adding certificate");
-        let context = unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, certificate_der) }
-            .map_err(|error| {
+        let context = unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, certificate_der) };
+        if context.is_null() {
+            let error = windows::core::Error::from_win32();
             let _ = unsafe { CertCloseStore(Some(store), 0) };
             let _ = remove_windows_ca_journal();
-            format!("could not parse temporary Claude Desktop certificate: {error}")
-        })?;
+            return Err(format!(
+                "could not parse temporary Claude Desktop certificate: {error}"
+            ));
+        }
         let source = CRYPTUI_WIZ_IMPORT_SRC_INFO {
             dwSize: std::mem::size_of::<CRYPTUI_WIZ_IMPORT_SRC_INFO>() as u32,
             dwSubjectChoice: CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT,
