@@ -401,7 +401,7 @@ impl WindowsUserCaGuard {
         )?;
         write_windows_ca_journal(serial)?;
         let status = Command::new(crate::windows_system_executable("certutil.exe"))
-            .args(["-user", "-addstore", "Root"])
+            .args(["-f", "-user", "-addstore", "Root"])
             .arg(certificate.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
