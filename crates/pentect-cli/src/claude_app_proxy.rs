@@ -351,6 +351,53 @@ fn open_windows_user_root_store(
 }
 
 #[cfg(windows)]
+fn open_windows_user_root_registry_store() -> Result<
+    (
+        windows::Win32::Security::Cryptography::HCERTSTORE,
+        windows::Win32::System::Registry::HKEY,
+    ),
+    String,
+> {
+    use windows::Win32::Security::Cryptography::{
+        CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_STORE_PROV_REG,
+    };
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
+    };
+
+    let mut key = HKEY::default();
+    unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::w!("Software\\Microsoft\\SystemCertificates\\Root"),
+            None,
+            KEY_READ | KEY_WRITE,
+            &mut key,
+        )
+    }
+    .ok()
+    .map_err(|error| format!("could not open the current-user Root registry store: {error}"))?;
+    let store = unsafe {
+        CertOpenStore(
+            CERT_STORE_PROV_REG,
+            0,
+            None,
+            CERT_OPEN_STORE_FLAGS(0),
+            Some(key.0 as *const std::ffi::c_void),
+        )
+    };
+    match store {
+        Ok(store) => Ok((store, key)),
+        Err(error) => {
+            let _ = unsafe { RegCloseKey(key) };
+            Err(format!(
+                "could not open the current-user Root registry certificate provider: {error}"
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
 fn find_windows_user_ca(thumbprint: &str) -> Result<bool, String> {
     use windows::Win32::Security::Cryptography::{
         CertCloseStore, CertFindCertificateInStore, CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB,
@@ -464,6 +511,11 @@ struct WindowsUserCaGuard {
 #[cfg(windows)]
 impl WindowsUserCaGuard {
     fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
+        use windows::Win32::Security::Cryptography::{
+            CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
+        };
+        use windows::Win32::System::Registry::RegCloseKey;
+
         validate_ca_thumbprint(thumbprint)?;
         if windows_user_ca_present(thumbprint)? {
             return Err(
@@ -471,42 +523,42 @@ impl WindowsUserCaGuard {
                     .to_string(),
             );
         }
-        let directory = crate::secure_temp::SecureTempDirectory::create(
-            "pentect-claude-ca-",
-            "Claude Desktop certificate",
-        )?;
-        let certificate = crate::secure_temp::SecureTempFile::create(
-            directory.path(),
-            "root-",
-            ".cer",
-            certificate_der,
-            "Claude Desktop certificate",
-        )?;
         #[cfg(test)]
         eprintln!("windows CA install: writing cleanup journal");
         write_windows_ca_journal(thumbprint)?;
         #[cfg(test)]
-        eprintln!("windows CA install: importing certificate with certutil");
-        let status = Command::new(crate::windows_system_executable("certutil.exe"))
-            .args(["-f", "-user", "-addstore", "Root"])
-            .arg(certificate.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let status = match status {
-            Ok(status) => status,
+        eprintln!("windows CA install: opening registry certificate provider");
+        let (store, key) = match open_windows_user_root_registry_store() {
+            Ok(handles) => handles,
             Err(error) => {
                 let _ = remove_windows_ca_journal();
-                return Err(format!(
-                    "could not trust temporary Claude Desktop certificate: {error}"
-                ));
+                return Err(error);
             }
         };
-        if !status.success() {
+        #[cfg(test)]
+        eprintln!("windows CA install: adding certificate through registry provider");
+        let add = unsafe {
+            CertAddEncodedCertificateToStore(
+                Some(store),
+                X509_ASN_ENCODING,
+                certificate_der,
+                CERT_STORE_ADD_NEW,
+                None,
+            )
+        };
+        let close_store = unsafe { CertCloseStore(Some(store), 0) };
+        let close_key = unsafe { RegCloseKey(key) };
+        if let Err(error) = add {
             let _ = remove_windows_ca_journal();
-            return Err("Windows rejected the temporary Claude Desktop certificate".to_string());
+            return Err(format!(
+                "could not trust temporary Claude Desktop certificate: {error}"
+            ));
         }
+        close_store
+            .map_err(|error| format!("could not close the Root certificate provider: {error}"))?;
+        close_key
+            .ok()
+            .map_err(|error| format!("could not close the Root registry store: {error}"))?;
         #[cfg(test)]
         eprintln!("windows CA install: certificate store update finished");
         Ok(Self {
