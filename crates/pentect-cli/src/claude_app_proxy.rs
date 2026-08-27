@@ -464,8 +464,14 @@ struct WindowsUserCaGuard {
 #[cfg(windows)]
 impl WindowsUserCaGuard {
     fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
+        use windows::Win32::Security::Cryptography::UI::{
+            CryptUIWizImport, CRYPTUI_WIZ_IMPORT_ALLOW_CERT, CRYPTUI_WIZ_IMPORT_SRC_INFO,
+            CRYPTUI_WIZ_IMPORT_SRC_INFO_0, CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT,
+            CRYPTUI_WIZ_NO_UI,
+        };
         use windows::Win32::Security::Cryptography::{
-            CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
+            CertCloseStore, CertCreateCertificateContext, CertFreeCertificateContext,
+            X509_ASN_ENCODING,
         };
 
         validate_ca_thumbprint(thumbprint)?;
@@ -480,15 +486,30 @@ impl WindowsUserCaGuard {
         })?;
         #[cfg(test)]
         eprintln!("windows CA install: adding certificate");
+        let context = unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, certificate_der) }
+            .map_err(|error| {
+            let _ = unsafe { CertCloseStore(Some(store), 0) };
+            let _ = remove_windows_ca_journal();
+            format!("could not parse temporary Claude Desktop certificate: {error}")
+        })?;
+        let source = CRYPTUI_WIZ_IMPORT_SRC_INFO {
+            dwSize: std::mem::size_of::<CRYPTUI_WIZ_IMPORT_SRC_INFO>() as u32,
+            dwSubjectChoice: CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT,
+            Anonymous: CRYPTUI_WIZ_IMPORT_SRC_INFO_0 {
+                pCertContext: context,
+            },
+            ..Default::default()
+        };
         let add = unsafe {
-            CertAddEncodedCertificateToStore(
-                Some(store),
-                X509_ASN_ENCODING,
-                certificate_der,
-                CERT_STORE_ADD_NEW,
+            CryptUIWizImport(
+                CRYPTUI_WIZ_NO_UI | CRYPTUI_WIZ_IMPORT_ALLOW_CERT,
                 None,
+                windows::core::PCWSTR::null(),
+                Some(&source),
+                Some(store),
             )
         };
+        let _ = unsafe { CertFreeCertificateContext(Some(context)) };
         #[cfg(test)]
         eprintln!("windows CA install: closing Root store");
         let close = unsafe { CertCloseStore(Some(store), 0) };
