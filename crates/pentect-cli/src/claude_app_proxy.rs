@@ -313,18 +313,18 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn remove_windows_ca_journal() -> Result<(), String> {
-    for path in [
-        windows_ca_journal_path()?,
-        legacy_windows_ca_journal_path()?,
-    ] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "could not remove Claude Desktop CA cleanup journal: {error}"
-                ))
-            }
+    remove_windows_ca_journal_at(&windows_ca_journal_path()?)
+}
+
+#[cfg(windows)]
+fn remove_windows_ca_journal_at(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not remove Claude Desktop CA cleanup journal: {error}"
+            ))
         }
     }
     Ok(())
@@ -397,13 +397,14 @@ fn legacy_windows_ca_journal_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-fn read_windows_ca_journal() -> Result<Option<WindowsCaJournal>, String> {
+fn read_windows_ca_journals() -> Result<Vec<(PathBuf, WindowsCaJournal)>, String> {
+    let mut journals = Vec::new();
     for path in [
         windows_ca_journal_path()?,
         legacy_windows_ca_journal_path()?,
     ] {
         match std::fs::read_to_string(&path) {
-            Ok(content) => return parse_windows_ca_journal(&content).map(Some),
+            Ok(content) => journals.push((path, parse_windows_ca_journal(&content)?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(format!(
@@ -412,7 +413,7 @@ fn read_windows_ca_journal() -> Result<Option<WindowsCaJournal>, String> {
             }
         }
     }
-    Ok(None)
+    Ok(journals)
 }
 
 #[cfg(windows)]
@@ -533,25 +534,30 @@ fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
 
 #[cfg(windows)]
 pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
-    let Some(journal) = read_windows_ca_journal()? else {
-        return Ok(false);
-    };
-    Ok(!windows_ca_owner_is_running(journal.owner))
+    Ok(read_windows_ca_journals()?
+        .iter()
+        .any(|(_, journal)| !windows_ca_owner_is_running(journal.owner)))
 }
 
 #[cfg(windows)]
 pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
-    let Some(journal) = read_windows_ca_journal()? else {
+    let journals = read_windows_ca_journals()?;
+    if journals.is_empty() {
         return Ok(());
-    };
-    if windows_ca_owner_is_running(journal.owner) {
+    }
+    if journals
+        .iter()
+        .any(|(_, journal)| windows_ca_owner_is_running(journal.owner))
+    {
         return Err(
             "Claude Desktop protection is active; refusing to remove its certificate".to_string(),
         );
     }
-    remove_windows_user_ca(&journal.thumbprint)?;
-    remove_windows_ca_journal()?;
-    eprintln!("[pentect] Removed a stale temporary Claude Desktop certificate");
+    for (path, journal) in journals {
+        remove_windows_user_ca(&journal.thumbprint)?;
+        remove_windows_ca_journal_at(&path)?;
+    }
+    eprintln!("[pentect] Removed stale temporary Claude Desktop certificates");
     Ok(())
 }
 
@@ -3612,6 +3618,47 @@ mod tests {
         eprintln!("windows CA round trip: checking final absence from a fresh process");
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, false);
         assert!(!windows_ca_cleanup_pending().unwrap());
+
+        // An upgrade can leave a legacy journal while a newer session writes
+        // the current journal. Each journal must remain paired with, and clean
+        // up, its own certificate.
+        let legacy_authority = CertificateAuthority::new().unwrap();
+        let legacy_guard = WindowsUserCaGuard::install(
+            legacy_authority.issuer.der(),
+            &legacy_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::rename(
+            windows_ca_journal_path().unwrap(),
+            legacy_windows_ca_journal_path().unwrap(),
+        )
+        .unwrap();
+        let current_authority = CertificateAuthority::new().unwrap();
+        let current_guard = WindowsUserCaGuard::install(
+            current_authority.issuer.der(),
+            &current_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_windows_ca_journal_path().unwrap(),
+            &legacy_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::write(
+            windows_ca_journal_path().unwrap(),
+            &current_authority.thumbprint,
+        )
+        .unwrap();
+        std::mem::forget(legacy_guard);
+        std::mem::forget(current_guard);
+
+        assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, true);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, true);
+        cleanup_stale_windows_user_ca().unwrap();
+        assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, false);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, false);
+        assert!(!legacy_windows_ca_journal_path().unwrap().exists());
+        assert!(!windows_ca_journal_path().unwrap().exists());
         remove_windows_test_ca_store(&store_name);
 
         match previous {
