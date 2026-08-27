@@ -324,6 +324,14 @@ fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn windows_ca_registry_path(thumbprint: &str) -> Result<windows::core::HSTRING, String> {
+    validate_ca_thumbprint(thumbprint)?;
+    Ok(windows::core::HSTRING::from(format!(
+        "Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}"
+    )))
+}
+
+#[cfg(windows)]
 fn open_windows_user_root_store(
 ) -> Result<windows::Win32::Security::Cryptography::HCERTSTORE, String> {
     use windows::core::w;
@@ -389,41 +397,17 @@ fn find_windows_user_ca(thumbprint: &str) -> Result<bool, String> {
 
 #[cfg(windows)]
 fn remove_windows_user_ca(thumbprint: &str) -> Result<(), String> {
-    use windows::Win32::Security::Cryptography::{
-        CertCloseStore, CertDeleteCertificateFromStore, CertFindCertificateInStore,
-        CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB, X509_ASN_ENCODING,
-    };
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
 
-    validate_ca_thumbprint(thumbprint)?;
-    let mut hash = data_encoding::HEXUPPER
-        .decode(thumbprint.as_bytes())
-        .map_err(|_| "Claude Desktop CA cleanup journal is invalid".to_string())?;
-    let blob = CRYPT_INTEGER_BLOB {
-        cbData: hash.len() as u32,
-        pbData: hash.as_mut_ptr(),
-    };
-    let store = open_windows_user_root_store()?;
-    let context = unsafe {
-        CertFindCertificateInStore(
-            store,
-            X509_ASN_ENCODING,
-            0,
-            CERT_FIND_SHA1_HASH,
-            Some(&blob as *const _ as *const std::ffi::c_void),
-            None,
-        )
-    };
-    if context.is_null() {
-        unsafe { CertCloseStore(Some(store), 0) }
-            .map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+    let path = windows_ca_registry_path(thumbprint)?;
+    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &path) };
+    if status == ERROR_FILE_NOT_FOUND {
         return Ok(());
     }
-    let deleted = unsafe { CertDeleteCertificateFromStore(context) };
-    let closed = unsafe { CertCloseStore(Some(store), 0) };
-    deleted.map_err(|error| {
-        format!("could not remove temporary Claude Desktop certificate: {error}")
-    })?;
-    closed.map_err(|error| format!("could not close the current-user Root store: {error}"))
+    status
+        .ok()
+        .map_err(|error| format!("could not remove temporary Claude Desktop certificate: {error}"))
 }
 
 #[cfg(windows)]
@@ -464,65 +448,97 @@ struct WindowsUserCaGuard {
 #[cfg(windows)]
 impl WindowsUserCaGuard {
     fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
-        use windows::Win32::Security::Cryptography::UI::{
-            CryptUIWizImport, CRYPTUI_WIZ_IMPORT_ALLOW_CERT, CRYPTUI_WIZ_IMPORT_SRC_INFO,
-            CRYPTUI_WIZ_IMPORT_SRC_INFO_0, CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT,
-            CRYPTUI_WIZ_NO_UI,
-        };
         use windows::Win32::Security::Cryptography::{
-            CertCloseStore, CertCreateCertificateContext, CertFreeCertificateContext,
-            X509_ASN_ENCODING,
+            CertCreateCertificateContext, CertFreeCertificateContext,
+            CertSerializeCertificateStoreElement, X509_ASN_ENCODING,
+        };
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+            REG_BINARY, REG_OPTION_NON_VOLATILE,
         };
 
         validate_ca_thumbprint(thumbprint)?;
+        if windows_user_ca_present(thumbprint)? {
+            return Err(
+                "temporary Claude Desktop certificate already exists in CurrentUser Root"
+                    .to_string(),
+            );
+        }
         #[cfg(test)]
         eprintln!("windows CA install: writing cleanup journal");
         write_windows_ca_journal(thumbprint)?;
         #[cfg(test)]
-        eprintln!("windows CA install: opening Root store");
-        let store = open_windows_user_root_store().map_err(|error| {
-            let _ = remove_windows_ca_journal();
-            error
-        })?;
-        #[cfg(test)]
-        eprintln!("windows CA install: adding certificate");
+        eprintln!("windows CA install: serializing certificate");
         let context = unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, certificate_der) };
         if context.is_null() {
             let error = windows::core::Error::from_win32();
-            let _ = unsafe { CertCloseStore(Some(store), 0) };
             let _ = remove_windows_ca_journal();
             return Err(format!(
                 "could not parse temporary Claude Desktop certificate: {error}"
             ));
         }
-        let source = CRYPTUI_WIZ_IMPORT_SRC_INFO {
-            dwSize: std::mem::size_of::<CRYPTUI_WIZ_IMPORT_SRC_INFO>() as u32,
-            dwSubjectChoice: CRYPTUI_WIZ_IMPORT_SUBJECT_CERT_CONTEXT,
-            Anonymous: CRYPTUI_WIZ_IMPORT_SRC_INFO_0 {
-                pCertContext: context,
-            },
-            ..Default::default()
+        let mut serialized_length = 0_u32;
+        let serialized_result = unsafe {
+            CertSerializeCertificateStoreElement(context, 0, None, &mut serialized_length)
         };
+        let mut serialized = vec![0_u8; serialized_length as usize];
+        let serialized_result = serialized_result.and_then(|()| unsafe {
+            CertSerializeCertificateStoreElement(
+                context,
+                0,
+                Some(serialized.as_mut_ptr()),
+                &mut serialized_length,
+            )
+        });
+        let _ = unsafe { CertFreeCertificateContext(Some(context)) };
+        if let Err(error) = serialized_result {
+            let _ = remove_windows_ca_journal();
+            return Err(format!(
+                "could not serialize temporary Claude Desktop certificate: {error}"
+            ));
+        }
+        serialized.truncate(serialized_length as usize);
+
+        #[cfg(test)]
+        eprintln!("windows CA install: writing CurrentUser Root registry entry");
+        let path = windows_ca_registry_path(thumbprint)?;
+        let mut key = HKEY::default();
         let add = unsafe {
-            CryptUIWizImport(
-                CRYPTUI_WIZ_NO_UI | CRYPTUI_WIZ_IMPORT_ALLOW_CERT,
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                &path,
                 None,
                 windows::core::PCWSTR::null(),
-                Some(&source),
-                Some(store),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                None,
+                &mut key,
+                None,
             )
-        };
-        let _ = unsafe { CertFreeCertificateContext(Some(context)) };
-        #[cfg(test)]
-        eprintln!("windows CA install: closing Root store");
-        let close = unsafe { CertCloseStore(Some(store), 0) };
+        }
+        .ok()
+        .and_then(|()| unsafe {
+            RegSetValueExW(
+                key,
+                windows::core::w!("Blob"),
+                None,
+                REG_BINARY,
+                Some(&serialized),
+            )
+            .ok()
+        });
+        if !key.is_invalid() {
+            let _ = unsafe { RegCloseKey(key) };
+        }
         if let Err(error) = add {
+            let _ = remove_windows_user_ca(thumbprint);
             let _ = remove_windows_ca_journal();
             return Err(format!(
                 "could not trust temporary Claude Desktop certificate: {error}"
             ));
         }
-        close.map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+        #[cfg(test)]
+        eprintln!("windows CA install: registry write finished");
         Ok(Self {
             thumbprint: thumbprint.to_string(),
         })

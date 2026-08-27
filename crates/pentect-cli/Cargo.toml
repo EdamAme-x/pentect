@@ -50,8 +50,8 @@ quick-xml = "0.41"
 sha1 = "0.10"
 windows = { version = "0.61.3", features = [
     "Win32_Security_Cryptography",
-    "Win32_Security_Cryptography_UI",
     "Win32_System_Com",
+    "Win32_System_Registry",
     "Win32_UI_Shell",
 ] }
 windows-sys = { version = "0.61.2", features = [
