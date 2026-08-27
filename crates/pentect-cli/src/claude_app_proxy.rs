@@ -324,13 +324,39 @@ fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn open_windows_user_root_store(
+) -> Result<windows::Win32::Security::Cryptography::HCERTSTORE, String> {
+    use windows::core::w;
+    use windows::Win32::Security::Cryptography::{
+        CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_STORE_MAXIMUM_ALLOWED_FLAG,
+        CERT_STORE_OPEN_EXISTING_FLAG, CERT_STORE_PROV_SYSTEM_REGISTRY_W,
+        CERT_SYSTEM_STORE_CURRENT_USER, X509_ASN_ENCODING,
+    };
+
+    let flags = CERT_OPEN_STORE_FLAGS(
+        CERT_SYSTEM_STORE_CURRENT_USER
+            | CERT_STORE_MAXIMUM_ALLOWED_FLAG.0
+            | CERT_STORE_OPEN_EXISTING_FLAG.0,
+    );
+    unsafe {
+        CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_REGISTRY_W,
+            X509_ASN_ENCODING,
+            None,
+            flags,
+            Some(w!("ROOT").as_ptr() as *const std::ffi::c_void),
+        )
+    }
+    .map_err(|error| format!("could not open the current-user Root store: {error}"))
+}
+
+#[cfg(windows)]
 fn find_windows_user_ca(
     thumbprint: &str,
 ) -> Result<Option<*const windows::Win32::Security::Cryptography::CERT_CONTEXT>, String> {
-    use windows::core::w;
     use windows::Win32::Security::Cryptography::{
-        CertCloseStore, CertFindCertificateInStore, CertOpenSystemStoreW, CERT_FIND_SHA1_HASH,
-        CRYPT_INTEGER_BLOB, X509_ASN_ENCODING,
+        CertCloseStore, CertFindCertificateInStore, CERT_FIND_SHA1_HASH, CRYPT_INTEGER_BLOB,
+        X509_ASN_ENCODING,
     };
 
     validate_ca_thumbprint(thumbprint)?;
@@ -341,8 +367,7 @@ fn find_windows_user_ca(
         cbData: hash.len() as u32,
         pbData: hash.as_mut_ptr(),
     };
-    let store = unsafe { CertOpenSystemStoreW(None, w!("ROOT")) }
-        .map_err(|error| format!("could not open the current-user Root store: {error}"))?;
+    let store = open_windows_user_root_store()?;
     let context = unsafe {
         CertFindCertificateInStore(
             store,
@@ -413,17 +438,15 @@ struct WindowsUserCaGuard {
 #[cfg(windows)]
 impl WindowsUserCaGuard {
     fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
-        use windows::core::w;
         use windows::Win32::Security::Cryptography::{
-            CertAddEncodedCertificateToStore, CertCloseStore, CertOpenSystemStoreW,
-            CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
+            CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
         };
 
         validate_ca_thumbprint(thumbprint)?;
         write_windows_ca_journal(thumbprint)?;
-        let store = unsafe { CertOpenSystemStoreW(None, w!("ROOT")) }.map_err(|error| {
+        let store = open_windows_user_root_store().map_err(|error| {
             let _ = remove_windows_ca_journal();
-            format!("could not open the current-user Root store: {error}")
+            error
         })?;
         let add = unsafe {
             CertAddEncodedCertificateToStore(
