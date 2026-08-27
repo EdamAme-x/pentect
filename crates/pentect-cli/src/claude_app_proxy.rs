@@ -3441,6 +3441,39 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn assert_windows_ca_visibility_in_fresh_process(thumbprint: &str, expected: bool) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "claude_app_proxy::tests::windows_user_ca_presence_probe",
+                "--nocapture",
+            ])
+            .env("PENTECT_TEST_WINDOWS_CA_THUMBPRINT", thumbprint)
+            .env(
+                "PENTECT_TEST_WINDOWS_CA_EXPECTED",
+                if expected { "1" } else { "0" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fresh-process CA visibility probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper launched by windows_user_ca_round_trip"]
+    fn windows_user_ca_presence_probe() {
+        let thumbprint = std::env::var("PENTECT_TEST_WINDOWS_CA_THUMBPRINT").unwrap();
+        let expected = std::env::var("PENTECT_TEST_WINDOWS_CA_EXPECTED").unwrap() == "1";
+        assert_eq!(windows_user_ca_present(&thumbprint).unwrap(), expected);
+    }
+
+    #[cfg(windows)]
     #[test]
     #[ignore = "mutates the ephemeral test user's CurrentUser Root store"]
     fn windows_user_ca_round_trip() {
@@ -3464,13 +3497,13 @@ mod tests {
         eprintln!("windows CA round trip: installing");
         let guard =
             WindowsUserCaGuard::install(authority.issuer.der(), &authority.thumbprint).unwrap();
-        eprintln!("windows CA round trip: checking presence");
-        assert!(windows_user_ca_present(&authority.thumbprint).unwrap());
+        eprintln!("windows CA round trip: checking presence from a fresh process");
+        assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
         assert!(windows_ca_cleanup_pending().unwrap());
         eprintln!("windows CA round trip: removing");
         drop(guard);
-        eprintln!("windows CA round trip: checking final absence");
-        assert!(!windows_user_ca_present(&authority.thumbprint).unwrap());
+        eprintln!("windows CA round trip: checking final absence from a fresh process");
+        assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, false);
         assert!(!windows_ca_cleanup_pending().unwrap());
 
         match previous {
