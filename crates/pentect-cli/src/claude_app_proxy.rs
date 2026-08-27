@@ -285,7 +285,14 @@ fn windows_ca_journal_path() -> Result<PathBuf, String> {
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
-    Ok(root.join("Pentect").join("claude-app-temporary-ca.sha1"))
+    // The journal lives in its own directory. `write_windows_ca_journal`
+    // restricts the containing directory to the current user, so it must never
+    // be the shared install root: that would strip the inheritable
+    // SYSTEM/Administrators entries from `bin`, `plugins`, and `runtime`.
+    Ok(root
+        .join("Pentect")
+        .join("claude-app-ca")
+        .join("claude-app-temporary-ca.sha1"))
 }
 
 #[cfg(windows)]
@@ -306,14 +313,18 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn remove_windows_ca_journal() -> Result<(), String> {
-    let path = windows_ca_journal_path()?;
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "could not remove Claude Desktop CA cleanup journal: {error}"
-        )),
+    for path in [windows_ca_journal_path()?, legacy_windows_ca_journal_path()?] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not remove Claude Desktop CA cleanup journal: {error}"
+                ))
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -371,15 +382,31 @@ fn windows_ca_owner_is_running(owner: Option<u32>) -> bool {
     system.process(pid).is_some()
 }
 
+// Releases before the journal moved into its own directory wrote it directly
+// into the install root. Read that location too so a certificate left behind by
+// an older build is still cleaned up after an upgrade.
+#[cfg(windows)]
+fn legacy_windows_ca_journal_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
+    Ok(root.join("Pentect").join("claude-app-temporary-ca.sha1"))
+}
+
 #[cfg(windows)]
 fn read_windows_ca_journal() -> Result<Option<WindowsCaJournal>, String> {
-    match std::fs::read_to_string(windows_ca_journal_path()?) {
-        Ok(content) => parse_windows_ca_journal(&content).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "could not read Claude Desktop CA cleanup journal: {error}"
-        )),
+    for path in [windows_ca_journal_path()?, legacy_windows_ca_journal_path()?] {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => return parse_windows_ca_journal(&content).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not read Claude Desktop CA cleanup journal: {error}"
+                ))
+            }
+        }
     }
+    Ok(None)
 }
 
 #[cfg(windows)]
