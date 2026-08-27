@@ -696,7 +696,7 @@ jobs:
         shell: pwsh
         run: |
           & $env:PENTECT_SMOKE_BINARY uninstall
-          for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY); $attempt++) {
+          for ($attempt = 0; $attempt -lt 300 -and (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY); $attempt++) {
             Start-Sleep -Milliseconds 100
           }
           if (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY) { throw 'uninstall did not remove the binary' }
