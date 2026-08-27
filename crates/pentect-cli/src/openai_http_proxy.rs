@@ -1831,6 +1831,16 @@ fn mask_openai_input(
                 .unwrap_or_default()
                 .to_string();
             match item_type.as_str() {
+                "function_call" => {
+                    if let Some(Value::String(arguments)) = object.get_mut("arguments") {
+                        mask_text(arguments, true, masker)?;
+                    }
+                }
+                "custom_tool_call" => {
+                    if let Some(Value::String(input)) = object.get_mut("input") {
+                        mask_text(input, true, masker)?;
+                    }
+                }
                 "function_call_output" | "custom_tool_call_output" => {
                     if let Some(output) = object.get_mut("output") {
                         mask_openai_input(output, true, masker, files)?;
@@ -3901,6 +3911,35 @@ mod tests {
         let original = tokens.clone();
         mask_embeddings_request(&mut tokens, &mut masker.lock().unwrap()).unwrap();
         assert_eq!(tokens, original);
+    }
+
+    #[test]
+    fn responses_tool_call_history_masks_arguments_and_custom_input() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let mut input = serde_json::json!([
+            {
+                "type": "function_call",
+                "name": "shell",
+                "arguments": "{\"command\":\"OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\"}"
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "exec_command",
+                "input": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+            }
+        ]);
+        mask_openai_input(&mut input, false, &mut masker, &HashMap::new()).unwrap();
+        for field in [&input[0]["arguments"], &input[1]["input"]] {
+            let protected = field.as_str().unwrap();
+            assert!(protected.contains("<<"), "{protected}");
+            assert!(
+                !protected.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+                "{protected}"
+            );
+        }
     }
 
     #[test]

@@ -1280,6 +1280,20 @@ mod tests {
     }
 
     #[test]
+    fn json_sibling_secret_context_is_order_independent() {
+        for input in [
+            r#"{"value":"correcthorsebattery","name":"db_password"}"#,
+            r#"{"value":"correcthorsebattery","key":"db_password"}"#,
+            r#"{"value":"correcthorsebattery","env":"db_password"}"#,
+        ] {
+            let result = mj(input);
+            assert!(!result.masked.contains("correcthorsebattery"), "{input}");
+            assert!(result.masked.contains("<<"), "{input}");
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+        }
+    }
+
+    #[test]
     fn ndjson_sensitive_values_are_parsed_per_line() {
         let input = "{\"password\":\"hunter2\"}\n{\"token\":\"abcdef\"}\n";
         let r = mn(input);
