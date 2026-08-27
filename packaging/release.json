@@ -3,36 +3,36 @@
     "license": {
       "asset": "LICENSE",
       "sha256": "c87936a4168b4cb93850c94a7f98e03e372145df0ecb3c90f7f02cd1a1fed248",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.58/LICENSE"
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.60/LICENSE"
     },
     "third_party_licenses": {
       "asset": "THIRD_PARTY_LICENSES.txt",
-      "sha256": "0d839725680e0e94972fe374c166fc393aa96a9d55e6690f4937714ed9bbf330",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.58/THIRD_PARTY_LICENSES.txt"
+      "sha256": "40efcb8a1fa5b5c81ee5f12e96dcb885d6103225fb8b1b6e64199cd8a98456bb",
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.60/THIRD_PARTY_LICENSES.txt"
     }
   },
   "systems": {
     "aarch64-darwin": {
       "asset": "pentect-macos-aarch64",
-      "sha256": "12b2b4b5aa71862e14d11bdbc8aa9d04c230278c2eee96cf9a7f1e033e25843c",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.58/pentect-macos-aarch64"
+      "sha256": "574b22a49a1c7f6b843f631d0808368d6459667f91256969d2c71b743d650bf2",
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.60/pentect-macos-aarch64"
     },
     "aarch64-linux": {
       "asset": "pentect-linux-aarch64",
-      "sha256": "51d8770952548d5357b0959bbfd694e02f86bae6694c64e0f42a4d1b0a5a72bc",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.58/pentect-linux-aarch64"
+      "sha256": "fa341c0dfa8c728b1bae45659240777d40c3f94b346d5529a15f873cb3f562cd",
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.60/pentect-linux-aarch64"
     },
     "x86_64-darwin": {
       "asset": "pentect-macos-x86_64",
-      "sha256": "653f8b69a36128e89acf98efc6fcb0054af7e6622054e80e6f0864867f050a06",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.58/pentect-macos-x86_64"
+      "sha256": "86fd9921f9ff658b8b61e447894c6f7a9160fa882e26eb5047b693517c6e137b",
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.60/pentect-macos-x86_64"
     },
     "x86_64-linux": {
       "asset": "pentect-linux-x86_64",
-      "sha256": "31c1d6b11be04538fe9ea8b1212c4b9c9c6bc06bd1b6068cf96afdf85d7804c7",
-      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.58/pentect-linux-x86_64"
+      "sha256": "506b8993daa6aebfad75671e7299ebb7f4d494b4af086949001d6d40a6774cec",
+      "url": "https://github.com/EdamAme-x/pentect/releases/download/v0.0.60/pentect-linux-x86_64"
     }
   },
-  "tag": "v0.0.58",
-  "version": "0.0.58"
+  "tag": "v0.0.60",
+  "version": "0.0.60"
 }
