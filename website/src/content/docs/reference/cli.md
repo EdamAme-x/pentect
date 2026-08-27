@@ -65,8 +65,8 @@ App commands also support
 
 On Windows, `pentect claude app` separately confirms the session-only
 current-user certificate needed for Claude Desktop HTTPS protection. Its
-`--yes` option skips that prompt in reviewed automation; it does not make the
-certificate permanent or machine-wide.
+`--yes` option skips Pentect's prompt; it does not bypass a Windows Root-store
+security confirmation, or make the certificate permanent or machine-wide.
 
 Codex and Claude arguments are forwarded directly:
 

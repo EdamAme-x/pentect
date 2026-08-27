@@ -326,75 +326,36 @@ fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
 #[cfg(windows)]
 fn open_windows_user_root_store(
 ) -> Result<windows::Win32::Security::Cryptography::HCERTSTORE, String> {
-    use windows::core::w;
     use windows::Win32::Security::Cryptography::{
         CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_STORE_MAXIMUM_ALLOWED_FLAG,
         CERT_STORE_OPEN_EXISTING_FLAG, CERT_STORE_PROV_SYSTEM_REGISTRY_W,
         CERT_SYSTEM_STORE_CURRENT_USER, X509_ASN_ENCODING,
     };
 
-    let flags = CERT_OPEN_STORE_FLAGS(
-        CERT_SYSTEM_STORE_CURRENT_USER
-            | CERT_STORE_MAXIMUM_ALLOWED_FLAG.0
-            | CERT_STORE_OPEN_EXISTING_FLAG.0,
-    );
+    #[cfg(test)]
+    let test_store = std::env::var_os("PENTECT_TEST_WINDOWS_CA_STORE")
+        .map(|name| windows::core::HSTRING::from(name.to_string_lossy().as_ref()));
+    #[cfg(not(test))]
+    let test_store: Option<windows::core::HSTRING> = None;
+    let store_name = test_store
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| windows::core::HSTRING::from("ROOT"));
+    let mut raw_flags = CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_MAXIMUM_ALLOWED_FLAG.0;
+    if test_store.is_none() {
+        raw_flags |= CERT_STORE_OPEN_EXISTING_FLAG.0;
+    }
+    let flags = CERT_OPEN_STORE_FLAGS(raw_flags);
     unsafe {
         CertOpenStore(
             CERT_STORE_PROV_SYSTEM_REGISTRY_W,
             X509_ASN_ENCODING,
             None,
             flags,
-            Some(w!("ROOT").as_ptr() as *const std::ffi::c_void),
+            Some(store_name.as_ptr() as *const std::ffi::c_void),
         )
     }
     .map_err(|error| format!("could not open the current-user Root store: {error}"))
-}
-
-#[cfg(windows)]
-fn open_windows_user_root_registry_store() -> Result<
-    (
-        windows::Win32::Security::Cryptography::HCERTSTORE,
-        windows::Win32::System::Registry::HKEY,
-    ),
-    String,
-> {
-    use windows::Win32::Security::Cryptography::{
-        CertOpenStore, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_PROV_REG,
-    };
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
-    };
-
-    let mut key = HKEY::default();
-    unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            windows::core::w!("Software\\Microsoft\\SystemCertificates\\Root"),
-            None,
-            KEY_READ | KEY_WRITE,
-            &mut key,
-        )
-    }
-    .ok()
-    .map_err(|error| format!("could not open the current-user Root registry store: {error}"))?;
-    let store = unsafe {
-        CertOpenStore(
-            CERT_STORE_PROV_REG,
-            CERT_QUERY_ENCODING_TYPE(0),
-            None,
-            CERT_OPEN_STORE_FLAGS(0),
-            Some(key.0 as *const std::ffi::c_void),
-        )
-    };
-    match store {
-        Ok(store) => Ok((store, key)),
-        Err(error) => {
-            let _ = unsafe { RegCloseKey(key) };
-            Err(format!(
-                "could not open the current-user Root registry certificate provider: {error}"
-            ))
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -514,7 +475,6 @@ impl WindowsUserCaGuard {
         use windows::Win32::Security::Cryptography::{
             CertAddEncodedCertificateToStore, CertCloseStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
         };
-        use windows::Win32::System::Registry::RegCloseKey;
 
         validate_ca_thumbprint(thumbprint)?;
         if windows_user_ca_present(thumbprint)? {
@@ -527,16 +487,16 @@ impl WindowsUserCaGuard {
         eprintln!("windows CA install: writing cleanup journal");
         write_windows_ca_journal(thumbprint)?;
         #[cfg(test)]
-        eprintln!("windows CA install: opening registry certificate provider");
-        let (store, key) = match open_windows_user_root_registry_store() {
-            Ok(handles) => handles,
+        eprintln!("windows CA install: opening current-user certificate store");
+        let store = match open_windows_user_root_store() {
+            Ok(store) => store,
             Err(error) => {
                 let _ = remove_windows_ca_journal();
                 return Err(error);
             }
         };
         #[cfg(test)]
-        eprintln!("windows CA install: adding certificate through registry provider");
+        eprintln!("windows CA install: adding certificate through system store provider");
         let add = unsafe {
             CertAddEncodedCertificateToStore(
                 Some(store),
@@ -547,7 +507,6 @@ impl WindowsUserCaGuard {
             )
         };
         let close_store = unsafe { CertCloseStore(Some(store), 0) };
-        let close_key = unsafe { RegCloseKey(key) };
         if let Err(error) = add {
             let _ = remove_windows_ca_journal();
             return Err(format!(
@@ -556,9 +515,6 @@ impl WindowsUserCaGuard {
         }
         close_store
             .map_err(|error| format!("could not close the Root certificate provider: {error}"))?;
-        close_key
-            .ok()
-            .map_err(|error| format!("could not close the Root registry store: {error}"))?;
         #[cfg(test)]
         eprintln!("windows CA install: certificate store update finished");
         Ok(Self {
@@ -3496,6 +3452,22 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn remove_windows_test_ca_store(name: &str) {
+        use windows::Win32::Security::Cryptography::{
+            CertUnregisterSystemStore, CERT_SYSTEM_STORE_CURRENT_USER,
+        };
+
+        let name = windows::core::HSTRING::from(name);
+        let removed = unsafe {
+            CertUnregisterSystemStore(
+                name.as_ptr() as *const std::ffi::c_void,
+                CERT_SYSTEM_STORE_CURRENT_USER,
+            )
+        };
+        assert!(removed.as_bool(), "could not remove temporary test store");
+    }
+
+    #[cfg(windows)]
     #[test]
     #[ignore = "mutates the ephemeral test user's CurrentUser Root store"]
     fn windows_user_ca_round_trip() {
@@ -3512,6 +3484,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&state).unwrap();
         std::env::set_var("LOCALAPPDATA", &state);
+        let previous_store = std::env::var_os("PENTECT_TEST_WINDOWS_CA_STORE");
+        let store_name = format!("PentectClaudeCaTest-{}", std::process::id());
+        std::env::set_var("PENTECT_TEST_WINDOWS_CA_STORE", &store_name);
 
         let authority = CertificateAuthority::new().unwrap();
         eprintln!("windows CA round trip: checking initial absence");
@@ -3527,10 +3502,15 @@ mod tests {
         eprintln!("windows CA round trip: checking final absence from a fresh process");
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, false);
         assert!(!windows_ca_cleanup_pending().unwrap());
+        remove_windows_test_ca_store(&store_name);
 
         match previous {
             Some(value) => std::env::set_var("LOCALAPPDATA", value),
             None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match previous_store {
+            Some(value) => std::env::set_var("PENTECT_TEST_WINDOWS_CA_STORE", value),
+            None => std::env::remove_var("PENTECT_TEST_WINDOWS_CA_STORE"),
         }
         let _ = std::fs::remove_dir_all(state);
     }

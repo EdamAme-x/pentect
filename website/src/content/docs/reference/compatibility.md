@@ -94,6 +94,8 @@ Current Claude Desktop builds on Windows reject Chromium's certificate-pin
 switch. Pentect instead asks before installing a session-specific public CA in
 the current user's trust store, launches Claude with its local proxy setting,
 and removes the certificate on exit. The CA private key stays process-local.
+Windows may also show its own Root-store security confirmation, which Pentect
+does not suppress or bypass.
 Crash residue is journaled and removed before the next protected launch. This
 path still requires a real-account release verification before it is listed as
 fully supported; use `pentect claude` for Claude Code when Desktop coverage is

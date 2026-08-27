@@ -98,7 +98,9 @@ the Pentect process, and Pentect removes the certificate when Claude Desktop
 exits. If Pentect or Claude crashes, the next `pentect claude app` launch
 removes the stale certificate before doing anything else; `pentect doctor
 --fix` can also remove it. Declining makes no trust-store change. Use `--yes`
-only in reviewed automation.
+only to skip Pentect's own prompt. Windows can still show its security
+confirmation for the Root store; Pentect does not bypass it, so this launch
+path is not suitable for unattended automation.
 :::
 
 Desktop protection affects only the launch started by Pentect. Test app
