@@ -298,7 +298,8 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
         format!("could not create Claude Desktop CA cleanup directory: {error}")
     })?;
     crate::secure_temp::restrict_to_current_user(parent)?;
-    std::fs::write(&path, thumbprint)
+    let journal = format!("{thumbprint}\n{}\n", std::process::id());
+    std::fs::write(&path, journal)
         .map_err(|error| format!("could not write Claude Desktop CA cleanup journal: {error}"))?;
     crate::secure_temp::restrict_to_current_user(&path)
 }
@@ -321,6 +322,64 @@ fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
         return Err("Claude Desktop CA cleanup journal is invalid".to_string());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsCaJournal {
+    thumbprint: String,
+    owner: Option<u32>,
+}
+
+#[cfg(windows)]
+fn parse_windows_ca_journal(content: &str) -> Result<WindowsCaJournal, String> {
+    let mut lines = content.lines();
+    let thumbprint = lines
+        .next()
+        .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())?;
+    validate_ca_thumbprint(thumbprint)?;
+    let owner = lines
+        .next()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|owner| *owner != 0)
+                .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())
+        })
+        .transpose()?;
+    if lines.next().is_some() {
+        return Err("Claude Desktop CA cleanup journal is invalid".to_string());
+    }
+    Ok(WindowsCaJournal {
+        thumbprint: thumbprint.to_string(),
+        owner,
+    })
+}
+
+#[cfg(windows)]
+fn windows_ca_owner_is_running(owner: Option<u32>) -> bool {
+    let Some(owner) = owner else {
+        return false;
+    };
+    let pid = sysinfo::Pid::from_u32(owner);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).is_some()
+}
+
+#[cfg(windows)]
+fn read_windows_ca_journal() -> Result<Option<WindowsCaJournal>, String> {
+    match std::fs::read_to_string(windows_ca_journal_path()?) {
+        Ok(content) => parse_windows_ca_journal(&content).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not read Claude Desktop CA cleanup journal: {error}"
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -441,24 +500,23 @@ fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
 
 #[cfg(windows)]
 pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
-    Ok(windows_ca_journal_path()?.is_file())
+    let Some(journal) = read_windows_ca_journal()? else {
+        return Ok(false);
+    };
+    Ok(!windows_ca_owner_is_running(journal.owner))
 }
 
 #[cfg(windows)]
 pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
-    let path = windows_ca_journal_path()?;
-    let thumbprint = match std::fs::read_to_string(&path) {
-        Ok(thumbprint) => thumbprint,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "could not read Claude Desktop CA cleanup journal: {error}"
-            ))
-        }
+    let Some(journal) = read_windows_ca_journal()? else {
+        return Ok(());
     };
-    let thumbprint = thumbprint.trim();
-    validate_ca_thumbprint(thumbprint)?;
-    remove_windows_user_ca(thumbprint)?;
+    if windows_ca_owner_is_running(journal.owner) {
+        return Err(
+            "Claude Desktop protection is active; refusing to remove its certificate".to_string(),
+        );
+    }
+    remove_windows_user_ca(&journal.thumbprint)?;
     remove_windows_ca_journal()?;
     eprintln!("[pentect] Removed a stale temporary Claude Desktop certificate");
     Ok(())
@@ -3407,7 +3465,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_ca_journal_accepts_only_sha1_thumbprints() {
-        assert!(validate_ca_thumbprint("00112233445566778899AABBCCDDEEFF00112233").is_ok());
+        let thumbprint = "00112233445566778899AABBCCDDEEFF00112233";
+        assert!(validate_ca_thumbprint(thumbprint).is_ok());
+        let current = parse_windows_ca_journal(&format!("{thumbprint}\n1234\n")).unwrap();
+        assert_eq!(current.owner, Some(1234));
+        let legacy = parse_windows_ca_journal(thumbprint).unwrap();
+        assert_eq!(legacy.owner, None);
+        assert!(parse_windows_ca_journal(&format!("{thumbprint}\n1234\nextra")).is_err());
         for invalid in [
             "",
             "0011",
@@ -3469,10 +3533,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "mutates the ephemeral test user's CurrentUser Root store"]
+    #[ignore = "mutates an ephemeral current-user certificate test store"]
     fn windows_user_ca_round_trip() {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(30));
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let watchdog = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                std::thread::sleep(Duration::from_millis(100));
+                if watchdog.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
             eprintln!("windows CA round trip exceeded 30 seconds");
             std::process::abort();
         });
@@ -3496,7 +3569,11 @@ mod tests {
             WindowsUserCaGuard::install(authority.issuer.der(), &authority.thumbprint).unwrap();
         eprintln!("windows CA round trip: checking presence from a fresh process");
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
-        assert!(windows_ca_cleanup_pending().unwrap());
+        assert!(windows_ca_journal_path().unwrap().is_file());
+        assert!(!windows_ca_cleanup_pending().unwrap());
+        let active_cleanup = cleanup_stale_windows_user_ca().unwrap_err();
+        assert!(active_cleanup.contains("protection is active"));
+        assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
         eprintln!("windows CA round trip: removing");
         drop(guard);
         eprintln!("windows CA round trip: checking final absence from a fresh process");
@@ -3513,6 +3590,7 @@ mod tests {
             None => std::env::remove_var("PENTECT_TEST_WINDOWS_CA_STORE"),
         }
         let _ = std::fs::remove_dir_all(state);
+        finished.store(true, Ordering::Relaxed);
     }
 
     #[cfg(windows)]
