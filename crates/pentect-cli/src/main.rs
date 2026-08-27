@@ -1317,6 +1317,14 @@ impl AgentToolOpts {
                 "--prompt-proxy" | "--no-prompt-proxy" => {
                     return Err("prompt protection is automatic".to_string());
                 }
+                _ if *tool == client_descriptor::OPENCODE => {
+                    let (trailing_model, trailing_args) = extract_opencode_model_arg(&args[i..])?;
+                    if trailing_model.is_some() {
+                        model = trailing_model;
+                    }
+                    tool_args.extend(trailing_args);
+                    break;
+                }
                 _ => {
                     tool_args.extend(args[i..].iter().cloned());
                     break;
@@ -1335,6 +1343,40 @@ impl AgentToolOpts {
             tool_args,
         })
     }
+}
+
+fn extract_opencode_model_arg(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut model = None;
+    let mut forwarded = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => {
+                forwarded.extend(args[i..].iter().cloned());
+                break;
+            }
+            "--model" | "-m" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{} requires a value", args[i]))?;
+                model = Some(value.clone());
+                i += 2;
+            }
+            value if value.starts_with("--model=") || value.starts_with("-m=") => {
+                let (_, value) = value.split_once('=').expect("matched model assignment");
+                if value.is_empty() {
+                    return Err("--model requires a value".to_string());
+                }
+                model = Some(value.to_string());
+                i += 1;
+            }
+            _ => {
+                forwarded.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok((model, forwarded))
 }
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
@@ -3318,8 +3360,27 @@ mod tests {
         ]
         .map(str::to_string);
         let opencode = AgentToolOpts::parse(&client_descriptor::OPENCODE, &opencode_args).unwrap();
+        assert_eq!(opencode.model.as_deref(), Some("second-client-value"));
+        assert_eq!(opencode.tool_args, ["run"]);
+    }
+
+    #[test]
+    fn opencode_model_after_separator_remains_client_owned() {
+        let args = [
+            "pentect",
+            "opencode",
+            "run",
+            "--",
+            "--model",
+            "literal-prompt-text",
+        ]
+        .map(str::to_string);
+        let opencode = AgentToolOpts::parse(&client_descriptor::OPENCODE, &args).unwrap();
         assert_eq!(opencode.model, None);
-        assert_eq!(opencode.tool_args, opencode_args[2..]);
+        assert_eq!(
+            opencode.tool_args,
+            ["run", "--", "--model", "literal-prompt-text"]
+        );
     }
 
     #[test]

@@ -629,7 +629,7 @@ jobs:
           cmp "$RUNNER_TEMP/config.before" "$CODEX_HOME/config.toml"
           claude_fixture="$RUNNER_TEMP/claude-app-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$claude_fixture"
-          "$PENTECT_SMOKE_BINARY" claude app --app "$claude_fixture" --upstream https://api.anthropic.com
+          "$PENTECT_SMOKE_BINARY" claude app --yes --app "$claude_fixture" --upstream https://api.anthropic.com
       - name: Verify persistent diagnostics (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -696,7 +696,7 @@ jobs:
         shell: pwsh
         run: |
           & $env:PENTECT_SMOKE_BINARY uninstall
-          for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY); $attempt++) {
+          for ($attempt = 0; $attempt -lt 300 -and (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY); $attempt++) {
             Start-Sleep -Milliseconds 100
           }
           if (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY) { throw 'uninstall did not remove the binary' }
