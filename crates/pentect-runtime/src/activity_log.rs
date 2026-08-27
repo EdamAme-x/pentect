@@ -507,11 +507,8 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
                     metrics.blocked_occurrences.saturating_add(event.count);
             }
         }
-        "diagnostic" => {
-            if is_block_event(event.event.as_deref()) {
-                metrics.blocked_occurrences =
-                    metrics.blocked_occurrences.saturating_add(event.count);
-            }
+        "diagnostic" if is_block_event(event.event.as_deref()) => {
+            metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
         }
         _ => {}
     }

@@ -856,7 +856,7 @@ fn cmd_metrics(args: &[String]) -> i32 {
     };
     if !enabled {
         if json {
-            println!("{}", r#"{"enabled":false}"#);
+            println!("{{\"enabled\":false}}");
         } else {
             println!("Pentect privacy metrics are disabled (metrics.enabled = false).");
         }
