@@ -36,7 +36,7 @@ pub(crate) use explicit::EXPLICIT_SECRET_PREFIXES;
 pub use key_value::KeyValueDetector;
 pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use rule::{RuleDetector, RuleSpec};
-pub(crate) use structural::SECRET_VALUE_HINT;
+pub(crate) use structural::{is_sensitive_key_name, SECRET_VALUE_HINT};
 pub use structural::{EnvValueDetector, SensitiveKeyDetector, StructuralDetector};
 pub use url::UrlDetector;
 pub use validate::Validator;

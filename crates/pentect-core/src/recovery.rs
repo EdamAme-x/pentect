@@ -443,7 +443,7 @@ fn is_remaskable_echo(value: &str, placeholder: &str) -> bool {
             | crate::model::labels::CMD_PASSWORD
             | crate::model::labels::URL_CREDENTIAL
             | crate::model::labels::PRIVATE_KEY
-    )
+    ) || crate::detect::is_sensitive_key_name(&parts.label)
 }
 
 fn sort_and_deduplicate_remask_pairs(pairs: &mut Vec<(String, &str)>) {
@@ -733,13 +733,18 @@ mod tests {
     #[test]
     fn remask_ignores_short_metadata_values() {
         let rec = Recovery::seal(
-            HashMap::from([("<<COUNT_0011223344556677>>".to_string(), "3".to_string())]),
+            HashMap::from([
+                ("<<COUNT_0011223344556677>>".to_string(), "1234".to_string()),
+                (
+                    "<<STATUS_8899aabbccddeeff>>".to_string(),
+                    "ready".to_string(),
+                ),
+            ]),
             &[5u8; 32],
         );
-        assert_eq!(rec.resolve("n=<<COUNT_0011223344556677>>"), "n=3");
         assert_eq!(
-            rec.remask("AKIA3EXAMPLE has a digit"),
-            "AKIA3EXAMPLE has a digit"
+            rec.remask("count 1234 status ready"),
+            "count 1234 status ready"
         );
     }
 
@@ -747,25 +752,28 @@ mod tests {
     fn remask_rehides_short_otp_and_keyed_secrets() {
         let otp = "<<OTP_0011223344556677>>";
         let password = "<<KEYED_SECRET_8899aabbccddeeff>>";
+        let database_password = "<<DB_PASSWORD_aabbccddeeff0011>>";
         let rec = Recovery::seal(
             HashMap::from([
                 (otp.to_string(), "1234".to_string()),
                 (password.to_string(), "abcde".to_string()),
+                (database_password.to_string(), "p1n5".to_string()),
             ]),
             &[5u8; 32],
         );
         assert_eq!(
-            rec.remask("code 1234 password abcde"),
-            format!("code {otp} password {password}")
+            rec.remask("code 1234 password abcde database p1n5"),
+            format!("code {otp} password {password} database {database_password}")
         );
 
         let mut stream = rec.stream_remasker();
         let mut output = stream.push_text(b"code 12");
-        output.extend(stream.push_text(b"34 password abcde"));
+        output.extend(stream.push_text(b"34 password abcde database p1"));
+        output.extend(stream.push_text(b"n5"));
         output.extend(stream.finish());
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            format!("code {otp} password {password}")
+            format!("code {otp} password {password} database {database_password}")
         );
     }
 

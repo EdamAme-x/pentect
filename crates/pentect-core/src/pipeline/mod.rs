@@ -1295,6 +1295,21 @@ mod tests {
     }
 
     #[test]
+    fn short_contextual_secret_is_remasked_after_local_restore() {
+        let input = r#"{"DB_PASSWORD":"p1n5"}"#;
+        let result = mj(input);
+        assert!(
+            result.masked.contains("<<DB_PASSWORD_"),
+            "{}",
+            result.masked
+        );
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+        let remasked = result.recovery.remask("tool echoed p1n5");
+        assert!(!remasked.contains("p1n5"), "{remasked}");
+        assert!(remasked.contains("<<DB_PASSWORD_"), "{remasked}");
+    }
+
+    #[test]
     fn ndjson_sensitive_values_are_parsed_per_line() {
         let input = "{\"password\":\"hunter2\"}\n{\"token\":\"abcdef\"}\n";
         let r = mn(input);
