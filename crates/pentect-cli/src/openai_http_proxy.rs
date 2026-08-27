@@ -446,16 +446,20 @@ async fn proxy_request_inner(
                 .ok()
                 .and_then(|value| value.get("stream").and_then(Value::as_bool))
                 .unwrap_or(false);
-            let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
-            let original = resolve_openai_file_references(
-                body,
-                state,
-                &headers,
-                &account_scope,
-                &mut remote_budget,
-            )
-            .await?;
-            let original = resolve_openai_remote_files(original, &mut remote_budget).await?;
+            let original = if embeddings_path {
+                body
+            } else {
+                let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
+                let original = resolve_openai_file_references(
+                    body,
+                    state,
+                    &headers,
+                    &account_scope,
+                    &mut remote_budget,
+                )
+                .await?;
+                resolve_openai_remote_files(original, &mut remote_budget).await?
+            };
             let masker = Arc::clone(&state.masker);
             let plugins = Arc::clone(&state.plugins);
             let files = {
