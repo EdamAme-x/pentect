@@ -15,11 +15,20 @@ Without `--model`, OpenCode's native Zen provider and model picker remain
 available. Pentect keeps the original provider name and model catalog, but
 routes its requests through the local privacy gateway.
 
-Normal OpenCode arguments pass through. A model flag may appear anywhere:
+Provider setup and credentials stay under OpenCode's native provider ID. If
+`opencode auth list` shows a credential named `pentect` from an older Pentect
+release, reconnect the intended native provider once. Pentect does not guess a
+destination and copy an ambiguous stored credential automatically.
+
+Normal OpenCode arguments pass through. A model flag may appear anywhere before
+the explicit `--` separator:
 
 ```sh
 pentect opencode "Review this project" --model openai/gpt-5
 ```
+
+After `--`, `--model` and `-m` are forwarded unchanged to OpenCode and do not
+select Pentect's provider route.
 
 Pentect currently routes native `opencode`, `openai`, `openrouter`, `anthropic`,
 and `google` providers. Select one with OpenCode's `provider/model` form:

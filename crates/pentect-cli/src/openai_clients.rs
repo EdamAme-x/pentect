@@ -268,28 +268,65 @@ fn run_opencode(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let mut header_env = opts.upstream_header_env.clone();
     let bearer_env = route.bearer_env.filter(|name| {
         std::env::var_os(name).is_some_and(|value| !value.is_empty())
-            && !has_authorization_override(&opts.upstream_header_env)
+            && !has_authorization_override(&header_env)
     });
+    let mut child_key_env = bearer_env.or_else(|| {
+        route
+            .bearer_env
+            .filter(|_| has_authorization_override(&header_env))
+    });
+    if route.protocol == OpenCodeProtocol::Anthropic {
+        if let Some(name) = configured_key_env(&["ANTHROPIC_API_KEY"]) {
+            child_key_env = Some(name);
+            if !has_header_override(&header_env, "x-api-key")
+                && !has_authorization_override(&header_env)
+            {
+                header_env.push(format!("x-api-key={name}"));
+            }
+        } else if has_header_override(&header_env, "x-api-key")
+            || has_authorization_override(&header_env)
+        {
+            child_key_env = Some("ANTHROPIC_API_KEY");
+        }
+    } else if route.protocol == OpenCodeProtocol::Gemini {
+        if let Some(name) = configured_key_env(&[
+            "GOOGLE_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+            "GEMINI_API_KEY",
+        ]) {
+            child_key_env = Some(name);
+            if !has_header_override(&header_env, "x-goog-api-key")
+                && !has_authorization_override(&header_env)
+            {
+                header_env.push(format!("x-goog-api-key={name}"));
+            }
+        } else if has_header_override(&header_env, "x-goog-api-key")
+            || has_authorization_override(&header_env)
+        {
+            child_key_env = Some("GOOGLE_API_KEY");
+        }
+    }
     let proxy = match route.protocol {
         OpenCodeProtocol::OpenAi => OpenCodeProxyGuard::OpenAi(
             crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
                 route.upstream.clone(),
-                &opts.upstream_header_env,
+                &header_env,
                 bearer_env,
             )?,
         ),
         OpenCodeProtocol::Anthropic => OpenCodeProxyGuard::Anthropic(
             crate::claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
                 route.upstream.clone(),
-                &opts.upstream_header_env,
+                &header_env,
             )?,
         ),
         OpenCodeProtocol::Gemini => OpenCodeProxyGuard::Gemini(
             crate::gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
                 route.upstream.clone(),
-                &opts.upstream_header_env,
+                &header_env,
             )?,
         ),
     };
@@ -302,8 +339,19 @@ fn run_opencode(
     )?;
     let mut command = Command::new(&opts.command);
     crate::clear_pentect_control_env(&mut command);
-    crate::upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
-    if let Some(name) = bearer_env {
+    crate::upstream::hide_header_source_env(&mut command, &header_env);
+    for name in [
+        "OPENAI_API_KEY",
+        "OPENCODE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GEMINI_API_KEY",
+    ] {
+        command.env_remove(name);
+    }
+    if let Some(name) = child_key_env {
         command.env(name, "pentect-local");
     }
     crate::apply_plugin_env(&mut command, &active_plugins)?;
@@ -314,10 +362,21 @@ fn run_opencode(
     crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
 }
 
+fn configured_key_env(names: &[&'static str]) -> Option<&'static str> {
+    names
+        .iter()
+        .copied()
+        .find(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
 fn has_authorization_override(specs: &[String]) -> bool {
+    has_header_override(specs, "authorization")
+}
+
+fn has_header_override(specs: &[String], header: &str) -> bool {
     specs.iter().any(|spec| {
         spec.split_once('=')
-            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(header))
     })
 }
 
@@ -430,21 +489,34 @@ fn opencode_config(
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| "OPENCODE_CONFIG_CONTENT.provider must be an object".to_string())?;
-    // Keep OpenCode's native provider identity and catalog while allowing only
-    // its Pentect-routed endpoint. Never copy provider credentials from config.
+    let mut provider_config = providers
+        .remove(provider)
+        .unwrap_or_else(|| Value::Object(Map::new()));
     providers.clear();
-    let mut provider_config = json!({"options": {"baseURL": proxy}});
+    remove_provider_credentials(&mut provider_config);
+    let provider_object = provider_config
+        .as_object_mut()
+        .ok_or_else(|| format!("OPENCODE_CONFIG_CONTENT.provider.{provider} must be an object"))?;
+    let options = provider_object
+        .entry("options")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            format!("OPENCODE_CONFIG_CONTENT.provider.{provider}.options must be an object")
+        })?;
+    options.insert("baseURL".to_string(), Value::String(proxy.to_string()));
     if let Some(package) = package {
-        let provider_object = provider_config
-            .as_object_mut()
-            .expect("provider config is an object");
         provider_object.insert("npm".to_string(), Value::String(package.to_string()));
         if let Some(model_id) = model.and_then(|value| value.strip_prefix(&format!("{provider}/")))
         {
-            provider_object.insert(
-                "models".to_string(),
-                json!({(model_id): {"name": model_id}}),
-            );
+            let models = provider_object
+                .entry("models")
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    format!("OPENCODE_CONFIG_CONTENT.provider.{provider}.models must be an object")
+                })?;
+            models.insert(model_id.to_string(), json!({"name": model_id}));
         }
     }
     providers.insert(provider.to_string(), provider_config);
@@ -462,6 +534,44 @@ fn opencode_config(
     root_object.insert("disabled_providers".to_string(), json!([]));
     serde_json::to_string(&root)
         .map_err(|error| format!("could not encode temporary OpenCode config: {error}"))
+}
+
+fn remove_provider_credentials(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, _| !is_provider_credential_key(key));
+            for value in object.values_mut() {
+                remove_provider_credentials(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_provider_credentials(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_provider_credential_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "token"
+            | "secret"
+            | "password"
+            | "authorization"
+            | "headers"
+            | "credentials"
+            | "accesskeyid"
+            | "secretaccesskey"
+            | "sessiontoken"
+    )
 }
 
 struct PiProviderFile {
@@ -547,7 +657,7 @@ mod tests {
         let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
         std::env::set_var(
             "OPENCODE_CONFIG_CONTENT",
-            r#"{"theme":"dark","provider":{"other":{"options":{"apiKey":"must-not-survive"}}}}"#,
+            r#"{"theme":"dark","provider":{"other":{"options":{"apiKey":"other-secret"}},"openrouter":{"models":{"team-alias":{"name":"Team alias"}},"options":{"timeout":30000,"apiKey":"must-not-survive"}}}}"#,
         );
         let value: Value = serde_json::from_str(
             &opencode_config(
@@ -575,7 +685,13 @@ mod tests {
             "http://127.0.0.1/token"
         );
         assert_eq!(value["provider"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            value["provider"]["openrouter"]["models"]["team-alias"]["name"],
+            "Team alias"
+        );
+        assert_eq!(value["provider"]["openrouter"]["options"]["timeout"], 30000);
         assert!(!value.to_string().contains("must-not-survive"));
+        assert!(!value.to_string().contains("other-secret"));
         assert!(!value.to_string().contains("apiKey"));
         assert!(!value.to_string().contains("pentect/"));
     }
