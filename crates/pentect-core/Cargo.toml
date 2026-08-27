@@ -27,7 +27,13 @@ chacha20 = { workspace = true }
 zeroize = { workspace = true }
 unicode-normalization = { workspace = true }
 data-encoding = { workspace = true }
-openssl = { workspace = true }
+crypto-bigint = { workspace = true }
+crypto-primes = { workspace = true }
+p12-keystore = { workspace = true }
+pkcs1 = { workspace = true }
+pkcs8 = { workspace = true }
+num-bigint = { workspace = true }
+sec1 = { workspace = true }
 bs58 = { workspace = true }
 bip39 = { workspace = true }
 flate2 = { workspace = true }
