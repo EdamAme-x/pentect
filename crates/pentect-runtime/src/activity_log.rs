@@ -482,13 +482,13 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
             }
             increment_metric(
                 &mut metrics.by_surface,
-                safe_metric_dimension(&event.surface),
+                safe_metric_surface(&event.surface).to_string(),
                 event.count,
             );
             for label in &event.labels {
                 increment_metric(
                     &mut metrics.by_secret_type,
-                    safe_metric_dimension(&label.name),
+                    safe_metric_secret_type(&label.name).to_string(),
                     label.count,
                 );
             }
@@ -531,16 +531,25 @@ fn increment_metric(values: &mut BTreeMap<String, u64>, name: String, count: u64
     *value = value.saturating_add(count);
 }
 
-fn safe_metric_dimension(value: &str) -> String {
-    if !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        value.to_string()
-    } else {
-        "OTHER".to_string()
+fn safe_metric_surface(value: &str) -> &str {
+    match value {
+        "prompt" | "output" | "tool" | "read" | "image" => value,
+        _ => "OTHER",
+    }
+}
+
+fn safe_metric_secret_type(value: &str) -> &str {
+    match value {
+        "ACCESS_TOKEN" | "ANTHROPIC_API_KEY" | "API_KEY" | "AWS_AKID" | "AWS_MULTI"
+        | "AWS_S3_BUCKET" | "BASE64_PRIVATE_KEY" | "BASIC_AUTH" | "BEARER_TOKEN" | "CREDENTIAL"
+        | "CREDENTIALS" | "CREDIT_CARD" | "EMAIL_ADDRESS" | "GITHUB_PAT" | "GITHUB_TOKEN"
+        | "GOOGLE_API_KEY" | "HUGGINGFACE_TOKEN" | "IBAN_CODE" | "KEYED_SECRET"
+        | "LIKELY_SECRET" | "OPENAI_API_KEY" | "PASSWORD" | "PEM_PRIVATE_KEY" | "PHONE_NUMBER"
+        | "PRIVATE_KEY" | "SECRET" | "SESSION_TOKEN" | "SLACK_TOKEN" | "SLACK_WEBHOOK"
+        | "STRIPE_SECRET_KEY" | "TELEGRAM_BOT_TOKEN" | "TOKEN" | "UK_NINO" | "URL_CREDENTIAL" => {
+            value
+        }
+        _ => "OTHER",
     }
 }
 
@@ -1516,9 +1525,25 @@ mod tests {
 
     #[test]
     fn privacy_metric_dimensions_collapse_untrusted_values() {
-        assert_eq!(safe_metric_dimension("AWS_AKID"), "AWS_AKID");
-        assert_eq!(safe_metric_dimension("secret\u{1b}[31m"), "OTHER");
-        assert_eq!(safe_metric_dimension(&"x".repeat(65)), "OTHER");
+        assert_eq!(safe_metric_secret_type("AWS_AKID"), "AWS_AKID");
+        assert_eq!(safe_metric_secret_type("accountIdentifier456"), "OTHER");
+        assert_eq!(safe_metric_secret_type("secret\u{1b}[31m"), "OTHER");
+        assert_eq!(safe_metric_surface("prompt"), "prompt");
+        assert_eq!(safe_metric_surface("private-plugin"), "OTHER");
+    }
+
+    #[test]
+    fn image_detection_count_does_not_inflate_blocked_operations() {
+        let mut metrics = PrivacyMetrics::default();
+        aggregate_metric_event(
+            &ActivityEvent::new("detect", "image", 3, BTreeMap::new(), None),
+            &mut metrics,
+        );
+        aggregate_metric_event(
+            &ActivityEvent::new("block", "image", 1, BTreeMap::new(), None),
+            &mut metrics,
+        );
+        assert_eq!(metrics.blocked_occurrences, 1);
     }
 
     #[test]
