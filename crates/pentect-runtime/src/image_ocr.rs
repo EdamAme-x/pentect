@@ -193,6 +193,18 @@ pub(crate) fn skip_text_masking_for_image_field(key: &str, text: &str) -> bool {
     ) && looks_like_base64_image_field_value(text)
 }
 
+pub(crate) fn count_image_results(value: &Value) -> usize {
+    match value {
+        Value::String(text) => {
+            usize::from(looks_like_image_reference(text) || looks_like_base64_image(text))
+        }
+        Value::Array(items) => items.iter().map(count_image_results).sum(),
+        Value::Object(map) if object_marks_image(map) => 1,
+        Value::Object(map) => map.values().map(count_image_results).sum(),
+        Value::Number(_) | Value::Bool(_) | Value::Null => 0,
+    }
+}
+
 pub(crate) fn inspect_tool_images_for_secrets(
     value: &Value,
     key: &[u8; 32],
@@ -3726,6 +3738,17 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    #[test]
+    fn image_result_count_counts_each_image_object_once() {
+        let value = serde_json::json!({
+            "content": [
+                {"type": "image", "data": "not-loaded-while-counting"},
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/two.png"}}
+            ]
+        });
+        assert_eq!(count_image_results(&value), 2);
     }
 
     #[test]

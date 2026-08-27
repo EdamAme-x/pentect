@@ -4322,7 +4322,7 @@ fn image_tool_result_block_reason(
     let cfg = config::image_ocr_config()?;
     if matches!(cfg.mode, config::ImageOcrMode::Off) {
         if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
-            record_image_block();
+            record_image_block(image_ocr::count_image_results(value));
             return Ok(Some("image blocked: OCR is off.".to_string()));
         }
         return Ok(None);
@@ -4336,27 +4336,28 @@ fn image_tool_result_block_reason(
             BTreeMap::new(),
             None,
         );
-        record_image_block();
+        record_image_block(inspection.secret_images);
         return Ok(Some("image blocked: secret text detected.".to_string()));
     }
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {
         return Ok(None);
     }
     if inspection.unscanned_images > 0 {
-        record_image_block();
+        record_image_block(inspection.unscanned_images);
         return Ok(Some(
             "image blocked: image could not be fetched or scanned.".to_string(),
         ));
     }
     if inspection.ocr_failures > 0 {
-        record_image_block();
+        record_image_block(inspection.ocr_failures);
         return Ok(Some("image blocked: image scan failed.".to_string()));
     }
     Ok(None)
 }
 
-fn record_image_block() {
+fn record_image_block(images: usize) {
     activity_log::record_summary("block", "image", 1, BTreeMap::new(), None);
+    activity_log::record_summary("block-image", "image", images as u64, BTreeMap::new(), None);
 }
 
 fn unsupported_tool_result_reason(value: &Value) -> Option<String> {
