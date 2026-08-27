@@ -63,6 +63,11 @@ launched client process. Use `--plugins SOURCE` to add a plugin for one launch.
 App commands also support
 `--app PATH` and `--check`.
 
+On Windows, `pentect claude app` separately confirms the session-only
+current-user certificate needed for Claude Desktop HTTPS protection. Its
+`--yes` option skips Pentect's prompt; it does not bypass a Windows Root-store
+security confirmation, or make the certificate permanent or machine-wide.
+
 Codex and Claude arguments are forwarded directly:
 
 ```sh

@@ -37,7 +37,7 @@ Pentect currently uses the upstream crate without source modifications.
 CARGO PACKAGES
 --------------
 
-532 non-workspace release dependency packages are covered below.
+533 non-workspace release dependency packages are covered below.
 Package labels show the license expression declared in Cargo metadata.
 
 DOCUMENT 1
@@ -444,6 +444,7 @@ Applies to:
 - salsa20 0.11.0 (MIT OR Apache-2.0)
 - scrypt 0.12.0 (MIT OR Apache-2.0)
 - sec1 0.8.1 (Apache-2.0 OR MIT)
+- sha1 0.10.7 (MIT OR Apache-2.0)
 - sha1 0.11.0 (MIT OR Apache-2.0)
 - sha2 0.10.9 (MIT OR Apache-2.0)
 - sha2 0.11.0 (MIT OR Apache-2.0)
@@ -10626,6 +10627,7 @@ DOCUMENT 165
 ~~~~~~~~~~~~
 Applies to:
 - md-5 0.10.6 (MIT OR Apache-2.0)
+- sha1 0.10.7 (MIT OR Apache-2.0)
 - sha2 0.10.9 (MIT OR Apache-2.0)
 
 Copyright (c) 2006-2009 Graydon Hoare

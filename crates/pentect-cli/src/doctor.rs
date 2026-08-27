@@ -46,7 +46,11 @@ struct Check {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Repair {
     AddToPath(PathBuf),
-    MigrateConfig { path: PathBuf },
+    MigrateConfig {
+        path: PathBuf,
+    },
+    #[cfg(windows)]
+    RemoveClaudeDesktopCa,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +92,8 @@ fn parse_args(args: &[String]) -> Result<DoctorOptions, String> {
 
 fn run_checks() -> Vec<Check> {
     let mut checks = vec![check_pentect_binary(), check_path()];
+    #[cfg(windows)]
+    checks.push(check_claude_desktop_ca());
     checks.extend(check_configs());
     checks.extend([
         check_memory_store(),
@@ -97,6 +103,19 @@ fn run_checks() -> Vec<Check> {
         check_command("claude"),
     ]);
     checks
+}
+
+#[cfg(windows)]
+fn check_claude_desktop_ca() -> Check {
+    match crate::claude_app_proxy::windows_ca_cleanup_pending() {
+        Ok(false) => Check::ok("claude-app-ca", "no stale temporary certificate"),
+        Ok(true) => Check::repairable_warn(
+            "claude-app-ca",
+            "a previous Claude Desktop session left a temporary certificate",
+            Repair::RemoveClaudeDesktopCa,
+        ),
+        Err(error) => Check::warn("claude-app-ca", error),
+    }
 }
 
 fn check_pentect_binary() -> Check {
@@ -474,6 +493,10 @@ impl Repair {
                 "back up '{}' and migrate its removed setting names",
                 path.display()
             ),
+            #[cfg(windows)]
+            Self::RemoveClaudeDesktopCa => {
+                "remove the stale temporary Claude Desktop certificate".to_string()
+            }
         }
     }
 
@@ -481,6 +504,11 @@ impl Repair {
         match self {
             Self::AddToPath(directory) => add_to_user_path(directory),
             Self::MigrateConfig { path } => migrate_config_file(path),
+            #[cfg(windows)]
+            Self::RemoveClaudeDesktopCa => {
+                crate::claude_app_proxy::cleanup_stale_windows_user_ca()?;
+                Ok("removed the stale temporary Claude Desktop certificate".to_string())
+            }
         }
     }
 }

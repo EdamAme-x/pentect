@@ -15,7 +15,7 @@ drift is visible before the next release.
 | OpenCode `1.18.20` | Real launch on Linux and all installer platforms | `pentect opencode` |
 | Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
 | ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests | `pentect codex app` |
-| Claude Desktop | Protocol tests; `1.24012.9` was manually launch-tested, while `1.34493.1` is known incompatible | `pentect claude app` only on an explicitly compatible build |
+| Claude Desktop | Protocol tests; Windows current-user trust-store launch path awaiting real-account release verification | `pentect claude app` with explicit certificate confirmation |
 
 ## Not implemented
 
@@ -90,14 +90,16 @@ that local handles are not printed.
 | Claude Desktop | Protocol support exists, but current build compatibility is restricted as described below |
 | Other app modes | Not claimed unless listed here |
 
-Claude Desktop `1.34493.1` on Windows deliberately rejects the Chromium
-certificate-pin switch required by Pentect's ephemeral local CA. Pentect does
-not weaken certificate verification or install that CA into the system trust
-store, so this build cannot use `pentect claude app`. Claude Desktop
-`1.24012.9` is an observed compatible point from a manual smoke test, not a
-guaranteed version range. Do not update or downgrade solely from an inferred
-range; check this page for an explicitly tested build. Use `pentect claude` for
-Claude Code.
+Current Claude Desktop builds on Windows reject Chromium's certificate-pin
+switch. Pentect instead asks before installing a session-specific public CA in
+the current user's trust store, launches Claude with its local proxy setting,
+and removes the certificate on exit. The CA private key stays process-local.
+Windows may also show its own Root-store security confirmation, which Pentect
+does not suppress or bypass.
+Crash residue is journaled and removed before the next protected launch. This
+path still requires a real-account release verification before it is listed as
+fully supported; use `pentect claude` for Claude Code when Desktop coverage is
+not acceptable.
 
 ## Not covered
 

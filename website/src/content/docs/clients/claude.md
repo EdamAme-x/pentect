@@ -91,14 +91,16 @@ credentials, and troubleshooting.
 
 ## Claude Desktop
 
-::: danger
-Claude Desktop `1.34493.1` on Windows rejects the certificate-pin switch that
-Pentect requires for its ephemeral local CA, so that build cannot be protected
-with `pentect claude app`. Pentect will not bypass certificate verification or
-install a system CA. Version `1.24012.9` is an older observed-compatible point,
-not a guaranteed version ceiling. Use `pentect claude` for Claude Code and see
-the [compatibility matrix](/reference/compatibility/#desktop-testing) before
-using Desktop mode.
+::: warning
+On Windows, `pentect claude app` asks before adding a session-specific public
+CA certificate to the current user's trust store. Its private key remains in
+the Pentect process, and Pentect removes the certificate when Claude Desktop
+exits. If Pentect or Claude crashes, the next `pentect claude app` launch
+removes the stale certificate before doing anything else; `pentect doctor
+--fix` can also remove it. Declining makes no trust-store change. Use `--yes`
+only to skip Pentect's own prompt. Windows can still show its security
+confirmation for the Root store; Pentect does not bypass it, so this launch
+path is not suitable for unattended automation.
 :::
 
 Desktop protection affects only the launch started by Pentect. Test app
@@ -107,6 +109,7 @@ discovery first. If Pentect cannot find the app, pass its path:
 ```sh
 pentect claude app --check
 pentect claude app --app /path/to/claude
+pentect claude app
 ```
 
 Run `pentect log` in another terminal and test with a fake secret. Check that it
