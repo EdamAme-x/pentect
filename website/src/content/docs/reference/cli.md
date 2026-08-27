@@ -87,6 +87,9 @@ pentect pi --model gpt-5
 | `pentect log [--json \| --path]` | Show persistent diagnostics and follow protection events |
 | `pentect metrics [--json]` | Show local counts by secret type and protection surface |
 
+Image statistics distinguish blocked operations from blocked images: one tool
+operation containing three blocked images counts as one operation and three images.
+
 ### `mask`
 
 Mask UTF-8 standard input. It infers structured formats from content when no

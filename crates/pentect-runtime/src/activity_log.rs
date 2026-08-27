@@ -81,6 +81,7 @@ struct PrivacyMetrics {
     scope: &'static str,
     masked_text_occurrences: u64,
     redacted_image_occurrences: u64,
+    blocked_image_occurrences: u64,
     restoration_operations: u64,
     blocked_occurrences: u64,
     warning_occurrences: u64,
@@ -388,6 +389,7 @@ pub(crate) fn print_metrics(json: bool) -> Result<(), String> {
     println!("Pentect privacy metrics (retained local logs)");
     println!("Masked occurrences: {}", metrics.masked_text_occurrences);
     println!("Redacted images: {}", metrics.redacted_image_occurrences);
+    println!("Blocked images: {}", metrics.blocked_image_occurrences);
     println!(
         "Local restoration operations: {}",
         metrics.restoration_operations
@@ -499,6 +501,11 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
         }
         "block" => {
             metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
+        }
+        "block-image" => {
+            metrics.blocked_image_occurrences = metrics
+                .blocked_image_occurrences
+                .saturating_add(event.count);
         }
         "warning" => {
             metrics.warning_occurrences = metrics.warning_occurrences.saturating_add(event.count);
@@ -1543,7 +1550,12 @@ mod tests {
             &ActivityEvent::new("block", "image", 1, BTreeMap::new(), None),
             &mut metrics,
         );
+        aggregate_metric_event(
+            &ActivityEvent::new("block-image", "image", 3, BTreeMap::new(), None),
+            &mut metrics,
+        );
         assert_eq!(metrics.blocked_occurrences, 1);
+        assert_eq!(metrics.blocked_image_occurrences, 3);
     }
 
     #[test]
