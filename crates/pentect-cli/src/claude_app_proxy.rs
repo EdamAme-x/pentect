@@ -313,7 +313,10 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn remove_windows_ca_journal() -> Result<(), String> {
-    for path in [windows_ca_journal_path()?, legacy_windows_ca_journal_path()?] {
+    for path in [
+        windows_ca_journal_path()?,
+        legacy_windows_ca_journal_path()?,
+    ] {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -395,7 +398,10 @@ fn legacy_windows_ca_journal_path() -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 fn read_windows_ca_journal() -> Result<Option<WindowsCaJournal>, String> {
-    for path in [windows_ca_journal_path()?, legacy_windows_ca_journal_path()?] {
+    for path in [
+        windows_ca_journal_path()?,
+        legacy_windows_ca_journal_path()?,
+    ] {
         match std::fs::read_to_string(&path) {
             Ok(content) => return parse_windows_ca_journal(&content).map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
