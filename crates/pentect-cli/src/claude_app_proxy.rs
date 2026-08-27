@@ -285,7 +285,14 @@ fn windows_ca_journal_path() -> Result<PathBuf, String> {
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
-    Ok(root.join("Pentect").join("claude-app-temporary-ca.sha1"))
+    // The journal lives in its own directory. `write_windows_ca_journal`
+    // restricts the containing directory to the current user, so it must never
+    // be the shared install root: that would strip the inheritable
+    // SYSTEM/Administrators entries from `bin`, `plugins`, and `runtime`.
+    Ok(root
+        .join("Pentect")
+        .join("claude-app-ca")
+        .join("claude-app-temporary-ca.sha1"))
 }
 
 #[cfg(windows)]
@@ -306,14 +313,21 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn remove_windows_ca_journal() -> Result<(), String> {
-    let path = windows_ca_journal_path()?;
+    remove_windows_ca_journal_at(&windows_ca_journal_path()?)
+}
+
+#[cfg(windows)]
+fn remove_windows_ca_journal_at(path: &std::path::Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "could not remove Claude Desktop CA cleanup journal: {error}"
-        )),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not remove Claude Desktop CA cleanup journal: {error}"
+            ))
+        }
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -371,15 +385,35 @@ fn windows_ca_owner_is_running(owner: Option<u32>) -> bool {
     system.process(pid).is_some()
 }
 
+// Releases before the journal moved into its own directory wrote it directly
+// into the install root. Read that location too so a certificate left behind by
+// an older build is still cleaned up after an upgrade.
 #[cfg(windows)]
-fn read_windows_ca_journal() -> Result<Option<WindowsCaJournal>, String> {
-    match std::fs::read_to_string(windows_ca_journal_path()?) {
-        Ok(content) => parse_windows_ca_journal(&content).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "could not read Claude Desktop CA cleanup journal: {error}"
-        )),
+fn legacy_windows_ca_journal_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
+    Ok(root.join("Pentect").join("claude-app-temporary-ca.sha1"))
+}
+
+#[cfg(windows)]
+fn read_windows_ca_journals() -> Result<Vec<(PathBuf, WindowsCaJournal)>, String> {
+    let mut journals = Vec::new();
+    for path in [
+        windows_ca_journal_path()?,
+        legacy_windows_ca_journal_path()?,
+    ] {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => journals.push((path, parse_windows_ca_journal(&content)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not read Claude Desktop CA cleanup journal: {error}"
+                ))
+            }
+        }
     }
+    Ok(journals)
 }
 
 #[cfg(windows)]
@@ -500,25 +534,30 @@ fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
 
 #[cfg(windows)]
 pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
-    let Some(journal) = read_windows_ca_journal()? else {
-        return Ok(false);
-    };
-    Ok(!windows_ca_owner_is_running(journal.owner))
+    Ok(read_windows_ca_journals()?
+        .iter()
+        .any(|(_, journal)| !windows_ca_owner_is_running(journal.owner)))
 }
 
 #[cfg(windows)]
 pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
-    let Some(journal) = read_windows_ca_journal()? else {
+    let journals = read_windows_ca_journals()?;
+    if journals.is_empty() {
         return Ok(());
-    };
-    if windows_ca_owner_is_running(journal.owner) {
+    }
+    if journals
+        .iter()
+        .any(|(_, journal)| windows_ca_owner_is_running(journal.owner))
+    {
         return Err(
             "Claude Desktop protection is active; refusing to remove its certificate".to_string(),
         );
     }
-    remove_windows_user_ca(&journal.thumbprint)?;
-    remove_windows_ca_journal()?;
-    eprintln!("[pentect] Removed a stale temporary Claude Desktop certificate");
+    for (path, journal) in journals {
+        remove_windows_user_ca(&journal.thumbprint)?;
+        remove_windows_ca_journal_at(&path)?;
+    }
+    eprintln!("[pentect] Removed stale temporary Claude Desktop certificates");
     Ok(())
 }
 
@@ -3579,6 +3618,47 @@ mod tests {
         eprintln!("windows CA round trip: checking final absence from a fresh process");
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, false);
         assert!(!windows_ca_cleanup_pending().unwrap());
+
+        // An upgrade can leave a legacy journal while a newer session writes
+        // the current journal. Each journal must remain paired with, and clean
+        // up, its own certificate.
+        let legacy_authority = CertificateAuthority::new().unwrap();
+        let legacy_guard = WindowsUserCaGuard::install(
+            legacy_authority.issuer.der(),
+            &legacy_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::rename(
+            windows_ca_journal_path().unwrap(),
+            legacy_windows_ca_journal_path().unwrap(),
+        )
+        .unwrap();
+        let current_authority = CertificateAuthority::new().unwrap();
+        let current_guard = WindowsUserCaGuard::install(
+            current_authority.issuer.der(),
+            &current_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_windows_ca_journal_path().unwrap(),
+            &legacy_authority.thumbprint,
+        )
+        .unwrap();
+        std::fs::write(
+            windows_ca_journal_path().unwrap(),
+            &current_authority.thumbprint,
+        )
+        .unwrap();
+        std::mem::forget(legacy_guard);
+        std::mem::forget(current_guard);
+
+        assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, true);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, true);
+        cleanup_stale_windows_user_ca().unwrap();
+        assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, false);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, false);
+        assert!(!legacy_windows_ca_journal_path().unwrap().exists());
+        assert!(!windows_ca_journal_path().unwrap().exists());
         remove_windows_test_ca_store(&store_name);
 
         match previous {
