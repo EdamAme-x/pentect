@@ -3370,6 +3370,11 @@ mod tests {
     #[test]
     #[ignore = "mutates the ephemeral test user's CurrentUser Root store"]
     fn windows_user_ca_round_trip() {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(30));
+            eprintln!("windows CA round trip exceeded 30 seconds");
+            std::process::abort();
+        });
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let previous = std::env::var_os("LOCALAPPDATA");
         let state = std::env::temp_dir().join(format!(
@@ -3380,12 +3385,17 @@ mod tests {
         std::env::set_var("LOCALAPPDATA", &state);
 
         let authority = CertificateAuthority::new().unwrap();
+        eprintln!("windows CA round trip: checking initial absence");
         assert!(!windows_user_ca_present(&authority.thumbprint).unwrap());
+        eprintln!("windows CA round trip: installing");
         let guard =
             WindowsUserCaGuard::install(authority.issuer.der(), &authority.thumbprint).unwrap();
+        eprintln!("windows CA round trip: checking presence");
         assert!(windows_user_ca_present(&authority.thumbprint).unwrap());
         assert!(windows_ca_cleanup_pending().unwrap());
+        eprintln!("windows CA round trip: removing");
         drop(guard);
+        eprintln!("windows CA round trip: checking final absence");
         assert!(!windows_user_ca_present(&authority.thumbprint).unwrap());
         assert!(!windows_ca_cleanup_pending().unwrap());
 
