@@ -5,14 +5,18 @@ use crate::model::{
 };
 use crate::normalize::NormalizedView;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use crypto_bigint::BoxedUint;
+use crypto_primes::{is_prime, Flavor};
 use data_encoding::{BASE32, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
-use openssl::encrypt::{Decrypter, Encrypter};
-use openssl::hash::MessageDigest;
-use openssl::pkcs12::Pkcs12;
-use openssl::pkey::{Id, PKey, Private};
-use openssl::provider::Provider;
-use openssl::rsa::Padding;
+use num_bigint::BigUint;
+use p12_keystore::{KeyStore, Pkcs12ImportPolicy};
+use pkcs1::{der::Decode, RsaPrivateKey};
+use pkcs8::der::{
+    asn1::{AnyRef, OctetStringRef, UintRef},
+    Reader, Tag, Tagged,
+};
+use pkcs8::PrivateKeyInfoRef;
 use regex::Regex as RustRegex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -55,11 +59,6 @@ static CREDSWEEPER_BASE32: LazyLock<data_encoding::Encoding> = LazyLock::new(|| 
     specification
         .encoding()
         .expect("CredSweeper-compatible base32 specification")
-});
-static OPENSSL_PKCS12_PROVIDERS: LazyLock<Option<(Provider, Provider)>> = LazyLock::new(|| {
-    let default = Provider::load(None, "default").ok()?;
-    let legacy = Provider::load(None, "legacy").ok()?;
-    Some((default, legacy))
 });
 
 #[derive(Clone)]
@@ -3648,60 +3647,205 @@ fn value_base64_encoded_pem_filtered(value: &str) -> bool {
     true
 }
 
-fn load_der_private_key(data: &[u8]) -> Option<PKey<Private>> {
-    PKey::private_key_from_der(data).ok().or_else(|| {
-        LazyLock::force(&OPENSSL_PKCS12_PROVIDERS).as_ref()?;
-        Pkcs12::from_der(data).ok()?.parse2("").ok()?.pkey
+enum CredSweeperPrivateKey {
+    Rsa,
+    SupportedNonRsa,
+}
+
+fn rsa_private_key_is_valid(data: &[u8]) -> bool {
+    let Ok(key) = RsaPrivateKey::from_der(data) else {
+        return false;
+    };
+    let one = BigUint::from(1_u8);
+    let modulus = BigUint::from_bytes_be(key.modulus.as_bytes());
+    let public_exponent = BigUint::from_bytes_be(key.public_exponent.as_bytes());
+    let private_exponent = BigUint::from_bytes_be(key.private_exponent.as_bytes());
+    let prime1 = BigUint::from_bytes_be(key.prime1.as_bytes());
+    let prime2 = BigUint::from_bytes_be(key.prime2.as_bytes());
+    let mut primes = vec![prime1.clone(), prime2.clone()];
+    if public_exponent <= one || private_exponent <= one || primes.iter().any(|prime| prime <= &one)
+    {
+        return false;
+    }
+    // SHA-1 OAEP with CredSweeper's 20-byte probe needs a 62-byte modulus.
+    if key.modulus.as_bytes().len() < 62 {
+        return false;
+    }
+    let exponent_product = &private_exponent * &public_exponent;
+    if BigUint::from_bytes_be(key.exponent1.as_bytes()) != &private_exponent % (&prime1 - &one)
+        || BigUint::from_bytes_be(key.exponent2.as_bytes()) != &private_exponent % (&prime2 - &one)
+        || (BigUint::from_bytes_be(key.coefficient.as_bytes()) * &prime2) % &prime1 != one
+    {
+        return false;
+    }
+    let mut prime_product = &prime1 * &prime2;
+    if let Some(other_primes) = key.other_prime_infos {
+        for info in other_primes {
+            let prime = BigUint::from_bytes_be(info.prime.as_bytes());
+            if prime <= one
+                || BigUint::from_bytes_be(info.exponent.as_bytes())
+                    != &private_exponent % (&prime - &one)
+                || (BigUint::from_bytes_be(info.coefficient.as_bytes()) * &prime_product) % &prime
+                    != one
+            {
+                return false;
+            }
+            prime_product *= &prime;
+            primes.push(prime);
+        }
+    }
+    prime_product == modulus
+        && primes
+            .iter()
+            .all(|prime| &exponent_product % (prime - &one) == one)
+        && primes.iter().all(|prime| {
+            let bytes = prime.to_bytes_be();
+            is_prime(
+                Flavor::Any,
+                &BoxedUint::from_be_slice_vartime(bytes.as_slice()),
+            )
+        })
+}
+
+fn der_positive_integer(data: &[u8]) -> bool {
+    AnyRef::try_from(data)
+        .and_then(|value| value.decode_as::<UintRef<'_>>())
+        .is_ok_and(|value| !value.is_empty() && value.as_bytes().iter().any(|byte| *byte != 0))
+}
+
+fn rfc8410_private_key(info: &PrivateKeyInfoRef<'_>, expected_len: usize) -> bool {
+    if info.algorithm.parameters.is_some() {
+        return false;
+    }
+    AnyRef::try_from(info.private_key.as_bytes())
+        .and_then(|value| value.decode_as::<&OctetStringRef>())
+        .is_ok_and(|key| key.as_bytes().len() == expected_len)
+}
+
+fn parameter_children(params: AnyRef<'_>) -> Option<Vec<AnyRef<'_>>> {
+    params
+        .sequence(|reader| {
+            let mut children = Vec::new();
+            while !reader.is_finished() {
+                children.push(reader.decode::<AnyRef<'_>>()?);
+            }
+            Ok::<_, pkcs8::der::Error>(children)
+        })
+        .ok()
+}
+
+fn any_positive_integer(value: AnyRef<'_>) -> bool {
+    value.decode_as::<UintRef<'_>>().is_ok_and(|integer| {
+        !integer.is_empty() && integer.as_bytes().iter().any(|byte| *byte != 0)
     })
 }
 
-fn rsa_private_key_roundtrip(key: &PKey<Private>) -> bool {
-    const DATA: &[u8] = b"CredSweeperRSAProbe";
-    let Ok(mut encrypter) = Encrypter::new(key) else {
-        return false;
-    };
-    if encrypter.set_rsa_padding(Padding::PKCS1_OAEP).is_err()
-        || encrypter.set_rsa_oaep_md(MessageDigest::sha1()).is_err()
-        || encrypter.set_rsa_mgf1_md(MessageDigest::sha1()).is_err()
-    {
-        return false;
-    }
-    let Ok(encrypted_len) = encrypter.encrypt_len(DATA) else {
-        return false;
-    };
-    let mut encrypted = vec![0u8; encrypted_len];
-    let Ok(encrypted_len) = encrypter.encrypt(DATA, &mut encrypted) else {
-        return false;
-    };
-    encrypted.truncate(encrypted_len);
-
-    let Ok(mut decrypter) = Decrypter::new(key) else {
-        return false;
-    };
-    if decrypter.set_rsa_padding(Padding::PKCS1_OAEP).is_err()
-        || decrypter.set_rsa_oaep_md(MessageDigest::sha1()).is_err()
-        || decrypter.set_rsa_mgf1_md(MessageDigest::sha1()).is_err()
-    {
-        return false;
-    }
-    let Ok(decrypted_len) = decrypter.decrypt_len(&encrypted) else {
-        return false;
-    };
-    let mut decrypted = vec![0u8; decrypted_len];
-    let Ok(decrypted_len) = decrypter.decrypt(&encrypted, &mut decrypted) else {
-        return false;
-    };
-    decrypted.truncate(decrypted_len);
-    decrypted == DATA
+fn dsa_parameters_valid(params: AnyRef<'_>) -> bool {
+    parameter_children(params).is_some_and(|children| {
+        children.len() == 3 && children.into_iter().all(any_positive_integer)
+    })
 }
 
-fn private_key_is_valid(key: &PKey<Private>) -> bool {
-    match key.id() {
-        Id::RSA | Id::RSA_PSS => rsa_private_key_roundtrip(key),
-        Id::EC | Id::DSA | Id::DH | Id::DHX | Id::ED448 | Id::ED25519 | Id::X448 | Id::X25519 => {
-            true
+fn dh_parameters_valid(params: AnyRef<'_>) -> bool {
+    parameter_children(params).is_some_and(|children| {
+        (2..=3).contains(&children.len()) && children.into_iter().all(any_positive_integer)
+    })
+}
+
+fn dhx_validation_parameters_valid(value: AnyRef<'_>) -> bool {
+    parameter_children(value).is_some_and(|children| {
+        children.len() == 2
+            && children[0].tag() == Tag::BitString
+            && any_positive_integer(children[1])
+    })
+}
+
+fn dhx_parameters_valid(params: AnyRef<'_>) -> bool {
+    parameter_children(params).is_some_and(|children| {
+        if !(3..=5).contains(&children.len())
+            || !children[..3].iter().copied().all(any_positive_integer)
+        {
+            return false;
         }
-        _ => false,
+        match &children[3..] {
+            [] => true,
+            [fourth] => any_positive_integer(*fourth) || dhx_validation_parameters_valid(*fourth),
+            [fourth, fifth] => {
+                any_positive_integer(*fourth) && dhx_validation_parameters_valid(*fifth)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn integer_key_with_parameters(
+    info: &PrivateKeyInfoRef<'_>,
+    parameters_valid: fn(AnyRef<'_>) -> bool,
+) -> bool {
+    info.algorithm.parameters.is_some_and(parameters_valid)
+        && der_positive_integer(info.private_key.as_bytes())
+}
+
+fn load_pkcs8_private_key(data: &[u8]) -> Option<CredSweeperPrivateKey> {
+    let info = PrivateKeyInfoRef::try_from(data).ok()?;
+    match info.algorithm.oid.to_string().as_str() {
+        // rsaEncryption and RSASSA-PSS. OpenSSL validates the embedded PKCS#1
+        // structure for both before CredSweeper performs its RSA probe.
+        "1.2.840.113549.1.1.1" | "1.2.840.113549.1.1.10"
+            if rsa_private_key_is_valid(info.private_key.as_bytes()) =>
+        {
+            Some(CredSweeperPrivateKey::Rsa)
+        }
+        // Keep parsing here rather than accepting a recognized OID by itself:
+        // cryptography.load_der_private_key(), used by CredSweeper, rejects
+        // malformed key bodies before classifying the private-key family.
+        "1.2.840.10045.2.1" => sec1::EcPrivateKey::try_from(info.private_key.as_bytes())
+            .ok()
+            .filter(|key| !key.private_key.is_empty())
+            .and(info.algorithm.parameters.as_ref())
+            .filter(|params| params.tag() == Tag::ObjectIdentifier)
+            .map(|_| CredSweeperPrivateKey::SupportedNonRsa),
+        "1.2.840.10040.4.1" if integer_key_with_parameters(&info, dsa_parameters_valid) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        "1.2.840.113549.1.3.1" if integer_key_with_parameters(&info, dh_parameters_valid) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        "1.2.840.10046.2.1" if integer_key_with_parameters(&info, dhx_parameters_valid) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        "1.3.101.110" if rfc8410_private_key(&info, 32) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        "1.3.101.111" if rfc8410_private_key(&info, 56) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        "1.3.101.112" if rfc8410_private_key(&info, 32) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        "1.3.101.113" if rfc8410_private_key(&info, 57) => {
+            Some(CredSweeperPrivateKey::SupportedNonRsa)
+        }
+        _ => None,
+    }
+}
+
+fn load_der_private_key(data: &[u8]) -> Option<CredSweeperPrivateKey> {
+    if rsa_private_key_is_valid(data) {
+        return Some(CredSweeperPrivateKey::Rsa);
+    }
+    if let Some(key) = load_pkcs8_private_key(data) {
+        return Some(key);
+    }
+    let store = KeyStore::from_pkcs12(data, "", Pkcs12ImportPolicy::Raw).ok()?;
+    let (_, chain) = store.private_key_chain()?;
+    load_pkcs8_private_key(chain.key().as_der())
+}
+
+fn private_key_is_valid(key: &CredSweeperPrivateKey) -> bool {
+    match key {
+        CredSweeperPrivateKey::Rsa => true,
+        CredSweeperPrivateKey::SupportedNonRsa => true,
     }
 }
 
@@ -6730,6 +6874,94 @@ fn normalize_label(rule: &str) -> String {
 mod tests {
     use super::*;
     use crate::detect::region;
+    use p12_keystore::{KeyStoreEntry, PrivateKey, PrivateKeyChain};
+
+    fn rsa_pkcs8_fixture() -> Vec<u8> {
+        BASE64
+            .decode(b"MIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBALT7bjP4S78u42idmuYyxhZrAini+XRpVhl+PMWKFyhZm+Xm2w+Yb9K6T1Ve9s3NwoxLqZDkXH8t0VGMfMxQfyIYfcTDqjXlg2p2BhdnZ59NeB+OrGw8hI4IaqPs371xVxXzE/v7LMRrIKmVra/i+lu+KVtIrsUfFoqx+gMUEsOBAgMBAAECgYANK3K0g2/3pJDVzwozkCRMA1Nv+t1ONFAYoNAJS+gtfn/Stf7g3qXcfsRBIRzykvOCRAs9yPBWLN5bgc6fC4iEskccmvVGntEyKkkNzF39CNjLBX8nlJkFTY7LxDDSjCj9LCZp343yTvV8tsChXE1+eMoeBE/K/1EmTP/GkacDVQJBAOK1Dt3kEF2ygi7bzILSUWPqk0XNt9kAnNsKMFhp/9CzwM87Zt6fEbG4tyffv7qcUj4jsSXn0h8pXKrnDTBUppMCQQDMXeTBp1td2R8POAe3cyRtL4H2aHGESBgeLhUM1STopdZyneixavl6xb5YsJGvOCav0cQziRffOjsr1zzio0YbAkBmg58UYWOxKt5JWCTzZy1ctB8ianLfErLbLZFM+amu8wmV6/OJaX6z0aYoxrnJJZTe+n7JeDmA09BOi6pgF3c3AkEAy58Z1+F55W35xl4bQitVNfzJzsuNnzF95kQf8SNFnQ/vNVAkkvF1FWCFITT8UsrtsOyeQoLr6BzK7AmOvnnT1QJAW8Pdg05dND79yAjMnowqcvsJEoi6nD1wN9Iq5CrHcGrRLV26vH5a+O1J6Zlz7UdEe6XpJ6mxax1UjICw4AXAOA==")
+            .expect("PKCS#8 RSA fixture")
+    }
+
+    fn rsa_fixture_der() -> Vec<u8> {
+        let pkcs8 = rsa_pkcs8_fixture();
+        PrivateKeyInfoRef::try_from(pkcs8.as_slice())
+            .expect("PKCS#8 fixture")
+            .private_key
+            .as_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn private_key_loader_accepts_pkcs1_and_pkcs8_rsa() {
+        let pkcs1 = rsa_fixture_der();
+        let pkcs8 = rsa_pkcs8_fixture();
+        assert!(load_der_private_key(&pkcs1).is_some());
+        assert!(load_der_private_key(&pkcs8).is_some());
+    }
+
+    #[test]
+    fn private_key_loader_rejects_malformed_rsa_der() {
+        let mut pkcs1 = rsa_fixture_der();
+        pkcs1.truncate(pkcs1.len() / 2);
+        assert!(load_der_private_key(&pkcs1).is_none());
+
+        let mut invalid_crt = rsa_fixture_der();
+        *invalid_crt.last_mut().expect("RSA coefficient") ^= 1;
+        assert!(load_der_private_key(&invalid_crt).is_none());
+    }
+
+    #[test]
+    fn private_key_loader_accepts_empty_password_pkcs12() {
+        let pkcs8 = rsa_pkcs8_fixture();
+        let chain = PrivateKeyChain::new(
+            [1_u8, 2, 3, 4].as_slice(),
+            PrivateKey::from_der(&pkcs8).expect("private key"),
+            [],
+        );
+        let mut store = KeyStore::new();
+        store.add_entry("test", KeyStoreEntry::PrivateKeyChain(chain));
+        let p12 = store.writer("").write().expect("PKCS#12 fixture");
+        let key = load_der_private_key(&p12).expect("load PKCS#12");
+        assert!(private_key_is_valid(&key));
+    }
+
+    #[test]
+    fn private_key_loader_validates_rfc8410_key_body() {
+        // RFC 8410 section 10.3 Ed25519 PKCS#8 fixture.
+        let mut ed25519 = data_encoding::HEXLOWER
+            .decode(b"302e020100300506032b65700422042017ed9c73e9db649ec189a612831c5fc570238207c1aa9dfbd2c53e3ff5e5ea85")
+            .expect("Ed25519 fixture");
+        assert!(load_der_private_key(&ed25519).is_some());
+
+        let nested_octet = ed25519
+            .windows(2)
+            .rposition(|bytes| bytes == [0x04, 0x20])
+            .expect("nested private-key OCTET STRING");
+        ed25519[nested_octet] = 0x05;
+        assert!(load_der_private_key(&ed25519).is_none());
+    }
+
+    #[test]
+    fn dsa_and_dh_parameter_parsers_reject_wrong_tags_and_extra_fields() {
+        let dsa = AnyRef::try_from(&[0x30, 9, 2, 1, 2, 2, 1, 3, 2, 1, 5][..]).unwrap();
+        assert!(dsa_parameters_valid(dsa));
+        let dsa_wrong_tag = AnyRef::try_from(&[0x30, 9, 2, 1, 2, 4, 1, 3, 2, 1, 5][..]).unwrap();
+        assert!(!dsa_parameters_valid(dsa_wrong_tag));
+
+        let dh = AnyRef::try_from(&[0x30, 6, 2, 1, 2, 2, 1, 3][..]).unwrap();
+        assert!(dh_parameters_valid(dh));
+        let dh_extra =
+            AnyRef::try_from(&[0x30, 12, 2, 1, 2, 2, 1, 3, 2, 1, 5, 2, 1, 7][..]).unwrap();
+        assert!(!dh_parameters_valid(dh_extra));
+
+        let dhx_with_validation = AnyRef::try_from(
+            &[
+                0x30, 17, 2, 1, 2, 2, 1, 3, 2, 1, 5, 0x30, 6, 3, 1, 0, 2, 1, 7,
+            ][..],
+        )
+        .unwrap();
+        assert!(dhx_parameters_valid(dhx_with_validation));
+    }
 
     #[test]
     fn embedded_assets_are_present() {
@@ -7359,8 +7591,7 @@ mod tests {
 
     #[test]
     fn value_base64_key_loads_and_checks_private_keys() {
-        let rsa = openssl::rsa::Rsa::generate(1024).unwrap();
-        let der = rsa.private_key_to_der().unwrap();
+        let der = rsa_fixture_der();
         let encoded = BASE64.encode(&der);
         assert!(!value_base64_key_filtered(&encoded));
 
@@ -7376,8 +7607,7 @@ mod tests {
 
     #[test]
     fn value_base64_key_ignores_captured_source_punctuation_like_python() {
-        let rsa = openssl::rsa::Rsa::generate(1024).expect("RSA fixture");
-        let encoded = BASE64.encode(&rsa.private_key_to_der().expect("DER fixture"));
+        let encoded = BASE64.encode(&rsa_fixture_der());
         assert!(!value_base64_key_filtered(&format!("{encoded}\"`,")));
     }
 
@@ -7723,8 +7953,7 @@ mod tests {
             "n7fzJc3_WG59VEOBTkayzuSMM780OJQuZjN_KbH8lOZG25ZoA7T4Bxcc0xQn5oZE5uSCI",
             "wg91oCt0JvxPcpmqzaJZg1nirjcWZ-oBtVk7gCAWq-B3qhfF3izlbkosrzjHajIcY33HBh",
         );
-        let rsa = openssl::rsa::Rsa::generate(1024).unwrap();
-        let base64_key = BASE64.encode(&rsa.private_key_to_der().unwrap());
+        let base64_key = BASE64.encode(&rsa_fixture_der());
         let raw = format!(
             "aws {aws_id} {aws_secret}\n\
              google 123-abcdeabcdeabcdeabcdeabcdeabcdeab.apps.googleusercontent.com {google_secret}\n\
