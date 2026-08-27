@@ -19,6 +19,8 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
     KeyUsagePurpose,
 };
+#[cfg(windows)]
+use sha1::{Digest as Sha1Digest, Sha1};
 #[cfg(not(windows))]
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -130,7 +132,8 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     )?;
     let proxy = ClaudeAppProxyGuard::start()?;
     #[cfg(windows)]
-    let _trusted_ca = WindowsUserCaGuard::install(proxy.root_certificate_der(), proxy.ca_serial())?;
+    let _trusted_ca =
+        WindowsUserCaGuard::install(proxy.root_certificate_der(), proxy.ca_thumbprint())?;
     let user_data_dir = claude_user_data_dir()?;
     #[cfg(windows)]
     if let Some(package) = find_windows_claude_package()
@@ -142,10 +145,10 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         let process = activate_windows_package(&package.aumid, &arguments)?;
         drop(environment);
         let process_id = process.id();
-        let ca_serial = proxy.ca_serial().to_string();
+        let ca_thumbprint = proxy.ca_thumbprint().to_string();
         if let Err(error) = ctrlc::set_handler(move || {
             terminate_child_process(process_id);
-            let _ = remove_windows_user_ca(&ca_serial);
+            let _ = remove_windows_user_ca(&ca_thumbprint);
             let _ = remove_windows_ca_journal();
             std::process::exit(130);
         }) {
@@ -179,12 +182,12 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .map_err(|error| format!("could not start Claude Desktop: {error}"))?;
     let child_id = child.id();
     #[cfg(windows)]
-    let ca_serial = proxy.ca_serial().to_string();
+    let ca_thumbprint = proxy.ca_thumbprint().to_string();
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
         #[cfg(windows)]
         {
-            let _ = remove_windows_user_ca(&ca_serial);
+            let _ = remove_windows_user_ca(&ca_thumbprint);
             let _ = remove_windows_ca_journal();
         }
         std::process::exit(130);
@@ -282,11 +285,11 @@ fn windows_ca_journal_path() -> Result<PathBuf, String> {
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "LOCALAPPDATA is unavailable for Claude Desktop CA cleanup".to_string())?;
-    Ok(root.join("Pentect").join("claude-app-temporary-ca.serial"))
+    Ok(root.join("Pentect").join("claude-app-temporary-ca.sha1"))
 }
 
 #[cfg(windows)]
-fn write_windows_ca_journal(serial: &str) -> Result<(), String> {
+fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
     let path = windows_ca_journal_path()?;
     let parent = path
         .parent()
@@ -295,7 +298,7 @@ fn write_windows_ca_journal(serial: &str) -> Result<(), String> {
         format!("could not create Claude Desktop CA cleanup directory: {error}")
     })?;
     crate::secure_temp::restrict_to_current_user(parent)?;
-    std::fs::write(&path, serial)
+    std::fs::write(&path, thumbprint)
         .map_err(|error| format!("could not write Claude Desktop CA cleanup journal: {error}"))?;
     crate::secure_temp::restrict_to_current_user(&path)
 }
@@ -313,45 +316,68 @@ fn remove_windows_ca_journal() -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn validate_ca_serial(serial: &str) -> Result<(), String> {
-    if serial.len() != 32 || !serial.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
+    if thumbprint.len() != 40 || !thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("Claude Desktop CA cleanup journal is invalid".to_string());
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn remove_windows_user_ca(serial: &str) -> Result<(), String> {
-    validate_ca_serial(serial)?;
-    if !windows_user_ca_present(serial)? {
-        return Ok(());
-    }
-    let status = Command::new(crate::windows_system_executable("certutil.exe"))
-        .args(["-user", "-delstore", "Root", serial])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| {
-            format!("could not remove temporary Claude Desktop certificate: {error}")
-        })?;
-    status.success().then_some(()).ok_or_else(|| {
-        "could not remove temporary Claude Desktop certificate; run `pentect claude app` again to retry cleanup"
-            .to_string()
-    })
+fn find_windows_user_ca(
+    thumbprint: &str,
+) -> Result<Option<*const windows::Win32::Security::Cryptography::CERT_CONTEXT>, String> {
+    use windows::core::w;
+    use windows::Win32::Security::Cryptography::{
+        CertCloseStore, CertFindCertificateInStore, CertOpenSystemStoreW, CERT_FIND_SHA1_HASH,
+        CRYPT_INTEGER_BLOB, X509_ASN_ENCODING,
+    };
+
+    validate_ca_thumbprint(thumbprint)?;
+    let mut hash = data_encoding::HEXUPPER
+        .decode(thumbprint.as_bytes())
+        .map_err(|_| "Claude Desktop CA cleanup journal is invalid".to_string())?;
+    let blob = CRYPT_INTEGER_BLOB {
+        cbData: hash.len() as u32,
+        pbData: hash.as_mut_ptr(),
+    };
+    let store = unsafe { CertOpenSystemStoreW(None, w!("ROOT")) }
+        .map_err(|error| format!("could not open the current-user Root store: {error}"))?;
+    let context = unsafe {
+        CertFindCertificateInStore(
+            store,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SHA1_HASH,
+            Some(&blob as *const _ as *const std::ffi::c_void),
+            None,
+        )
+    };
+    let close = unsafe { CertCloseStore(Some(store), 0) };
+    close.map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+    Ok((!context.is_null()).then_some(context))
 }
 
 #[cfg(windows)]
-fn windows_user_ca_present(serial: &str) -> Result<bool, String> {
-    validate_ca_serial(serial)?;
-    Command::new(crate::windows_system_executable("certutil.exe"))
-        .args(["-user", "-store", "Root", serial])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .map_err(|error| format!("could not inspect temporary Claude Desktop certificate: {error}"))
+fn remove_windows_user_ca(thumbprint: &str) -> Result<(), String> {
+    use windows::Win32::Security::Cryptography::CertDeleteCertificateFromStore;
+
+    let Some(context) = find_windows_user_ca(thumbprint)? else {
+        return Ok(());
+    };
+    unsafe { CertDeleteCertificateFromStore(context) }
+        .map_err(|error| format!("could not remove temporary Claude Desktop certificate: {error}"))
+}
+
+#[cfg(windows)]
+fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
+    use windows::Win32::Security::Cryptography::CertFreeCertificateContext;
+
+    let Some(context) = find_windows_user_ca(thumbprint)? else {
+        return Ok(false);
+    };
+    let _ = unsafe { CertFreeCertificateContext(Some(context)) };
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -362,8 +388,8 @@ pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
 #[cfg(windows)]
 pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
     let path = windows_ca_journal_path()?;
-    let serial = match std::fs::read_to_string(&path) {
-        Ok(serial) => serial,
+    let thumbprint = match std::fs::read_to_string(&path) {
+        Ok(thumbprint) => thumbprint,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(format!(
@@ -371,9 +397,9 @@ pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
             ))
         }
     };
-    let serial = serial.trim();
-    validate_ca_serial(serial)?;
-    remove_windows_user_ca(serial)?;
+    let thumbprint = thumbprint.trim();
+    validate_ca_thumbprint(thumbprint)?;
+    remove_windows_user_ca(thumbprint)?;
     remove_windows_ca_journal()?;
     eprintln!("[pentect] Removed a stale temporary Claude Desktop certificate");
     Ok(())
@@ -381,62 +407,58 @@ pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
 
 #[cfg(windows)]
 struct WindowsUserCaGuard {
-    serial: String,
+    thumbprint: String,
 }
 
 #[cfg(windows)]
 impl WindowsUserCaGuard {
-    fn install(certificate_der: &[u8], serial: &str) -> Result<Self, String> {
-        validate_ca_serial(serial)?;
-        let directory = crate::secure_temp::SecureTempDirectory::create(
-            "pentect-claude-ca-",
-            "Claude Desktop certificate",
-        )?;
-        let certificate = crate::secure_temp::SecureTempFile::create(
-            directory.path(),
-            "root-",
-            ".cer",
-            certificate_der,
-            "Claude Desktop certificate",
-        )?;
-        write_windows_ca_journal(serial)?;
-        let status = Command::new(crate::windows_system_executable("certutil.exe"))
-            .args(["-f", "-user", "-addstore", "Root"])
-            .arg(certificate.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| {
-                format!("could not trust temporary Claude Desktop certificate: {error}")
-            });
-        match status {
-            Ok(status) if status.success() => Ok(Self {
-                serial: serial.to_string(),
-            }),
-            Ok(_) => {
-                let _ = remove_windows_ca_journal();
-                Err("Windows rejected the temporary Claude Desktop certificate".to_string())
-            }
-            Err(error) => {
-                let _ = remove_windows_ca_journal();
-                Err(error)
-            }
+    fn install(certificate_der: &[u8], thumbprint: &str) -> Result<Self, String> {
+        use windows::core::w;
+        use windows::Win32::Security::Cryptography::{
+            CertAddEncodedCertificateToStore, CertCloseStore, CertOpenSystemStoreW,
+            CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
+        };
+
+        validate_ca_thumbprint(thumbprint)?;
+        write_windows_ca_journal(thumbprint)?;
+        let store = unsafe { CertOpenSystemStoreW(None, w!("ROOT")) }.map_err(|error| {
+            let _ = remove_windows_ca_journal();
+            format!("could not open the current-user Root store: {error}")
+        })?;
+        let add = unsafe {
+            CertAddEncodedCertificateToStore(
+                Some(store),
+                X509_ASN_ENCODING,
+                certificate_der,
+                CERT_STORE_ADD_NEW,
+                None,
+            )
+        };
+        let close = unsafe { CertCloseStore(Some(store), 0) };
+        if let Err(error) = add {
+            let _ = remove_windows_ca_journal();
+            return Err(format!(
+                "could not trust temporary Claude Desktop certificate: {error}"
+            ));
         }
+        close.map_err(|error| format!("could not close the current-user Root store: {error}"))?;
+        Ok(Self {
+            thumbprint: thumbprint.to_string(),
+        })
     }
 }
 
 #[cfg(windows)]
 impl Drop for WindowsUserCaGuard {
     fn drop(&mut self) {
-        if let Err(error) = remove_windows_user_ca(&self.serial) {
+        if let Err(error) = remove_windows_user_ca(&self.thumbprint) {
             eprintln!("[pentect] {error}");
             return;
         }
         if let Err(error) = remove_windows_ca_journal() {
             eprintln!("[pentect] {error}");
         }
-        self.serial.zeroize();
+        self.thumbprint.zeroize();
     }
 }
 
@@ -719,7 +741,7 @@ struct ClaudeAppProxyGuard {
     #[cfg(windows)]
     root_certificate_der: Vec<u8>,
     #[cfg(windows)]
-    ca_serial: String,
+    ca_thumbprint: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -732,7 +754,7 @@ impl ClaudeAppProxyGuard {
         #[cfg(windows)]
         let root_certificate_der = authority.issuer.der().to_vec();
         #[cfg(windows)]
-        let ca_serial = authority.serial.clone();
+        let ca_thumbprint = authority.thumbprint.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread = thread::spawn(move || {
@@ -765,7 +787,7 @@ impl ClaudeAppProxyGuard {
             #[cfg(windows)]
             root_certificate_der,
             #[cfg(windows)]
-            ca_serial,
+            ca_thumbprint,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -786,8 +808,8 @@ impl ClaudeAppProxyGuard {
     }
 
     #[cfg(windows)]
-    fn ca_serial(&self) -> &str {
-        &self.ca_serial
+    fn ca_thumbprint(&self) -> &str {
+        &self.ca_thumbprint
     }
 }
 
@@ -805,7 +827,7 @@ impl Drop for ClaudeAppProxyGuard {
         #[cfg(windows)]
         {
             self.root_certificate_der.zeroize();
-            self.ca_serial.zeroize();
+            self.ca_thumbprint.zeroize();
         }
     }
 }
@@ -815,7 +837,7 @@ struct CertificateAuthority {
     #[cfg(not(windows))]
     spki_hash: String,
     #[cfg(windows)]
-    serial: String,
+    thumbprint: String,
 }
 
 impl CertificateAuthority {
@@ -835,24 +857,16 @@ impl CertificateAuthority {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-        #[cfg(windows)]
-        let serial = {
-            let mut serial = [0_u8; 16];
-            getrandom::getrandom(&mut serial).map_err(|error| {
-                format!("OS CSPRNG unavailable for Claude App CA serial: {error}")
-            })?;
-            serial[0] &= 0x7f;
-            params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
-            data_encoding::HEXUPPER.encode(&serial)
-        };
         let issuer = CertifiedIssuer::self_signed(params, key)
             .map_err(|error| format!("could not sign Claude App proxy CA: {error}"))?;
+        #[cfg(windows)]
+        let thumbprint = data_encoding::HEXUPPER.encode(&Sha1::digest(issuer.der()));
         Ok(Self {
             issuer,
             #[cfg(not(windows))]
             spki_hash,
             #[cfg(windows)]
-            serial,
+            thumbprint,
         })
     }
 
@@ -3305,9 +3319,9 @@ mod tests {
         assert!(!authority.spki_hash.is_empty());
         #[cfg(windows)]
         {
-            assert_eq!(authority.serial.len(), 32);
+            assert_eq!(authority.thumbprint.len(), 40);
             assert!(authority
-                .serial
+                .thumbprint
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit()));
             assert!(!authority.issuer.der().is_empty());
@@ -3317,15 +3331,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_ca_journal_accepts_only_generated_serial_shape() {
-        assert!(validate_ca_serial("00112233445566778899AABBCCDDEEFF").is_ok());
+    fn windows_ca_journal_accepts_only_sha1_thumbprints() {
+        assert!(validate_ca_thumbprint("00112233445566778899AABBCCDDEEFF00112233").is_ok());
         for invalid in [
             "",
             "0011",
-            "00112233445566778899AABBCCDDEEFG",
-            "00112233445566778899AABBCCDDEEFF --force",
+            "00112233445566778899AABBCCDDEEFF0011223G",
+            "00112233445566778899AABBCCDDEEFF00112233 --force",
         ] {
-            assert!(validate_ca_serial(invalid).is_err(), "{invalid}");
+            assert!(validate_ca_thumbprint(invalid).is_err(), "{invalid}");
         }
     }
 
@@ -3343,12 +3357,13 @@ mod tests {
         std::env::set_var("LOCALAPPDATA", &state);
 
         let authority = CertificateAuthority::new().unwrap();
-        assert!(!windows_user_ca_present(&authority.serial).unwrap());
-        let guard = WindowsUserCaGuard::install(authority.issuer.der(), &authority.serial).unwrap();
-        assert!(windows_user_ca_present(&authority.serial).unwrap());
+        assert!(!windows_user_ca_present(&authority.thumbprint).unwrap());
+        let guard =
+            WindowsUserCaGuard::install(authority.issuer.der(), &authority.thumbprint).unwrap();
+        assert!(windows_user_ca_present(&authority.thumbprint).unwrap());
         assert!(windows_ca_cleanup_pending().unwrap());
         drop(guard);
-        assert!(!windows_user_ca_present(&authority.serial).unwrap());
+        assert!(!windows_user_ca_present(&authority.thumbprint).unwrap());
         assert!(!windows_ca_cleanup_pending().unwrap());
 
         match previous {
