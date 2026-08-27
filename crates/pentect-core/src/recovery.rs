@@ -106,7 +106,7 @@ impl Recovery {
             .map
             .keys()
             .filter_map(|ph| self.reveal(ph).map(|v| (v, ph.as_str())))
-            .filter(|(v, _)| is_remaskable_echo(v))
+            .filter(|(value, placeholder)| is_remaskable_echo(value, placeholder))
             .collect();
         sort_and_deduplicate_remask_pairs(&mut pairs);
         if pairs.is_empty() {
@@ -232,7 +232,7 @@ impl RecoveryStreamRemasker {
             .filter_map(|placeholder| {
                 recovery
                     .reveal(placeholder)
-                    .filter(|value| is_remaskable_echo(value))
+                    .filter(|value| is_remaskable_echo(value, placeholder))
                     .map(|value| StreamPattern {
                         value: value.into_bytes(),
                         placeholder: placeholder.as_bytes().to_vec(),
@@ -421,9 +421,29 @@ impl Drop for RecoveryStreamRemasker {
     }
 }
 
-fn is_remaskable_echo(value: &str) -> bool {
+fn is_remaskable_echo(value: &str, placeholder: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.len() >= 6 && !matches!(trimmed, "true" | "false" | "null")
+    if matches!(trimmed, "true" | "false" | "null") {
+        return false;
+    }
+    if trimmed.len() >= 6 {
+        return true;
+    }
+    if trimmed.len() < 4 {
+        return false;
+    }
+    let Ok(parts) = crate::placeholder::parse_placeholder(placeholder) else {
+        return false;
+    };
+    matches!(
+        parts.label.as_str(),
+        crate::model::labels::SECRET
+            | crate::model::labels::KEYED_SECRET
+            | crate::model::labels::OTP
+            | crate::model::labels::CMD_PASSWORD
+            | crate::model::labels::URL_CREDENTIAL
+            | crate::model::labels::PRIVATE_KEY
+    ) || crate::detect::is_sensitive_key_name(&parts.label)
 }
 
 fn sort_and_deduplicate_remask_pairs(pairs: &mut Vec<(String, &str)>) {
@@ -713,13 +733,47 @@ mod tests {
     #[test]
     fn remask_ignores_short_metadata_values() {
         let rec = Recovery::seal(
-            HashMap::from([("<<COUNT_0011223344556677>>".to_string(), "3".to_string())]),
+            HashMap::from([
+                ("<<COUNT_0011223344556677>>".to_string(), "1234".to_string()),
+                (
+                    "<<STATUS_8899aabbccddeeff>>".to_string(),
+                    "ready".to_string(),
+                ),
+            ]),
             &[5u8; 32],
         );
-        assert_eq!(rec.resolve("n=<<COUNT_0011223344556677>>"), "n=3");
         assert_eq!(
-            rec.remask("AKIA3EXAMPLE has a digit"),
-            "AKIA3EXAMPLE has a digit"
+            rec.remask("count 1234 status ready"),
+            "count 1234 status ready"
+        );
+    }
+
+    #[test]
+    fn remask_rehides_short_otp_and_keyed_secrets() {
+        let otp = "<<OTP_0011223344556677>>";
+        let password = "<<KEYED_SECRET_8899aabbccddeeff>>";
+        let database_password = "<<DB_PASSWORD_aabbccddeeff0011>>";
+        let rec = Recovery::seal(
+            HashMap::from([
+                (otp.to_string(), "1234".to_string()),
+                (password.to_string(), "abcde".to_string()),
+                (database_password.to_string(), "p1n5".to_string()),
+            ]),
+            &[5u8; 32],
+        );
+        assert_eq!(
+            rec.remask("code 1234 password abcde database p1n5"),
+            format!("code {otp} password {password} database {database_password}")
+        );
+
+        let mut stream = rec.stream_remasker();
+        let mut output = stream.push_text(b"code 12");
+        output.extend(stream.push_text(b"34 password abcde database p1"));
+        output.extend(stream.push_text(b"n5"));
+        output.extend(stream.finish());
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("code {otp} password {password} database {database_password}")
         );
     }
 

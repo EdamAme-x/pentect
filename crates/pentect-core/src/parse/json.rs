@@ -96,6 +96,12 @@ enum JsonRegionMode {
     ToolResult,
 }
 
+fn is_sibling_hint_key(key: &str) -> bool {
+    ["name", "key", "env"]
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
@@ -155,7 +161,8 @@ impl Parser<'_> {
             self.i += 1;
             return Some(());
         }
-        let mut sibling_name: Option<String> = None;
+        let mut sibling_hints = Vec::new();
+        let mut sibling_values = Vec::new();
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
@@ -180,9 +187,9 @@ impl Parser<'_> {
             }
             self.i += 1;
             self.skip_ws();
-            if key.eq_ignore_ascii_case("name") && self.peek() == Some(b'"') {
+            if is_sibling_hint_key(&key) && self.peek() == Some(b'"') {
                 let (range, value) = self.string()?;
-                sibling_name = Some(value);
+                sibling_hints.push(value);
                 self.out.push(Region {
                     span: range,
                     ctx: Context {
@@ -194,18 +201,31 @@ impl Parser<'_> {
                     },
                 });
             } else {
-                let hints = if key.eq_ignore_ascii_case("value") {
-                    sibling_name.iter().cloned().collect()
-                } else {
-                    Vec::new()
-                };
-                self.value(Some(key), hints, depth)?;
+                let start = self.out.len();
+                self.value(Some(key.clone()), Vec::new(), depth)?;
+                if key.eq_ignore_ascii_case("value") {
+                    sibling_values.push((start, self.out.len()));
+                }
             }
             self.skip_ws();
             match self.peek()? {
                 b',' => self.i += 1,
                 b'}' => {
                     self.i += 1;
+                    if !sibling_hints.is_empty() {
+                        for (start, end) in sibling_values {
+                            for region in &mut self.out[start..end] {
+                                if region
+                                    .ctx
+                                    .key
+                                    .as_deref()
+                                    .is_some_and(|key| key.eq_ignore_ascii_case("value"))
+                                {
+                                    region.ctx.hints.extend(sibling_hints.iter().cloned());
+                                }
+                            }
+                        }
+                    }
                     return Some(());
                 }
                 _ => return None,
@@ -419,6 +439,30 @@ mod tests {
             .unwrap();
         assert_eq!(value.ctx.key.as_deref(), Some("value"));
         assert_eq!(value.ctx.hints, ["Authorization"]);
+    }
+
+    #[test]
+    fn sibling_hints_do_not_depend_on_object_field_order() {
+        for raw in [
+            r#"{"value":"correcthorsebattery","name":"db_password"}"#,
+            r#"{"value":"correcthorsebattery","key":"db_password"}"#,
+            r#"{"value":"correcthorsebattery","env":"db_password"}"#,
+        ] {
+            let regions = parse_json_regions(raw).unwrap();
+            let value = regions
+                .iter()
+                .find(|region| &raw[region.span.start..region.span.end] == "correcthorsebattery")
+                .unwrap();
+            assert_eq!(value.ctx.hints, ["db_password"], "{raw}");
+        }
+
+        let raw = r#"{"name":"display_label","value":"correcthorsebattery","key":"db_password"}"#;
+        let regions = parse_json_regions(raw).unwrap();
+        let value = regions
+            .iter()
+            .find(|region| &raw[region.span.start..region.span.end] == "correcthorsebattery")
+            .unwrap();
+        assert_eq!(value.ctx.hints, ["display_label", "db_password"]);
     }
 
     #[test]

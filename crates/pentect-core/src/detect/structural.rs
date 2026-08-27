@@ -147,7 +147,7 @@ fn sensitive_context_label(ctx: &Context) -> Option<String> {
         .map(sensitive_label_for_key)
 }
 
-fn is_sensitive_key_name(key: &str) -> bool {
+pub(crate) fn is_sensitive_key_name(key: &str) -> bool {
     let name = normalize_identifier(key);
     if is_explicitly_non_sensitive_key(&name) || is_non_credential_sensitive_word_name(&name) {
         return false;
