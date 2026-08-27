@@ -150,6 +150,12 @@ const COMMANDS: &[CommandSpec] = &[
         audience: CommandAudience::Public,
     },
     CommandSpec {
+        name: "metrics",
+        usage: "pentect metrics [--json]",
+        summary: "Show local value-free protection statistics",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
         name: "resolve",
         usage: "pentect resolve [PATH...]",
         summary: "Write real values for known handles",
@@ -352,7 +358,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("plugins") => plugins_cmd::cmd_plugins(&args),
         Some("provider") => return Some(cmd_provider(&args)),
         Some(
-            "exec" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
+            "exec" | "resolve" | "log" | "metrics" | "hook" | "bridge" | "memory-store" | "purge"
             | "__agent-script" | "__agent-stream",
         ) => return Some(cmd_agent_from(1, &args, inherited_env_is_trusted)),
         Some("agent") => return Some(cmd_agent_from(2, &args, inherited_env_is_trusted)),
@@ -3091,6 +3097,7 @@ mod tests {
                 "help",
                 "log",
                 "mask",
+                "metrics",
                 "opencode",
                 "pi",
                 "plugins",

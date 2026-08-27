@@ -420,6 +420,12 @@ pub(crate) fn activity_share_enabled() -> Result<bool, String> {
     Ok(project.or(global).unwrap_or(true))
 }
 
+pub(crate) fn metrics_enabled() -> Result<bool, String> {
+    let project = read_metrics_enabled(project_config_path())?;
+    let global = read_metrics_enabled(global_config_path()?)?;
+    Ok(project.or(global).unwrap_or(true))
+}
+
 pub(crate) fn update_check_enabled() -> Result<bool, String> {
     let project = read_update_check(project_config_path())?;
     let global = read_update_check(global_config_path()?)?;
@@ -674,6 +680,10 @@ fn read_activity_share(path: PathBuf) -> Result<Option<bool>, String> {
     parse_config_file(&path)?.map_or(Ok(None), |value| activity_share_value(&value))
 }
 
+fn read_metrics_enabled(path: PathBuf) -> Result<Option<bool>, String> {
+    parse_config_file(&path)?.map_or(Ok(None), |value| metrics_enabled_value(&value))
+}
+
 fn read_unknown_format_policy(path: PathBuf) -> Result<Option<UnknownFormatPolicy>, String> {
     parse_config_file(&path)?.map_or(Ok(None), |value| unknown_format_policy_value(&value))
 }
@@ -711,6 +721,19 @@ fn activity_share_value(value: &toml::Value) -> Result<Option<bool>, String> {
         }
     }
     Ok(None)
+}
+
+fn metrics_enabled_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("metrics") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("metrics config must be a table".to_string());
+    };
+    table
+        .get("enabled")
+        .map(|raw| config_bool(raw, "metrics.enabled"))
+        .transpose()
 }
 
 fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
@@ -1321,6 +1344,20 @@ unknown_min_bytes = 32
 
         let value = "[log]\nshare = true".parse::<toml::Value>().unwrap();
         assert!(activity_share_value(&value).is_err());
+    }
+
+    #[test]
+    fn metrics_enabled_defaults_on_and_accepts_boolean_like_values() {
+        let disabled = "[metrics]\nenabled = false".parse::<toml::Value>().unwrap();
+        assert_eq!(metrics_enabled_value(&disabled).unwrap(), Some(false));
+
+        let enabled = "[metrics]\nenabled = \"on\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(metrics_enabled_value(&enabled).unwrap(), Some(true));
+
+        let invalid = "[metrics]\nenabled = 3".parse::<toml::Value>().unwrap();
+        assert!(metrics_enabled_value(&invalid).is_err());
     }
 
     #[test]

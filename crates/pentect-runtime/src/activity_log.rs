@@ -4,7 +4,7 @@ use pentect_core::MaskResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -73,6 +73,21 @@ pub(crate) struct ActivityEvent {
 struct LabelCount {
     name: String,
     count: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct PrivacyMetrics {
+    enabled: bool,
+    scope: &'static str,
+    masked_text_occurrences: u64,
+    redacted_image_occurrences: u64,
+    restoration_operations: u64,
+    blocked_occurrences: u64,
+    warning_occurrences: u64,
+    by_secret_type: BTreeMap<String, u64>,
+    by_surface: BTreeMap<String, u64>,
+    records_read: u64,
+    records_skipped: u64,
 }
 
 struct ActivitySource {
@@ -357,6 +372,185 @@ pub(crate) fn persistent_log_path() -> PathBuf {
         .join(".pentect")
         .join("logs")
         .join("pentect.log")
+}
+
+pub(crate) fn print_metrics(json: bool) -> Result<(), String> {
+    let metrics = read_metrics(&persistent_log_path())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&metrics)
+                .map_err(|error| format!("could not encode privacy metrics: {error}"))?
+        );
+        return Ok(());
+    }
+
+    println!("Pentect privacy metrics (retained local logs)");
+    println!("Masked occurrences: {}", metrics.masked_text_occurrences);
+    println!("Redacted images: {}", metrics.redacted_image_occurrences);
+    println!(
+        "Local restoration operations: {}",
+        metrics.restoration_operations
+    );
+    println!("Blocked operations: {}", metrics.blocked_occurrences);
+    println!("Warnings: {}", metrics.warning_occurrences);
+    print_metric_group(
+        "Secret types (text masks and image redactions)",
+        &metrics.by_secret_type,
+    );
+    print_metric_group("Protection surfaces", &metrics.by_surface);
+    if metrics.records_skipped > 0 {
+        println!(
+            "Skipped unreadable records: {} (counts may be incomplete)",
+            metrics.records_skipped
+        );
+    }
+    println!("No secret values, handles, paths, URLs, or account identifiers are included.");
+    Ok(())
+}
+
+fn print_metric_group(title: &str, values: &BTreeMap<String, u64>) {
+    println!("{title}:");
+    if values.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    let mut values = values.iter().collect::<Vec<_>>();
+    values.sort_by(|(left_name, left_count), (right_name, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    for (name, count) in values {
+        println!("  {name}: {count}");
+    }
+}
+
+fn read_metrics(path: &Path) -> Result<PrivacyMetrics, String> {
+    let mut metrics = PrivacyMetrics {
+        enabled: true,
+        scope: "retained_local_logs",
+        ..PrivacyMetrics::default()
+    };
+    for generation in (1..=LOG_ROTATIONS).rev() {
+        aggregate_metrics_file(&rotated_log_path(path, generation), &mut metrics)?;
+    }
+    aggregate_metrics_file(path, &mut metrics)?;
+    Ok(metrics)
+}
+
+fn aggregate_metrics_file(path: &Path, metrics: &mut PrivacyMetrics) -> Result<(), String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not read persistent activity log: {error}")),
+    };
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => {
+                metrics.records_skipped = metrics.records_skipped.saturating_add(1);
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = match serde_json::from_str::<ActivityEvent>(&line) {
+            Ok(event) => event,
+            Err(_) => {
+                metrics.records_skipped = metrics.records_skipped.saturating_add(1);
+                continue;
+            }
+        };
+        metrics.records_read = metrics.records_read.saturating_add(1);
+        aggregate_metric_event(&event, metrics);
+    }
+    Ok(())
+}
+
+fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
+    match event.action.as_str() {
+        "mask" | "redact" => {
+            if event.action == "mask" {
+                metrics.masked_text_occurrences =
+                    metrics.masked_text_occurrences.saturating_add(event.count);
+            } else {
+                metrics.redacted_image_occurrences = metrics
+                    .redacted_image_occurrences
+                    .saturating_add(event.count);
+            }
+            increment_metric(
+                &mut metrics.by_surface,
+                safe_metric_surface(&event.surface).to_string(),
+                event.count,
+            );
+            for label in &event.labels {
+                increment_metric(
+                    &mut metrics.by_secret_type,
+                    safe_metric_secret_type(&label.name).to_string(),
+                    label.count,
+                );
+            }
+        }
+        "resolve" => {
+            metrics.restoration_operations =
+                metrics.restoration_operations.saturating_add(event.count);
+        }
+        "block" => {
+            metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
+        }
+        "warning" => {
+            metrics.warning_occurrences = metrics.warning_occurrences.saturating_add(event.count);
+            if is_block_event(event.event.as_deref()) {
+                metrics.blocked_occurrences =
+                    metrics.blocked_occurrences.saturating_add(event.count);
+            }
+        }
+        "diagnostic" if is_block_event(event.event.as_deref()) => {
+            metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
+        }
+        _ => {}
+    }
+}
+
+fn is_block_event(event: Option<&str>) -> bool {
+    matches!(
+        event,
+        Some(
+            "request-rejected"
+                | "scan-failure-blocked"
+                | "scan-unavailable-blocked"
+                | "unknown-content-block"
+        )
+    )
+}
+
+fn increment_metric(values: &mut BTreeMap<String, u64>, name: String, count: u64) {
+    let value = values.entry(name).or_default();
+    *value = value.saturating_add(count);
+}
+
+fn safe_metric_surface(value: &str) -> &str {
+    match value {
+        "prompt" | "output" | "tool" | "read" | "image" => value,
+        _ => "OTHER",
+    }
+}
+
+fn safe_metric_secret_type(value: &str) -> &str {
+    match value {
+        "ACCESS_TOKEN" | "ANTHROPIC_API_KEY" | "API_KEY" | "AWS_AKID" | "AWS_MULTI"
+        | "AWS_S3_BUCKET" | "BASE64_PRIVATE_KEY" | "BASIC_AUTH" | "BEARER_TOKEN" | "CREDENTIAL"
+        | "CREDENTIALS" | "CREDIT_CARD" | "EMAIL_ADDRESS" | "GITHUB_PAT" | "GITHUB_TOKEN"
+        | "GOOGLE_API_KEY" | "HUGGINGFACE_TOKEN" | "IBAN_CODE" | "KEYED_SECRET"
+        | "LIKELY_SECRET" | "OPENAI_API_KEY" | "PASSWORD" | "PEM_PRIVATE_KEY" | "PHONE_NUMBER"
+        | "PRIVATE_KEY" | "SECRET" | "SESSION_TOKEN" | "SLACK_TOKEN" | "SLACK_WEBHOOK"
+        | "STRIPE_SECRET_KEY" | "TELEGRAM_BOT_TOKEN" | "TOKEN" | "UK_NINO" | "URL_CREDENTIAL" => {
+            value
+        }
+        _ => "OTHER",
+    }
 }
 
 pub(crate) fn record_mask_result(surface: &str, result: &MaskResult, target: Option<&Path>) {
@@ -1253,6 +1447,104 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_metrics_count_occurrences_without_retaining_sensitive_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-metrics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("pentect.log");
+
+        let masked = ActivityEvent::new(
+            "mask",
+            "prompt",
+            3,
+            BTreeMap::from([
+                ("AWS_AKID".to_string(), 2),
+                ("EMAIL_ADDRESS".to_string(), 1),
+            ]),
+            Some("private-project/.env".to_string()),
+        );
+        let redacted = ActivityEvent::new(
+            "redact",
+            "image",
+            1,
+            BTreeMap::from([("AWS_AKID".to_string(), 1)]),
+            None,
+        );
+        let restored = ActivityEvent::new("resolve", "tool", 2, BTreeMap::new(), None);
+        let warning = ActivityEvent::diagnostic(
+            "openai",
+            "request-failed",
+            Some("connect"),
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+        );
+        std::fs::write(
+            rotated_log_path(&path, 1),
+            format!("{}\n", serde_json::to_string(&masked).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            [redacted, restored, warning]
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\nnot-json\n",
+        )
+        .unwrap();
+
+        let metrics = read_metrics(&path).unwrap();
+        assert!(metrics.enabled);
+        assert_eq!(metrics.masked_text_occurrences, 3);
+        assert_eq!(metrics.redacted_image_occurrences, 1);
+        assert_eq!(metrics.restoration_operations, 2);
+        assert_eq!(metrics.warning_occurrences, 1);
+        assert_eq!(metrics.by_secret_type["AWS_AKID"], 3);
+        assert_eq!(metrics.by_secret_type["EMAIL_ADDRESS"], 1);
+        assert_eq!(metrics.by_surface["prompt"], 3);
+        assert_eq!(metrics.by_surface["image"], 1);
+        assert_eq!(metrics.records_skipped, 1);
+
+        let output = serde_json::to_string(&metrics).unwrap();
+        assert!(!output.contains("private-project"));
+        assert!(!output.contains(".env"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn privacy_metric_dimensions_collapse_untrusted_values() {
+        assert_eq!(safe_metric_secret_type("AWS_AKID"), "AWS_AKID");
+        assert_eq!(safe_metric_secret_type("accountIdentifier456"), "OTHER");
+        assert_eq!(safe_metric_secret_type("secret\u{1b}[31m"), "OTHER");
+        assert_eq!(safe_metric_surface("prompt"), "prompt");
+        assert_eq!(safe_metric_surface("private-plugin"), "OTHER");
+    }
+
+    #[test]
+    fn image_detection_count_does_not_inflate_blocked_operations() {
+        let mut metrics = PrivacyMetrics::default();
+        aggregate_metric_event(
+            &ActivityEvent::new("detect", "image", 3, BTreeMap::new(), None),
+            &mut metrics,
+        );
+        aggregate_metric_event(
+            &ActivityEvent::new("block", "image", 1, BTreeMap::new(), None),
+            &mut metrics,
+        );
+        assert_eq!(metrics.blocked_occurrences, 1);
+    }
 
     #[test]
     fn activity_event_contains_metadata_only() {
