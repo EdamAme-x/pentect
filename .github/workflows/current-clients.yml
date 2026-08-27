@@ -37,7 +37,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
-      GH_TOKEN: ${{ github.token }}
       PENTECT_LOG_DIR: ${{ github.workspace }}/.pentect-client-logs
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -58,7 +57,7 @@ jobs:
           irm https://pentect.dev/install | iex
           $binary = Join-Path $env:PENTECT_INSTALL_DIR 'pentect.exe'
           if (-not (Test-Path -LiteralPath $binary)) { throw 'public installer did not produce pentect.exe' }
-          $latest = (gh release view --repo $env:GITHUB_REPOSITORY --json tagName --jq .tagName).TrimStart('v')
+          $latest = (Invoke-RestMethod 'https://api.github.com/repos/EdamAme-x/pentect/releases/latest').tag_name.TrimStart('v')
           $installed = (& $binary version).Trim() -replace '^pentect\s+', ''
           if ($installed -ne $latest) { throw "public installer installed $installed, expected $latest" }
           "PENTECT_SMOKE_BINARY=$binary" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
@@ -71,7 +70,7 @@ jobs:
           curl -fsSL --proto '=https' --tlsv1.2 https://pentect.dev/install.sh |
             PENTECT_INSTALL_DIR="$install_dir" sh
           test -x "$install_dir/pentect"
-          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          latest=$(curl -fsSL https://api.github.com/repos/EdamAme-x/pentect/releases/latest | jq -r .tag_name)
           latest=${latest#v}
           installed=$("$install_dir/pentect" version | sed 's/^pentect //')
           test "$installed" = "$latest"
