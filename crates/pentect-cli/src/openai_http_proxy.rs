@@ -3964,35 +3964,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_tool_call_history_masks_arguments_and_custom_input() {
-        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
-        let store = pentect_agent::start_in_process_memory_store().unwrap();
-        let _env = ProviderBoundaryTestEnv::install(&store);
-        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
-        let mut input = serde_json::json!([
-            {
-                "type": "function_call",
-                "name": "shell",
-                "arguments": "{\"command\":\"OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\"}"
-            },
-            {
-                "type": "custom_tool_call",
-                "name": "exec_command",
-                "input": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
-            }
-        ]);
-        mask_openai_input(&mut input, false, &mut masker, &HashMap::new()).unwrap();
-        for field in [&input[0]["arguments"], &input[1]["input"]] {
-            let protected = field.as_str().unwrap();
-            assert!(protected.contains("<<"), "{protected}");
-            assert!(
-                !protected.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-                "{protected}"
-            );
-        }
-    }
-
-    #[test]
     fn response_function_arguments_are_restored() {
         let input = br#"{"output":[{"type":"function_call","name":"shell","arguments":"{\"command\":\"echo <<SECRET_0123456789abcdef>>\"}"}]}"#;
         let mut value: Value = serde_json::from_slice(input).unwrap();

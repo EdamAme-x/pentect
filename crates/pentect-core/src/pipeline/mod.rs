@@ -1285,6 +1285,7 @@ mod tests {
             r#"{"value":"correcthorsebattery","name":"db_password"}"#,
             r#"{"value":"correcthorsebattery","key":"db_password"}"#,
             r#"{"value":"correcthorsebattery","env":"db_password"}"#,
+            r#"{"name":"display_label","value":"correcthorsebattery","key":"db_password"}"#,
         ] {
             let result = mj(input);
             assert!(!result.masked.contains("correcthorsebattery"), "{input}");

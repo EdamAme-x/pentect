@@ -161,7 +161,7 @@ impl Parser<'_> {
             self.i += 1;
             return Some(());
         }
-        let mut sibling_hint: Option<String> = None;
+        let mut sibling_hints = Vec::new();
         let mut sibling_values = Vec::new();
         loop {
             self.skip_ws();
@@ -189,9 +189,7 @@ impl Parser<'_> {
             self.skip_ws();
             if is_sibling_hint_key(&key) && self.peek() == Some(b'"') {
                 let (range, value) = self.string()?;
-                if sibling_hint.is_none() {
-                    sibling_hint = Some(value);
-                }
+                sibling_hints.push(value);
                 self.out.push(Region {
                     span: range,
                     ctx: Context {
@@ -214,7 +212,7 @@ impl Parser<'_> {
                 b',' => self.i += 1,
                 b'}' => {
                     self.i += 1;
-                    if let Some(hint) = sibling_hint {
+                    if !sibling_hints.is_empty() {
                         for (start, end) in sibling_values {
                             for region in &mut self.out[start..end] {
                                 if region
@@ -223,7 +221,7 @@ impl Parser<'_> {
                                     .as_deref()
                                     .is_some_and(|key| key.eq_ignore_ascii_case("value"))
                                 {
-                                    region.ctx.hints.push(hint.clone());
+                                    region.ctx.hints.extend(sibling_hints.iter().cloned());
                                 }
                             }
                         }
@@ -457,6 +455,14 @@ mod tests {
                 .unwrap();
             assert_eq!(value.ctx.hints, ["db_password"], "{raw}");
         }
+
+        let raw = r#"{"name":"display_label","value":"correcthorsebattery","key":"db_password"}"#;
+        let regions = parse_json_regions(raw).unwrap();
+        let value = regions
+            .iter()
+            .find(|region| &raw[region.span.start..region.span.end] == "correcthorsebattery")
+            .unwrap();
+        assert_eq!(value.ctx.hints, ["display_label", "db_password"]);
     }
 
     #[test]
