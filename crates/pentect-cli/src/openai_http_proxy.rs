@@ -351,6 +351,7 @@ async fn proxy_request_inner(
     let chat_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::ChatCompletions;
     let standalone_search_path =
         method == hyper::Method::POST && endpoint == OpenAiEndpoint::StandaloneSearch;
+    let embeddings_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Embeddings;
     let responses_response = matches!(
         endpoint,
         OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
@@ -363,6 +364,7 @@ async fn proxy_request_inner(
                 | OpenAiEndpoint::InputTokens
                 | OpenAiEndpoint::ChatCompletions
                 | OpenAiEndpoint::StandaloneSearch
+                | OpenAiEndpoint::Embeddings
         );
     let files_upload = method == hyper::Method::POST && endpoint == OpenAiEndpoint::FilesCollection;
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
@@ -474,6 +476,8 @@ async fn proxy_request_inner(
                         OpenAiRequestDialect::ChatCompletions
                     } else if standalone_search_path {
                         OpenAiRequestDialect::StandaloneSearch
+                    } else if embeddings_path {
+                        OpenAiRequestDialect::Embeddings
                     } else {
                         OpenAiRequestDialect::Responses
                     },
@@ -800,6 +804,7 @@ enum OpenAiRequestDialect {
     Responses,
     ChatCompletions,
     StandaloneSearch,
+    Embeddings,
 }
 
 fn protect_openai_request_body(
@@ -865,7 +870,12 @@ fn protect_openai_request_body(
     let mut masker = masker
         .lock()
         .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
-    if let Err(error) = mask_openai_request(&mut value, &mut masker, files) {
+    let mask_result = if dialect == OpenAiRequestDialect::Embeddings {
+        mask_embeddings_request(&mut value, &mut masker)
+    } else {
+        mask_openai_request(&mut value, &mut masker, files)
+    };
+    if let Err(error) = mask_result {
         if error.starts_with("image blocked:") || error.starts_with("document blocked:") {
             return Err(error);
         }
@@ -882,7 +892,10 @@ fn protect_openai_request_body(
             local_response: None,
         });
     }
-    if dialect != OpenAiRequestDialect::StandaloneSearch {
+    if matches!(
+        dialect,
+        OpenAiRequestDialect::Responses | OpenAiRequestDialect::ChatCompletions
+    ) {
         inject_handle_contract(&mut value);
     }
     serde_json::to_vec(&value)
@@ -1330,6 +1343,33 @@ fn openai_request_unknown_content_kind(
             .map(visit_chat_messages)
             .unwrap_or(Some("missing messages")),
         OpenAiRequestDialect::StandaloneSearch => standalone_search_unknown_shape(value, visit),
+        OpenAiRequestDialect::Embeddings => embeddings_unknown_shape(value),
+    }
+}
+
+fn embeddings_unknown_shape(value: &Value) -> Option<&str> {
+    let Some(input) = value.as_object().and_then(|object| object.get("input")) else {
+        return Some("missing embeddings input");
+    };
+    if is_supported_embeddings_input(input) {
+        None
+    } else {
+        Some("unsupported embeddings input")
+    }
+}
+
+fn is_supported_embeddings_input(input: &Value) -> bool {
+    match input {
+        Value::String(_) => true,
+        Value::Array(items) => {
+            items.iter().all(Value::is_string)
+                || items.iter().all(Value::is_u64)
+                || items.iter().all(|item| {
+                    item.as_array()
+                        .is_some_and(|tokens| tokens.iter().all(Value::is_u64))
+                })
+        }
+        _ => false,
     }
 }
 
@@ -1530,6 +1570,38 @@ fn mask_openai_request(
         }
     }
     Ok(())
+}
+
+fn mask_embeddings_request(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let input = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("input"))
+        .ok_or_else(|| "OpenAI embeddings request is missing input".to_string())?;
+    match input {
+        Value::String(text) => mask_text(text, false, masker),
+        Value::Array(items) if items.iter().all(Value::is_string) => {
+            for item in items {
+                let Value::String(text) = item else {
+                    unreachable!("array shape checked before masking")
+                };
+                mask_text(text, false, masker)?;
+            }
+            Ok(())
+        }
+        Value::Array(items)
+            if items.iter().all(Value::is_u64)
+                || items.iter().all(|item| {
+                    item.as_array()
+                        .is_some_and(|tokens| tokens.iter().all(Value::is_u64))
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err("OpenAI embeddings input has an unsupported shape".to_string()),
+    }
 }
 
 fn mask_search_value(
@@ -2939,6 +3011,7 @@ enum OpenAiEndpoint {
     InputTokens,
     StandaloneSearch,
     ChatCompletions,
+    Embeddings,
     FilesCollection,
     Files,
     Models,
@@ -2954,6 +3027,7 @@ impl OpenAiEndpoint {
             Self::InputTokens => "input-tokens",
             Self::StandaloneSearch => "standalone-search",
             Self::ChatCompletions => "chat-completions",
+            Self::Embeddings => "embeddings",
             Self::FilesCollection => "files-collection",
             Self::Files => "files",
             Self::Models => "models",
@@ -2982,6 +3056,11 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         OpenAiEndpoint::ResponsesResource
     } else if path.ends_with("/chat/completions") {
         OpenAiEndpoint::ChatCompletions
+    } else if matches!(
+        segments.as_slice(),
+        ["v1", "embeddings"] | ["backend-api", "codex", "embeddings"]
+    ) {
+        OpenAiEndpoint::Embeddings
     } else if path.ends_with("/files") {
         OpenAiEndpoint::FilesCollection
     } else if is_known_openai_resource_path(&segments, "files") {
@@ -3733,6 +3812,14 @@ mod tests {
             OpenAiEndpoint::ChatCompletions
         );
         assert_eq!(
+            classify_openai_endpoint("/v1/embeddings"),
+            OpenAiEndpoint::Embeddings
+        );
+        assert_eq!(
+            classify_openai_endpoint("/backend-api/codex/embeddings"),
+            OpenAiEndpoint::Embeddings
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/responses/resp_123"),
             OpenAiEndpoint::ResponsesResource
         );
@@ -3771,6 +3858,45 @@ mod tests {
         );
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, true).is_err());
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn embeddings_mask_text_without_changing_token_inputs() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let text = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "text-embedding-3-small",
+                "input": ["OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"]
+            }))
+            .unwrap(),
+        );
+        let protected = protect_openai_request_body(
+            &text,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::Embeddings,
+            true,
+        )
+        .unwrap();
+        let text: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert!(text["input"][0]
+            .as_str()
+            .unwrap()
+            .contains("<<OPENAI_API_KEY_"));
+        assert!(text.get("instructions").is_none());
+
+        let mut tokens = serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": [[1, 2, 3], [4, 5]]
+        });
+        let original = tokens.clone();
+        mask_embeddings_request(&mut tokens, &mut masker.lock().unwrap()).unwrap();
+        assert_eq!(tokens, original);
     }
 
     #[test]
