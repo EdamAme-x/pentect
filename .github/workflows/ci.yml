@@ -313,7 +313,7 @@ jobs:
         run: python tools/run_filtered_tests.py claude_app_proxy::tests
       - name: Test Claude Desktop temporary certificate lifecycle
         if: needs.changes.outputs.claude_app == 'true' && runner.os == 'Windows'
-        run: cargo test -p pentect-cli windows_user_ca_round_trip --locked -- --ignored
+        run: cargo test -p pentect-cli --no-default-features windows_user_ca_round_trip --locked -- --ignored
       - name: Test OpenAI gateway
         if: needs.changes.outputs.openai_proxy == 'true'
         run: python tools/run_filtered_tests.py openai_http_proxy::tests
