@@ -85,6 +85,7 @@ pentect pi --model gpt-5
 | `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
 | `pentect view HANDLE` | Show handle details without revealing its value |
 | `pentect log [--json \| --path]` | Show persistent diagnostics and follow protection events |
+| `pentect metrics [--json]` | Show local counts by secret type and protection surface |
 
 ### `mask`
 

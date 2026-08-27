@@ -111,6 +111,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("exec") => cmd_exec(&args),
         Some("resolve") => cmd_resolve(&args),
         Some("log") => cmd_log(&args),
+        Some("metrics") => cmd_metrics(&args),
         Some("hook") => cmd_hook(&args),
         Some("bridge") => cmd_bridge(&args),
         Some("memory-store") => cmd_memory_store(&args),
@@ -817,11 +818,13 @@ fn usage() {
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect log [--json | --path]\n\
+         pentect metrics [--json]\n\
          \n\
          exec: masked output\n\
          view: handle\n\
          resolve: write handles\n\
-         log: gateway history and live events"
+         log: gateway history and live events\n\
+         metrics: local value-free protection statistics"
     );
 }
 
@@ -836,6 +839,30 @@ fn cmd_log(args: &[String]) -> i32 {
         _ => return die("log [--json | --path]"),
     };
     match activity_log::follow(json) {
+        Ok(()) => 0,
+        Err(error) => die(&error),
+    }
+}
+
+fn cmd_metrics(args: &[String]) -> i32 {
+    let json = match args.get(2).map(String::as_str) {
+        None => false,
+        Some("--json") if args.len() == 3 => true,
+        _ => return die("metrics [--json]"),
+    };
+    let enabled = match config::metrics_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => return die(&error),
+    };
+    if !enabled {
+        if json {
+            println!("{}", r#"{"enabled":false}"#);
+        } else {
+            println!("Pentect privacy metrics are disabled (metrics.enabled = false).");
+        }
+        return 0;
+    }
+    match activity_log::print_metrics(json) {
         Ok(()) => 0,
         Err(error) => die(&error),
     }

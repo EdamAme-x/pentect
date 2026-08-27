@@ -37,6 +37,7 @@ ignored.
 | `image.unscanned` | `block` | Stop when image or document content cannot be checked |
 | `files.remember` | `true` | Remember safe local file-to-handle information |
 | `activity.share` | `true` | Share events with compatible local Pentect processes |
+| `metrics.enabled` | `true` | Allow on-demand local privacy statistics |
 | `agent.required` | `false` | Require supported agents to start through Pentect |
 | `output.restore` | `true` | Restore known handles in assistant text shown by supported clients |
 | `update.check` | `true` | Check in the background for a newer Pentect release |
@@ -148,10 +149,17 @@ remember = true
 
 [activity]
 share = true
+
+[metrics]
+enabled = true
 ```
 
 `files.remember` keeps local information that helps restore handles from files.
 `activity.share` lets compatible Pentect processes share protection events.
+`metrics.enabled` controls the local `pentect metrics` summary and defaults to
+`true`. Metrics are calculated on demand from retained diagnostic logs and are
+never sent externally. Setting it to `false` disables the summary; diagnostic
+logging and rotation continue independently so crashes remain diagnosable.
 
 Project values normally override user values. `agent.required` is stricter: if
 either file sets it to `true`, the effective value is true.
