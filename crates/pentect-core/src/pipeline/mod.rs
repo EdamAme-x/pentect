@@ -1532,6 +1532,7 @@ mod tests {
     // inputs whose validity does not depend on invented vendor test tokens.
     const CORE_FLOOR: &[(&str, &str)] = &[
         ("AKIACSVC3FV5KQHYWH8A", "aws_access_key"),
+        ("ASIACSVC3FV5KQHYWH8A", "aws_sts_access_key"),
         (
             "api_key=Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh",
             "keyed_secret",
