@@ -12,15 +12,10 @@ enum Action {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellKind {
-    #[cfg(windows)]
     PowerShell,
-    #[cfg(windows)]
     Pwsh,
-    #[cfg(not(windows))]
     Bash,
-    #[cfg(not(windows))]
     Zsh,
-    #[cfg(not(windows))]
     Fish,
 }
 
@@ -304,16 +299,29 @@ fn backup_path(profile: &Path) -> PathBuf {
 
 fn definition(shell: ShellKind, tool: &str) -> String {
     match shell {
-        #[cfg(windows)]
         ShellKind::PowerShell | ShellKind::Pwsh => {
             format!("function global:{tool} {{ & pentect {tool} @args }}")
         }
-        #[cfg(not(windows))]
         ShellKind::Bash | ShellKind::Zsh => {
             format!(r#"{tool}() {{ command pentect {tool} "$@"; }}"#)
         }
-        #[cfg(not(windows))]
         ShellKind::Fish => format!("function {tool}\n    command pentect {tool} $argv\nend"),
+    }
+}
+
+fn shell_kind_from_name(name: &str) -> Option<ShellKind> {
+    let name = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "powershell" | "powershell.exe" => Some(ShellKind::PowerShell),
+        "pwsh" | "pwsh.exe" => Some(ShellKind::Pwsh),
+        "bash" | "bash.exe" => Some(ShellKind::Bash),
+        "zsh" | "zsh.exe" => Some(ShellKind::Zsh),
+        "fish" | "fish.exe" => Some(ShellKind::Fish),
+        _ => None,
     }
 }
 
@@ -326,39 +334,35 @@ fn detect_shell() -> Result<ShellKind, String> {
         let Some(process) = system.process(pid) else {
             break;
         };
-        let name = process.name().to_string_lossy().to_ascii_lowercase();
-        if matches!(name.as_str(), "pwsh" | "pwsh.exe") {
-            return Ok(ShellKind::Pwsh);
-        }
-        if matches!(name.as_str(), "powershell" | "powershell.exe") {
-            return Ok(ShellKind::PowerShell);
+        if let Some(shell) = shell_kind_from_name(&process.name().to_string_lossy()) {
+            return Ok(shell);
         }
         let Some(parent) = process.parent() else {
             break;
         };
         pid = parent;
     }
-    Err("could not detect PowerShell; run this command from PowerShell".into())
+    if let Some(shell) =
+        std::env::var_os("SHELL").and_then(|value| shell_kind_from_name(&value.to_string_lossy()))
+    {
+        return Ok(shell);
+    }
+    Err("could not detect the shell; use Bash, Zsh, Fish, or PowerShell".into())
 }
 
 #[cfg(not(windows))]
 fn detect_shell() -> Result<ShellKind, String> {
     let shell = std::env::var_os("SHELL")
-        .and_then(|value| PathBuf::from(value).file_name().map(|name| name.to_owned()))
-        .and_then(|name| name.to_str().map(str::to_ascii_lowercase))
+        .and_then(|value| shell_kind_from_name(&value.to_string_lossy()))
         .ok_or_else(|| "could not detect the shell from SHELL".to_string())?;
-    match shell.as_str() {
-        "bash" => Ok(ShellKind::Bash),
-        "zsh" => Ok(ShellKind::Zsh),
-        "fish" => Ok(ShellKind::Fish),
-        _ => Err(format!(
-            "unsupported shell '{shell}'; use Bash, Zsh, Fish, or PowerShell"
-        )),
-    }
+    Ok(shell)
 }
 
 #[cfg(windows)]
 fn profile_path(shell: ShellKind) -> Result<PathBuf, String> {
+    if matches!(shell, ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish) {
+        return posix_profile_path(shell);
+    }
     let executable = powershell_executable(shell)?;
     let output = Command::new(&executable)
         .args([
@@ -431,6 +435,10 @@ fn powershell_executable(shell: ShellKind) -> Result<PathBuf, String> {
 
 #[cfg(not(windows))]
 fn profile_path(shell: ShellKind) -> Result<PathBuf, String> {
+    posix_profile_path(shell)
+}
+
+fn posix_profile_path(shell: ShellKind) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is unavailable".to_string())?;
@@ -438,12 +446,26 @@ fn profile_path(shell: ShellKind) -> Result<PathBuf, String> {
         ShellKind::Bash => Ok(home.join(".bashrc")),
         ShellKind::Zsh => Ok(home.join(".zshrc")),
         ShellKind::Fish => Ok(home.join(".config").join("fish").join("config.fish")),
+        ShellKind::PowerShell | ShellKind::Pwsh => {
+            Err("PowerShell profiles require Windows".to_string())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_windows_and_posix_shell_process_names() {
+        assert_eq!(shell_kind_from_name("bash.exe"), Some(ShellKind::Bash));
+        assert_eq!(
+            shell_kind_from_name(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            Some(ShellKind::Pwsh)
+        );
+        assert_eq!(shell_kind_from_name("/usr/bin/zsh"), Some(ShellKind::Zsh));
+        assert_eq!(shell_kind_from_name("cmd.exe"), None);
+    }
 
     #[test]
     fn installs_updates_and_removes_one_owned_block() {
