@@ -560,6 +560,18 @@ fn safe_metric_secret_type(value: &str) -> &str {
     }
 }
 
+fn safe_metric_labels(values: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    let mut labels = BTreeMap::new();
+    for (label, count) in values {
+        increment_metric(
+            &mut labels,
+            safe_metric_secret_type(label).to_string(),
+            *count,
+        );
+    }
+    labels
+}
+
 pub(crate) fn record_mask_result(surface: &str, result: &MaskResult, target: Option<&Path>) {
     if result.summary.masked_count == 0 {
         return;
@@ -606,23 +618,11 @@ pub(crate) fn record_summary(
     ));
 }
 
-pub(crate) fn record_image(secret_images: usize, notes: &[String]) {
+pub(crate) fn record_image(secret_images: usize, detected_labels: &BTreeMap<String, u64>) {
     if secret_images == 0 {
         return;
     }
-    let mut labels = BTreeMap::new();
-    for note in notes {
-        let Some((_, list)) = note.split_once(']') else {
-            continue;
-        };
-        for label in list
-            .split(',')
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-        {
-            *labels.entry(label.to_string()).or_insert(0) += 1;
-        }
-    }
+    let labels = safe_metric_labels(detected_labels);
     record(ActivityEvent::new(
         "redact",
         "image",
@@ -1536,6 +1536,13 @@ mod tests {
         for label in labels::ALL {
             assert_eq!(safe_metric_secret_type(label), *label);
         }
+        let image_labels = safe_metric_labels(&BTreeMap::from([
+            (labels::KEYED_SECRET.to_string(), 2),
+            ("<<KEYED_SECRET_deadbeefdeadbeef>>".to_string(), 1),
+        ]));
+        assert_eq!(image_labels.get(labels::KEYED_SECRET), Some(&2));
+        assert_eq!(image_labels.get("OTHER"), Some(&1));
+        assert!(image_labels.keys().all(|label| !label.contains("<<")));
         assert_eq!(safe_metric_secret_type("accountIdentifier456"), "OTHER");
         assert_eq!(safe_metric_secret_type("secret\u{1b}[31m"), "OTHER");
         assert_eq!(safe_metric_surface("prompt"), "prompt");

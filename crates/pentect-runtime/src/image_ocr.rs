@@ -10,7 +10,7 @@ use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::ByteRange;
 use pentect_core::Recovery;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
 
@@ -52,7 +52,7 @@ pub(crate) struct ImageRedaction {
     pub(crate) unscanned_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
-    pub(crate) notes: Vec<String>,
+    pub(crate) labels: BTreeMap<String, u64>,
     pub(crate) recovery: Recovery,
     pub(crate) visual_notes: Vec<String>,
     pub(crate) metadata_notes: Vec<String>,
@@ -66,7 +66,7 @@ struct ImageRedactionState {
     attempted_images: usize,
     total_image_bytes: u64,
     started_at: std::time::Instant,
-    notes: Vec<String>,
+    labels: BTreeMap<String, u64>,
     recovery: HashMap<String, String>,
     visual_notes: Vec<String>,
     metadata_notes: Vec<String>,
@@ -264,7 +264,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         attempted_images: 0,
         total_image_bytes: 0,
         started_at: std::time::Instant::now(),
-        notes: Vec::new(),
+        labels: BTreeMap::new(),
         recovery: HashMap::new(),
         visual_notes: Vec::new(),
         metadata_notes: Vec::new(),
@@ -282,7 +282,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         unscanned_images: state.unscanned_images,
         ocr_failures: state.ocr_failures,
         secret_images: state.secret_images,
-        notes: state.notes,
+        labels: state.labels,
         recovery: Recovery::seal(state.recovery, key),
         visual_notes: state.visual_notes,
         metadata_notes: state.metadata_notes,
@@ -674,14 +674,15 @@ fn redact_image_bytes(
     }
     state.secret_images += 1;
     let index = state.secret_images;
+    for label in visual_labels.iter().chain(&metadata_labels) {
+        *state.labels.entry(label.clone()).or_default() += 1;
+    }
     if let Some(summary) = image_note_summary(&visual_labels, &visual_handles) {
         let note = format!("[{index}] {summary}");
-        state.notes.push(note.clone());
         state.visual_notes.push(note);
     }
     if let Some(summary) = image_note_summary(&metadata_labels, &metadata_handles) {
         let note = format!("[{index}] {summary}");
-        state.notes.push(note.clone());
         state.metadata_notes.push(note);
     }
     let payload = redacted_image_payload(bytes, index, cfg, &findings)?;
@@ -3466,6 +3467,9 @@ mod tests {
         assert!(!visual.contains("<<KEYED_SECRET_"), "{visual}");
         assert!(metadata.contains("<<KEYED_SECRET_"), "{metadata}");
         assert!(!metadata.contains("<<AWS_CLIENT_ID_"), "{metadata}");
+        assert_eq!(redaction.labels.get("AWS_CLIENT_ID"), Some(&1));
+        assert_eq!(redaction.labels.get(labels::KEYED_SECRET), Some(&1));
+        assert!(redaction.labels.keys().all(|label| !label.contains("<<")));
         assert!(
             redaction.recovery.resolve(&visual).contains(visual_secret),
             "{visual}"
