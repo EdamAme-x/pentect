@@ -1545,14 +1545,28 @@ fn run_endpoint_env(
             run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
         }
         client_descriptor::Protocol::Gemini => {
-            let proxy = gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
+            let google_api_key = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+                .iter()
+                .find_map(|name| nonempty_env(name));
+            let shield_child_key = google_api_key.is_some()
+                || upstream::has_google_api_key_override(&opts.upstream_header_env);
+            let proxy = gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env_and_api_key(
                 upstream,
                 &opts.upstream_header_env,
+                google_api_key,
             )?;
+            shield_google_api_key_env(&mut command, shield_child_key);
             command.env(tool.upstream_env[0], proxy.base_url());
             run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
         }
         _ => Err("internal endpoint-environment protocol mismatch".to_string()),
+    }
+}
+
+fn shield_google_api_key_env(command: &mut Command, enabled: bool) {
+    if enabled {
+        command.env("GEMINI_API_KEY", "pentect-local");
+        command.env("GOOGLE_API_KEY", "pentect-local");
     }
 }
 
@@ -3595,6 +3609,27 @@ mod tests {
         assert_eq!(
             environment.get(OsStr::new(plugins::GLOBAL_BINARY_IDS_ENV)),
             Some(&None)
+        );
+    }
+
+    #[test]
+    fn gemini_child_receives_only_local_placeholder_keys_when_gateway_owns_auth() {
+        let mut command = Command::new("gemini-child");
+        command.env("GEMINI_API_KEY", "inherited-value");
+        command.env("GOOGLE_API_KEY", "inherited-value");
+
+        shield_google_api_key_env(&mut command, true);
+
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new("GEMINI_API_KEY")),
+            Some(&Some(OsStr::new("pentect-local")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GOOGLE_API_KEY")),
+            Some(&Some(OsStr::new("pentect-local")))
         );
     }
 

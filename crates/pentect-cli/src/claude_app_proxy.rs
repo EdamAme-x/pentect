@@ -2039,6 +2039,23 @@ fn protect_chat_request(
             local_response: Some(body),
         });
     }
+    let inline_file_partial = {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "Claude App plugin lock was poisoned".to_string())?;
+        crate::http_files::run_anthropic_inline_file_stages(
+            &value,
+            &plugins,
+            "claude",
+            "desktop_http_json",
+        )
+    }?;
+    if block_unknown_formats && inline_file_partial {
+        return Err(
+            "unknown format blocked: a Claude App file plugin reported partial inline-file coverage"
+                .to_string(),
+        );
+    }
     let mut masker = masker
         .lock()
         .map_err(|_| "Claude App Chat masker lock was poisoned".to_string())?;
