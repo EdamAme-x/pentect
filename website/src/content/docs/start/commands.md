@@ -15,7 +15,10 @@ this guide before reaching for the advanced `resolve` command.
 | Inspect a handle | `pentect view HANDLE` | Nowhere; only safe metadata is printed |
 
 `read` uses the filename to recognize formats and can retain safe recovery
-metadata in the active local store. `mask` is a one-run stdin filter.
+metadata in the active local store. Without an active store, `read` still masks
+the file but any emitted handles are intentionally one-run values and cannot be
+resolved later; Pentect prints a warning to stderr in that case. `mask` is
+always a one-run stdin filter.
 
 ::: code-group
 

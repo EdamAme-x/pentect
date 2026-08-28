@@ -1057,7 +1057,16 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     };
     pentect_agent::record_read_activity(&result, &opts.path);
+    if let Some(warning) = transient_read_warning(result.summary.masked_count) {
+        eprintln!("{warning}");
+    }
     print_read_result(result, opts.emit_meta);
+}
+
+fn transient_read_warning(masked_count: usize) -> Option<&'static str> {
+    (masked_count > 0).then_some(
+        "[pentect] warning: no active memory store; handles in this output cannot be resolved later",
+    )
 }
 
 fn print_read_result(result: pentect_core::MaskResult, emit_meta: bool) {
@@ -3376,6 +3385,14 @@ mod tests {
             provider_upstream_key_env_names(&["x-api-key=MY_GATEWAY_KEY".to_string()]),
             &["OPENAI_API_KEY"]
         );
+    }
+
+    #[test]
+    fn transient_read_warns_only_when_it_emits_handles() {
+        assert!(transient_read_warning(0).is_none());
+        let warning = transient_read_warning(1).unwrap();
+        assert!(warning.contains("no active memory store"));
+        assert!(warning.contains("cannot be resolved later"));
     }
 
     #[test]
