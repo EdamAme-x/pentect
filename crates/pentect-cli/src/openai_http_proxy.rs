@@ -3749,7 +3749,12 @@ mod tests {
             std::env::set_var("PENTECT_HOME", &home);
             std::env::set_var("HOME", &home);
             std::env::set_var("LOCALAPPDATA", &home);
-            let process_host_candidate = Some(
+            let mut environment = Self {
+                saved,
+                home,
+                process_host_candidate: None,
+            };
+            environment.process_host_candidate = Some(
                 pentect_agent::register_process_host_candidate(
                     &pentect_agent::process_host_root().unwrap(),
                     store.addr(),
@@ -3760,11 +3765,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            Self {
-                saved,
-                home,
-                process_host_candidate,
-            }
+            environment
         }
 
         fn set(&mut self, name: &'static str, value: &str) {

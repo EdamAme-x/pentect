@@ -740,14 +740,21 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
             });
         }
     });
-    Ok(InProcessMemoryStore {
+    let store = InProcessMemoryStore {
         addr,
         token,
         process_host_read_token,
         process_host_write_token,
         shutdown: Some(shutdown_tx),
         server_thread: Some(server_thread),
-    })
+    };
+    MemoryStoreClient::for_activity(
+        store.addr.clone(),
+        store.process_host_read_token.to_string(),
+    )
+    .poll_activity_once(u64::MAX, REQUEST_TIMEOUT)
+    .context("in-process memory store did not become ready")?;
+    Ok(store)
 }
 
 #[cfg(not(test))]
