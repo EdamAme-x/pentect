@@ -325,8 +325,26 @@ fn shell_kind_from_name(name: &str) -> Option<ShellKind> {
     }
 }
 
-#[cfg(windows)]
 fn detect_shell() -> Result<ShellKind, String> {
+    let ancestry = shell_from_process_ancestry()?;
+    let login_shell = std::env::var_os("SHELL").map(|value| value.to_string_lossy().into_owned());
+    select_shell(ancestry, login_shell.as_deref())
+}
+
+fn select_shell(
+    ancestry: Option<ShellKind>,
+    login_shell: Option<&str>,
+) -> Result<ShellKind, String> {
+    if let Some(shell) = ancestry {
+        return Ok(shell);
+    }
+    if let Some(shell) = login_shell.and_then(shell_kind_from_name) {
+        return Ok(shell);
+    }
+    Err("could not detect the shell; use Bash, Zsh, Fish, or PowerShell".into())
+}
+
+fn shell_from_process_ancestry() -> Result<Option<ShellKind>, String> {
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut pid = sysinfo::get_current_pid().map_err(|error| error.to_string())?;
@@ -335,27 +353,14 @@ fn detect_shell() -> Result<ShellKind, String> {
             break;
         };
         if let Some(shell) = shell_kind_from_name(&process.name().to_string_lossy()) {
-            return Ok(shell);
+            return Ok(Some(shell));
         }
         let Some(parent) = process.parent() else {
             break;
         };
         pid = parent;
     }
-    if let Some(shell) =
-        std::env::var_os("SHELL").and_then(|value| shell_kind_from_name(&value.to_string_lossy()))
-    {
-        return Ok(shell);
-    }
-    Err("could not detect the shell; use Bash, Zsh, Fish, or PowerShell".into())
-}
-
-#[cfg(not(windows))]
-fn detect_shell() -> Result<ShellKind, String> {
-    let shell = std::env::var_os("SHELL")
-        .and_then(|value| shell_kind_from_name(&value.to_string_lossy()))
-        .ok_or_else(|| "could not detect the shell from SHELL".to_string())?;
-    Ok(shell)
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -465,6 +470,20 @@ mod tests {
         );
         assert_eq!(shell_kind_from_name("/usr/bin/zsh"), Some(ShellKind::Zsh));
         assert_eq!(shell_kind_from_name("cmd.exe"), None);
+    }
+
+    #[test]
+    fn current_process_shell_precedes_login_shell_with_a_fallback() {
+        assert_eq!(
+            select_shell(Some(ShellKind::Bash), Some("/bin/zsh")).unwrap(),
+            ShellKind::Bash
+        );
+        assert_eq!(
+            select_shell(None, Some("/bin/fish")).unwrap(),
+            ShellKind::Fish
+        );
+        assert!(select_shell(None, None).is_err());
+        assert!(select_shell(None, Some("/bin/unsupported-shell")).is_err());
     }
 
     #[test]
