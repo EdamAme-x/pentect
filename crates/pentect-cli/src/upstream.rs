@@ -159,6 +159,57 @@ pub(crate) fn has_authorization_override(specs: &[String]) -> bool {
         })
 }
 
+pub(crate) fn has_google_api_key_override(specs: &[String]) -> bool {
+    std::env::var_os(AUTHORIZATION_ENV).is_some()
+        || specs.iter().any(|spec| {
+            spec.split_once('=').is_some_and(|(name, _)| {
+                matches!(
+                    name.trim().to_ascii_lowercase().as_str(),
+                    "authorization" | "x-goog-api-key"
+                )
+            })
+        })
+}
+
+pub(crate) fn header_overrides_with_google_api_key(
+    specs: &[String],
+    mut api_key: Option<String>,
+) -> Result<HeaderOverrides, String> {
+    let mut overrides = match header_overrides(specs) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            if let Some(value) = api_key.as_mut() {
+                value.zeroize();
+            }
+            return Err(error);
+        }
+    };
+    if overrides.suppress_origin_auth {
+        if let Some(value) = api_key.as_mut() {
+            value.zeroize();
+        }
+        return Ok(overrides);
+    }
+    let Some(mut value) = api_key else {
+        return Ok(overrides);
+    };
+    if value.is_empty() {
+        return Err("provider Google API key is empty".to_string());
+    }
+    if value.len() > 16 * 1024 {
+        value.zeroize();
+        return Err("provider Google API key is too large".to_string());
+    }
+    let header = sensitive_header_value(&value, "provider Google API key");
+    value.zeroize();
+    overrides.suppress_origin_auth = true;
+    overrides.values.push(HeaderOverride {
+        name: reqwest::header::HeaderName::from_static("x-goog-api-key"),
+        value: Some(header?),
+    });
+    Ok(overrides)
+}
+
 pub(crate) fn header_overrides_with_bearer_env(
     specs: &[String],
     bearer_env: Option<&str>,
@@ -582,6 +633,52 @@ mod tests {
             "Bearer provider-test-key"
         );
         assert!(!overrides.forward_incoming_header("authorization"));
+    }
+
+    #[test]
+    fn provider_google_key_becomes_an_upstream_only_header() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _authorization = EnvRestore::remove(AUTHORIZATION_ENV);
+        let overrides = header_overrides_with_google_api_key(
+            &[],
+            Some("synthetic-google-provider-key".to_string()),
+        )
+        .unwrap();
+        let request = overrides
+            .apply(reqwest::Client::new().get("https://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("x-goog-api-key").unwrap(),
+            "synthetic-google-provider-key"
+        );
+        assert!(!overrides.forward_incoming_header("x-goog-api-key"));
+        assert!(!overrides.forward_incoming_header("authorization"));
+        assert!(request
+            .headers()
+            .get("x-goog-api-key")
+            .unwrap()
+            .is_sensitive());
+    }
+
+    #[test]
+    fn explicit_google_auth_override_prevents_provider_key_injection() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _authorization = EnvRestore::remove(AUTHORIZATION_ENV);
+        let _explicit = EnvRestore::set("PENTECT_TEST_GOOGLE_OVERRIDE", "explicit-test-key");
+        let specs = ["x-goog-api-key=PENTECT_TEST_GOOGLE_OVERRIDE".to_string()];
+        assert!(has_google_api_key_override(&specs));
+        let overrides =
+            header_overrides_with_google_api_key(&specs, Some("ignored-provider-key".to_string()))
+                .unwrap();
+        let request = overrides
+            .apply(reqwest::Client::new().get("https://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("x-goog-api-key").unwrap(),
+            "explicit-test-key"
+        );
     }
 
     #[test]

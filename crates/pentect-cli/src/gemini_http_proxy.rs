@@ -62,8 +62,16 @@ impl GeminiHttpProxyGuard {
         upstream: String,
         header_env: &[String],
     ) -> Result<Self, String> {
+        Self::start_with_header_env_and_api_key(upstream, header_env, None)
+    }
+
+    pub(crate) fn start_with_header_env_and_api_key(
+        upstream: String,
+        header_env: &[String],
+        api_key: Option<String>,
+    ) -> Result<Self, String> {
         let upstream = crate::upstream::parse_base(&upstream, "Gemini")?;
-        let headers = crate::upstream::header_overrides(header_env)?;
+        let headers = crate::upstream::header_overrides_with_google_api_key(header_env, api_key)?;
         let auth = random_auth_token()?;
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1204,6 +1212,77 @@ mod tests {
             value["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["key"],
             "sk_test_synthetic"
         );
+    }
+
+    #[test]
+    fn gateway_replaces_the_child_google_key_before_upstream() {
+        use std::io::{Read, Write};
+
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (headers_tx, headers_rx) = std::sync::mpsc::channel();
+        let upstream = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            headers_tx
+                .send(String::from_utf8(request[..header_end].to_vec()).unwrap())
+                .unwrap();
+            let response = r#"{"candidates":[]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            socket.flush().unwrap();
+        });
+
+        let proxy = GeminiHttpProxyGuard::start_with_header_env_and_api_key(
+            format!("http://{address}"),
+            &[],
+            Some("upstream-test-key".to_string()),
+        )
+        .unwrap();
+        reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1beta/models/gemini-test:generateContent",
+                proxy.base_url()
+            ))
+            .header("x-goog-api-key", "pentect-local")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(r#"{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}"#)
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let headers = headers_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        upstream.join().unwrap();
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: upstream-test-key")),
+            "upstream did not receive the gateway-owned key"
+        );
+        assert!(!headers.contains("pentect-local"));
     }
 
     #[test]
