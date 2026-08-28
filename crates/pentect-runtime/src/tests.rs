@@ -2245,7 +2245,6 @@ fn generic_posttool_masks_payload_alias() {
 #[test]
 fn posttool_masks_secret_query_inside_image_url() {
     let (root, session) = empty_session("hook-post-image-url-query");
-    write_project_config(&root, "[image]\nocr = \"off\"\nunscanned = \"allow\"\n");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2261,6 +2260,7 @@ fn posttool_masks_secret_query_inside_image_url() {
     });
     let output = {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _home = write_user_config(&root, "[image]\nocr = \"off\"\nunscanned = \"allow\"\n");
         let _cwd = enter_temp_cwd(&root);
         handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
     };
@@ -2275,7 +2275,6 @@ fn posttool_masks_secret_query_inside_image_url() {
 #[test]
 fn posttool_masks_text_in_invalid_image_shaped_object() {
     let (root, session) = empty_session("hook-post-invalid-image-object");
-    write_project_config(&root, "[image]\nocr = \"off\"\nunscanned = \"allow\"\n");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2289,6 +2288,7 @@ fn posttool_masks_text_in_invalid_image_shaped_object() {
     });
     let output = {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _home = write_user_config(&root, "[image]\nocr = \"off\"\nunscanned = \"allow\"\n");
         let _cwd = enter_temp_cwd(&root);
         handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
     };
@@ -2364,9 +2364,8 @@ fn tool_text_output_masks_mcp_connector_and_plugin_envelopes() {
 }
 
 #[test]
-fn posttool_allows_unscanned_image_output_by_default() {
+fn posttool_allows_unscanned_image_output_when_user_configured() {
     let (root, session) = empty_session("hook-post-image-best-effort");
-    write_project_config(&root, "[image]\nocr = \"on\"\nunscanned = \"allow\"\n");
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__screenshot",
@@ -2380,6 +2379,7 @@ fn posttool_allows_unscanned_image_output_by_default() {
     });
     let output = {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _home = write_user_config(&root, "[image]\nocr = \"on\"\nunscanned = \"allow\"\n");
         let _cwd = enter_temp_cwd(&root);
         handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
     };
@@ -4686,6 +4686,38 @@ fn write_project_config(root: &Path, config: &str) {
     let dir = root.join(".pentect");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.toml"), config).unwrap();
+}
+
+struct TestHome {
+    previous_home: Option<std::ffi::OsString>,
+    previous_user_profile: Option<std::ffi::OsString>,
+}
+
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        match self.previous_home.take() {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match self.previous_user_profile.take() {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+}
+
+fn write_user_config(root: &Path, config: &str) -> TestHome {
+    let home = root.join("home");
+    let dir = home.join(".pentect");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), config).unwrap();
+    let guard = TestHome {
+        previous_home: std::env::var_os("HOME"),
+        previous_user_profile: std::env::var_os("USERPROFILE"),
+    };
+    std::env::set_var("HOME", &home);
+    std::env::set_var("USERPROFILE", &home);
+    guard
 }
 
 struct TestCwd {
