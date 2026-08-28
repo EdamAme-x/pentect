@@ -984,8 +984,11 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown option: {flag}"));
             }
-            value => {
-                return Err(format!("unexpected argument for mask: {value}"));
+            _ => {
+                return Err(
+                    "pentect mask reads standard input only; pipe input to it or use `pentect mask < FILE`. Positional values are refused because command-line arguments may be recorded"
+                        .to_string(),
+                );
             }
         }
     }
@@ -3050,6 +3053,21 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_positional_error_guides_without_echoing_the_value() {
+        let secret = "should-never-appear-in-an-error";
+        let args = vec![
+            "pentect".to_string(),
+            "mask".to_string(),
+            secret.to_string(),
+        ];
+        let error = validate_mask_args(&args).unwrap_err();
+        assert!(!error.contains(secret), "{error}");
+        assert!(error.contains("standard input"), "{error}");
+        assert!(error.contains("pentect mask < FILE"), "{error}");
+        assert!(error.contains("may be recorded"), "{error}");
+    }
 
     #[test]
     fn metadata_and_client_commands_skip_memory_store_probe() {
