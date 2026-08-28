@@ -21,6 +21,7 @@ case "$1 $2" in
     case "$*" in
       *ci.yml*) touch "$MOCK_STATE/ci" ;;
       *nix.yml*) touch "$MOCK_STATE/nix" ;;
+      *current-clients.yml*) touch "$MOCK_STATE/clients" ;;
       *aur.yml*) touch "$MOCK_STATE/aur" ;;
     esac
     ;;
@@ -28,6 +29,7 @@ case "$1 $2" in
     case "$*" in
       *ci.yml*) test ! -e "$MOCK_STATE/ci" || printf '%s\n' 101 ;;
       *nix.yml*) test ! -e "$MOCK_STATE/nix" || printf '%s\n' 102 ;;
+      *current-clients.yml*) test ! -e "$MOCK_STATE/clients" || printf '%s\n' 103 ;;
     esac
     ;;
   "run watch") printf '%s\n' "$*" >> "$MOCK_STATE/watch" ;;
@@ -51,13 +53,17 @@ output=$(
 )
 test "$output" = https://github.com/example/project/pull/1
 test ! -e "$tmp/state/aur"
-test "$(wc -l < "$tmp/state/watch")" -eq 2
+test "$(wc -l < "$tmp/state/watch")" -eq 3
 grep -Fx 'run watch 101 --repo example/project --exit-status' "$tmp/state/watch"
 grep -Fx 'run watch 102 --repo example/project --exit-status' "$tmp/state/watch"
-test "$(wc -l < "$tmp/state/api")" -eq 3
+grep -Fx 'run watch 103 --repo example/project --exit-status' "$tmp/state/watch"
+test "$(wc -l < "$tmp/state/api")" -eq 5
 status_endpoint='api --method POST repos/example/project/statuses/0123456789abcdef'
-test "$(grep -Fc "$status_endpoint" "$tmp/state/api")" -eq 3
+test "$(grep -Fc "$status_endpoint" "$tmp/state/api")" -eq 5
 grep -F 'context=test' "$tmp/state/api"
 grep -F 'context=Native OCR (windows-latest)' "$tmp/state/api"
 grep -F 'context=Native OCR (macos-latest)' "$tmp/state/api"
-test "$(grep -Fc 'target_url=https://github.com/example/project/actions/runs/101' "$tmp/state/api")" -eq 3
+grep -F 'context=CI Gate' "$tmp/state/api"
+grep -F 'context=Current Client Gate' "$tmp/state/api"
+test "$(grep -Fc 'target_url=https://github.com/example/project/actions/runs/101' "$tmp/state/api")" -eq 4
+test "$(grep -Fc 'target_url=https://github.com/example/project/actions/runs/103' "$tmp/state/api")" -eq 1

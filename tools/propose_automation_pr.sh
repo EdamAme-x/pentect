@@ -57,8 +57,10 @@ latest_run() {
 
 previous_ci=$(latest_run ci.yml)
 previous_nix=$(latest_run nix.yml)
+previous_clients=$(latest_run current-clients.yml)
 gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
 gh workflow run nix.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
+gh workflow run current-clients.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
 aur_state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/aur.yml" --jq .state)
 if [ "$aur_state" = active ]; then
   gh workflow run aur.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
@@ -83,14 +85,17 @@ new_run() {
 
 ci_run=$(new_run ci.yml "$previous_ci")
 nix_run=$(new_run nix.yml "$previous_nix")
+clients_run=$(new_run current-clients.yml "$previous_clients")
 gh run watch "$ci_run" --repo "$GITHUB_REPOSITORY" --exit-status >&2
 gh run watch "$nix_run" --repo "$GITHUB_REPOSITORY" --exit-status >&2
+gh run watch "$clients_run" --repo "$GITHUB_REPOSITORY" --exit-status >&2
 
 ci_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$ci_run"
 for context in \
   test \
   'Native OCR (windows-latest)' \
-  'Native OCR (macos-latest)'
+  'Native OCR (macos-latest)' \
+  'CI Gate'
 do
   gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
     -f state=success \
@@ -98,6 +103,13 @@ do
     -f description='Validated by the automation PR CI workflow' \
     -f target_url="$ci_url" >/dev/null
 done
+
+clients_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$clients_run"
+gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+  -f state=success \
+  -f context='Current Client Gate' \
+  -f description='Validated by the current-client compatibility workflow' \
+  -f target_url="$clients_url" >/dev/null
 
 gh pr merge "$pull" --repo "$GITHUB_REPOSITORY" --auto --merge --delete-branch \
   --match-head-commit "$head" >&2
