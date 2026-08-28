@@ -69,18 +69,12 @@ jobs:
           EOF
           test -n "$(find debs -name 'pentect_*.deb' -print -quit)"
           gh release upload "$TAG" debs/* --clobber --repo "$GITHUB_REPOSITORY"
-      - name: Download all stable Debian packages
+      - name: Download recent stable Debian packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           rm -rf debs
-          mkdir -p debs
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
-          while IFS= read -r tag; do
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-              --pattern 'pentect_*.deb' --dir debs --skip-existing || true
-          done
+          sh tools/download_recent_stable_debs.sh debs 3
       - name: Sign repository
         id: signing
         env:
@@ -92,6 +86,10 @@ jobs:
           test "$fingerprint" = "$(cat packaging/apt/KEY_FINGERPRINT)"
           bash tools/build_apt_repository.sh debs site \
             packaging/apt/pentect-archive-keyring.asc "$fingerprint"
+          bytes=$(du -sb site | awk '{print $1}')
+          packages=$(find site -type f -name '*.deb' | wc -l)
+          echo "APT repository: $packages package files, $bytes bytes"
+          test "$bytes" -le 800000000
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
