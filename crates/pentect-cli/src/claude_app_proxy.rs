@@ -2757,12 +2757,20 @@ where
                 None => {
                     state.finished = true;
                     if let Some(mut transformer) = state.transformer.take() {
-                        state.ready.extend(
-                            transformer
-                                .finish()
-                                .into_iter()
-                                .map(|chunk| Ok(Frame::data(chunk))),
-                        );
+                        match transformer.finish() {
+                            Ok(chunks) => state
+                                .ready
+                                .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
+                            Err(error) => {
+                                eprintln!(
+                                    "[pentect] Claude App Chat response blocked at EOF: {error}"
+                                );
+                                state.ready.push_back(Err(Box::new(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    error,
+                                ))));
+                            }
+                        }
                     }
                 }
             }
