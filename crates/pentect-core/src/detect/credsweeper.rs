@@ -3837,7 +3837,11 @@ fn load_der_private_key(data: &[u8]) -> Option<CredSweeperPrivateKey> {
     if let Some(key) = load_pkcs8_private_key(data) {
         return Some(key);
     }
-    let store = KeyStore::from_pkcs12(data, "", Pkcs12ImportPolicy::Raw).ok()?;
+    // Raw import stores an unlinked private key and its certificate under the
+    // same friendly name. The certificate is inserted last and can overwrite
+    // the key entry. Relaxed import links matching local-key IDs while still
+    // retaining unmatched private keys, matching CredSweeper's load_pk probe.
+    let store = KeyStore::from_pkcs12(data, "", Pkcs12ImportPolicy::Relaxed).ok()?;
     let (_, chain) = store.private_key_chain()?;
     load_pkcs8_private_key(chain.key().as_der())
 }
@@ -6874,7 +6878,7 @@ fn normalize_label(rule: &str) -> String {
 mod tests {
     use super::*;
     use crate::detect::region;
-    use p12_keystore::{KeyStoreEntry, PrivateKey, PrivateKeyChain};
+    use p12_keystore::{Certificate, KeyStoreEntry, PrivateKey, PrivateKeyChain};
 
     fn rsa_pkcs8_fixture() -> Vec<u8> {
         BASE64
@@ -6922,6 +6926,27 @@ mod tests {
         store.add_entry("test", KeyStoreEntry::PrivateKeyChain(chain));
         let p12 = store.writer("").write().expect("PKCS#12 fixture");
         let key = load_der_private_key(&p12).expect("load PKCS#12");
+        assert!(private_key_is_valid(&key));
+    }
+
+    #[test]
+    fn private_key_loader_keeps_pkcs12_keys_that_share_a_certificate_alias() {
+        let ed25519 = data_encoding::HEXLOWER
+            .decode(b"302e020100300506032b65700422042017ed9c73e9db649ec189a612831c5fc570238207c1aa9dfbd2c53e3ff5e5ea85")
+            .expect("Ed25519 PKCS#8 fixture");
+        let certificate = BASE64
+            .decode(b"MIIBWDCCAQqgAwIBAgIUJHqHxlYUeJLW/OvjdnQXBwy/eWswBQYDK2VwMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4XDTI2MDYxOTA2MjA1OFoXDTI4MDUxOTA2MjA1OFowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wKjAFBgMrZXADIQBZeSuQJmHBhe6U7x4GDBUMK4INE8VxqP311K/ejllcnaNqMGgwCQYDVR0TBAIwADAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCwYDVR0PBAQDAgOIMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBSw1lXZ6Gnm3DuRtrFmcWOZEYxdqjAFBgMrZXADQQCicT1reAXWy/i58EABJ2n2zNYdeKP1jyvjlUwzm81sZbNfeaqYNjJoYAK1EBiCW0PGfFIuS++1od7w56YgV+EO")
+            .expect("X.509 fixture");
+        let chain = PrivateKeyChain::new(
+            [1_u8, 2, 3, 4].as_slice(),
+            PrivateKey::from_der(&ed25519).expect("private key"),
+            [Certificate::from_der(&certificate).expect("certificate")],
+        );
+        let mut store = KeyStore::new();
+        store.add_entry("shared alias", KeyStoreEntry::PrivateKeyChain(chain));
+        let p12 = store.writer("").write().expect("PKCS#12 fixture");
+
+        let key = load_der_private_key(&p12).expect("load PKCS#12 key with certificate");
         assert!(private_key_is_valid(&key));
     }
 
