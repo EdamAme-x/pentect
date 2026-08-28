@@ -1094,7 +1094,7 @@ fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
 fn ocr_off_obeys_block_policy_for_active_image_redaction() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("ocr-off-block-active");
-    write_project_config(&root, "[image]\nocr = \"off\"\nunscanned = \"block\"\n");
+    let _home = write_user_config(&root, "[image]\nocr = \"off\"\nunscanned = \"block\"\n");
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("ocr-off-block-store");
     let _cwd = enter_temp_cwd(&root);
     let image = json!({
