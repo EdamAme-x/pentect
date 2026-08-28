@@ -3051,6 +3051,13 @@ fn print_permissions(permissions: &PermissionsConfig) {
     }
     if !permissions.env.is_empty() {
         println!("permission-env: {}", permissions.env.join(", "));
+        let sensitive = sensitive_env_permissions(&permissions.env);
+        if !sensitive.is_empty() {
+            println!(
+                "WARNING: credential-like environment access: {}",
+                sensitive.join(", ")
+            );
+        }
     }
     for argv in &permissions.run {
         println!("permission-run: {}", display_command(argv));
@@ -3058,6 +3065,36 @@ fn print_permissions(permissions: &PermissionsConfig) {
     if permissions.storage {
         println!("permission-storage: enabled");
     }
+}
+
+fn sensitive_env_permissions(names: &[String]) -> Vec<&str> {
+    names
+        .iter()
+        .filter(|name| {
+            let upper = name.to_ascii_uppercase();
+            upper == "PASSWORD"
+                || upper == "PASSWD"
+                || upper == "API_KEY"
+                || upper == "SECRET"
+                || upper == "TOKEN"
+                || upper == "CREDENTIAL"
+                || upper == "CREDENTIALS"
+                || upper == "PRIVATE_KEY"
+                || upper == "ACCESS_KEY"
+                || upper.ends_with("_PASSWORD")
+                || upper.ends_with("_PASSWD")
+                || upper.contains("_API_KEY")
+                || upper.ends_with("_SECRET")
+                || upper.contains("_SECRET_")
+                || upper.ends_with("_TOKEN")
+                || upper.contains("_TOKEN_")
+                || upper.ends_with("_CREDENTIAL")
+                || upper.ends_with("_CREDENTIALS")
+                || upper.ends_with("_PRIVATE_KEY")
+                || upper.ends_with("_ACCESS_KEY")
+        })
+        .map(String::as_str)
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4815,5 +4852,26 @@ pattern = "token-[0-9]+"
 
         let _ = std::fs::remove_dir_all(data_dir);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn credential_like_environment_permissions_are_highlighted() {
+        let names = vec![
+            "PATH".to_string(),
+            "OPENAI_API_KEY".to_string(),
+            "GITHUB_TOKEN".to_string(),
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "DATABASE_PASSWORD".to_string(),
+            "PUBLIC_ENDPOINT".to_string(),
+        ];
+        assert_eq!(
+            sensitive_env_permissions(&names),
+            [
+                "OPENAI_API_KEY",
+                "GITHUB_TOKEN",
+                "AWS_SECRET_ACCESS_KEY",
+                "DATABASE_PASSWORD"
+            ]
+        );
     }
 }
