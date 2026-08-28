@@ -71,11 +71,12 @@ pub(crate) fn run(
         }
         _ => &["OPENAI_API_KEY"],
     };
-    let standard_key_names = if has_authorization_override(&opts.upstream_header_env) {
-        &[][..]
-    } else {
-        standard_key_names
-    };
+    let standard_key_names =
+        if crate::upstream::has_authorization_override(&opts.upstream_header_env) {
+            &[][..]
+        } else {
+            standard_key_names
+        };
     let _authorization = crate::upstream_bearer_guard(standard_key_names);
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
         upstream,
@@ -313,23 +314,23 @@ fn start_opencode_proxy(
     let mut header_env = base_header_env.to_vec();
     let bearer_env = route.bearer_env.filter(|name| {
         std::env::var_os(name).is_some_and(|value| !value.is_empty())
-            && !has_authorization_override(&header_env)
+            && !crate::upstream::has_authorization_override(&header_env)
     });
     let mut child_key_env = bearer_env.or_else(|| {
         route
             .bearer_env
-            .filter(|_| has_authorization_override(&header_env))
+            .filter(|_| crate::upstream::has_authorization_override(&header_env))
     });
     if route.protocol == OpenCodeProtocol::Anthropic {
         if let Some(name) = configured_key_env(&["ANTHROPIC_API_KEY"]) {
             child_key_env = Some(name);
             if !has_header_override(&header_env, "x-api-key")
-                && !has_authorization_override(&header_env)
+                && !crate::upstream::has_authorization_override(&header_env)
             {
                 header_env.push(format!("x-api-key={name}"));
             }
         } else if has_header_override(&header_env, "x-api-key")
-            || has_authorization_override(&header_env)
+            || crate::upstream::has_authorization_override(&header_env)
         {
             child_key_env = Some("ANTHROPIC_API_KEY");
         }
@@ -341,12 +342,12 @@ fn start_opencode_proxy(
         ]) {
             child_key_env = Some(name);
             if !has_header_override(&header_env, "x-goog-api-key")
-                && !has_authorization_override(&header_env)
+                && !crate::upstream::has_authorization_override(&header_env)
             {
                 header_env.push(format!("x-goog-api-key={name}"));
             }
         } else if has_header_override(&header_env, "x-goog-api-key")
-            || has_authorization_override(&header_env)
+            || crate::upstream::has_authorization_override(&header_env)
         {
             child_key_env = Some("GOOGLE_API_KEY");
         }
@@ -485,10 +486,6 @@ fn configured_key_env(names: &[&'static str]) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
-}
-
-fn has_authorization_override(specs: &[String]) -> bool {
-    has_header_override(specs, "authorization")
 }
 
 fn has_header_override(specs: &[String], header: &str) -> bool {
@@ -1017,13 +1014,13 @@ mod tests {
 
     #[test]
     fn explicit_authorization_header_disables_implicit_key_selection() {
-        assert!(has_authorization_override(&[
+        assert!(crate::upstream::has_authorization_override(&[
             "authorization=MY_HEADER".to_string()
         ]));
-        assert!(has_authorization_override(&[
+        assert!(crate::upstream::has_authorization_override(&[
             " Authorization =MY_HEADER".to_string()
         ]));
-        assert!(!has_authorization_override(&[
+        assert!(!crate::upstream::has_authorization_override(&[
             "X-Api-Key=MY_HEADER".to_string()
         ]));
     }

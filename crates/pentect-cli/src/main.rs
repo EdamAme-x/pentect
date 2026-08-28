@@ -1157,7 +1157,7 @@ fn cmd_provider(args: &[String]) -> i32 {
     // credential. Rust converts the standard OpenAI key into an upstream-only
     // Authorization override, so a local caller's dummy header cannot replace
     // it and the key never appears in readiness output or arguments.
-    let _authorization = upstream_bearer_guard(&["OPENAI_API_KEY"]);
+    let _authorization = upstream_bearer_guard(provider_upstream_key_env_names(&header_env));
     let proxy =
         openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(upstream, &header_env)
             .unwrap_or_else(|error| die_with_issue(error));
@@ -1187,6 +1187,14 @@ fn cmd_provider(args: &[String]) -> i32 {
     discard.zeroize();
     drop(proxy);
     0
+}
+
+fn provider_upstream_key_env_names(header_env: &[String]) -> &'static [&'static str] {
+    if upstream::has_authorization_override(header_env) {
+        &[]
+    } else {
+        &["OPENAI_API_KEY"]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3356,6 +3364,18 @@ mod tests {
             Some("https://cloud-code.example/base")
         );
         assert_eq!(antigravity.tool_args, ["--agent", "reviewer"]);
+    }
+
+    #[test]
+    fn provider_authorization_override_disables_implicit_openai_bearer() {
+        assert_eq!(
+            provider_upstream_key_env_names(&["authorization=MY_GATEWAY_AUTH".to_string()]),
+            &[] as &[&str]
+        );
+        assert_eq!(
+            provider_upstream_key_env_names(&["x-api-key=MY_GATEWAY_KEY".to_string()]),
+            &["OPENAI_API_KEY"]
+        );
     }
 
     #[test]
