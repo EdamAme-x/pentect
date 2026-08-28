@@ -764,6 +764,27 @@ fn active_prompt_masks_keyed_and_vendor_secrets_in_prose() {
 }
 
 #[test]
+fn active_prompt_preserves_label_like_plain_prose() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-prose-precision");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+
+    for prompt in [
+        "NOTE: please read the documentation before continuing.",
+        "Error: connection refused while contacting the service.",
+        "Summary: the build passed and all tests are green.",
+        "Question: why does the build fail on Windows only?",
+        "Traceback: File main.py line 12 in handler raise ValueError",
+        "Result: 42",
+        "Error connection refused while contacting the service",
+        "IMPORTANT: this context may or may not be relevant to your tasks.",
+    ] {
+        let masked = masker.mask_prompt_text(prompt).unwrap().unwrap();
+        assert_eq!(masked, prompt, "plain prompt was changed: {prompt}");
+    }
+}
+
+#[test]
 fn active_prompt_explicit_marker_masks_low_entropy_value_and_removes_wrapper() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-explicit-marker");
@@ -2005,7 +2026,10 @@ fn write_tool_applies_edit_with_masked_old_string_before_tool() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    assert_eq!(
+        output["hookSpecificOutput"]["permissionDecision"], "allow",
+        "{output}"
+    );
     let updated = &output["hookSpecificOutput"]["updatedInput"];
     let old_string = updated["old_string"].as_str().unwrap();
     let new_string = updated["new_string"].as_str().unwrap();

@@ -3686,6 +3686,10 @@ fn safe_noop_edit_anchor(content: &str, key: &[u8; 32]) -> Option<String> {
         .split_inclusive('\n')
         .find(|candidate| safe_noop_edit_anchor_candidate(candidate, key))
         .map(str::to_string)
+        // A file made entirely of secret-bearing lines has no publishable
+        // text anchor. Replacing one existing line feed with itself is still
+        // a valid edit no-op and reveals none of the file content.
+        .or_else(|| content.contains('\n').then(|| "\n".to_string()))
 }
 
 fn safe_noop_edit_anchor_candidate(candidate: &str, key: &[u8; 32]) -> bool {
