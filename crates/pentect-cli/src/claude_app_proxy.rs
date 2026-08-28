@@ -795,15 +795,34 @@ fn wide_null(value: &str) -> Vec<u16> {
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn quote_windows_argument(value: &str) -> String {
-    if !value
-        .chars()
-        .any(|ch| ch.is_ascii_whitespace() || ch == '"')
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || ch == '"')
     {
         return value.to_string();
     }
-    format!("\"{}\"", value.replace('"', "\\\""))
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+        }
+        backslashes = 0;
+        quoted.push(ch);
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(windows)]
@@ -4009,13 +4028,48 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn activation_arguments_quote_paths_with_spaces() {
         assert_eq!(quote_windows_argument("--flag=value"), "--flag=value");
+        assert_eq!(quote_windows_argument(""), "\"\"");
         assert_eq!(
             quote_windows_argument("--user-data-dir=C:\\Users\\Test User\\Claude"),
             "\"--user-data-dir=C:\\Users\\Test User\\Claude\""
         );
+        assert_eq!(
+            quote_windows_argument(r#"--settings={"theme": "dark"}"#),
+            r#""--settings={\"theme\": \"dark\"}""#
+        );
+        assert_eq!(
+            quote_windows_argument("--value=C:\\path\\\\\"quoted value\"\\"),
+            "\"--value=C:\\path\\\\\\\\\\\"quoted value\\\"\\\\\""
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_arguments_round_trip_through_windows_parser() {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+
+        for expected in [
+            "",
+            "--flag=value",
+            "--user-data-dir=C:\\Users\\Test User\\Claude\\",
+            r#"--settings={"theme": "dark"}"#,
+            "--value=C:\\path\\\\\"quoted value\"\\",
+        ] {
+            let command = wide_null(&format!("program.exe {}", quote_windows_argument(expected)));
+            let mut count = 0;
+            let arguments = unsafe { CommandLineToArgvW(PCWSTR(command.as_ptr()), &mut count) };
+            assert!(!arguments.is_null());
+            assert_eq!(count, 2, "argument was split: {expected}");
+            let actual = unsafe { (*arguments.add(1)).to_string().unwrap() };
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(arguments.cast())));
+            }
+            assert_eq!(actual, expected);
+        }
     }
 }
