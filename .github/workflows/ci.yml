@@ -123,6 +123,8 @@ jobs:
               - 'tools/test_download_recent_stable_debs.sh'
               - 'tools/propose_automation_pr.sh'
               - 'tools/test_propose_automation_pr.sh'
+              - 'tools/wait_for_automation_pr.sh'
+              - 'tools/test_wait_for_automation_pr.sh'
               - 'tools/test_release_package_metadata.py'
               - 'tools/update_package_metadata.py'
               - 'tools/client_smoke.py'
@@ -417,13 +419,14 @@ jobs:
           python tools/test_client_smoke_coverage.py
           python tools/test_release_package_metadata.py
           python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/propose_automation_pr.sh tools/wait_for_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
           sh tools/test_download_recent_stable_debs.sh
           sh tools/test_install.sh
           bash -n .github/scripts/publish-aur.sh
           cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$RUNNER_TEMP/codex-app-smoke-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           sh tools/test_propose_automation_pr.sh
+          sh tools/test_wait_for_automation_pr.sh
       - name: Validate PowerShell tools
         if: needs.changes.outputs.packaging == 'true'
         shell: pwsh
