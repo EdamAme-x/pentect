@@ -148,6 +148,10 @@ jobs:
         id: rust-cache
         with:
           shared-key: release-${{ matrix.asset }}
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+        with:
+          version: "v0.17.0"
       - name: Report release build environment
         shell: pwsh
         run: |
@@ -158,15 +162,41 @@ jobs:
           cargo --version --verbose
           go version
       - name: Build release binary
+        id: release-build
         shell: pwsh
         env:
           PENTECT_REQUIRE_ALCATRAZ: "1"
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_VERSION: pentect-release-v1-${{ matrix.asset }}
         run: |
+          & $env:SCCACHE_PATH --zero-stats
+          if ($LASTEXITCODE -ne 0) { throw 'could not reset sccache statistics' }
           $timer = [Diagnostics.Stopwatch]::StartNew()
           cargo build --release --locked --timings -p pentect-cli
           $exitCode = $LASTEXITCODE
           $timer.Stop()
           "Release build elapsed: $($timer.Elapsed)"
+          "elapsed_seconds=$([Math]::Round($timer.Elapsed.TotalSeconds, 3))" >> $env:GITHUB_OUTPUT
+          if ($exitCode -ne 0) { exit $exitCode }
+      - name: Record compiler cache statistics
+        if: always()
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_VERSION: pentect-release-v1-${{ matrix.asset }}
+        run: |
+          $stats = (& $env:SCCACHE_PATH --show-stats 2>&1 | Out-String).Trim()
+          $exitCode = $LASTEXITCODE
+          $stats
+          $stats | Set-Content -Encoding utf8 sccache-stats.txt
+          @"
+          #### sccache
+
+          ``````text
+          $stats
+          ``````
+          "@ >> $env:GITHUB_STEP_SUMMARY
           if ($exitCode -ne 0) { exit $exitCode }
       - name: Summarize release build diagnostics
         if: always()
@@ -182,6 +212,7 @@ jobs:
           - Runner: `$env:RUNNER_OS/$env:RUNNER_ARCH`
           - Logical processors: $([Environment]::ProcessorCount)
           - Rust cache hit: `${{ steps.rust-cache.outputs.cache-hit }}`
+          - Release build: `${{ steps.release-build.outputs.elapsed_seconds }}` seconds
           - Target directory: ${targetMiB} MiB
           "@ >> $env:GITHUB_STEP_SUMMARY
       - name: Upload Cargo timing report
@@ -190,6 +221,14 @@ jobs:
         with:
           name: build-diagnostics-${{ matrix.asset }}
           path: target/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload compiler cache statistics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sccache-statistics-${{ matrix.asset }}
+          path: sccache-stats.txt
           if-no-files-found: warn
           retention-days: 14
       - name: Verify bundled Alcatraz without an external Go runtime
