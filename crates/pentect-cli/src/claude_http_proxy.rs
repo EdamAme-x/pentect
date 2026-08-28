@@ -1688,6 +1688,12 @@ fn mask_anthropic_request(
             }
         }
     }
+    // Tool descriptions and input schemas are model-visible and can be
+    // generated from local MCP/editor state. Apply the same bounded traversal
+    // used by the OpenAI boundary; keys remain structural and unchanged.
+    if let Some(tools) = value.get_mut("tools") {
+        crate::model_definition::mask_model_definition(tools, "Anthropic", masker)?;
+    }
     Ok(())
 }
 
@@ -3635,6 +3641,54 @@ mod tests {
         );
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, true).is_err());
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn anthropic_tools_mask_model_visible_descriptions_and_schemas() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["AKIA", "CSVC3FV5", "KQHYWH8A"].concat();
+        let mut request = serde_json::json!({
+            "model": "test",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "use the lookup tool"}],
+            "tools": [{
+                "name": "lookup",
+                "description": format!("Use credential {secret}"),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": format!("Query with {secret}")
+                        }
+                    }
+                }
+            }]
+        });
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+
+        mask_anthropic_request(
+            &mut request,
+            &mut masker,
+            &HashMap::new(),
+            AnthropicEndpoint::Messages,
+        )
+        .unwrap();
+
+        let tools = &request["tools"];
+        assert!(!tools.to_string().contains(&secret), "{tools}");
+        assert!(first_valid_handle(tools[0]["description"].as_str().unwrap()).is_some());
+        assert!(first_valid_handle(
+            tools[0]["input_schema"]["properties"]["query"]["description"]
+                .as_str()
+                .unwrap()
+        )
+        .is_some());
+        assert_eq!(tools[0]["name"], "lookup");
+        assert_eq!(tools[0]["input_schema"]["type"], "object");
+        assert_eq!(request["messages"][0]["content"], "use the lookup tool");
     }
 
     #[test]
