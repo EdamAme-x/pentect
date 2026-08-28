@@ -2184,7 +2184,14 @@ fn mask_chat_value(
                 || kind.contains("tool_result")
                 || kind.contains("tool_output")
                 || kind.contains("function_output");
+            let tool_call = kind.contains("tool_use")
+                || kind.contains("tool_call")
+                || kind.contains("function_call");
             for (key, nested) in object {
+                if tool_call && matches!(key.as_str(), "input" | "arguments") {
+                    crate::claude_http_proxy::mask_value_strings(nested, masker)?;
+                    continue;
+                }
                 if matches!(
                     key.as_str(),
                     "signature" | "thinking_signature" | "attestation"
@@ -2657,6 +2664,7 @@ fn run_chat_tool_plugins(
                     serde_json::Value::Object(object.clone()),
                     Some(serde_json::json!({"provider": "claude", "transport": "desktop-http"})),
                 )?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude App")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin blocked: {}",
@@ -3401,6 +3409,15 @@ mod tests {
                     "type": "tool_result",
                     "tool_use_id": "tool-stable-id",
                     "content": {"token": secret, "status": "ok"}
+                }, {
+                    "type": "tool_use",
+                    "name": "configure_service",
+                    "input": {
+                        "token": secret,
+                        "authorization": secret,
+                        "id": secret,
+                        "name": secret
+                    }
                 }]}],
                 "client_context": {"locale": "ja-JP", "revision": 7}
             }))
@@ -3433,6 +3450,12 @@ mod tests {
             value["messages"][0]["content"][0]["content"]["token"],
             secret
         );
+        let tool_input = &value["messages"][0]["content"][1]["input"];
+        for key in ["token", "authorization", "id", "name"] {
+            let protected = tool_input[key].as_str().unwrap();
+            assert!(!protected.contains(&secret), "{key} was not protected");
+            assert!(protected.contains("<<"), "{key} has no handle");
+        }
 
         let telemetry = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
