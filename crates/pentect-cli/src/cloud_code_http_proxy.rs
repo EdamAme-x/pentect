@@ -295,7 +295,7 @@ async fn proxy_request_inner(
             Err(error) => return Err(format!("could not read Google Cloud Code request: {error}")),
         };
         let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
-        let body = resolve_cloud_code_remote_files(body, &mut remote_budget).await?;
+        let body = resolve_google_remote_files(body, &mut remote_budget).await?;
         let protected = protect_request_body(
             &body,
             endpoint,
@@ -411,7 +411,7 @@ async fn proxy_request_inner(
         .map_err(|error| format!("could not build Google Cloud Code response: {error}"))
 }
 
-async fn resolve_cloud_code_remote_files(
+pub(crate) async fn resolve_google_remote_files(
     body: Bytes,
     budget: &mut crate::remote_content::RemoteRequestBudget,
 ) -> Result<Bytes, String> {
@@ -419,13 +419,13 @@ async fn resolve_cloud_code_remote_files(
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    resolve_cloud_code_remote_values(&mut value, budget).await?;
+    resolve_google_remote_values(&mut value, budget).await?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| "could not encode resolved Google Cloud Code attachment".to_string())
 }
 
-fn resolve_cloud_code_remote_values<'a>(
+fn resolve_google_remote_values<'a>(
     value: &'a mut Value,
     budget: &'a mut crate::remote_content::RemoteRequestBudget,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
@@ -433,7 +433,7 @@ fn resolve_cloud_code_remote_values<'a>(
         match value {
             Value::Array(values) => {
                 for value in values {
-                    resolve_cloud_code_remote_values(value, budget).await?;
+                    resolve_google_remote_values(value, budget).await?;
                 }
             }
             Value::Object(object) => {
@@ -461,7 +461,7 @@ fn resolve_cloud_code_remote_values<'a>(
                     }
                 }
                 for value in object.values_mut() {
-                    resolve_cloud_code_remote_values(value, budget).await?;
+                    resolve_google_remote_values(value, budget).await?;
                 }
             }
             _ => {}
@@ -768,9 +768,7 @@ fn mask_part(
         .transpose()?
         .flatten();
     if object.contains_key("fileData") && pentect_agent::unscanned_images_should_block()? {
-        return Err(
-            "document blocked: Google Cloud Code fileData could not be scanned".to_string(),
-        );
+        return Err("document blocked: Google fileData could not be scanned".to_string());
     }
     if let Some(code) = object.get_mut("executableCode") {
         mask_value_strings(code, false, masker)?;
