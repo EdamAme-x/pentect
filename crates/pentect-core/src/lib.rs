@@ -156,8 +156,26 @@ fn has_yaml_key_value(raw: &str, expected_key: &str, expected_value: Option<&str
             return false;
         };
         key.trim() == expected_key
-            && expected_value.is_none_or(|expected| value.trim().eq_ignore_ascii_case(expected))
+            && expected_value.is_none_or(|expected| {
+                yaml_scalar_without_quotes(value).eq_ignore_ascii_case(expected)
+            })
     })
+}
+
+pub(crate) fn yaml_scalar_without_quotes(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() < 2 {
+        return value;
+    }
+    let bytes = value.as_bytes();
+    if matches!(
+        (bytes[0], bytes[value.len() - 1]),
+        (b'"', b'"') | (b'\'', b'\'')
+    ) {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 fn looks_like_aws_config(raw: &str) -> bool {
@@ -414,13 +432,17 @@ mod tests {
             infer_kind_with_content(Path::new("stdin"), r#"{"token":"x"}"#),
             Kind::Json
         );
-        assert_eq!(
-            infer_kind_with_content(
-                Path::new("stdin"),
-                "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  password: x\n"
-            ),
-            Kind::Other("structured".into())
-        );
+        for kind in ["Secret", "\"Secret\"", "'Secret'"] {
+            assert_eq!(
+                infer_kind_with_content(
+                    Path::new("stdin"),
+                    &format!(
+                        "apiVersion: v1\nkind: {kind}\nmetadata:\n  name: app\nstringData:\n  password: x\n"
+                    )
+                ),
+                Kind::Other("structured".into())
+            );
+        }
         assert_eq!(
             infer_kind_with_content(
                 Path::new("stdin"),
