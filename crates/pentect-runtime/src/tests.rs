@@ -801,6 +801,13 @@ fn active_prompt_explicit_marker_masks_low_entropy_value_and_removes_wrapper() {
     );
     assert!(!masked.contains("pentect("), "{masked}");
     assert!(!masked.contains("abc"), "{masked}");
+
+    let handle = masked
+        .split_whitespace()
+        .last()
+        .expect("masked prompt contains a handle");
+    let output = masker.mask_tool_output("echo abc xabc").unwrap().unwrap();
+    assert_eq!(output, format!("echo {handle} xabc"));
 }
 
 #[test]

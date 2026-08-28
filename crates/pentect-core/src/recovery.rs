@@ -112,7 +112,7 @@ impl Recovery {
         if pairs.is_empty() {
             return text.to_string();
         }
-        if pairs.len() == 1 {
+        if pairs.len() == 1 && !requires_token_boundaries(&pairs[0].0) {
             let (mut value, ph) = pairs.pop().expect("checked len");
             let out = text.replace(&value, ph);
             value.zeroize();
@@ -125,10 +125,26 @@ impl Recovery {
             .expect("non-empty remask patterns");
         let mut out = String::with_capacity(text.len());
         let mut cursor = 0usize;
-        for m in ac.find_iter(text) {
-            out.push_str(&text[cursor..m.start()]);
-            out.push_str(pairs[m.pattern().as_usize()].1);
-            cursor = m.end();
+        let mut search = 0usize;
+        while let Some(m) = ac.find(&text[search..]) {
+            let start = search + m.start();
+            let end = search + m.end();
+            let pattern = m.pattern().as_usize();
+            if requires_token_boundaries(&pairs[pattern].0)
+                && !short_value_has_token_boundaries(text, start, end)
+            {
+                search = start
+                    + text[start..]
+                        .chars()
+                        .next()
+                        .expect("match starts before text end")
+                        .len_utf8();
+                continue;
+            }
+            out.push_str(&text[cursor..start]);
+            out.push_str(pairs[pattern].1);
+            cursor = end;
+            search = end;
         }
         out.push_str(&text[cursor..]);
         for (value, _) in &mut pairs {
@@ -209,11 +225,13 @@ pub struct RecoveryStreamRemasker {
     pending_visible: Vec<u8>,
     visible_raw_starts: Vec<usize>,
     visible_raw_ends: Vec<usize>,
+    previous_visible: Option<u8>,
 }
 
 struct StreamPattern {
     value: Vec<u8>,
     placeholder: Vec<u8>,
+    token_boundaries: bool,
 }
 
 impl Recovery {
@@ -233,9 +251,13 @@ impl RecoveryStreamRemasker {
                 recovery
                     .reveal(placeholder)
                     .filter(|value| is_remaskable_echo(value, placeholder))
-                    .map(|value| StreamPattern {
-                        value: value.into_bytes(),
-                        placeholder: placeholder.as_bytes().to_vec(),
+                    .map(|value| {
+                        let token_boundaries = requires_token_boundaries(&value);
+                        StreamPattern {
+                            value: value.into_bytes(),
+                            placeholder: placeholder.as_bytes().to_vec(),
+                            token_boundaries,
+                        }
                     })
             })
             .collect::<Vec<_>>();
@@ -287,6 +309,7 @@ impl RecoveryStreamRemasker {
     pub fn push_boundary_control(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut out = self.drain_ready(true);
         out.extend_from_slice(bytes);
+        self.previous_visible = None;
         out
     }
 
@@ -298,6 +321,7 @@ impl RecoveryStreamRemasker {
         let mut out = Vec::new();
         if self.patterns.is_empty() {
             out.extend(std::mem::take(&mut self.pending_raw));
+            self.previous_visible = self.pending_visible.last().copied();
             self.clear_visible();
             return out;
         }
@@ -325,6 +349,7 @@ impl RecoveryStreamRemasker {
                 }
                 None => {
                     out.extend(std::mem::take(&mut self.pending_raw));
+                    self.previous_visible = self.pending_visible.last().copied();
                     self.clear_visible();
                     break;
                 }
@@ -340,6 +365,24 @@ impl RecoveryStreamRemasker {
             let mut has_partial = false;
             for (index, pattern) in self.patterns.iter().enumerate() {
                 if remaining.len() >= pattern.value.len() && remaining.starts_with(&pattern.value) {
+                    let end = start + pattern.value.len();
+                    if pattern.token_boundaries {
+                        let left = start
+                            .checked_sub(1)
+                            .and_then(|index| self.pending_visible.get(index).copied())
+                            .or(self.previous_visible);
+                        if left.is_some_and(is_token_byte) {
+                            continue;
+                        }
+                        let right = self.pending_visible.get(end).copied();
+                        if right.is_some_and(is_token_byte) {
+                            continue;
+                        }
+                        if right.is_none() && !force {
+                            has_partial = true;
+                            continue;
+                        }
+                    }
                     if longest_full.is_none_or(|(_, len)| pattern.value.len() > len) {
                         longest_full = Some((index, pattern.value.len()));
                     }
@@ -377,6 +420,9 @@ impl RecoveryStreamRemasker {
     }
 
     fn remove_visible_prefix(&mut self, visible: usize, raw: usize) {
+        if visible > 0 {
+            self.previous_visible = self.pending_visible.get(visible - 1).copied();
+        }
         let mut discarded = self.pending_visible.drain(..visible).collect::<Vec<_>>();
         discarded.zeroize();
         self.visible_raw_starts.drain(..visible);
@@ -423,14 +469,14 @@ impl Drop for RecoveryStreamRemasker {
 
 fn is_remaskable_echo(value: &str, placeholder: &str) -> bool {
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
     if matches!(trimmed, "true" | "false" | "null") {
         return false;
     }
     if trimmed.len() >= 6 {
         return true;
-    }
-    if trimmed.len() < 4 {
-        return false;
     }
     let Ok(parts) = crate::placeholder::parse_placeholder(placeholder) else {
         return false;
@@ -444,6 +490,23 @@ fn is_remaskable_echo(value: &str, placeholder: &str) -> bool {
             | crate::model::labels::URL_CREDENTIAL
             | crate::model::labels::PRIVATE_KEY
     ) || crate::detect::is_sensitive_key_name(&parts.label)
+}
+
+fn requires_token_boundaries(value: &str) -> bool {
+    value.trim().len() < 4
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+fn short_value_has_token_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    !start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index).copied())
+        .is_some_and(is_token_byte)
+        && !bytes.get(end).copied().is_some_and(is_token_byte)
 }
 
 fn sort_and_deduplicate_remask_pairs(pairs: &mut Vec<(String, &str)>) {
@@ -755,25 +818,54 @@ mod tests {
         let database_password = "<<DB_PASSWORD_aabbccddeeff0011>>";
         let rec = Recovery::seal(
             HashMap::from([
-                (otp.to_string(), "1234".to_string()),
-                (password.to_string(), "abcde".to_string()),
-                (database_password.to_string(), "p1n5".to_string()),
+                (otp.to_string(), "123".to_string()),
+                (password.to_string(), "abc".to_string()),
+                (database_password.to_string(), "p1".to_string()),
             ]),
             &[5u8; 32],
         );
         assert_eq!(
-            rec.remask("code 1234 password abcde database p1n5"),
+            rec.remask("code 123 password abc database p1"),
             format!("code {otp} password {password} database {database_password}")
+        );
+        assert_eq!(
+            rec.remask("embedded 1234 xabc database p1n5"),
+            "embedded 1234 xabc database p1n5"
         );
 
         let mut stream = rec.stream_remasker();
         let mut output = stream.push_text(b"code 12");
-        output.extend(stream.push_text(b"34 password abcde database p1"));
-        output.extend(stream.push_text(b"n5"));
+        output.extend(stream.push_text(b"3 password ab"));
+        output.extend(stream.push_text(b"c database p"));
+        output.extend(stream.push_text(b"1 embedded 1234 xabc p1n5"));
         output.extend(stream.finish());
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            format!("code {otp} password {password} database {database_password}")
+            format!(
+                "code {otp} password {password} database {database_password} embedded 1234 xabc p1n5"
+            )
+        );
+    }
+
+    #[test]
+    fn remask_rehides_single_character_explicit_secrets_without_corrupting_words() {
+        let placeholder = "<<KEYED_SECRET_0011223344556677>>";
+        let rec = Recovery::seal(
+            HashMap::from([(placeholder.to_string(), "a".to_string())]),
+            &[5u8; 32],
+        );
+        assert_eq!(
+            rec.remask("value=a catalog a"),
+            format!("value={placeholder} catalog {placeholder}")
+        );
+
+        let mut stream = rec.stream_remasker();
+        let mut output = stream.push_text(b"value=a cat");
+        output.extend(stream.push_text(b"alog a"));
+        output.extend(stream.finish());
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("value={placeholder} catalog {placeholder}")
         );
     }
 
