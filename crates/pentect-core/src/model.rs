@@ -8,48 +8,67 @@ pub type Label = String;
 /// placeholders; keeping the shared ones here stops the same string being
 /// retyped (and drifting) across detectors.
 pub mod labels {
-    /// High-entropy run with no anchoring context (entropy detector).
-    pub const LIKELY_SECRET: &str = "LIKELY_SECRET";
-    /// Decodes to binary-looking bytes ("looks encrypted") with no inner secret.
-    pub const OPAQUE_BLOB: &str = "OPAQUE_BLOB";
-    /// Value masked because its key name looks sensitive.
-    pub const SECRET: &str = "SECRET";
-    /// Ambiguous personally identifying information.
-    pub const PII: &str = "PII";
-    /// Ambiguous identifier.
-    pub const IDENTIFIER: &str = "IDENTIFIER";
-    /// Ambiguous endpoint.
-    pub const ENDPOINT: &str = "ENDPOINT";
-    /// Sensitive value whose category could not be narrowed further.
-    pub const SENSITIVE: &str = "SENSITIVE";
-    /// Value masked because a plaintext key/value structure carries a sensitive key.
-    pub const KEYED_SECRET: &str = "KEYED_SECRET";
-    /// One-time password or verification code.
-    pub const OTP: &str = "OTP";
-    /// BIP-39 wallet recovery phrase.
-    pub const BIP39_MNEMONIC: &str = "BIP39_MNEMONIC";
-    /// Body of a PEM private-key block.
-    pub const PRIVATE_KEY: &str = "PRIVATE_KEY";
-    /// Host/authority of an internal service URL.
-    pub const INTERNAL_ENDPOINT: &str = "INTERNAL_ENDPOINT";
-    /// Resource identifier inside an internal URL path.
-    pub const RESOURCE_ID: &str = "RESOURCE_ID";
-    /// User-info credential portion of a URL authority.
-    pub const URL_CREDENTIAL: &str = "URL_CREDENTIAL";
-    /// Password-like value passed through a shell or PowerShell command option.
-    pub const CMD_PASSWORD: &str = "CMD_PASSWORD";
-    /// UUID/GUID value in an identifier-bearing slot.
-    pub const UUID: &str = "UUID";
-    /// Bucket name in an Amazon S3 hostname.
-    pub const AWS_S3_BUCKET: &str = "AWS_S3_BUCKET";
-    /// Firebase project/database prefix in a Realtime Database hostname.
-    pub const FIREBASE_PROJECT_ID: &str = "FIREBASE_PROJECT_ID";
-    /// Query parameter value in an internal URL.
-    pub const URL_QUERY_VALUE: &str = "URL_QUERY_VALUE";
-    /// Fragment value in an internal URL.
-    pub const URL_FRAGMENT: &str = "URL_FRAGMENT";
-    /// Location metadata embedded in image EXIF GPS tags.
-    pub const IMAGE_GPS_METADATA: &str = "IMAGE_GPS_METADATA";
+    macro_rules! define_canonical_labels {
+        ($( $(#[$meta:meta])* $name:ident = $value:literal; )+) => {
+            $(
+                $(#[$meta])*
+                pub const $name: &str = $value;
+            )+
+
+            /// Every synthetic label emitted by the core detectors.
+            pub const ALL: &[&str] = &[$($name),+];
+
+            /// Whether `value` is a fixed, core-defined label rather than input text.
+            pub fn is_canonical(value: &str) -> bool {
+                ALL.contains(&value)
+            }
+        };
+    }
+
+    define_canonical_labels! {
+        /// High-entropy run with no anchoring context (entropy detector).
+        LIKELY_SECRET = "LIKELY_SECRET";
+        /// Decodes to binary-looking bytes ("looks encrypted") with no inner secret.
+        OPAQUE_BLOB = "OPAQUE_BLOB";
+        /// Value masked because its key name looks sensitive.
+        SECRET = "SECRET";
+        /// Ambiguous personally identifying information.
+        PII = "PII";
+        /// Ambiguous identifier.
+        IDENTIFIER = "IDENTIFIER";
+        /// Ambiguous endpoint.
+        ENDPOINT = "ENDPOINT";
+        /// Sensitive value whose category could not be narrowed further.
+        SENSITIVE = "SENSITIVE";
+        /// Value masked because a plaintext key/value structure carries a sensitive key.
+        KEYED_SECRET = "KEYED_SECRET";
+        /// One-time password or verification code.
+        OTP = "OTP";
+        /// BIP-39 wallet recovery phrase.
+        BIP39_MNEMONIC = "BIP39_MNEMONIC";
+        /// Body of a PEM private-key block.
+        PRIVATE_KEY = "PRIVATE_KEY";
+        /// Host/authority of an internal service URL.
+        INTERNAL_ENDPOINT = "INTERNAL_ENDPOINT";
+        /// Resource identifier inside an internal URL path.
+        RESOURCE_ID = "RESOURCE_ID";
+        /// User-info credential portion of a URL authority.
+        URL_CREDENTIAL = "URL_CREDENTIAL";
+        /// Password-like value passed through a shell or PowerShell command option.
+        CMD_PASSWORD = "CMD_PASSWORD";
+        /// UUID/GUID value in an identifier-bearing slot.
+        UUID = "UUID";
+        /// Bucket name in an Amazon S3 hostname.
+        AWS_S3_BUCKET = "AWS_S3_BUCKET";
+        /// Firebase project/database prefix in a Realtime Database hostname.
+        FIREBASE_PROJECT_ID = "FIREBASE_PROJECT_ID";
+        /// Query parameter value in an internal URL.
+        URL_QUERY_VALUE = "URL_QUERY_VALUE";
+        /// Fragment value in an internal URL.
+        URL_FRAGMENT = "URL_FRAGMENT";
+        /// Location metadata embedded in image EXIF GPS tags.
+        IMAGE_GPS_METADATA = "IMAGE_GPS_METADATA";
+    }
 }
 
 /// Half-open byte range into the raw input, aligned to UTF-8 char boundaries.
