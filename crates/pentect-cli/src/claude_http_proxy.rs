@@ -1046,7 +1046,7 @@ fn inject_handle_contract(value: &mut Value) {
     }
 }
 
-fn request_contains_masked_handle(value: &Value) -> bool {
+pub(crate) fn request_contains_masked_handle(value: &Value) -> bool {
     match value {
         Value::String(text) => pentect_agent::contains_pentect_masked_handle(text),
         Value::Array(values) => values.iter().any(request_contains_masked_handle),

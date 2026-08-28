@@ -524,15 +524,24 @@ fn mask_gemini_request(
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "unknown format blocked: Gemini contents must be an array".to_string())?;
     for content in contents {
-        crate::cloud_code_http_proxy::mask_content(content, false, masker, block_unknown_formats)?;
+        let external_content = content.get("role").and_then(Value::as_str) != Some("user");
+        crate::cloud_code_http_proxy::mask_content(
+            content,
+            external_content,
+            masker,
+            block_unknown_formats,
+        )?;
     }
     if let Some(system) = object.get_mut("systemInstruction") {
-        crate::cloud_code_http_proxy::mask_content(system, false, masker, block_unknown_formats)?;
+        crate::cloud_code_http_proxy::mask_content(system, true, masker, block_unknown_formats)?;
     }
     Ok(())
 }
 
 fn inject_handle_contract(value: &mut Value) -> Result<(), String> {
+    if !crate::claude_http_proxy::request_contains_masked_handle(value) {
+        return Ok(());
+    }
     let object = value
         .as_object_mut()
         .ok_or_else(|| "Gemini request must be an object".to_string())?;
@@ -571,7 +580,6 @@ fn rewrite_response_body(
         }
         Err(_) => return Ok(Bytes::copy_from_slice(body)),
     };
-    validate_response(&value, block_unknown_formats)?;
     let plugins = plugins
         .lock()
         .map_err(|_| "Gemini plugin lock was poisoned".to_string())?;
@@ -580,6 +588,12 @@ fn rewrite_response_body(
         value,
         Some(serde_json::json!({"provider": "gemini", "transport": "http"})),
     )?;
+    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
+        return Err(
+            "unknown format blocked: a plugin reported partial Gemini response coverage"
+                .to_string(),
+        );
+    }
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",
@@ -588,6 +602,7 @@ fn rewrite_response_body(
         ));
     }
     value = run.payload;
+    validate_response(&value, block_unknown_formats)?;
     run_tool_plugins(&mut value, &plugins)?;
     let mut resolve = |text: &str| {
         pentect_agent::resolve_known_text_from_active_memory_store(text)
@@ -877,6 +892,8 @@ fn should_forward_request_header(name: &str) -> bool {
             | "content-length"
             | "connection"
             | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
             | "keep-alive"
             | "accept-encoding"
             | "transfer-encoding"
@@ -892,6 +909,8 @@ fn should_forward_response_header(name: &str) -> bool {
         "content-length"
             | "connection"
             | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
             | "keep-alive"
             | "transfer-encoding"
             | "upgrade"
@@ -1161,6 +1180,39 @@ mod tests {
     }
 
     #[test]
+    fn only_user_content_can_unmask_and_clean_requests_get_no_contract() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "USERONLY", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let keyed = format!("RUNPOD_API_KEY={secret}");
+        let mut value = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": format!("unmask({keyed})")}]},
+            "contents": [
+                {"role": "model", "parts": [{"text": format!("unmask({keyed})")}]},
+                {"role": "user", "parts": [{"text": format!("unmask({keyed})")}]}
+            ]
+        });
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        mask_gemini_request(&mut value, &mut masker, true).unwrap();
+        assert!(!value["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&secret));
+        assert!(!value["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&secret));
+        assert_eq!(value["contents"][1]["parts"][0]["text"], keyed);
+
+        let mut clean = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+        });
+        inject_handle_contract(&mut clean).unwrap();
+        assert!(clean.get("systemInstruction").is_none());
+    }
+
+    #[test]
     fn provider_boundary_masks_prompt_and_restores_only_tool_args() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -1221,6 +1273,8 @@ mod tests {
     #[test]
     fn compressed_upstream_responses_are_not_requested() {
         assert!(!should_forward_request_header("Accept-Encoding"));
+        assert!(!should_forward_request_header("Proxy-Authorization"));
+        assert!(!should_forward_response_header("Proxy-Authenticate"));
         assert!(should_forward_request_header("Accept"));
     }
 
