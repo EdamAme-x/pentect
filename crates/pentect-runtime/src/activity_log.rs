@@ -1,6 +1,6 @@
 use crate::delegated_process_host::{self, ProcessHostEndpoint};
 use crate::memory_store::MemoryStoreClient;
-use pentect_core::MaskResult;
+use pentect_core::{model::labels, MaskResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -546,16 +546,16 @@ fn safe_metric_surface(value: &str) -> &str {
 }
 
 fn safe_metric_secret_type(value: &str) -> &str {
+    if labels::is_canonical(value) {
+        return value;
+    }
     match value {
         "ACCESS_TOKEN" | "ANTHROPIC_API_KEY" | "API_KEY" | "AWS_AKID" | "AWS_MULTI"
-        | "AWS_S3_BUCKET" | "BASE64_PRIVATE_KEY" | "BASIC_AUTH" | "BEARER_TOKEN" | "CREDENTIAL"
-        | "CREDENTIALS" | "CREDIT_CARD" | "EMAIL_ADDRESS" | "GITHUB_PAT" | "GITHUB_TOKEN"
-        | "GOOGLE_API_KEY" | "HUGGINGFACE_TOKEN" | "IBAN_CODE" | "KEYED_SECRET"
-        | "LIKELY_SECRET" | "OPENAI_API_KEY" | "PASSWORD" | "PEM_PRIVATE_KEY" | "PHONE_NUMBER"
-        | "PRIVATE_KEY" | "SECRET" | "SESSION_TOKEN" | "SLACK_TOKEN" | "SLACK_WEBHOOK"
-        | "STRIPE_SECRET_KEY" | "TELEGRAM_BOT_TOKEN" | "TOKEN" | "UK_NINO" | "URL_CREDENTIAL" => {
-            value
-        }
+        | "BASE64_PRIVATE_KEY" | "BASIC_AUTH" | "BEARER_TOKEN" | "CREDENTIAL" | "CREDENTIALS"
+        | "CREDIT_CARD" | "EMAIL_ADDRESS" | "GITHUB_PAT" | "GITHUB_TOKEN" | "GOOGLE_API_KEY"
+        | "HUGGINGFACE_TOKEN" | "IBAN_CODE" | "OPENAI_API_KEY" | "PASSWORD" | "PEM_PRIVATE_KEY"
+        | "PHONE_NUMBER" | "SESSION_TOKEN" | "SLACK_TOKEN" | "SLACK_WEBHOOK"
+        | "STRIPE_SECRET_KEY" | "TELEGRAM_BOT_TOKEN" | "TOKEN" | "UK_NINO" => value,
         _ => "OTHER",
     }
 }
@@ -1533,6 +1533,9 @@ mod tests {
     #[test]
     fn privacy_metric_dimensions_collapse_untrusted_values() {
         assert_eq!(safe_metric_secret_type("AWS_AKID"), "AWS_AKID");
+        for label in labels::ALL {
+            assert_eq!(safe_metric_secret_type(label), *label);
+        }
         assert_eq!(safe_metric_secret_type("accountIdentifier456"), "OTHER");
         assert_eq!(safe_metric_secret_type("secret\u{1b}[31m"), "OTHER");
         assert_eq!(safe_metric_surface("prompt"), "prompt");
