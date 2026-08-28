@@ -150,12 +150,13 @@ pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, Stri
 }
 
 pub(crate) fn has_authorization_override(specs: &[String]) -> bool {
-    specs.iter().any(|spec| {
-        spec.split_once('=').is_some_and(|(name, _)| {
-            name.trim()
-                .eq_ignore_ascii_case(reqwest::header::AUTHORIZATION.as_str())
+    std::env::var_os(AUTHORIZATION_ENV).is_some()
+        || specs.iter().any(|spec| {
+            spec.split_once('=').is_some_and(|(name, _)| {
+                name.trim()
+                    .eq_ignore_ascii_case(reqwest::header::AUTHORIZATION.as_str())
+            })
         })
-    })
 }
 
 pub(crate) fn header_overrides_with_bearer_env(
@@ -397,6 +398,15 @@ mod tests {
                 value: previous,
             }
         }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self {
+                name,
+                value: previous,
+            }
+        }
     }
 
     impl Drop for EnvRestore {
@@ -430,6 +440,8 @@ mod tests {
 
     #[test]
     fn authorization_override_detection_is_case_and_whitespace_insensitive() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _unset = EnvRestore::remove(AUTHORIZATION_ENV);
         assert!(has_authorization_override(&[
             "authorization=GATEWAY_AUTH".to_string()
         ]));
@@ -440,6 +452,17 @@ mod tests {
             "x-api-key=GATEWAY_KEY".to_string()
         ]));
         assert!(!has_authorization_override(&["authorization".to_string()]));
+        {
+            let _authorization = EnvRestore::set(AUTHORIZATION_ENV, "Bearer gateway-token");
+            assert!(has_authorization_override(&[]));
+        }
+        {
+            let _authorization = EnvRestore::set(AUTHORIZATION_ENV, "");
+            assert!(
+                has_authorization_override(&[]),
+                "an empty control value explicitly removes origin authorization"
+            );
+        }
     }
 
     #[test]
