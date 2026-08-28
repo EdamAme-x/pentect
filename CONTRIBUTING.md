@@ -40,3 +40,8 @@ back to prereleases so they cannot replace the last healthy `latest` release.
 
 Never reuse a release tag. A workflow retry may fill in a missing prerelease
 asset only when every already-published asset has the same SHA-256 digest.
+
+The `main` ruleset must require the stable `CI Gate` status. Requiring only the
+Linux `test` job is unsafe: the gate converts every applicable Windows, macOS,
+packaging, plugin, OCR, and npm job into one required result. Keep the gate name
+stable when matrix job display names change.
