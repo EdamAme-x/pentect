@@ -3,12 +3,13 @@ use anyhow::{anyhow, bail, Context};
 use pentect_core::{load_pack, load_plugin_pack, Pack};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
@@ -857,6 +858,7 @@ fn plugin_source_with_refresh(
 ) -> Result<PluginSource> {
     validate_plugin_spec(spec)?;
     if is_remote_spec(spec) {
+        let fetch = RemotePluginFetchSession::default();
         let normalized = normalize_github_plugin_url(spec)?;
         let repository = github_repository(&normalized);
         let points_to_manifest = normalized.ends_with("/plugin.toml");
@@ -874,14 +876,21 @@ fn plugin_source_with_refresh(
             (base, manifest)
         };
         if refresh {
-            let _ = fetch_remote_plugin_file_with_refresh(
+            fetch.protect_urls([
+                manifest_url.as_str(),
+                format!("{base}/{PLUGIN_CONFIG_FILE}").as_str(),
+            ])?;
+        }
+        if refresh {
+            let _ = fetch_remote_plugin_file_in_session(
                 &format!("{base}/{PLUGIN_CONFIG_FILE}"),
                 true,
+                &fetch,
             )?;
         }
-        let manifest_path = fetch_remote_plugin_file_with_refresh(&manifest_url, refresh)?;
+        let manifest_path = fetch_remote_plugin_file_in_session(&manifest_url, refresh, &fetch)?;
         if refresh {
-            refresh_remote_command_files(&base, manifest_path.as_deref())?;
+            refresh_remote_command_files_in_session(&base, manifest_path.as_deref(), &fetch)?;
         }
         let name = remote_plugin_name(&base)?;
         let remote_base = if points_to_manifest {
@@ -959,14 +968,24 @@ fn plugin_source_with_refresh(
         }
     }
     let base = format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{spec}");
+    let fetch = RemotePluginFetchSession::default();
     if refresh {
-        let _ =
-            fetch_remote_plugin_file_with_refresh(&format!("{base}/{PLUGIN_CONFIG_FILE}"), true)?;
+        let manifest_url = format!("{base}/{PLUGIN_MANIFEST_FILE}");
+        let config_url = format!("{base}/{PLUGIN_CONFIG_FILE}");
+        fetch.protect_urls([manifest_url.as_str(), config_url.as_str()])?;
+        let _ = fetch_remote_plugin_file_in_session(
+            &format!("{base}/{PLUGIN_CONFIG_FILE}"),
+            true,
+            &fetch,
+        )?;
     }
-    let manifest_path =
-        fetch_remote_plugin_file_with_refresh(&format!("{base}/{PLUGIN_MANIFEST_FILE}"), refresh)?;
+    let manifest_path = fetch_remote_plugin_file_in_session(
+        &format!("{base}/{PLUGIN_MANIFEST_FILE}"),
+        refresh,
+        &fetch,
+    )?;
     if refresh {
-        refresh_remote_command_files(&base, manifest_path.as_deref())?;
+        refresh_remote_command_files_in_session(&base, manifest_path.as_deref(), &fetch)?;
     }
     Ok(PluginSource {
         name: spec.to_string(),
@@ -1052,17 +1071,26 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
     let base = base_url.trim_end_matches('/');
     let manifest_url = format!("{base}/{PLUGIN_MANIFEST_FILE}");
     let config_url = format!("{base}/{PLUGIN_CONFIG_FILE}");
+    let fetch = RemotePluginFetchSession::default();
+    fetch.protect_urls([manifest_url.as_str(), config_url.as_str()])?;
     let (manifest, config) = std::thread::scope(|scope| {
-        let manifest = scope.spawn(|| fetch_remote_plugin_file(&manifest_url));
-        let config = scope.spawn(|| fetch_remote_plugin_file(&config_url));
+        let manifest_fetch = fetch.clone();
+        let config_fetch = fetch.clone();
+        let manifest = scope.spawn(move || {
+            fetch_remote_plugin_file_in_session(&manifest_url, false, &manifest_fetch)
+        });
+        let config = scope
+            .spawn(move || fetch_remote_plugin_file_in_session(&config_url, false, &config_fetch));
         (manifest.join(), config.join())
     });
     let join = |result: std::thread::Result<Result<Option<PathBuf>>>| {
         result.map_err(|_| anyhow!("remote plugin fetch worker panicked"))?
     };
     if let Some(manifest) = join(manifest)? {
-        for (_, url) in command_files_from_manifest(base, &manifest)? {
-            fetch_remote_plugin_file(&url)?
+        let command_files = command_files_from_manifest(base, &manifest)?;
+        fetch.protect_urls(command_files.iter().map(|(_, url)| url.as_str()))?;
+        for (_, url) in command_files {
+            fetch_remote_plugin_file_in_session(&url, false, &fetch)?
                 .ok_or_else(|| anyhow!("remote command plugin file was not found: {url}"))?;
         }
         add_manifest_paths(&manifest, &mut paths)?;
@@ -1512,12 +1540,24 @@ fn command_files_from_manifest(base: &str, manifest: &Path) -> Result<Vec<(PathB
     Ok(files)
 }
 
+#[cfg(test)]
 fn refresh_remote_command_files(base: &str, manifest: Option<&Path>) -> Result<()> {
+    refresh_remote_command_files_in_session(base, manifest, &RemotePluginFetchSession::default())
+}
+
+fn refresh_remote_command_files_in_session(
+    base: &str,
+    manifest: Option<&Path>,
+    fetch: &RemotePluginFetchSession,
+) -> Result<()> {
     let Some(manifest) = manifest else {
         return Ok(());
     };
-    for (_, url) in command_files_from_manifest(base.trim_end_matches("/plugin.toml"), manifest)? {
-        fetch_remote_plugin_file_with_refresh(&url, true)?
+    let command_files =
+        command_files_from_manifest(base.trim_end_matches("/plugin.toml"), manifest)?;
+    fetch.protect_urls(command_files.iter().map(|(_, url)| url.as_str()))?;
+    for (_, url) in command_files {
+        fetch_remote_plugin_file_in_session(&url, true, fetch)?
             .ok_or_else(|| anyhow!("remote command plugin file was not found: {url}"))?;
     }
     Ok(())
@@ -1531,10 +1571,13 @@ pub(crate) fn remote_command_files(source: &PluginSource) -> Result<Vec<(PathBuf
         return Ok(Vec::new());
     };
     let base = base.trim_end_matches("/plugin.toml");
-    command_files_from_manifest(base, manifest)?
+    let files = command_files_from_manifest(base, manifest)?;
+    let fetch = RemotePluginFetchSession::default();
+    fetch.protect_urls(remote_plugin_urls(base).iter().map(String::as_str))?;
+    files
         .into_iter()
         .map(|(relative, url)| {
-            let cached = fetch_remote_plugin_file(&url)?
+            let cached = fetch_remote_plugin_file_in_session(&url, false, &fetch)?
                 .ok_or_else(|| anyhow!("remote command plugin file was not found: {url}"))?;
             Ok((relative, cached))
         })
@@ -1780,9 +1823,41 @@ fn atomic_replace(staged: &Path, destination: &Path) -> Result<()> {
 }
 
 fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Option<PathBuf>> {
+    fetch_remote_plugin_file_in_session(url, refresh, &RemotePluginFetchSession::default())
+}
+
+#[derive(Clone, Default)]
+struct RemotePluginFetchSession {
+    protected: Arc<Mutex<BTreeSet<PathBuf>>>,
+}
+
+impl RemotePluginFetchSession {
+    fn protect_urls<'a>(&self, urls: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        for url in urls {
+            self.protect(remote_cache_file(url)?)?;
+        }
+        Ok(())
+    }
+
+    fn protect(&self, path: PathBuf) -> Result<Vec<PathBuf>> {
+        let mut protected = self
+            .protected
+            .lock()
+            .map_err(|_| anyhow!("remote plugin cache protection lock poisoned"))?;
+        protected.insert(path);
+        Ok(protected.iter().cloned().collect())
+    }
+}
+
+fn fetch_remote_plugin_file_in_session(
+    url: &str,
+    refresh: bool,
+    session: &RemotePluginFetchSession,
+) -> Result<Option<PathBuf>> {
     let path = remote_cache_file(url)?;
+    let protected = session.protect(path.clone())?;
     if let Some(cache_root) = path.parent().and_then(Path::parent) {
-        prune_remote_plugin_cache(cache_root, Some(&path))?;
+        prune_remote_plugin_cache(cache_root, &protected)?;
     }
     let missing = remote_missing_file(&path);
     if !refresh && path.is_file() {
@@ -1808,7 +1883,8 @@ fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Opt
         std::fs::write(&missing, [])
             .with_context(|| format!("could not write plugin cache '{}'", missing.display()))?;
         if let Some(cache_root) = path.parent().and_then(Path::parent) {
-            prune_remote_plugin_cache(cache_root, Some(&missing))?;
+            let protected = session.protect(missing.clone())?;
+            prune_remote_plugin_cache(cache_root, &protected)?;
         }
         return Ok(None);
     }
@@ -1837,7 +1913,8 @@ fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Opt
         .with_context(|| format!("could not write plugin cache '{}'", path.display()))?;
     let _ = std::fs::remove_file(missing);
     if let Some(cache_root) = path.parent().and_then(Path::parent) {
-        prune_remote_plugin_cache(cache_root, Some(&path))?;
+        let protected = session.protect(path.clone())?;
+        prune_remote_plugin_cache(cache_root, &protected)?;
     }
     Ok(Some(path))
 }
@@ -1849,7 +1926,7 @@ struct RemoteCacheEntry {
     modified: SystemTime,
 }
 
-fn prune_remote_plugin_cache(cache_root: &Path, protected: Option<&Path>) -> Result<()> {
+fn prune_remote_plugin_cache(cache_root: &Path, protected: &[PathBuf]) -> Result<()> {
     prune_remote_plugin_cache_with_limits(
         cache_root,
         protected,
@@ -1860,7 +1937,7 @@ fn prune_remote_plugin_cache(cache_root: &Path, protected: Option<&Path>) -> Res
 
 fn prune_remote_plugin_cache_with_limits(
     cache_root: &Path,
-    protected: Option<&Path>,
+    protected: &[PathBuf],
     max_bytes: u64,
     max_entries: usize,
 ) -> Result<()> {
@@ -1868,14 +1945,16 @@ fn prune_remote_plugin_cache_with_limits(
         return Ok(());
     }
 
-    let protected_entry = protected
-        .and_then(|path| path.strip_prefix(cache_root).ok())
-        .and_then(|relative| {
+    let protected_entries = protected
+        .iter()
+        .filter_map(|path| path.strip_prefix(cache_root).ok())
+        .filter_map(|relative| {
             relative
                 .components()
                 .next()
                 .map(|component| cache_root.join(component.as_os_str()))
-        });
+        })
+        .collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     let cache_entries = match std::fs::read_dir(cache_root) {
         Ok(entries) => entries,
@@ -1926,7 +2005,7 @@ fn prune_remote_plugin_cache_with_limits(
         if total_bytes <= max_bytes && total_entries <= max_entries {
             break;
         }
-        if protected_entry.as_ref() == Some(&entry.path) {
+        if protected_entries.contains(&entry.path) {
             continue;
         }
         if let Err(error) = std::fs::remove_dir_all(&entry.path) {
@@ -2205,7 +2284,8 @@ label = "INLINE_SECRET"
             std::fs::write(path, b"1234").unwrap();
         }
 
-        prune_remote_plugin_cache_with_limits(&root, Some(&protected), 8, 2).unwrap();
+        prune_remote_plugin_cache_with_limits(&root, std::slice::from_ref(&protected), 8, 2)
+            .unwrap();
 
         assert!(protected.is_file());
         let remaining = std::fs::read_dir(&root).unwrap().count();
@@ -2215,6 +2295,30 @@ label = "INLINE_SECRET"
             .map(|entry| remote_cache_entry_usage(&entry.unwrap().path()).unwrap().0)
             .sum::<u64>();
         assert_eq!(remaining_bytes, 8);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_plugin_cache_pruning_preserves_all_files_in_one_fetch_session() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pentect-plugin-cache-session-{nonce}"));
+        let old = root.join("old").join("plugin.toml");
+        let manifest = root.join("manifest").join("plugin.toml");
+        let config = root.join("config").join("config.toml");
+        for path in [&old, &manifest, &config] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"1234").unwrap();
+        }
+
+        prune_remote_plugin_cache_with_limits(&root, &[manifest.clone(), config.clone()], 4, 1)
+            .unwrap();
+
+        assert!(!old.exists());
+        assert!(manifest.is_file());
+        assert!(config.is_file());
         std::fs::remove_dir_all(root).unwrap();
     }
 
