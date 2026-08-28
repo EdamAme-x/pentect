@@ -410,7 +410,10 @@ fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
 }
 
 fn manager_dir() -> PathBuf {
-    PathBuf::from(".pentect").join(MANAGER_DIR)
+    crate::config::project_root()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join(".pentect")
+        .join(MANAGER_DIR)
 }
 
 fn empty_index() -> FilePointerIndex {
@@ -425,14 +428,18 @@ fn envelope_overhead() -> usize {
 }
 
 fn stored_path(path: &Path) -> String {
-    if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Ok(relative) = path.strip_prefix(cwd) {
-                return relative.to_string_lossy().into_owned();
+    path.canonicalize()
+        .unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path))
+                    .unwrap_or_else(|_| path.to_path_buf())
             }
-        }
-    }
-    path.to_string_lossy().into_owned()
+        })
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
