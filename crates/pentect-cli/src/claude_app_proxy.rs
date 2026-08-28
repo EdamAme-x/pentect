@@ -2664,6 +2664,7 @@ fn run_chat_tool_plugins(
                     serde_json::Value::Object(object.clone()),
                     Some(serde_json::json!({"provider": "claude", "transport": "desktop-http"})),
                 )?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude App")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin blocked: {}",
