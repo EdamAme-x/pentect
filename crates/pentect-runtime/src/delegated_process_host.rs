@@ -13,6 +13,7 @@ const CANDIDATE_PREFIX: &str = "process-host-candidate-";
 const CANDIDATE_SUFFIX: &str = ".json";
 const ELECTION_ATTEMPTS: usize = 8;
 const ELECTION_RETRY: Duration = Duration::from_millis(10);
+const HOST_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProcessHostEndpoint {
@@ -347,7 +348,7 @@ fn endpoint_is_alive(endpoint: &ProcessHostEndpoint) -> bool {
         return false;
     }
     MemoryStoreClient::for_activity(endpoint.addr.clone(), endpoint.read_token.clone())
-        .poll_activity(u64::MAX)
+        .poll_activity_once(u64::MAX, HOST_PROBE_TIMEOUT)
         .is_ok()
 }
 
@@ -403,6 +404,33 @@ fn restrict_file(_: &File) {}
 mod tests {
     use super::*;
     use crate::memory_store::spawn_test_memory_store_with_activity;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    #[test]
+    fn host_probe_times_out_once_without_general_request_retries() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let endpoint = ProcessHostEndpoint {
+            addr: addr.to_string(),
+            store_token_hash: String::new(),
+            read_token: "read-token".to_string(),
+            write_token: "write-token".to_string(),
+            pid: 1,
+        };
+
+        let started = Instant::now();
+        assert!(!endpoint_is_alive(&endpoint));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "host probe exceeded its single short timeout: {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn remaining_candidate_takes_over_when_host_unregisters() {

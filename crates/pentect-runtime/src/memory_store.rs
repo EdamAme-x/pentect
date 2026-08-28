@@ -447,7 +447,20 @@ impl MemoryStoreClient {
 
     pub(crate) fn poll_activity(&self, after: u64) -> Result<Vec<(u64, String)>> {
         let line = self.request("LOGS", &after.to_string())?;
-        let fields = response_fields(&line)?;
+        Self::decode_activity_response(&line)
+    }
+
+    pub(crate) fn poll_activity_once(
+        &self,
+        after: u64,
+        timeout: Duration,
+    ) -> Result<Vec<(u64, String)>> {
+        let line = self.request_once_with_timeout("LOGS", &after.to_string(), timeout)?;
+        Self::decode_activity_response(&line)
+    }
+
+    fn decode_activity_response(line: &str) -> Result<Vec<(u64, String)>> {
+        let fields = response_fields(line)?;
         if fields.len() != 2 || fields[0] != "OK" {
             bail!("memory store activity response is malformed");
         }
