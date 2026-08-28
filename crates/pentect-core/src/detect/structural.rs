@@ -6,6 +6,7 @@ use super::benign::{
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use crate::placeholder::parse_placeholder;
 use std::sync::LazyLock;
 
 static SENSITIVE_HEADERS: LazyLock<Vec<String>> =
@@ -664,7 +665,7 @@ fn is_benign_value(v: &str) -> bool {
         || matches!(t, "true" | "false" | "null")
         || is_rendered_placeholder(t)
         || is_version_literal(t)
-        || is_documentation_placeholder(t)
+        || (!is_angle_placeholder(t) && is_documentation_placeholder(t))
 }
 
 fn is_documentation_placeholder(value: &str) -> bool {
@@ -709,7 +710,12 @@ fn is_version_literal(value: &str) -> bool {
 }
 
 fn is_rendered_placeholder(v: &str) -> bool {
-    v.starts_with("<<") && v.ends_with(">>")
+    let value = v.trim();
+    is_angle_placeholder(value) && parse_placeholder(value).is_ok()
+}
+
+fn is_angle_placeholder(value: &str) -> bool {
+    value.starts_with("<<") && value.ends_with(">>")
 }
 
 #[cfg(test)]
@@ -857,6 +863,12 @@ mod tests {
         assert!(env_fires(Some("USERNAME"), "alice"));
         assert!(env_fires(Some("FLAG"), "false"));
         assert!(!env_fires(Some("USERNAME"), "<<SECRET_0123456789abcdef>>"));
+        assert!(env_fires(Some("PASSWORD"), "<<MY_PASSWORD>>"));
+        assert!(env_fires(
+            Some("TOKEN"),
+            "<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>"
+        ));
+        assert!(env_fires(Some("TOKEN"), "<<LABEL_ABCDEF0123456789>>"));
     }
 
     #[test]
