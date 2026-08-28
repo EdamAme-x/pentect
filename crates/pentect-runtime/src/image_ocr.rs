@@ -180,7 +180,22 @@ pub(crate) fn contains_image_result(value: &Value) -> bool {
 }
 
 pub(crate) fn skip_text_masking_for_image_payload(text: &str) -> bool {
-    text.trim().to_ascii_lowercase().starts_with("data:image/") || looks_like_base64_image(text)
+    let text = text.trim();
+    if text
+        .get(.."data:image/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
+    {
+        return text
+            .split_once(',')
+            .filter(|(metadata, _)| {
+                metadata
+                    .split(';')
+                    .skip(1)
+                    .any(|part| part.eq_ignore_ascii_case("base64"))
+            })
+            .is_some_and(|(_, payload)| looks_like_base64_image_field_value(payload));
+    }
+    looks_like_base64_image(text)
 }
 
 pub(crate) fn skip_text_masking_for_image_field(key: &str, text: &str) -> bool {
@@ -2306,10 +2321,7 @@ fn looks_like_base64_image(text: &str) -> bool {
 fn looks_like_base64_image_field_value(text: &str) -> bool {
     let compact = compact_base64(text);
     compact.len() >= 16
-        && compact.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
-        })
+        && decode_base64_prefix(&compact).is_some_and(|prefix| image_signature(&prefix).is_some())
 }
 
 fn decode_base64_limited(text: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
@@ -3127,6 +3139,26 @@ pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::config::{ImageOcrMode, ImageRedactionStyle, UnscannedImagePolicy};
+
+    #[test]
+    fn generic_base64_shaped_fields_require_an_image_signature() {
+        let non_image = data_encoding::BASE64.encode(b"token-like bytes that are not an image");
+        for key in ["data", "bytes", "base64", "imageData", "dataUrl"] {
+            assert!(
+                !skip_text_masking_for_image_field(key, &non_image),
+                "{key} must not exempt a token from text masking"
+            );
+        }
+
+        let png_header = data_encoding::BASE64.encode(b"\x89PNG\r\n\x1a\nheader");
+        assert!(skip_text_masking_for_image_field("data", &png_header));
+        assert!(!skip_text_masking_for_image_payload(&format!(
+            "data:image/png;base64,{non_image}"
+        )));
+        assert!(skip_text_masking_for_image_payload(&format!(
+            "data:image/png;base64,{png_header}"
+        )));
+    }
 
     fn test_config() -> ImageOcrConfig {
         ImageOcrConfig {

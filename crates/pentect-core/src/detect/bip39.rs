@@ -1,8 +1,6 @@
 use super::{validate, Detector};
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use std::sync::LazyLock;
 
 #[derive(Default)]
 pub struct Bip39Detector;
@@ -14,27 +12,9 @@ struct WordToken {
     language_mask: u16,
 }
 
-static MNEMONIC_KEYWORDS: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    AhoCorasickBuilder::new()
-        .ascii_case_insensitive(true)
-        .build([
-            "secret recovery phrase",
-            "recovery phrase",
-            "seed phrase",
-            "wallet seed",
-            "wallet mnemonic",
-            "mnemonic",
-            "wallet",
-        ])
-        .expect("mnemonic keyword prefilter compiles")
-});
-
 impl Detector for Bip39Detector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
-        if !has_mnemonic_evidence_hint(text) {
-            return Vec::new();
-        }
         let tokens = word_tokens(text);
         if looks_like_reference_wordlist(text, &tokens) {
             return Vec::new();
@@ -63,7 +43,6 @@ impl Detector for Bip39Detector {
                     .collect::<Vec<_>>();
                 let norm = ByteRange::new(tokens[start].start, tokens[end - 1].end);
                 if !has_strong_boundary(text, &tokens, start, end)
-                    || !has_mnemonic_evidence(text, &tokens, start, end, norm)
                     || !validate::bip39_mnemonic_window(&words)
                 {
                     continue;
@@ -82,50 +61,6 @@ impl Detector for Bip39Detector {
 
         out
     }
-}
-
-fn has_mnemonic_evidence_hint(text: &str) -> bool {
-    has_any_mnemonic_keyword(text) || may_be_standalone_phrase(text) || may_be_numbered_phrase(text)
-}
-
-fn has_any_mnemonic_keyword(text: &str) -> bool {
-    MNEMONIC_KEYWORDS.find(text).is_some()
-}
-
-fn may_be_standalone_phrase(text: &str) -> bool {
-    let mut word_count = 0usize;
-    for segment in text.split_whitespace() {
-        if !segment.chars().all(char::is_alphabetic) {
-            return false;
-        }
-        word_count += 1;
-        if word_count > 24 {
-            return false;
-        }
-    }
-    matches!(word_count, 12 | 15 | 18 | 21 | 24)
-}
-
-fn may_be_numbered_phrase(text: &str) -> bool {
-    let mut expected = 1usize;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let number = expected.to_string();
-        let Some(rest) = trimmed.strip_prefix(&number) else {
-            continue;
-        };
-        if !matches!(
-            rest.trim_start().chars().next(),
-            Some('.' | ')' | ':' | '-')
-        ) {
-            continue;
-        }
-        expected += 1;
-        if expected > 12 {
-            return true;
-        }
-    }
-    false
 }
 
 fn word_tokens(text: &str) -> Vec<WordToken> {
@@ -153,7 +88,6 @@ fn has_strong_boundary(text: &str, tokens: &[WordToken], start: usize, end: usiz
         true
     } else {
         is_strong_separator(&text[tokens[start - 1].end..tokens[start].start])
-            || has_mnemonic_context(text, tokens[start].start)
     };
     let right = if end >= tokens.len() {
         true
@@ -164,116 +98,12 @@ fn has_strong_boundary(text: &str, tokens: &[WordToken], start: usize, end: usiz
 }
 
 fn is_strong_separator(value: &str) -> bool {
-    value.bytes().any(|b| {
-        matches!(
-            b,
-            b'\n' | b'\r' | b':' | b'=' | b';' | b',' | b'.' | b'<' | b'>' | b'|'
-        )
-    })
-}
-
-fn has_mnemonic_evidence(
-    text: &str,
-    tokens: &[WordToken],
-    start: usize,
-    end: usize,
-    range: ByteRange,
-) -> bool {
-    is_standalone_phrase(text, range)
-        || is_numbered_list(text, tokens, start, end)
-        || has_mnemonic_context(text, range.start)
-}
-
-fn is_standalone_phrase(text: &str, range: ByteRange) -> bool {
-    text[..range.start].trim().is_empty() && text[range.end..].trim().is_empty()
-}
-
-fn is_numbered_list(text: &str, tokens: &[WordToken], start: usize, end: usize) -> bool {
-    tokens[start..end]
-        .iter()
-        .enumerate()
-        .all(|(offset, token)| {
-            let line_start = text[..token.start]
-                .rfind(['\n', '\r'])
-                .map_or(0, |index| index + 1);
-            let prefix = text[line_start..token.start].trim();
-            matches_number_prefix(prefix, offset + 1)
-        })
-}
-
-fn matches_number_prefix(prefix: &str, number: usize) -> bool {
-    let number = number.to_string();
-    let Some(rest) = prefix.strip_prefix(&number) else {
-        return false;
-    };
-    matches!(rest.trim_start(), "." | ")" | ":" | "-")
-}
-
-fn has_mnemonic_context(text: &str, phrase_start: usize) -> bool {
-    let mut window_start = phrase_start.saturating_sub(96);
-    while window_start < phrase_start && !text.is_char_boundary(window_start) {
-        window_start += 1;
-    }
-    let prefix = text[window_start..phrase_start].to_ascii_lowercase();
-    for keyword in [
-        "secret recovery phrase",
-        "recovery phrase",
-        "seed phrase",
-        "wallet seed",
-        "wallet mnemonic",
-        "mnemonic",
-        "wallet",
-    ] {
-        let Some(index) = prefix.rfind(keyword) else {
-            continue;
-        };
-        if !keyword_boundary(&prefix, index, keyword.len()) {
-            continue;
-        }
-        let suffix = &prefix[index + keyword.len()..];
-        if context_suffix_allows_phrase(suffix) {
-            return true;
-        }
-    }
-    false
-}
-
-fn keyword_boundary(text: &str, start: usize, len: usize) -> bool {
-    let before = start
-        .checked_sub(1)
-        .and_then(|index| text.as_bytes().get(index))
-        .copied();
-    let after = text.as_bytes().get(start + len).copied();
-    !before.is_some_and(is_keyword_byte) && !after.is_some_and(is_keyword_byte)
-}
-
-fn is_keyword_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn context_suffix_allows_phrase(suffix: &str) -> bool {
-    let has_separator = suffix
-        .chars()
-        .any(|ch| matches!(ch, ':' | '=' | '\n' | '\r'));
-    if has_separator
-        && suffix.chars().all(|ch| {
-            ch.is_ascii_whitespace() || matches!(ch, ':' | '=' | '>' | '"' | '\'' | '`' | '-')
-        })
-    {
-        return true;
-    }
-
-    let trimmed = suffix.trim_start();
-    let Some(rest) = trimmed.strip_prefix("is") else {
-        return false;
-    };
-    let boundary = match rest.chars().next() {
-        Some(ch) => ch.is_ascii_whitespace() || matches!(ch, ':' | '='),
-        None => true,
-    };
-    boundary
-        && rest.chars().all(|ch| {
-            ch.is_ascii_whitespace() || matches!(ch, ':' | '=' | '>' | '"' | '\'' | '`' | '-')
+    (!value.is_empty() && value.chars().all(char::is_whitespace))
+        || value.bytes().any(|b| {
+            matches!(
+                b,
+                b'\n' | b'\r' | b':' | b'=' | b';' | b',' | b'.' | b'<' | b'>' | b'|'
+            )
         })
 }
 
@@ -376,6 +206,22 @@ mod tests {
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
             ]
         );
+
+        let followed_by_prose = "seed phrase: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about for wallet recovery";
+        assert_eq!(
+            hit_values(followed_by_prose),
+            vec![
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+            ]
+        );
+
+        let unlabelled_prose = "keep abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about safe and offline";
+        assert_eq!(
+            hit_values(unlabelled_prose),
+            vec![
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+            ]
+        );
     }
 
     #[test]
@@ -391,22 +237,19 @@ mod tests {
         )
         .is_empty());
         assert!(hit_values("just three words here").is_empty());
-        assert!(hit_values(
-            "ordinary prose page recovery phrase abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-        )
-        .is_empty());
     }
 
     #[test]
-    fn rejects_wordlists_and_source_test_vectors() {
+    fn rejects_reference_wordlists_but_protects_valid_source_literals() {
         assert!(hit_values(include_str!("bip39_english.txt")).is_empty());
-        assert!(hit_values(
-            r#"const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";"#
-        )
-        .is_empty());
-        assert!(hit_values(
-            r#"("BIP39_MNEMONIC", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")"#
-        )
-        .is_empty());
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert_eq!(
+            hit_values(&format!(r#"const PHRASE: &str = "{phrase}";"#)),
+            vec![phrase]
+        );
+        assert_eq!(
+            hit_values(&format!(r#"("BIP39_MNEMONIC", "{phrase}")"#)),
+            vec![phrase]
+        );
     }
 }
