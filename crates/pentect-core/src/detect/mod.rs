@@ -10,6 +10,7 @@ mod credsweeper_ml;
 mod decode;
 mod documentation;
 mod explicit;
+mod jwt;
 mod key_value;
 mod pattern;
 mod rule;
@@ -33,6 +34,7 @@ pub use decode::{
 };
 pub use explicit::ExplicitSecretDetector;
 pub(crate) use explicit::EXPLICIT_SECRET_PREFIXES;
+pub use jwt::JwtDetector;
 pub use key_value::KeyValueDetector;
 pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use rule::{RuleDetector, RuleSpec};
