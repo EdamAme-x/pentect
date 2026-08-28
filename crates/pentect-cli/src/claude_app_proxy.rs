@@ -1613,7 +1613,11 @@ async fn forward_inspected_inner(
             .map_err(|error| Box::new(error) as ProxyBodyError)
     });
     let body = if transform_chat_sse {
-        chat_sse_body(Box::pin(stream), Arc::clone(&state.plugins))
+        chat_sse_body(
+            Box::pin(stream),
+            Arc::clone(&state.plugins),
+            state.restore_output,
+        )
     } else {
         BodyExt::boxed_unsync(StreamBody::new(stream))
     };
@@ -2371,12 +2375,9 @@ type ChatResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
 
 struct ChatStreamState {
     upstream: ChatFrameStream,
-    pending: Vec<u8>,
     ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
-    max_pending_bytes: usize,
     finished: bool,
-    plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
-    resolve: Option<ChatResolver>,
+    transformer: Option<crate::claude_http_proxy::SseStreamTransformer<ChatResolver>>,
 }
 
 fn rewrite_chat_json_response(
@@ -2453,29 +2454,48 @@ where
         .map_err(|error| format!("could not encode Claude App Chat response: {error}"))
 }
 
-fn chat_sse_body<S>(stream: S, plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>) -> ProxyBody
+fn chat_sse_body<S>(
+    stream: S,
+    plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+    restore_output: bool,
+) -> ProxyBody
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
 {
-    chat_sse_body_with_limit(stream, plugins, MAX_CHAT_BODY_BYTES)
+    chat_sse_body_with_limit(stream, plugins, restore_output, MAX_CHAT_BODY_BYTES)
 }
 
 fn chat_sse_body_with_limit<S>(
     stream: S,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+    restore_output: bool,
     max_pending_bytes: usize,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
+{
+    let resolve: ChatResolver = Box::new(crate::claude_http_proxy::request_scoped_resolver());
+    let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
+        resolve,
+        plugins,
+        restore_output,
+        max_pending_bytes,
+    );
+    chat_sse_body_with_transformer(stream, transformer)
+}
+
+fn chat_sse_body_with_transformer<S>(
+    stream: S,
+    transformer: crate::claude_http_proxy::SseStreamTransformer<ChatResolver>,
 ) -> ProxyBody
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
 {
     let state = ChatStreamState {
         upstream: Box::pin(stream),
-        pending: Vec::new(),
         ready: VecDeque::new(),
-        max_pending_bytes,
         finished: false,
-        plugins,
-        resolve: Some(Box::new(crate::claude_http_proxy::request_scoped_resolver())),
+        transformer: Some(transformer),
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -2490,56 +2510,40 @@ where
                     let Ok(chunk) = frame.into_data() else {
                         continue;
                     };
-                    if state.pending.len().saturating_add(chunk.len()) > state.max_pending_bytes {
-                        eprintln!("[pentect] Claude App Chat response blocked: SSE event exceeded inspection limit");
-                        state.pending.clear();
+                    let Some(mut transformer) = state.transformer.take() else {
                         state.finished = true;
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "Claude App Chat SSE event exceeded inspection limit",
+                        state.ready.push_back(Err(Box::new(io::Error::other(
+                            "Claude App Chat transformer is unavailable",
                         ))));
                         continue;
-                    }
-                    state.pending.extend_from_slice(&chunk);
-                    while let Some(end) = first_sse_block_end(&state.pending) {
-                        let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        if !chat_sse_block_contains_tool_call(&block) {
-                            state.ready.push_back(Ok(Frame::data(Bytes::from(block))));
-                            continue;
-                        }
-                        let Some(mut resolve) = state.resolve.take() else {
+                    };
+                    let transformed = tokio::task::spawn_blocking(move || {
+                        let result = transformer.push(&chunk);
+                        (result, transformer)
+                    })
+                    .await;
+                    let (result, transformer) = match transformed {
+                        Ok(result) => result,
+                        Err(_) => {
                             state.finished = true;
                             state.ready.push_back(Err(Box::new(io::Error::other(
-                                "Claude App Chat resolver is unavailable",
+                                "Claude App Chat restoration task failed",
                             ))));
-                            break;
-                        };
-                        let plugins = Arc::clone(&state.plugins);
-                        let rewritten = tokio::task::spawn_blocking(move || {
-                            let result = rewrite_chat_sse_block(&block, &plugins, &mut resolve);
-                            (result, resolve)
-                        })
-                        .await;
-                        let (result, resolve) = match rewritten {
-                            Ok(result) => result,
-                            Err(_) => {
-                                state.finished = true;
-                                state.ready.push_back(Err(Box::new(io::Error::other(
-                                    "Claude App Chat restoration task failed",
-                                ))));
-                                break;
-                            }
-                        };
-                        state.resolve = Some(resolve);
-                        match result {
-                            Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
-                            Err(error) => {
-                                state.finished = true;
-                                state
-                                    .ready
-                                    .push_back(Err(Box::new(io::Error::other(error))));
-                                break;
-                            }
+                            continue;
+                        }
+                    };
+                    state.transformer = Some(transformer);
+                    match result {
+                        Ok(chunks) => state
+                            .ready
+                            .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
+                        Err(error) => {
+                            eprintln!("[pentect] Claude App Chat response blocked: {error}");
+                            state.finished = true;
+                            state.ready.push_back(Err(Box::new(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                error,
+                            ))));
                         }
                     }
                 }
@@ -2549,99 +2553,19 @@ where
                 }
                 None => {
                     state.finished = true;
-                    if !state.pending.is_empty() {
-                        state
-                            .ready
-                            .push_back(Ok(Frame::data(Bytes::from(std::mem::take(
-                                &mut state.pending,
-                            )))));
+                    if let Some(mut transformer) = state.transformer.take() {
+                        state.ready.extend(
+                            transformer
+                                .finish()
+                                .into_iter()
+                                .map(|chunk| Ok(Frame::data(chunk))),
+                        );
                     }
                 }
             }
         }
     });
     StreamBody::new(stream).boxed_unsync()
-}
-
-fn chat_sse_block_contains_tool_call(block: &[u8]) -> bool {
-    std::str::from_utf8(block)
-        .ok()
-        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("data:")))
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(data.trim_start()).ok())
-        .is_some_and(|value| contains_chat_tool_call(&value))
-}
-
-fn rewrite_chat_sse_block<R>(
-    block: &[u8],
-    plugins: &Mutex<pentect_agent::PluginMiddleware>,
-    resolve: &mut R,
-) -> Result<Bytes, String>
-where
-    R: FnMut(&str) -> Result<String, String>,
-{
-    let Ok(text) = std::str::from_utf8(block) else {
-        return Ok(Bytes::copy_from_slice(block));
-    };
-    let Some(data) = text.lines().find_map(|line| line.strip_prefix("data:")) else {
-        return Ok(Bytes::copy_from_slice(block));
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data.trim_start()) else {
-        return Ok(Bytes::copy_from_slice(block));
-    };
-    if contains_chat_tool_call(&value) {
-        let plugins = {
-            plugins
-                .lock()
-                .map_err(|_| "Claude App plugin lock was poisoned".to_string())?
-                .clone()
-        };
-        run_chat_tool_plugins(&mut value, &plugins)?;
-    }
-    if let Err(error) = resolve_chat_tool_calls(&mut value, resolve) {
-        eprintln!("[pentect] Claude App Chat tool restoration skipped: {error}");
-        return Ok(Bytes::copy_from_slice(block));
-    }
-    let Ok(encoded) = serde_json::to_string(&value) else {
-        return Ok(Bytes::copy_from_slice(block));
-    };
-    let mut replaced = false;
-    let mut output = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        if !replaced && line.trim_end_matches(['\r', '\n']).starts_with("data:") {
-            output.push_str("data: ");
-            output.push_str(&encoded);
-            if line.ends_with("\r\n") {
-                output.push_str("\r\n");
-            } else if line.ends_with('\n') {
-                output.push('\n');
-            }
-            replaced = true;
-        } else {
-            output.push_str(line);
-        }
-    }
-    Ok(Bytes::from(output))
-}
-
-fn contains_chat_tool_call(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_chat_tool_call),
-        serde_json::Value::Object(object) => {
-            let kind = object
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            ((kind.contains("tool_use")
-                || kind.contains("tool_call")
-                || kind.contains("function_call"))
-                && ["arguments", "input"]
-                    .into_iter()
-                    .any(|key| object.contains_key(key)))
-                || object.values().any(contains_chat_tool_call)
-        }
-        _ => false,
-    }
 }
 
 fn run_chat_tool_plugins(
@@ -2752,22 +2676,6 @@ where
         _ => {}
     }
     Ok(())
-}
-
-fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
 }
 
 fn metadata_path(path: &str) -> String {
@@ -3122,6 +3030,7 @@ mod tests {
         let body = chat_sse_body_with_limit(
             stream,
             Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            false,
             4,
         );
 
@@ -3133,6 +3042,108 @@ mod tests {
             error
                 .to_string()
                 .contains("SSE event exceeded inspection limit"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_restores_text_handles_split_across_events() {
+        let first = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"before <<CHAR\"}}\n\n"
+        );
+        let second = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"GE_0123456789abcdef>> after\"}}\n\n"
+        );
+        let stop = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        );
+        let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
+            Bytes::from(format!("{first}{second}{stop}")),
+        ))]);
+        let resolve: ChatResolver =
+            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
+            resolve,
+            Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            true,
+            MAX_CHAT_BODY_BYTES,
+        );
+
+        let output = chat_sse_body_with_transformer(stream, transformer)
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("\"text\":\"before \""), "{output}");
+        assert!(
+            output.contains("\"text\":\"local-value after\""),
+            "{output}"
+        );
+        assert!(!output.contains("<<CHARGE_"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_reassembles_tool_input_and_multiline_data() {
+        let input = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"http\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\n",
+            "data: \"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"token\\\":\\\"<<KEYED_SECRET_0123456789abcdef>>\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        );
+        let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
+            Bytes::from_static(input.as_bytes()),
+        ))]);
+        let resolve: ChatResolver = Box::new(|text: &str| {
+            Ok(text.replace("<<KEYED_SECRET_0123456789abcdef>>", "local-value"))
+        });
+        let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
+            resolve,
+            Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            false,
+            MAX_CHAT_BODY_BYTES,
+        );
+
+        let output = chat_sse_body_with_transformer(stream, transformer)
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<KEYED_SECRET_"), "{output}");
+        assert!(!output.contains("\ndata: \"index\""), "{output}");
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_restoration_error_fails_closed() {
+        let input = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<<SECRET_0123456789abcdef>>\"}}\n\n"
+        );
+        let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
+            Bytes::from_static(input.as_bytes()),
+        ))]);
+        let resolve: ChatResolver = Box::new(|_: &str| Err("memory store unavailable".to_string()));
+        let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
+            resolve,
+            Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            true,
+            MAX_CHAT_BODY_BYTES,
+        );
+
+        let error = chat_sse_body_with_transformer(stream, transformer)
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("memory store unavailable"),
             "{error}"
         );
     }
