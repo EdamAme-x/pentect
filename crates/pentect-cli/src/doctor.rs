@@ -335,7 +335,16 @@ fn table_has(document: &toml_edit::DocumentMut, table: &str, key: &str) -> bool 
 }
 
 fn table_bool(document: &toml_edit::DocumentMut, table: &str, key: &str) -> Option<bool> {
-    document.get(table)?.as_table_like()?.get(key)?.as_bool()
+    let value = document.get(table)?.as_table_like()?.get(key)?;
+    value.as_bool().or_else(|| {
+        value
+            .as_str()
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            })
+    })
 }
 
 fn ensure_table<'a>(
@@ -796,6 +805,17 @@ mod tests {
         assert!(migrated.contains("share = true"), "{migrated}");
         assert!(migrated.contains("required = true"), "{migrated}");
         assert!(migrated.contains("scope = \"device\""), "{migrated}");
+    }
+
+    #[test]
+    fn removed_config_string_booleans_use_runtime_semantics() {
+        let source = concat!(
+            "file_pointer_manager = { save = \"off\" }\n",
+            "log = { share = \"yes\" }\n",
+        );
+        let migrated = migrate_removed_config_keys(source).unwrap().unwrap();
+        assert!(migrated.contains("remember = false"), "{migrated}");
+        assert!(migrated.contains("share = true"), "{migrated}");
     }
 
     #[test]

@@ -715,12 +715,12 @@ fn unknown_format_policy_value(value: &toml::Value) -> Result<Option<UnknownForm
         return Ok(None);
     };
     let Some(raw) = raw.as_str() else {
-        return Err("compatibility.unknown_formats must be error or ignore".to_string());
+        return Err("compatibility.unknown_formats must be error, block, or ignore".to_string());
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "ignore" => Ok(Some(UnknownFormatPolicy::Ignore)),
-        "error" => Ok(Some(UnknownFormatPolicy::Error)),
-        _ => Err("compatibility.unknown_formats must be error or ignore".to_string()),
+        "error" | "block" => Ok(Some(UnknownFormatPolicy::Error)),
+        _ => Err("compatibility.unknown_formats must be error, block, or ignore".to_string()),
     }
 }
 
@@ -1156,6 +1156,13 @@ mod tests {
         assert_eq!(
             unknown_format_policy_value(&ignore).unwrap(),
             Some(UnknownFormatPolicy::Ignore)
+        );
+        let block = "[compatibility]\nunknown_formats = \"block\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            unknown_format_policy_value(&block).unwrap(),
+            Some(UnknownFormatPolicy::Error)
         );
         let invalid = "[compatibility]\nunknown_formats = \"allow\""
             .parse::<toml::Value>()

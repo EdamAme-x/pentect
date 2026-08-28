@@ -646,7 +646,9 @@ impl ScopedPackageEnvironment {
             "ANTHROPIC_BASE_URL".to_string(),
             Some(std::ffi::OsString::from(anthropic_base_url)),
         )];
-        changes.extend(hidden.iter().map(|name| (name.clone(), None)));
+        changes.extend(hidden.iter().filter_map(|spec| {
+            crate::upstream::header_source_env_name(spec).map(|name| (name.to_string(), None))
+        }));
         let mut previous = Vec::with_capacity(changes.len());
         for (name, value) in changes {
             previous.push((name.clone(), std::env::var_os(&name)));

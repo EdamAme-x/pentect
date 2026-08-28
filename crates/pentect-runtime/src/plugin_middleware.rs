@@ -2788,7 +2788,7 @@ fn perform_plugin_http(
 
 fn private_access_for_origin(origin: &HttpOrigin, approved: bool) -> bool {
     approved
-        && origin.host.parse::<IpAddr>().is_ok_and(|ip| match ip {
+        && origin.host.parse::<IpAddr>().map_or(true, |ip| match ip {
             IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
             IpAddr::V6(ip) => {
                 ip.is_loopback()
@@ -4517,14 +4517,22 @@ disk = "CPU: about 5 GB"
     }
 
     #[test]
-    fn private_network_approval_does_not_apply_to_dns_names() {
-        assert!(!private_access_for_origin(
+    fn private_network_approval_applies_to_explicitly_allowed_dns_origins() {
+        assert!(private_access_for_origin(
             &HttpOrigin {
-                scheme: "https".to_string(),
-                host: "example.com".to_string(),
-                port: 443,
+                scheme: "http".to_string(),
+                host: "localhost".to_string(),
+                port: 8080,
             },
             true,
+        ));
+        assert!(!private_access_for_origin(
+            &HttpOrigin {
+                scheme: "http".to_string(),
+                host: "localhost".to_string(),
+                port: 8080,
+            },
+            false,
         ));
         assert!(private_access_for_origin(
             &HttpOrigin {
