@@ -1019,6 +1019,7 @@ fn run_tool_plugins(
                     call.clone(),
                     Some(serde_json::json!({"provider": "google-cloud-code", "transport": "http"})),
                 )?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Google Cloud Code")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin blocked: {}",
