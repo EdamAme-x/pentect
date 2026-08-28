@@ -1338,7 +1338,15 @@ fn configure_command_tree(command: &mut Command) {
 }
 
 #[cfg(windows)]
-fn configure_command_tree(_command: &mut Command) {}
+fn configure_command_tree(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    // A running child can create descendants before AssignProcessToJobObject.
+    // Keep its primary thread suspended until CommandTree::attach has made the
+    // Job Object assignment atomic from the child's point of view.
+    command.creation_flags(CREATE_SUSPENDED);
+}
 
 #[cfg(not(any(unix, windows)))]
 fn configure_command_tree(_command: &mut Command) {}
@@ -1408,6 +1416,13 @@ impl CommandTree {
             }
             return Err("could not assign the process to a Windows Job Object".to_string());
         }
+        if let Err(error) = resume_suspended_process(child.id()) {
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
+                windows_sys::Win32::Foundation::CloseHandle(job);
+            }
+            return Err(error);
+        }
         Ok(Self { job: job as usize })
     }
 
@@ -1416,6 +1431,53 @@ impl CommandTree {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
         }
     }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(process_id: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err("could not enumerate the suspended process threads".to_string());
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut thread_id = None;
+    let mut available = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while available {
+        if entry.th32OwnerProcessID == process_id {
+            thread_id = Some(entry.th32ThreadID);
+            break;
+        }
+        available = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    let thread_id = thread_id
+        .ok_or_else(|| "could not find the suspended process primary thread".to_string())?;
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    if thread.is_null() {
+        return Err("could not open the suspended process primary thread".to_string());
+    }
+    let previous_suspend_count = unsafe { ResumeThread(thread) };
+    unsafe {
+        CloseHandle(thread);
+    }
+    if previous_suspend_count == u32::MAX {
+        return Err("could not resume the isolated Windows process".to_string());
+    }
+    if previous_suspend_count != 1 {
+        return Err("isolated Windows process had an unexpected suspend state".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -4092,6 +4154,46 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("output exceeds its limit"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_does_not_execute_before_job_attachment() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-suspended-command-{}-{}",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("executed.txt");
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/S", "/C", "echo executed>executed.txt"])
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_command_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+
+        std::thread::sleep(Duration::from_millis(200));
+        if marker.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("the child executed before Job Object attachment");
+        }
+
+        let tree = CommandTree::attach(&child).unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("could not attach suspended test process: {error}");
+        });
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "executed");
+        drop(tree);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
