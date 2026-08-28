@@ -1368,6 +1368,7 @@ async fn forward_inspected_inner(
     }
     let body = if protect_chat {
         let body = read_request_capped(request.into_body(), "Chat").await?;
+        let request_streaming = claude_app_request_streaming(&headers, &body);
         hydrate_claude_app_attested_files(&body, &account_scope, state).await?;
         let original = body.clone();
         let masker = Arc::clone(&state.masker);
@@ -1386,6 +1387,12 @@ async fn forward_inspected_inner(
         .await
         .map_err(|_| "Claude App Chat protection task failed".to_string())??;
         if let Some(response) = protected.local_response {
+            if request_streaming {
+                return Ok(text_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Plugin local responses are unavailable for streaming Claude App requests",
+                ));
+            }
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -1964,6 +1971,21 @@ fn reqwest_error_summary(error: &reqwest::Error) -> &'static str {
     } else {
         "request failed"
     }
+}
+
+fn claude_app_request_streaming(headers: &hyper::HeaderMap, body: &Bytes) -> bool {
+    let body_streaming = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    let accepts_event_stream = headers
+        .get_all(hyper::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|value| value.split(';').next())
+        .any(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    body_streaming || accepts_event_stream
 }
 
 struct ProtectedChatRequest {
@@ -3331,6 +3353,31 @@ mod tests {
             "claude.ai",
             "/completion_status",
             "application/json"
+        ));
+    }
+
+    #[test]
+    fn claude_app_streaming_requests_are_detected_from_body_or_accept_header() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::ACCEPT,
+            hyper::header::HeaderValue::from_static(
+                "application/json, text/event-stream; charset=utf-8",
+            ),
+        );
+        assert!(claude_app_request_streaming(
+            &headers,
+            &Bytes::from_static(br#"{"stream":false}"#)
+        ));
+
+        let headers = hyper::HeaderMap::new();
+        assert!(claude_app_request_streaming(
+            &headers,
+            &Bytes::from_static(br#"{"stream":true}"#)
+        ));
+        assert!(!claude_app_request_streaming(
+            &headers,
+            &Bytes::from_static(br#"{"stream":false}"#)
         ));
     }
 
