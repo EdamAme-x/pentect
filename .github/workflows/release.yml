@@ -41,9 +41,9 @@ jobs:
           if ($env:GITHUB_REF_NAME -ne "v$version") {
             throw "tag $env:GITHUB_REF_NAME must match pentect-cli version v$version"
           }
-          $main = git rev-parse origin/main
-          if ($env:GITHUB_SHA -ne $main) {
-            throw "release tag must point at origin/main ($main)"
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "release tag must point at a commit in origin/main history"
           }
       - name: Validate POSIX installer
         run: |
