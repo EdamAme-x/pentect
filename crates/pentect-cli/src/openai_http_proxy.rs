@@ -13,6 +13,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
@@ -2011,13 +2012,16 @@ where
             }
         }
         Value::Object(object) => {
-            let is_output_text = object.get("type").and_then(Value::as_str) == Some("output_text");
-            if is_output_text {
+            let restores_text = matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("output_text" | "summary_text" | "reasoning_text")
+            );
+            if restores_text {
                 if let Some(Value::String(text)) = object.get_mut("text") {
                     *text = resolve(text)?;
                 }
             }
-            for key in ["output", "content", "response", "item"] {
+            for key in ["output", "content", "summary", "response", "item"] {
                 if let Some(value) = object.get_mut(key) {
                     restore_openai_output_text(value, resolve)?;
                 }
@@ -2036,25 +2040,28 @@ where
         return Ok(());
     };
     for choice in choices {
-        let Some(content) = choice
-            .get_mut("message")
-            .and_then(Value::as_object_mut)
-            .and_then(|message| message.get_mut("content"))
-        else {
+        let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
             continue;
         };
-        match content {
-            Value::String(text) => *text = resolve(text)?,
-            Value::Array(parts) => {
-                for part in parts {
-                    if part.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(Value::String(text)) = part.get_mut("text") {
-                            *text = resolve(text)?;
+        if let Some(content) = message.get_mut("content") {
+            match content {
+                Value::String(text) => *text = resolve(text)?,
+                Value::Array(parts) => {
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) == Some("text") {
+                            if let Some(Value::String(text)) = part.get_mut("text") {
+                                *text = resolve(text)?;
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+        for field in ["reasoning_content", "reasoning"] {
+            if let Some(Value::String(text)) = message.get_mut(field) {
+                *text = resolve(text)?;
+            }
         }
     }
     Ok(())
@@ -2523,8 +2530,7 @@ fn streaming_response_body(
                                 state.restore_output,
                                 &mut state.output_text,
                                 &mut state.output_resolve,
-                            )
-                            .map(|block| vec![block]),
+                            ),
                             StreamTransform::ChatCompletions => state.chat.rewrite_block(
                                 &block,
                                 &state.plugins,
@@ -2561,6 +2567,19 @@ fn streaming_response_body(
                 }
                 None => {
                     state.finished = true;
+                    if state.transform == StreamTransform::ChatCompletions {
+                        match state.chat.finish_output_text("data: {}\n\n") {
+                            Ok(blocks) => {
+                                for block in blocks {
+                                    state.ready.push_back(Ok(Frame::data(block)));
+                                }
+                            }
+                            Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                error,
+                            )))),
+                        }
+                    }
                     if !state.pending.is_empty() {
                         state
                             .ready
@@ -2579,7 +2598,7 @@ fn streaming_response_body(
 struct ChatStreamState {
     calls: HashMap<(u64, u64), ChatStreamCall>,
     buffered_bytes: usize,
-    output_text: HashMap<u64, crate::claude_http_proxy::OutputTextRestorer>,
+    output_text: HashMap<(u64, &'static str), crate::claude_http_proxy::OutputTextRestorer>,
 }
 
 #[derive(Default)]
@@ -2611,14 +2630,17 @@ impl ChatStreamState {
             return Ok(vec![Bytes::copy_from_slice(block)]);
         };
         if data == "[DONE]" {
-            if self.calls.is_empty() {
-                return Ok(vec![Bytes::copy_from_slice(block)]);
+            if !self.calls.is_empty() {
+                return Err(
+                    "OpenAI Chat Completions stream ended before its tool call completed"
+                        .to_string(),
+                );
             }
-            return Err(
-                "OpenAI Chat Completions stream ended before its tool call completed".to_string(),
-            );
+            let mut output = self.finish_output_text(text)?;
+            output.push(Bytes::copy_from_slice(block));
+            return Ok(output);
         }
-        let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+        let Ok(mut value) = serde_json::from_str::<Value>(data.as_ref()) else {
             return Ok(vec![Bytes::copy_from_slice(block)]);
         };
         let mut has_tool_delta = false;
@@ -2636,22 +2658,28 @@ impl ChatStreamState {
                     continue;
                 };
                 if restore_output {
-                    if let Some(Value::String(content)) = delta.get_mut("content") {
-                        *content = self
-                            .output_text
-                            .entry(choice_index)
-                            .or_default()
-                            .push(content, resolve)?;
+                    for field in ["content", "reasoning_content", "reasoning"] {
+                        if let Some(Value::String(content)) = delta.get_mut(field) {
+                            *content = self
+                                .output_text
+                                .entry((choice_index, field))
+                                .or_default()
+                                .push(content, resolve)?;
+                        }
                     }
                     if choice_finished {
-                        if let Some(mut restorer) = self.output_text.remove(&choice_index) {
-                            let pending = restorer.finish();
-                            if !pending.is_empty() {
-                                let content = delta
-                                    .entry("content".to_string())
-                                    .or_insert_with(|| Value::String(String::new()));
-                                if let Value::String(content) = content {
-                                    content.push_str(&pending);
+                        for field in ["content", "reasoning_content", "reasoning"] {
+                            if let Some(mut restorer) =
+                                self.output_text.remove(&(choice_index, field))
+                            {
+                                let pending = restorer.finish();
+                                if !pending.is_empty() {
+                                    let content = delta
+                                        .entry(field.to_string())
+                                        .or_insert_with(|| Value::String(String::new()));
+                                    if let Value::String(content) = content {
+                                        content.push_str(&pending);
+                                    }
                                 }
                             }
                         }
@@ -2715,6 +2743,29 @@ impl ChatStreamState {
         let keep_original = !has_tool_delta || chat_chunk_has_visible_delta(&value);
         if keep_original {
             output.push(encode_sse_value(text, &value)?);
+        }
+        Ok(output)
+    }
+
+    fn finish_output_text(&mut self, template: &str) -> Result<Vec<Bytes>, String> {
+        let mut pending = self.output_text.drain().collect::<Vec<_>>();
+        pending.sort_by_key(|((choice_index, field), _)| (*choice_index, *field));
+        let mut output = Vec::new();
+        for ((choice_index, field), mut restorer) in pending {
+            let text = restorer.finish();
+            if text.is_empty() {
+                continue;
+            }
+            let mut delta = serde_json::Map::new();
+            delta.insert(field.to_string(), Value::String(text));
+            let value = serde_json::json!({
+                "choices": [{
+                    "index": choice_index,
+                    "delta": Value::Object(delta),
+                    "finish_reason": Value::Null,
+                }]
+            });
+            output.push(encode_sse_value(template, &value)?);
         }
         Ok(output)
     }
@@ -2796,9 +2847,23 @@ fn chat_chunk_has_visible_delta(value: &Value) -> bool {
         })
 }
 
-fn sse_data(text: &str) -> Option<&str> {
-    text.lines()
-        .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+fn sse_data(text: &str) -> Option<Cow<'_, str>> {
+    let mut lines = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start));
+    let first = lines.next()?;
+    let Some(second) = lines.next() else {
+        return Some(Cow::Borrowed(first));
+    };
+    let mut joined = String::with_capacity(first.len() + second.len() + 1);
+    joined.push_str(first);
+    joined.push('\n');
+    joined.push_str(second);
+    for line in lines {
+        joined.push('\n');
+        joined.push_str(line);
+    }
+    Some(Cow::Owned(joined))
 }
 
 fn run_sse_response_plugins(
@@ -2814,7 +2879,7 @@ fn run_sse_response_plugins(
     if data == "[DONE]" {
         return Ok(block.to_vec());
     }
-    let Ok(value) = serde_json::from_str::<Value>(data) else {
+    let Ok(value) = serde_json::from_str::<Value>(data.as_ref()) else {
         return Ok(block.to_vec());
     };
     let payload = run_response_plugins_value(value, plugins, "openai")?;
@@ -2822,20 +2887,39 @@ fn run_sse_response_plugins(
 }
 
 fn encode_sse_value(template: &str, value: &Value) -> Result<Bytes, String> {
+    encode_sse_value_for_event(template, value, None)
+}
+
+fn encode_sse_value_for_event(
+    template: &str,
+    value: &Value,
+    event: Option<&str>,
+) -> Result<Bytes, String> {
     let encoded = serde_json::to_string(value)
         .map_err(|error| format!("could not encode OpenAI SSE event: {error}"))?;
     let mut replaced = false;
     let mut output = String::with_capacity(template.len() + encoded.len());
     for line in template.split_inclusive('\n') {
-        if !replaced && line.trim_end_matches(['\r', '\n']).starts_with("data:") {
-            output.push_str("data: ");
-            output.push_str(&encoded);
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if let Some(event) = event.filter(|_| trimmed.starts_with("event:")) {
+            output.push_str("event: ");
+            output.push_str(event);
             if line.ends_with("\r\n") {
                 output.push_str("\r\n");
             } else if line.ends_with('\n') {
                 output.push('\n');
             }
-            replaced = true;
+        } else if trimmed.starts_with("data:") {
+            if !replaced {
+                output.push_str("data: ");
+                output.push_str(&encoded);
+                if line.ends_with("\r\n") {
+                    output.push_str("\r\n");
+                } else if line.ends_with('\n') {
+                    output.push('\n');
+                }
+                replaced = true;
+            }
         } else {
             output.push_str(line);
         }
@@ -2849,27 +2933,29 @@ fn rewrite_openai_sse_block(
     restore_output: bool,
     output_text: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     resolve: &mut HandleResolver,
-) -> Result<Bytes, String> {
+) -> Result<Vec<Bytes>, String> {
     let Ok(text) = std::str::from_utf8(block) else {
-        return Ok(Bytes::copy_from_slice(block));
+        return Ok(vec![Bytes::copy_from_slice(block)]);
     };
-    let Some(data_line) = text.lines().find(|line| line.starts_with("data:")) else {
-        return Ok(Bytes::copy_from_slice(block));
+    let Some(data) = sse_data(text) else {
+        return Ok(vec![Bytes::copy_from_slice(block)]);
     };
-    let data = data_line
-        .strip_prefix("data:")
-        .unwrap_or_default()
-        .trim_start();
     if data == "[DONE]" {
-        return Ok(Bytes::copy_from_slice(block));
+        return Ok(vec![Bytes::copy_from_slice(block)]);
     }
-    let Ok(mut value) = serde_json::from_str::<Value>(data) else {
-        return Ok(Bytes::copy_from_slice(block));
+    let Ok(mut value) = serde_json::from_str::<Value>(data.as_ref()) else {
+        return Ok(vec![Bytes::copy_from_slice(block)]);
     };
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.function_call_arguments.delta" | "response.custom_tool_call_input.delta")
+    ) {
+        return Ok(Vec::new());
+    }
     let completed_function_call = contains_completed_function_call(&value);
     let output_event = restore_output && contains_openai_output_text(&value);
     if !completed_function_call && !output_event {
-        return Ok(Bytes::copy_from_slice(block));
+        return Ok(vec![Bytes::copy_from_slice(block)]);
     }
     if completed_function_call {
         let plugins = plugins
@@ -2880,31 +2966,46 @@ fn rewrite_openai_sse_block(
     if let Err(error) = rewrite_function_calls(&mut value, resolve) {
         let _ = error;
         proxy_diagnostic("sse-restore-skipped");
-        return Ok(Bytes::copy_from_slice(block));
+        return Ok(vec![Bytes::copy_from_slice(block)]);
+    }
+    let mut output = Vec::new();
+    if let Some(delta) = completed_openai_call_delta(&value) {
+        let event = delta.get("type").and_then(Value::as_str);
+        output.push(encode_sse_value_for_event(text, &delta, event)?);
     }
     if output_event {
-        restore_openai_sse_output_text(&mut value, output_text, resolve)?;
-    }
-    let Ok(encoded) = serde_json::to_string(&value) else {
-        return Ok(Bytes::copy_from_slice(block));
-    };
-    let mut replaced = false;
-    let mut output = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        if !replaced && line.trim_end_matches(['\r', '\n']).starts_with("data:") {
-            output.push_str("data: ");
-            output.push_str(&encoded);
-            if line.ends_with("\r\n") {
-                output.push_str("\r\n");
-            } else if line.ends_with('\n') {
-                output.push('\n');
-            }
-            replaced = true;
-        } else {
-            output.push_str(line);
+        for prefix in restore_openai_sse_output_text(&mut value, output_text, resolve)? {
+            let event = prefix.get("type").and_then(Value::as_str);
+            output.push(encode_sse_value_for_event(text, &prefix, event)?);
         }
     }
-    Ok(Bytes::from(output))
+    output.push(encode_sse_value(text, &value)?);
+    Ok(output)
+}
+
+fn completed_openai_call_delta(value: &Value) -> Option<Value> {
+    let (done_type, field, delta_type) = match value.get("type").and_then(Value::as_str)? {
+        "response.function_call_arguments.done" => (
+            "response.function_call_arguments.done",
+            "arguments",
+            "response.function_call_arguments.delta",
+        ),
+        "response.custom_tool_call_input.done" => (
+            "response.custom_tool_call_input.done",
+            "input",
+            "response.custom_tool_call_input.delta",
+        ),
+        _ => return None,
+    };
+    let mut delta = value.clone();
+    let object = delta.as_object_mut()?;
+    if object.get("type").and_then(Value::as_str) != Some(done_type) {
+        return None;
+    }
+    let completed = object.remove(field)?.as_str()?.to_string();
+    object.insert("type".to_string(), Value::String(delta_type.to_string()));
+    object.insert("delta".to_string(), Value::String(completed));
+    Some(delta)
 }
 
 fn contains_openai_output_text(value: &Value) -> bool {
@@ -2941,10 +3042,11 @@ fn restore_openai_sse_output_text<R>(
     value: &mut Value,
     streams: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     resolve: &mut R,
-) -> Result<(), String>
+) -> Result<Vec<Value>, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut prefixes = Vec::new();
     let event_type = value.get("type").and_then(Value::as_str).map(str::to_owned);
     match event_type.as_deref() {
         Some("response.output_text.delta") => {
@@ -2955,7 +3057,21 @@ where
         }
         Some("response.output_text.done") => {
             let key = openai_output_stream_key(value);
-            streams.remove(&key);
+            if let Some(mut restorer) = streams.remove(&key) {
+                let pending = restorer.finish();
+                if !pending.is_empty() {
+                    let mut prefix = value.clone();
+                    if let Some(object) = prefix.as_object_mut() {
+                        object.insert(
+                            "type".to_string(),
+                            Value::String("response.output_text.delta".to_string()),
+                        );
+                        object.remove("text");
+                        object.insert("delta".to_string(), Value::String(pending));
+                    }
+                    prefixes.push(prefix);
+                }
+            }
             if let Some(Value::String(text)) = value.get_mut("text") {
                 *text = resolve(text)?;
             }
@@ -2968,7 +3084,7 @@ where
         }
         _ => {}
     }
-    Ok(())
+    Ok(prefixes)
 }
 
 fn contains_completed_function_call(value: &Value) -> bool {
@@ -4005,6 +4121,37 @@ mod tests {
     }
 
     #[test]
+    fn nonstream_reasoning_text_is_restored_without_touching_encrypted_content() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let mut response = serde_json::json!({
+            "output": [{
+                "type": "reasoning",
+                "encrypted_content": handle,
+                "summary": [{"type": "summary_text", "text": handle}],
+                "content": [{"type": "reasoning_text", "text": handle}]
+            }]
+        });
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        restore_openai_output_text(&mut response, &mut resolve).unwrap();
+        assert_eq!(response["output"][0]["summary"][0]["text"], "local-value");
+        assert_eq!(response["output"][0]["content"][0]["text"], "local-value");
+        assert_eq!(response["output"][0]["encrypted_content"], handle);
+
+        let mut chat = serde_json::json!({
+            "choices": [{"message": {
+                "content": handle,
+                "reasoning_content": handle,
+                "reasoning": handle
+            }}]
+        });
+        restore_chat_output_text(&mut chat, &mut resolve).unwrap();
+        let message = &chat["choices"][0]["message"];
+        assert_eq!(message["content"], "local-value");
+        assert_eq!(message["reasoning_content"], "local-value");
+        assert_eq!(message["reasoning"], "local-value");
+    }
+
+    #[test]
     fn chat_stream_buffers_fragmented_tool_json_until_completion() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut state = ChatStreamState::default();
@@ -4056,6 +4203,52 @@ mod tests {
         );
         assert!(state.calls.is_empty());
         assert_eq!(state.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn chat_stream_restores_reasoning_and_flushes_it_on_finish() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut state = ChatStreamState::default();
+        let mut resolve: HandleResolver =
+            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let blocks = [
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"before <<CHAR\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"GE_0123456789abcdef>> after\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ];
+        let mut output = String::new();
+        for block in blocks {
+            for rewritten in state
+                .rewrite_block(block.as_bytes(), &plugins, true, &mut resolve)
+                .unwrap()
+            {
+                output.push_str(std::str::from_utf8(&rewritten).unwrap());
+            }
+        }
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
+        assert!(output.contains("reasoning_content"), "{output}");
+    }
+
+    #[test]
+    fn chat_stream_done_flushes_buffered_trailing_text() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut state = ChatStreamState::default();
+        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"trailing text\"},\"finish_reason\":null}]}\n\n";
+        let first = state
+            .rewrite_block(chunk, &plugins, true, &mut resolve)
+            .unwrap();
+        let done = state
+            .rewrite_block(b"data: [DONE]\n\n", &plugins, true, &mut resolve)
+            .unwrap();
+        let output = first
+            .iter()
+            .chain(&done)
+            .map(|block| std::str::from_utf8(block).unwrap())
+            .collect::<String>();
+        assert!(output.contains("trailing text"), "{output}");
+        assert!(output.ends_with("data: [DONE]\n\n"), "{output:?}");
     }
 
     #[test]
@@ -4468,13 +4661,52 @@ mod tests {
             rewrite_openai_sse_block(first, &plugins, true, &mut streams, &mut resolve).unwrap();
         let second =
             rewrite_openai_sse_block(second, &plugins, true, &mut streams, &mut resolve).unwrap();
-        let output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&first),
-            String::from_utf8_lossy(&second)
-        );
+        let output = first
+            .into_iter()
+            .chain(second)
+            .flat_map(|block| block.to_vec())
+            .collect::<Vec<_>>();
+        let output = String::from_utf8(output).unwrap();
         assert!(output.contains("local-value"), "{output}");
         assert!(!output.contains("<<CHARGE_"), "{output}");
+    }
+
+    #[test]
+    fn openai_output_text_done_flushes_buffered_delta_text() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let first = rewrite_openai_sse_block(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"trailing text\"}\n\n",
+            &plugins,
+            true,
+            &mut streams,
+            &mut resolve,
+        )
+        .unwrap();
+        let done = rewrite_openai_sse_block(
+            b"event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"content_index\":0,\"text\":\"trailing text\"}\n\n",
+            &plugins,
+            true,
+            &mut streams,
+            &mut resolve,
+        )
+        .unwrap();
+        let output = first
+            .into_iter()
+            .chain(done)
+            .map(|block| String::from_utf8(block.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.contains("trailing text"), "{output}");
+        assert!(
+            output.contains("event: response.output_text.delta\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("event: response.output_text.done\n"),
+            "{output}"
+        );
+        assert!(streams.is_empty());
     }
 
     #[test]
@@ -4500,6 +4732,62 @@ mod tests {
     }
 
     #[test]
+    fn multiline_sse_data_is_joined_and_reencoded_once() {
+        let input = concat!(
+            "event: response.function_call_arguments.done\r\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\r\n",
+            "data: \"arguments\":\"{\\\"command\\\":\\\"echo <<SECRET_0123456789abcdef>>\\\"}\"}\r\n",
+            "\r\n",
+        );
+        assert_eq!(
+            sse_data(input).unwrap(),
+            concat!(
+                "{\"type\":\"response.function_call_arguments.done\",\n",
+                "\"arguments\":\"{\\\"command\\\":\\\"echo <<SECRET_0123456789abcdef>>\\\"}\"}",
+            )
+        );
+
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver =
+            Box::new(|text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "local-value")));
+        let delta = rewrite_openai_sse_block(
+            b"event: response.function_call_arguments.delta\r\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"untrusted\"}\r\n\r\n",
+            &plugins,
+            false,
+            &mut streams,
+            &mut resolve,
+        )
+        .unwrap();
+        assert!(delta.is_empty());
+        let rewritten = rewrite_openai_sse_block(
+            input.as_bytes(),
+            &plugins,
+            false,
+            &mut streams,
+            &mut resolve,
+        )
+        .unwrap();
+        assert_eq!(rewritten.len(), 2);
+        let rewritten = rewritten
+            .into_iter()
+            .map(|block| String::from_utf8(block.to_vec()).unwrap())
+            .collect::<String>();
+        assert_eq!(rewritten.matches("data:").count(), 2, "{rewritten}");
+        assert!(rewritten.contains("local-value"), "{rewritten}");
+        assert!(!rewritten.contains("<<SECRET_"), "{rewritten}");
+        assert!(
+            rewritten.starts_with("event: response.function_call_arguments.delta\r\ndata: "),
+            "{rewritten:?}"
+        );
+        assert!(
+            rewritten.contains("event: response.function_call_arguments.done\r\ndata: "),
+            "{rewritten:?}"
+        );
+        assert!(rewritten.ends_with("\r\n\r\n"), "{rewritten:?}");
+    }
+
+    #[test]
     fn untouched_sse_framing_is_preserved() {
         let input = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\r\n\r\n";
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
@@ -4508,8 +4796,8 @@ mod tests {
         assert_eq!(
             rewrite_openai_sse_block(input, &plugins, false, &mut streams, &mut resolve,)
                 .unwrap()
-                .as_ref(),
-            input
+                .as_slice(),
+            &[Bytes::copy_from_slice(input)]
         );
     }
 }
