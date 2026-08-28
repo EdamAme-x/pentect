@@ -2493,21 +2493,12 @@ fn streaming_response_body(
                 }
                 Some(Ok(chunk)) => {
                     if state.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
-                        if state.transform == StreamTransform::ChatCompletions
-                            && !state.chat.calls.is_empty()
-                        {
-                            state.finished = true;
-                            state.ready.push_back(Err(Box::new(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "OpenAI Chat Completions tool input exceeded limit",
-                            ))));
-                            continue;
-                        }
                         proxy_diagnostic("sse-event-limit");
-                        state.transform = StreamTransform::None;
-                        let mut pending = std::mem::take(&mut state.pending);
-                        pending.extend_from_slice(&chunk);
-                        state.ready.push_back(Ok(Frame::data(Bytes::from(pending))));
+                        state.finished = true;
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "OpenAI SSE event exceeded inspection limit",
+                        ))));
                         continue;
                     }
                     state.pending.extend_from_slice(&chunk);
@@ -2600,6 +2591,7 @@ struct ChatStreamState {
     calls: HashMap<(u64, u64), ChatStreamCall>,
     buffered_bytes: usize,
     output_text: HashMap<(u64, &'static str), crate::claude_http_proxy::OutputTextRestorer>,
+    last_envelope: Option<Value>,
 }
 
 #[derive(Default)]
@@ -2631,13 +2623,22 @@ impl ChatStreamState {
             return Ok(vec![Bytes::copy_from_slice(block)]);
         };
         if data == "[DONE]" {
-            if !self.calls.is_empty() {
-                return Err(
-                    "OpenAI Chat Completions stream ended before its tool call completed"
-                        .to_string(),
-                );
-            }
             let mut output = self.finish_output_text(text)?;
+            if !self.calls.is_empty() {
+                let envelope = self.last_envelope.take().ok_or_else(|| {
+                    "OpenAI Chat Completions stream ended without a tool call envelope".to_string()
+                })?;
+                let mut choices = self
+                    .calls
+                    .keys()
+                    .map(|(choice, _)| *choice)
+                    .collect::<Vec<_>>();
+                choices.sort_unstable();
+                choices.dedup();
+                for choice in choices {
+                    output.push(self.completed_tool_block(text, &envelope, choice, plugins)?);
+                }
+            }
             output.push(Bytes::copy_from_slice(block));
             return Ok(output);
         }
@@ -2742,6 +2743,7 @@ impl ChatStreamState {
             }
         }
         let keep_original = !has_tool_delta || chat_chunk_has_visible_delta(&value);
+        self.last_envelope = Some(value.clone());
         if keep_original {
             output.push(encode_sse_value(text, &value)?);
         }
@@ -4202,6 +4204,38 @@ mod tests {
             completed.contains(r#"{\"command\":\"echo ok\"}"#),
             "{completed}"
         );
+        assert!(state.calls.is_empty());
+        assert_eq!(state.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn chat_stream_done_flushes_tool_calls_without_finish_reason() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut state = ChatStreamState::default();
+        let chunk = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chat_1", "model": "test", "choices": [{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "run_command", "arguments": "{\"cmd\":\"ls\"}"}}]
+                }, "finish_reason": null}]
+            })
+        );
+        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        assert!(state
+            .rewrite_block(chunk.as_bytes(), &plugins, false, &mut resolve)
+            .unwrap()
+            .is_empty());
+
+        let finished = state
+            .rewrite_block(b"data: [DONE]\n\n", &plugins, false, &mut resolve)
+            .unwrap();
+        assert_eq!(finished.len(), 2);
+        let tool_call = String::from_utf8_lossy(&finished[0]);
+        assert!(tool_call.contains("call_1"), "{tool_call}");
+        assert!(tool_call.contains("run_command"), "{tool_call}");
+        assert!(tool_call.contains(r#"{\"cmd\":\"ls\"}"#), "{tool_call}");
+        assert_eq!(finished[1], Bytes::from_static(b"data: [DONE]\n\n"));
         assert!(state.calls.is_empty());
         assert_eq!(state.buffered_bytes, 0);
     }
