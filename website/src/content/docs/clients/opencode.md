@@ -11,9 +11,10 @@ Pentect protects this OpenCode launch only. It does not edit `opencode.json` or
 change normal OpenCode launches. Background tasks and subagents use the same
 protected provider during the session.
 
-Without `--model`, OpenCode's native Zen provider and model picker remain
-available. Pentect keeps the original provider name and model catalog, but
-routes its requests through the local privacy gateway.
+Without `--model`, OpenCode's native picker exposes every provider Pentect can
+protect: OpenCode Zen, OpenAI, OpenRouter, Anthropic, and Google. `/connect`
+uses those native provider IDs, and each provider has its own local privacy
+gateway, so selecting or switching providers in the UI cannot bypass Pentect.
 
 Provider setup and credentials stay under OpenCode's native provider ID. If
 `opencode auth list` shows a credential named `pentect` from an older Pentect
@@ -29,8 +30,8 @@ pentect opencode auth login
 
 Authentication commands retain OpenCode's complete provider list and do not
 install Pentect's temporary conversation routing. They exchange credentials,
-not conversation content. Subsequent `pentect opencode` launches protect AI
-traffic normally.
+not conversation content. Providers not listed as supported below can be
+authenticated there, but protected conversations require a supported provider.
 
 Normal OpenCode arguments pass through. A model flag may appear anywhere before
 the explicit `--` separator:
@@ -49,9 +50,9 @@ and `google` providers. Select one with OpenCode's `provider/model` form:
 pentect opencode run --model openrouter/anthropic/claude-sonnet "Review this project"
 ```
 
-Only the selected provider is enabled for that protected launch. Start a new
-Pentect launch to switch providers; this prevents background agents from
-bypassing the matching protocol gateway.
+An explicit `--model` enables only its matching provider for that protected
+launch. Without `--model`, the UI can switch among all supported providers;
+each remains bound to its matching local gateway.
 
 Chat Completions is the default. Select Responses when the upstream supports
 it:

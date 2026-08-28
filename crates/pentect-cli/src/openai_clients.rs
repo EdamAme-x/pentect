@@ -274,7 +274,6 @@ fn run_opencode(
         return crate::run_native_command_with_guards(command, &opts.command, ());
     }
 
-    let route = OpenCodeRoute::resolve(opts)?;
     let api = ClientApi::parse(opts.api.as_deref())?;
     if opts.dry_run {
         crate::print_dry_run(&opts.command, &opts.tool_args);
@@ -284,7 +283,34 @@ fn run_opencode(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let mut header_env = opts.upstream_header_env.clone();
+    if opts.model.is_none() && opts.upstream.is_none() {
+        return run_opencode_picker(opts, pentect, &active_plugins, memory_store);
+    }
+
+    let route = OpenCodeRoute::resolve(opts)?;
+    let (proxy, header_env, child_key_env) =
+        start_opencode_proxy(&route, &opts.upstream_header_env)?;
+    let package = opts.upstream.as_ref().map(|_| api.opencode_package());
+    let config = opencode_config(
+        proxy.base_url(),
+        &route.provider,
+        route.model.as_deref(),
+        package,
+    )?;
+    let mut command = opencode_command(opts, pentect, &active_plugins, &memory_store, &header_env)?;
+    if let Some(name) = child_key_env {
+        command.env(name, "pentect-local");
+    }
+    command.env("OPENCODE_CONFIG_CONTENT", config);
+    command.args(&opts.tool_args);
+    crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+}
+
+fn start_opencode_proxy(
+    route: &OpenCodeRoute,
+    base_header_env: &[String],
+) -> Result<(OpenCodeProxyGuard, Vec<String>, Option<&'static str>), String> {
+    let mut header_env = base_header_env.to_vec();
     let bearer_env = route.bearer_env.filter(|name| {
         std::env::var_os(name).is_some_and(|value| !value.is_empty())
             && !has_authorization_override(&header_env)
@@ -346,16 +372,19 @@ fn run_opencode(
             )?,
         ),
     };
-    let package = opts.upstream.as_ref().map(|_| api.opencode_package());
-    let config = opencode_config(
-        proxy.base_url(),
-        &route.provider,
-        route.model.as_deref(),
-        package,
-    )?;
+    Ok((proxy, header_env, child_key_env))
+}
+
+fn opencode_command(
+    opts: &crate::AgentToolOpts,
+    pentect: &Path,
+    active_plugins: &crate::plugins::ActivePlugins,
+    memory_store: &crate::MemoryStoreGuard,
+    header_env: &[String],
+) -> Result<Command, String> {
     let mut command = Command::new(&opts.command);
     crate::clear_pentect_control_env(&mut command);
-    crate::upstream::hide_header_source_env(&mut command, &header_env);
+    crate::upstream::hide_header_source_env(&mut command, header_env);
     for name in [
         "OPENAI_API_KEY",
         "OPENCODE_API_KEY",
@@ -367,15 +396,84 @@ fn run_opencode(
     ] {
         command.env_remove(name);
     }
-    if let Some(name) = child_key_env {
+    crate::apply_plugin_env(&mut command, active_plugins)?;
+    crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
+    crate::apply_memory_store_env(&mut command, Some(memory_store));
+    Ok(command)
+}
+
+fn run_opencode_picker(
+    opts: &crate::AgentToolOpts,
+    pentect: &Path,
+    active_plugins: &crate::plugins::ActivePlugins,
+    memory_store: crate::MemoryStoreGuard,
+) -> Result<std::process::ExitStatus, String> {
+    let routes = [
+        OpenCodeRoute {
+            provider: "opencode".to_string(),
+            model: None,
+            upstream: "https://opencode.ai/zen/v1".to_string(),
+            protocol: OpenCodeProtocol::OpenAi,
+            bearer_env: Some("OPENCODE_API_KEY"),
+        },
+        OpenCodeRoute {
+            provider: "openai".to_string(),
+            model: None,
+            upstream: "https://api.openai.com/v1".to_string(),
+            protocol: OpenCodeProtocol::OpenAi,
+            bearer_env: Some("OPENAI_API_KEY"),
+        },
+        OpenCodeRoute {
+            provider: "openrouter".to_string(),
+            model: None,
+            upstream: "https://openrouter.ai/api/v1".to_string(),
+            protocol: OpenCodeProtocol::OpenAi,
+            bearer_env: Some("OPENROUTER_API_KEY"),
+        },
+        OpenCodeRoute {
+            provider: "anthropic".to_string(),
+            model: None,
+            upstream: "https://api.anthropic.com".to_string(),
+            protocol: OpenCodeProtocol::Anthropic,
+            bearer_env: None,
+        },
+        OpenCodeRoute {
+            provider: "google".to_string(),
+            model: None,
+            upstream: "https://generativelanguage.googleapis.com".to_string(),
+            protocol: OpenCodeProtocol::Gemini,
+            bearer_env: None,
+        },
+    ];
+    let mut proxies = Vec::with_capacity(routes.len());
+    let mut provider_urls = Vec::with_capacity(routes.len());
+    let mut hidden_header_env = Vec::new();
+    let mut child_key_env = Vec::new();
+    for route in &routes {
+        let (proxy, headers, child_key) = start_opencode_proxy(route, &opts.upstream_header_env)?;
+        provider_urls.push((route.provider.as_str(), proxy.base_url().to_string()));
+        hidden_header_env.extend(headers);
+        if let Some(name) = child_key {
+            child_key_env.push(name);
+        }
+        proxies.push(proxy);
+    }
+    let config = opencode_picker_config(&provider_urls)?;
+    let mut command = opencode_command(
+        opts,
+        pentect,
+        active_plugins,
+        &memory_store,
+        &hidden_header_env,
+    )?;
+    child_key_env.sort_unstable();
+    child_key_env.dedup();
+    for name in child_key_env {
         command.env(name, "pentect-local");
     }
-    crate::apply_plugin_env(&mut command, &active_plugins)?;
-    crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
-    crate::apply_memory_store_env(&mut command, Some(&memory_store));
     command.env("OPENCODE_CONFIG_CONTENT", config);
     command.args(&opts.tool_args);
-    crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+    crate::run_native_command_with_guards(command, &opts.command, (proxies, memory_store))
 }
 
 fn is_opencode_auth_command(args: &[String]) -> bool {
@@ -488,6 +586,59 @@ fn validate_model(model: &str) -> Result<(), String> {
         return Err("model ID is invalid".to_string());
     }
     Ok(())
+}
+
+fn opencode_picker_config(provider_urls: &[(&str, String)]) -> Result<String, String> {
+    let mut root = match std::env::var("OPENCODE_CONFIG_CONTENT") {
+        Ok(existing) if !existing.trim().is_empty() => serde_json::from_str::<Value>(&existing)
+            .map_err(|error| format!("OPENCODE_CONFIG_CONTENT is invalid JSON: {error}"))?,
+        _ => Value::Object(Map::new()),
+    };
+    let root_object = root
+        .as_object_mut()
+        .ok_or_else(|| "OPENCODE_CONFIG_CONTENT must contain a JSON object".to_string())?;
+    let providers = root_object
+        .entry("provider")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "OPENCODE_CONFIG_CONTENT.provider must be an object".to_string())?;
+    let mut protected = Vec::with_capacity(provider_urls.len());
+    for (provider, proxy) in provider_urls {
+        let mut provider_config = providers
+            .remove(*provider)
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        remove_provider_credentials(&mut provider_config);
+        let provider_object = provider_config.as_object_mut().ok_or_else(|| {
+            format!("OPENCODE_CONFIG_CONTENT.provider.{provider} must be an object")
+        })?;
+        let options = provider_object
+            .entry("options")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                format!("OPENCODE_CONFIG_CONTENT.provider.{provider}.options must be an object")
+            })?;
+        options.insert("baseURL".to_string(), Value::String(proxy.clone()));
+        protected.push(((*provider).to_string(), provider_config));
+    }
+    providers.clear();
+    for (provider, config) in protected {
+        providers.insert(provider, config);
+    }
+    root_object.remove("model");
+    root_object.remove("small_model");
+    root_object.insert(
+        "enabled_providers".to_string(),
+        Value::Array(
+            provider_urls
+                .iter()
+                .map(|(provider, _)| Value::String((*provider).to_string()))
+                .collect(),
+        ),
+    );
+    root_object.insert("disabled_providers".to_string(), json!([]));
+    serde_json::to_string(&root)
+        .map_err(|error| format!("could not encode temporary OpenCode config: {error}"))
 }
 
 fn opencode_config(
@@ -735,6 +886,47 @@ mod tests {
         assert!(value.get("model").is_none());
         assert!(value.get("small_model").is_none());
         assert_eq!(value["enabled_providers"], serde_json::json!(["opencode"]));
+    }
+
+    #[test]
+    fn opencode_picker_routes_every_supported_native_provider() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
+        std::env::set_var(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"model":"old/model","provider":{"openrouter":{"models":{"team":{"name":"Team"}},"options":{"apiKey":"secret","timeout":30000}},"unprotected":{"options":{"baseURL":"https://bypass.invalid"}}}}"#,
+        );
+        let urls = [
+            ("opencode", "http://127.0.0.1:1/opencode".to_string()),
+            ("openai", "http://127.0.0.1:2/openai".to_string()),
+            ("openrouter", "http://127.0.0.1:3/openrouter".to_string()),
+            ("anthropic", "http://127.0.0.1:4/anthropic".to_string()),
+            ("google", "http://127.0.0.1:5/google".to_string()),
+        ];
+        let value: Value = serde_json::from_str(&opencode_picker_config(&urls).unwrap()).unwrap();
+        match old {
+            Some(value) => std::env::set_var("OPENCODE_CONFIG_CONTENT", value),
+            None => std::env::remove_var("OPENCODE_CONFIG_CONTENT"),
+        }
+        assert!(value.get("model").is_none());
+        assert!(value.get("small_model").is_none());
+        assert_eq!(
+            value["enabled_providers"],
+            serde_json::json!(["opencode", "openai", "openrouter", "anthropic", "google"])
+        );
+        assert!(value["provider"].get("unprotected").is_none());
+        assert_eq!(
+            value["provider"]["openrouter"]["options"]["baseURL"],
+            "http://127.0.0.1:3/openrouter"
+        );
+        assert_eq!(value["provider"]["openrouter"]["options"]["timeout"], 30000);
+        assert!(value["provider"]["openrouter"]["options"]
+            .get("apiKey")
+            .is_none());
+        assert_eq!(
+            value["provider"]["openrouter"]["models"]["team"]["name"],
+            "Team"
+        );
     }
 
     #[test]
