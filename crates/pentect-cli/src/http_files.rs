@@ -555,6 +555,221 @@ fn run_file_stage(
     Ok(run.payload)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct InlineFileMetadata {
+    filename: Option<String>,
+    media_type: String,
+    size: usize,
+}
+
+pub(crate) fn run_anthropic_inline_file_stages(
+    value: &serde_json::Value,
+    plugins: &pentect_agent::PluginMiddleware,
+    provider: &str,
+    transport: &str,
+) -> Result<bool, String> {
+    let mut files = Vec::new();
+    collect_anthropic_inline_files(value, &mut files);
+    run_inline_file_stages(files, plugins, provider, transport)
+}
+
+pub(crate) fn run_google_inline_file_stages(
+    value: &serde_json::Value,
+    plugins: &pentect_agent::PluginMiddleware,
+    provider: &str,
+    transport: &str,
+) -> Result<bool, String> {
+    let mut files = Vec::new();
+    collect_google_inline_files(value, &mut files);
+    run_inline_file_stages(files, plugins, provider, transport)
+}
+
+fn run_inline_file_stages(
+    files: Vec<InlineFileMetadata>,
+    plugins: &pentect_agent::PluginMiddleware,
+    provider: &str,
+    transport: &str,
+) -> Result<bool, String> {
+    let mut partial = false;
+    for file in files {
+        let run = plugins.run(
+            pentect_agent::MiddlewareStage::File,
+            serde_json::json!({
+                "filename": file.filename,
+                "media_type": file.media_type,
+                "size": file.size,
+            }),
+            Some(serde_json::json!({
+                "provider": provider,
+                "transport": transport,
+                "inline": true,
+                "encoding": "base64",
+            })),
+        )?;
+        partial |= run.coverage == pentect_agent::MiddlewareCoverage::Partial;
+        if run.stopped.is_some() {
+            return Err(format!(
+                "file upload blocked: {}",
+                run.message
+                    .unwrap_or_else(|| "blocked by plugin".to_string())
+            ));
+        }
+    }
+    Ok(partial)
+}
+
+fn collect_anthropic_inline_files(value: &serde_json::Value, output: &mut Vec<InlineFileMetadata>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_anthropic_inline_files(value, output);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let kind = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(kind, "document" | "image") {
+                if let Some(source) = object.get("source").and_then(serde_json::Value::as_object) {
+                    if source.get("type").and_then(serde_json::Value::as_str) == Some("base64") {
+                        push_inline_file(
+                            output,
+                            object_filename(object),
+                            source
+                                .get("media_type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("application/octet-stream"),
+                            source.get("data").and_then(serde_json::Value::as_str),
+                        );
+                    }
+                } else if let Some((field, data)) = ["file_data", "image_url", "url", "data"]
+                    .into_iter()
+                    .find_map(|key| {
+                        object
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .map(|data| (key, data))
+                    })
+                {
+                    if data.starts_with("data:") {
+                        push_data_uri_file(output, object_filename(object), data);
+                    } else if matches!(field, "file_data" | "data") {
+                        push_inline_file(
+                            output,
+                            object_filename(object),
+                            object_media_type(object),
+                            Some(data),
+                        );
+                    }
+                }
+                return;
+            }
+            if matches!(kind, "tool_use" | "mcp_tool_use" | "server_tool_use") {
+                return;
+            }
+            for child in object.values() {
+                collect_anthropic_inline_files(child, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_google_inline_files(value: &serde_json::Value, output: &mut Vec<InlineFileMetadata>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_google_inline_files(value, output);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(inline) = object
+                .get("inlineData")
+                .and_then(serde_json::Value::as_object)
+            {
+                push_inline_file(
+                    output,
+                    None,
+                    inline
+                        .get("mimeType")
+                        .or_else(|| inline.get("mime_type"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("application/octet-stream"),
+                    inline.get("data").and_then(serde_json::Value::as_str),
+                );
+            }
+            for (key, child) in object {
+                if !matches!(
+                    key.as_str(),
+                    "inlineData" | "functionCall" | "functionResponse"
+                ) {
+                    collect_google_inline_files(child, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn object_filename(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    ["filename", "file_name", "name"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn object_media_type(object: &serde_json::Map<String, serde_json::Value>) -> &str {
+    ["media_type", "mime_type", "mimeType"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+}
+
+fn push_data_uri_file(output: &mut Vec<InlineFileMetadata>, filename: Option<String>, data: &str) {
+    let Some((metadata, encoded)) = data.split_once(',') else {
+        return;
+    };
+    let Some(media_type) = metadata
+        .strip_prefix("data:")
+        .and_then(|metadata| metadata.strip_suffix(";base64"))
+    else {
+        return;
+    };
+    push_inline_file(output, filename, media_type, Some(encoded));
+}
+
+fn push_inline_file(
+    output: &mut Vec<InlineFileMetadata>,
+    filename: Option<String>,
+    media_type: &str,
+    encoded: Option<&str>,
+) {
+    let Some(encoded) = encoded else {
+        return;
+    };
+    let Ok(max_size) = data_encoding::BASE64.decode_len(encoded.len()) else {
+        return;
+    };
+    let padding = encoded
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count()
+        .min(2);
+    let Some(size) = max_size.checked_sub(padding) else {
+        return;
+    };
+    output.push(InlineFileMetadata {
+        filename,
+        media_type: media_type.to_string(),
+        size,
+    });
+}
+
 fn extend_protected_output(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() > MAX_MULTIPART_OUTPUT_BYTES.saturating_sub(output.len()) {
         output.zeroize();
@@ -1512,6 +1727,79 @@ mod tests {
         assert_eq!(
             multipart_boundary("multipart/form-data; boundary=\"hello-world\""),
             Some("hello-world".to_string())
+        );
+    }
+
+    #[test]
+    fn collects_only_known_anthropic_inline_media_blocks() {
+        let value = serde_json::json!({
+            "messages": [{"content": [
+                {"type": "document", "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "aGVsbG8="
+                }},
+                {"type": "image", "name": "screen.png", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "YWJjZA=="
+                }},
+                {"type": "document", "file_name": "notes.txt",
+                    "media_type": "text/plain", "file_data": "YWJj"
+                },
+                {"type": "image", "image_url": "https://example.com/not-inline.png"},
+                {"type": "tool_use", "input": {"type": "document", "source": {
+                    "type": "base64", "data": "aGlkZGVu"
+                }}}
+            ]}]
+        });
+        let mut files = Vec::new();
+        collect_anthropic_inline_files(&value, &mut files);
+        assert_eq!(
+            files,
+            [
+                InlineFileMetadata {
+                    filename: None,
+                    media_type: "application/pdf".to_string(),
+                    size: 5,
+                },
+                InlineFileMetadata {
+                    filename: Some("screen.png".to_string()),
+                    media_type: "image/png".to_string(),
+                    size: 4,
+                },
+                InlineFileMetadata {
+                    filename: Some("notes.txt".to_string()),
+                    media_type: "text/plain".to_string(),
+                    size: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_google_inline_data_but_not_function_arguments() {
+        let value = serde_json::json!({
+            "contents": [{"parts": [
+                {"inlineData": {
+                    "mimeType": "text/plain",
+                    "data": "aGVsbG8="
+                }},
+                {"functionCall": {"args": {"inlineData": {
+                    "mimeType": "text/plain",
+                    "data": "aGlkZGVu"
+                }}}}
+            ]}]
+        });
+        let mut files = Vec::new();
+        collect_google_inline_files(&value, &mut files);
+        assert_eq!(
+            files,
+            [InlineFileMetadata {
+                filename: None,
+                media_type: "text/plain".to_string(),
+                size: 5,
+            }]
         );
     }
 

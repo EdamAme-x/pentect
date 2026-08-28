@@ -2039,6 +2039,23 @@ fn protect_chat_request(
             local_response: Some(body),
         });
     }
+    let inline_file_partial = {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "Claude App plugin lock was poisoned".to_string())?;
+        crate::http_files::run_anthropic_inline_file_stages(
+            &value,
+            &plugins,
+            "claude",
+            "desktop_http_json",
+        )
+    }?;
+    if block_unknown_formats && inline_file_partial {
+        return Err(
+            "unknown format blocked: a Claude App file plugin reported partial inline-file coverage"
+                .to_string(),
+        );
+    }
     let mut masker = masker
         .lock()
         .map_err(|_| "Claude App Chat masker lock was poisoned".to_string())?;
@@ -2097,7 +2114,7 @@ fn protect_generic_json_request(
     let mut masker = masker
         .lock()
         .map_err(|_| "Claude App JSON masker lock was poisoned".to_string())?;
-    if let Err(error) = mask_generic_json_value(&mut value, &mut masker) {
+    if let Err(error) = mask_generic_json_value(&mut value, &mut masker, true) {
         if block_unknown_formats {
             return Err(format!(
                 "Claude App JSON request blocked: content inspection is unavailable ({error})"
@@ -2114,6 +2131,7 @@ fn protect_generic_json_request(
 fn mask_generic_json_value(
     value: &mut serde_json::Value,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    top_level: bool,
 ) -> Result<(), String> {
     match value {
         serde_json::Value::String(text) => {
@@ -2121,7 +2139,7 @@ fn mask_generic_json_value(
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                mask_generic_json_value(value, masker)?;
+                mask_generic_json_value(value, masker, false)?;
             }
             Ok(())
         }
@@ -2129,11 +2147,12 @@ fn mask_generic_json_value(
             for (key, value) in object {
                 if matches!(
                     key.as_str(),
-                    "signature" | "thinking_signature" | "attestation" | "authorization" | "token"
-                ) {
+                    "signature" | "thinking_signature" | "attestation"
+                ) || (top_level && matches!(key.as_str(), "authorization" | "token"))
+                {
                     continue;
                 }
-                mask_generic_json_value(value, masker)?;
+                mask_generic_json_value(value, masker, false)?;
             }
             Ok(())
         }
@@ -3555,6 +3574,45 @@ mod tests {
         );
         let protected = protect_generic_json_request(&telemetry, &masker, true).unwrap();
         assert!(!String::from_utf8_lossy(&protected).contains(&secret));
+    }
+
+    #[test]
+    fn generic_json_preserves_only_top_level_auth_fields() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = MaskingTestEnv::install(&store);
+        let secret = [
+            "rpa_",
+            "ZYXWVUTS",
+            "RQPONMLK",
+            "JIHGFEDC",
+            "BA098765",
+            "4321fedcba",
+        ]
+        .concat();
+        let keyed_secret = format!("RUNPOD_API_KEY={secret}");
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "token": keyed_secret,
+                "authorization": keyed_secret,
+                "event": {
+                    "token": keyed_secret,
+                    "authorization": keyed_secret,
+                }
+            }))
+            .unwrap(),
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let protected = protect_generic_json_request(&body, &masker, true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&protected).unwrap();
+
+        assert_eq!(value["token"], keyed_secret);
+        assert_eq!(value["authorization"], keyed_secret);
+        for key in ["token", "authorization"] {
+            let nested = value["event"][key].as_str().unwrap();
+            assert!(!nested.contains(&secret), "nested {key} was not protected");
+            assert!(nested.contains("<<"), "nested {key} has no handle");
+        }
     }
 
     #[test]

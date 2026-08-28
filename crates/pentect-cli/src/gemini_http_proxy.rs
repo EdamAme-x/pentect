@@ -504,6 +504,18 @@ fn protect_request_body(
         );
     }
     value = run.payload;
+    let inline_file_partial = {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "Gemini plugin lock was poisoned".to_string())?;
+        crate::http_files::run_google_inline_file_stages(&value, &plugins, "gemini", "http_json")
+    }?;
+    if block_unknown_formats && inline_file_partial {
+        return Err(
+            "unknown format blocked: a file plugin reported partial Gemini inline-file coverage"
+                .to_string(),
+        );
+    }
     let mut masker = masker
         .lock()
         .map_err(|_| "Gemini masker lock was poisoned".to_string())?;
