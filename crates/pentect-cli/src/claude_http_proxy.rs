@@ -1239,13 +1239,15 @@ fn streaming_response_body(
                 }
                 None => {
                     state.finished = true;
-                    state.ready.extend(
-                        state
-                            .transformer
-                            .finish()
-                            .into_iter()
-                            .map(|chunk| Ok(Frame::data(chunk))),
-                    );
+                    match state.transformer.finish() {
+                        Ok(chunks) => state
+                            .ready
+                            .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
+                        Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            error,
+                        )))),
+                    }
                 }
             }
         }
@@ -1363,20 +1365,20 @@ where
         Ok(output)
     }
 
-    pub(crate) fn finish(&mut self) -> Vec<Bytes> {
+    pub(crate) fn finish(&mut self) -> Result<Vec<Bytes>, String> {
         if self.terminated {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let mut output = self.finish_output_text();
-        if let Some(mut tools) = self.tool_buffer.take() {
-            tools.bytes.append(&mut self.pending);
-            if !tools.bytes.is_empty() {
-                output.push(Bytes::from(tools.bytes));
-            }
-        } else if !self.pending.is_empty() {
-            output.push(Bytes::from(std::mem::take(&mut self.pending)));
+        let mut output = Vec::new();
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            self.process_block(pending, &mut output)?;
         }
-        output
+        if self.tool_buffer.take().is_some() {
+            return Err("Anthropic SSE tool input ended before content_block_stop".to_string());
+        }
+        output.extend(self.finish_output_text());
+        Ok(output)
     }
 
     fn finish_output_text(&mut self) -> Vec<Bytes> {
@@ -4244,7 +4246,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_tool_stream_keeps_handles_unresolved() {
+    fn interrupted_tool_stream_fails_closed_without_emitting_handles() {
         let incomplete = concat!(
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"input\":{}}}\n\n",
@@ -4257,9 +4259,28 @@ mod tests {
             false,
         );
         assert!(transformer.push(incomplete.as_bytes()).unwrap().is_empty());
-        let output = join_bytes(transformer.finish());
-        assert!(output.contains("<<SECRET_deadbeef>>"));
-        assert!(!output.contains("must-not-appear"));
+        let error = transformer.finish().unwrap_err();
+        assert!(error.contains("ended before content_block_stop"), "{error}");
+    }
+
+    #[test]
+    fn unterminated_final_sse_event_is_processed_at_eof() {
+        let event = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<<SECRET_deadbeef>>\"}}"
+        );
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "local-value")),
+            None,
+            true,
+        );
+        let output = transformer.push(event.as_bytes()).unwrap();
+        assert!(join_bytes(output).contains("content_block_start"));
+        let output = join_bytes(transformer.finish().unwrap());
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<SECRET_deadbeef>>"), "{output}");
     }
 
     #[test]
@@ -4321,7 +4342,7 @@ mod tests {
             error
         );
         assert!(transformer.push(after_error.as_bytes()).unwrap().is_empty());
-        assert!(transformer.finish().is_empty());
+        assert!(transformer.finish().unwrap().is_empty());
     }
 
     #[test]

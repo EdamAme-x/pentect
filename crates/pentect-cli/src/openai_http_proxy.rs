@@ -2681,6 +2681,45 @@ enum StreamTransform {
     Completions,
 }
 
+fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), String> {
+    let block = run_sse_response_plugins(&block, &state.plugins)?;
+    let rewritten = match state.transform {
+        StreamTransform::Responses => rewrite_openai_sse_block(
+            &block,
+            &state.plugins,
+            state.restore_output,
+            &mut state.output_text,
+            &mut state.output_resolve,
+        ),
+        StreamTransform::ChatCompletions => state.chat.rewrite_block(
+            &block,
+            &state.plugins,
+            state.restore_output,
+            &mut state.output_resolve,
+        ),
+        StreamTransform::Completions => {
+            state
+                .completions
+                .rewrite_block(&block, state.restore_output, &mut state.output_resolve)
+        }
+        StreamTransform::None => Ok(vec![Bytes::from(block)]),
+    }?;
+    for block in rewritten {
+        if !block.is_empty() {
+            state.ready.push_back(Ok(Frame::data(block)));
+        }
+    }
+    Ok(())
+}
+
+fn process_pending_stream_block(state: &mut StreamState) -> Result<(), String> {
+    if state.pending.is_empty() {
+        return Ok(());
+    }
+    let pending = std::mem::take(&mut state.pending);
+    process_stream_block(state, pending)
+}
+
 fn streaming_response_body(
     response: reqwest::Response,
     transform: StreamTransform,
@@ -2725,54 +2764,13 @@ fn streaming_response_body(
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        let block = match run_sse_response_plugins(&block, &state.plugins) {
-                            Ok(block) => block,
-                            Err(error) => {
-                                state.finished = true;
-                                state.ready.push_back(Err(Box::new(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    error,
-                                ))));
-                                break;
-                            }
-                        };
-                        let rewritten = match state.transform {
-                            StreamTransform::Responses => rewrite_openai_sse_block(
-                                &block,
-                                &state.plugins,
-                                state.restore_output,
-                                &mut state.output_text,
-                                &mut state.output_resolve,
-                            ),
-                            StreamTransform::ChatCompletions => state.chat.rewrite_block(
-                                &block,
-                                &state.plugins,
-                                state.restore_output,
-                                &mut state.output_resolve,
-                            ),
-                            StreamTransform::Completions => state.completions.rewrite_block(
-                                &block,
-                                state.restore_output,
-                                &mut state.output_resolve,
-                            ),
-                            StreamTransform::None => Ok(vec![Bytes::from(block)]),
-                        };
-                        match rewritten {
-                            Ok(blocks) => {
-                                for block in blocks {
-                                    if !block.is_empty() {
-                                        state.ready.push_back(Ok(Frame::data(block)));
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                state.finished = true;
-                                state.ready.push_back(Err(Box::new(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    error,
-                                ))));
-                                break;
-                            }
+                        if let Err(error) = process_stream_block(&mut state, block) {
+                            state.finished = true;
+                            state.ready.push_back(Err(Box::new(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                error,
+                            ))));
+                            break;
                         }
                     }
                 }
@@ -2785,6 +2783,13 @@ fn streaming_response_body(
                 }
                 None => {
                     state.finished = true;
+                    if let Err(error) = process_pending_stream_block(&mut state) {
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            error,
+                        ))));
+                        continue;
+                    }
                     if state.transform == StreamTransform::ChatCompletions {
                         match state.chat.finish_output_text("data: {}\n\n") {
                             Ok(blocks) => {
@@ -2809,13 +2814,6 @@ fn streaming_response_body(
                                 error,
                             )))),
                         }
-                    }
-                    if !state.pending.is_empty() {
-                        state
-                            .ready
-                            .push_back(Ok(Frame::data(Bytes::from(std::mem::take(
-                                &mut state.pending,
-                            )))));
                     }
                 }
             }
@@ -4893,6 +4891,65 @@ mod tests {
         assert_eq!(finished[1], Bytes::from_static(b"data: [DONE]\n\n"));
         assert!(state.calls.is_empty());
         assert_eq!(state.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn unterminated_final_chat_event_is_processed_at_eof() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let masked = masker
+            .mask_prompt_text("pentect(local-value)")
+            .unwrap()
+            .unwrap();
+        let handle = first_handle(&masked).unwrap();
+        let event = format!(
+            "data: {}",
+            serde_json::json!({
+                "id": "chat_eof",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call_eof",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": format!("{{\"token\":\"{handle}\"}}")
+                        }
+                    }]},
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        );
+        let upstream: UpstreamByteStream =
+            Box::pin(stream::empty::<Result<Bytes, reqwest::Error>>());
+        let mut state = StreamState {
+            upstream,
+            pending: event.into_bytes(),
+            ready: VecDeque::new(),
+            transform: StreamTransform::ChatCompletions,
+            chat: ChatStreamState::default(),
+            completions: CompletionStreamState::default(),
+            finished: false,
+            plugins: Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            restore_output: false,
+            output_text: HashMap::new(),
+            output_resolve: Box::new(|text| Ok(text.to_string())),
+        };
+
+        process_pending_stream_block(&mut state).unwrap();
+        assert!(state.pending.is_empty());
+        let mut output = Vec::new();
+        while let Some(frame) = state.ready.pop_front() {
+            if let Ok(data) = frame.unwrap().into_data() {
+                output.extend_from_slice(&data);
+            }
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains(&handle), "{output}");
     }
 
     #[test]

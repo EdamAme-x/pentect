@@ -902,18 +902,35 @@ fn streaming_response_body(
                 }
                 None => {
                     state.finished = true;
-                    if !state.pending.is_empty() {
-                        state
-                            .ready
-                            .push_back(Ok(Frame::data(Bytes::from(std::mem::take(
-                                &mut state.pending,
-                            )))));
+                    match rewrite_pending_sse(
+                        &mut state.pending,
+                        &state.plugins,
+                        state.block_unknown_formats,
+                    ) {
+                        Ok(Some(block)) => state.ready.push_back(Ok(Frame::data(block))),
+                        Ok(None) => {}
+                        Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            error,
+                        )))),
                     }
                 }
             }
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+fn rewrite_pending_sse(
+    pending: &mut Vec<u8>,
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
+) -> Result<Option<Bytes>, String> {
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let pending = std::mem::take(pending);
+    rewrite_sse_block(&pending, plugins, block_unknown_formats).map(Some)
 }
 
 fn rewrite_sse_block(
@@ -1638,5 +1655,21 @@ mod tests {
             "{rewritten:?}"
         );
         assert!(rewritten.ends_with("\r\n\r\n"), "{rewritten:?}");
+    }
+
+    #[test]
+    fn unterminated_final_sse_event_is_processed_at_eof() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut pending = br#"data: {"candidates":[]}"#.to_vec();
+        let rewritten = rewrite_pending_sse(&mut pending, &plugins, true)
+            .unwrap()
+            .unwrap();
+        assert!(pending.is_empty());
+        assert!(rewritten.ends_with(b"\n\n"));
+
+        let mut malformed = b"data: {broken".to_vec();
+        let error = rewrite_pending_sse(&mut malformed, &plugins, true).unwrap_err();
+        assert!(malformed.is_empty());
+        assert!(error.starts_with("unknown format blocked:"), "{error}");
     }
 }
