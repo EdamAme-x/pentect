@@ -62,15 +62,7 @@ pub(crate) fn run(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let standard_key_names: &[&str] = match injection {
-        crate::client_descriptor::OpenAiInjection::GooseEnv => {
-            &["GOOSE_PROVIDER__API_KEY", "OPENAI_API_KEY"]
-        }
-        crate::client_descriptor::OpenAiInjection::JunieProfile => {
-            &["JUNIE_OPENAI_API_KEY", "OPENAI_API_KEY"]
-        }
-        _ => &["OPENAI_API_KEY"],
-    };
+    let standard_key_names = provider_key_env_names(injection);
     let standard_key_names =
         if crate::upstream::has_authorization_override(&opts.upstream_header_env) {
             &[][..]
@@ -89,6 +81,7 @@ pub(crate) fn run(
     // its local tools. The client only needs a syntactically valid loopback
     // credential; the gateway replaces it for the upstream request.
     command.env("OPENAI_API_KEY", "pentect-local");
+    command.env_remove("AIDER_OPENAI_API_KEY");
     command.env_remove("GOOSE_PROVIDER__API_KEY");
     command.env_remove("JUNIE_OPENAI_API_KEY");
     crate::apply_plugin_env(&mut command, &active_plugins)?;
@@ -120,6 +113,7 @@ pub(crate) fn run(
             )
         }
         crate::client_descriptor::OpenAiInjection::ForcedArgs => {
+            command.env("AIDER_OPENAI_API_KEY", "pentect-local");
             command.args(args);
             // Appended last so config files, environment variables and caller
             // options cannot select an unprotected provider or helper model.
@@ -150,6 +144,23 @@ pub(crate) fn run(
                 (proxy, memory_store, profile),
             )
         }
+    }
+}
+
+fn provider_key_env_names(
+    injection: crate::client_descriptor::OpenAiInjection,
+) -> &'static [&'static str] {
+    match injection {
+        crate::client_descriptor::OpenAiInjection::ForcedArgs => {
+            &["AIDER_OPENAI_API_KEY", "OPENAI_API_KEY"]
+        }
+        crate::client_descriptor::OpenAiInjection::GooseEnv => {
+            &["GOOSE_PROVIDER__API_KEY", "OPENAI_API_KEY"]
+        }
+        crate::client_descriptor::OpenAiInjection::JunieProfile => {
+            &["JUNIE_OPENAI_API_KEY", "OPENAI_API_KEY"]
+        }
+        _ => &["OPENAI_API_KEY"],
     }
 }
 
@@ -526,6 +537,8 @@ fn aider_model(model: &str) -> Result<String, String> {
 fn aider_gateway_args(proxy: &str, model: &str) -> Result<Vec<String>, String> {
     let model = aider_model(model)?;
     Ok(vec![
+        "--openai-api-key".to_string(),
+        "pentect-local".to_string(),
         "--openai-api-base".to_string(),
         proxy.to_string(),
         "--model".to_string(),
@@ -1126,6 +1139,8 @@ mod tests {
         assert_eq!(
             aider_gateway_args("http://127.0.0.1:4321/v1", "gpt-5").unwrap(),
             [
+                "--openai-api-key",
+                "pentect-local",
                 "--openai-api-base",
                 "http://127.0.0.1:4321/v1",
                 "--model",
@@ -1135,6 +1150,10 @@ mod tests {
                 "--editor-model",
                 "openai/gpt-5",
             ]
+        );
+        assert_eq!(
+            provider_key_env_names(crate::client_descriptor::OpenAiInjection::ForcedArgs),
+            ["AIDER_OPENAI_API_KEY", "OPENAI_API_KEY"]
         );
         assert_eq!(aider_model("openai/custom").unwrap(), "openai/custom");
         assert!(aider_model("anthropic/claude-sonnet").is_err());
