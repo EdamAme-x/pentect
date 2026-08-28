@@ -172,8 +172,14 @@ enabled = true
 never sent externally. Setting it to `false` disables the summary; diagnostic
 logging and rotation continue independently so crashes remain diagnosable.
 
+For `activity.share` and `metrics.enabled`, `false` in either the user config or
+the project config disables the feature. A project cannot re-enable a feature
+that the user disabled globally.
+
 Project values normally override user values. `agent.required` is stricter: if
-either file sets it to `true`, the effective value is true.
+either file sets it to `true`, the effective value is true. The local privacy
+settings above and `output.restore` are opt-out settings, so `false` in either
+scope wins.
 
 ## Assistant output restoration
 
