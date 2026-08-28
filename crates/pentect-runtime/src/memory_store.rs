@@ -758,6 +758,21 @@ pub(crate) fn spawn_test_memory_store_with_activity(
     read_token: String,
     write_token: String,
 ) -> String {
+    spawn_test_memory_store_with_activity_and_timeout(
+        token,
+        read_token,
+        write_token,
+        REQUEST_TIMEOUT,
+    )
+}
+
+#[cfg(test)]
+fn spawn_test_memory_store_with_activity_and_timeout(
+    token: String,
+    read_token: String,
+    write_token: String,
+    request_timeout: Duration,
+) -> String {
     let token = Arc::new(Zeroizing::new(token));
     let read_token = Arc::new(Zeroizing::new(read_token));
     let write_token = Arc::new(Zeroizing::new(write_token));
@@ -786,14 +801,14 @@ pub(crate) fn spawn_test_memory_store_with_activity(
             let state = state.clone();
             std::thread::spawn(move || {
                 let _permit = permit;
-                handle_client(
+                let _ = handle_client_with_timeout(
                     stream,
                     token.as_str(),
                     read_token.as_str(),
                     write_token.as_str(),
                     &state,
-                )
-                .unwrap();
+                    request_timeout,
+                );
             });
         }
     });
@@ -807,13 +822,30 @@ fn handle_client(
     process_host_write_token: &str,
     state: &Arc<Mutex<MemoryStoreState>>,
 ) -> Result<()> {
+    handle_client_with_timeout(
+        stream,
+        token,
+        process_host_read_token,
+        process_host_write_token,
+        state,
+        REQUEST_TIMEOUT,
+    )
+}
+
+fn handle_client_with_timeout(
+    stream: TcpStream,
+    token: &str,
+    process_host_read_token: &str,
+    process_host_write_token: &str,
+    state: &Arc<Mutex<MemoryStoreState>>,
+    request_timeout: Duration,
+) -> Result<()> {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(request_timeout));
+    let _ = stream.set_write_timeout(Some(request_timeout));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut exit_on_disconnect = false;
-    let mut authenticated = false;
     loop {
         line.clear();
         let read = match Read::take(reader.by_ref(), MAX_REQUEST_LINE_BYTES as u64 + 1)
@@ -852,10 +884,6 @@ fn handle_client(
                 .context("could not write memory store error")?;
             return Ok(());
         };
-        if !authenticated {
-            authenticated = true;
-            let _ = reader.get_mut().set_read_timeout(None);
-        }
         let response = match fields.as_slice() {
             [_, "KEY", ""] if access == RequestAccess::Primary => key_response(state),
             [_, "KEYS", ""] if access == RequestAccess::Primary => keys_response(state),
@@ -877,6 +905,7 @@ fn handle_client(
                 render_agent_script_request(state, id)
             }
             [_, "LEASE", ""] if access == RequestAccess::Primary => {
+                let _ = reader.get_mut().set_read_timeout(None);
                 exit_on_disconnect = true;
                 Ok("OK".to_string())
             }
@@ -1197,6 +1226,45 @@ mod tests {
         assert!(ConnectionPermit::acquire(&active).is_none());
         drop(permits);
         assert!(ConnectionPermit::acquire(&active).is_some());
+    }
+
+    #[test]
+    fn idle_query_connections_expire_and_pooled_clients_reconnect() {
+        let token = "idle-timeout-token".to_string();
+        let timeout = Duration::from_millis(100);
+        let addr = spawn_test_memory_store_with_activity_and_timeout(
+            token.clone(),
+            format!("{token}-activity-read"),
+            format!("{token}-activity-write"),
+            timeout,
+        );
+
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        writeln!(stream, "{token}\tCOUNT\t").unwrap();
+        stream.flush().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        assert_eq!(line.trim(), "OK\t0");
+        std::thread::sleep(timeout * 4);
+        line.clear();
+        assert_eq!(
+            reader.read_line(&mut line).unwrap(),
+            0,
+            "an authenticated non-LEASE connection remained open after the idle timeout"
+        );
+
+        let client = MemoryStoreClient::new(addr, token);
+        assert_eq!(client.masked_count().unwrap(), 0);
+        std::thread::sleep(timeout * 4);
+        assert_eq!(
+            client.masked_count().unwrap(),
+            0,
+            "the pooled client did not reconnect after its idle socket expired"
+        );
     }
 
     #[test]
