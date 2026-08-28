@@ -299,7 +299,7 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
     session
         .sync_recovery(&redaction.recovery)
         .map_err(|error| error.to_string())?;
-    activity_log::record_image(redaction.secret_images, &redaction.notes);
+    activity_log::record_image(redaction.secret_images, &redaction.labels);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
             return Err("image blocked: image could not be fetched or scanned.".to_string());
@@ -4205,7 +4205,7 @@ fn claude_image_tool_output(
     session
         .sync_recovery(&redaction.recovery)
         .map_err(|error| error.to_string())?;
-    activity_log::record_image(redaction.secret_images, &redaction.notes);
+    activity_log::record_image(redaction.secret_images, &redaction.labels);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
             return Ok(Some(ToolTextOutput::Block(

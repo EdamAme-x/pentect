@@ -1325,6 +1325,10 @@ fn is_env_name(name: &str) -> bool {
 }
 
 fn redact_env_derivative_lines(text: &str) -> String {
+    // This is a syntactically valid handle so every masking pass preserves it,
+    // but `is_reusable_placeholder` explicitly excludes its label because no
+    // recovery value exists for derived previews.
+    const REDACTED_DERIVED_HANDLE: &str = "<<REDACTED_DERIVED_0000000000000000>>";
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
     for segment in text.split_inclusive('\n') {
@@ -1335,7 +1339,8 @@ fn redact_env_derivative_lines(text: &str) -> String {
             let indent_len = body.len() - body.trim_start().len();
             out.push_str(&body[..indent_len]);
             out.push_str(key);
-            out.push_str("=<<REDACTED_DERIVED>>");
+            out.push('=');
+            out.push_str(REDACTED_DERIVED_HANDLE);
             out.push_str(ending);
             changed = true;
         } else {
