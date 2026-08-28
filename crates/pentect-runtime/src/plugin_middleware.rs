@@ -3817,9 +3817,9 @@ mod tests {
     }
 
     #[test]
-    fn command_program_cold_start_consumes_the_chain_deadline() {
+    fn command_program_warm_request_uses_request_timeout_after_cold_start() {
         let Some(command) = python_protocol_fixture(
-            "import json,sys,time; time.sleep(0.15);\nfor line in sys.stdin:\n r=json.loads(line); time.sleep(0.10); print(json.dumps({'id':r['id']}), flush=True)",
+            "import json,sys,time\nfor index,line in enumerate(sys.stdin):\n r=json.loads(line)\n if index: time.sleep(2)\n print(json.dumps({'id':r['id']}), flush=True)",
         ) else {
             return;
         };
