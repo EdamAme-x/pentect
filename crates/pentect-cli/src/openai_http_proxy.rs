@@ -354,6 +354,10 @@ async fn proxy_request_inner(
     let standalone_search_path =
         method == hyper::Method::POST && endpoint == OpenAiEndpoint::StandaloneSearch;
     let embeddings_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Embeddings;
+    let image_generation_path =
+        method == hyper::Method::POST && endpoint == OpenAiEndpoint::ImageGeneration;
+    let audio_speech_path =
+        method == hyper::Method::POST && endpoint == OpenAiEndpoint::AudioSpeech;
     let responses_response = matches!(
         endpoint,
         OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
@@ -369,8 +373,15 @@ async fn proxy_request_inner(
                 | OpenAiEndpoint::Completions
                 | OpenAiEndpoint::StandaloneSearch
                 | OpenAiEndpoint::Embeddings
+                | OpenAiEndpoint::ImageGeneration
+                | OpenAiEndpoint::AudioSpeech
         );
     let files_upload = method == hyper::Method::POST && endpoint == OpenAiEndpoint::FilesCollection;
+    let audio_upload = method == hyper::Method::POST
+        && matches!(
+            endpoint,
+            OpenAiEndpoint::AudioTranscription | OpenAiEndpoint::AudioTranslation
+        );
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
     let headers = request.headers().clone();
     let credential_material = state.headers.credential_scope_material(&headers);
@@ -378,7 +389,7 @@ async fn proxy_request_inner(
     let mut request_coverage = None;
     let mut request_streaming = false;
     let mut inspect_protected_request = protected_request;
-    let body = if protected_request || files_upload {
+    let body = if protected_request || files_upload || audio_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -442,6 +453,34 @@ async fn proxy_request_inner(
             .map_err(|_| "OpenAI file protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
             reqwest::Body::from(protected.body)
+        } else if audio_upload {
+            let content_type = headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "OpenAI audio upload is missing Content-Type".to_string())?
+                .to_string();
+            let masker = Arc::clone(&state.masker);
+            let plugins = Arc::clone(&state.plugins);
+            let block_unknown_formats = state.block_unknown_formats;
+            let protected = tokio::task::spawn_blocking(move || {
+                let mut masker = masker
+                    .lock()
+                    .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
+                let plugins = plugins
+                    .lock()
+                    .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+                crate::http_files::protect_audio_multipart_upload_with_plugins(
+                    &content_type,
+                    &body,
+                    &mut masker,
+                    &plugins,
+                    block_unknown_formats,
+                )
+            })
+            .await
+            .map_err(|_| "OpenAI audio protection task failed".to_string())??;
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
         } else if !inspect_protected_request {
             request_coverage = Some(crate::http_files::Coverage::Partial);
             reqwest::Body::from(body)
@@ -488,6 +527,10 @@ async fn proxy_request_inner(
                         OpenAiRequestDialect::StandaloneSearch
                     } else if embeddings_path {
                         OpenAiRequestDialect::Embeddings
+                    } else if image_generation_path {
+                        OpenAiRequestDialect::ImageGeneration
+                    } else if audio_speech_path {
+                        OpenAiRequestDialect::AudioSpeech
                     } else {
                         OpenAiRequestDialect::Responses
                     },
@@ -519,7 +562,8 @@ async fn proxy_request_inner(
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
         if state.headers.forward_incoming_header(name.as_str())
-            && ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
+            && ((!(protected_request || files_upload || audio_upload)
+                && name == hyper::header::CONTENT_LENGTH)
                 || should_forward_request_header(name.as_str()))
             && (!inspect_protected_request || name != hyper::header::CONTENT_ENCODING)
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
@@ -863,6 +907,8 @@ enum OpenAiRequestDialect {
     Completions,
     StandaloneSearch,
     Embeddings,
+    ImageGeneration,
+    AudioSpeech,
 }
 
 fn protect_openai_request_body(
@@ -928,10 +974,17 @@ fn protect_openai_request_body(
     let mut masker = masker
         .lock()
         .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
-    let mask_result = if dialect == OpenAiRequestDialect::Embeddings {
-        mask_embeddings_request(&mut value, &mut masker)
-    } else {
-        mask_openai_request(&mut value, &mut masker, files)
+    let mask_result = match dialect {
+        OpenAiRequestDialect::Embeddings => mask_embeddings_request(&mut value, &mut masker),
+        OpenAiRequestDialect::ImageGeneration => {
+            mask_json_string_field(&mut value, "prompt", true, &mut masker)
+        }
+        OpenAiRequestDialect::AudioSpeech => {
+            mask_json_string_field(&mut value, "input", true, &mut masker).and_then(|_| {
+                mask_json_string_field(&mut value, "instructions", false, &mut masker)
+            })
+        }
+        _ => mask_openai_request(&mut value, &mut masker, files),
     };
     if let Err(error) = mask_result {
         if error.starts_with("image blocked:") || error.starts_with("document blocked:") {
@@ -1405,6 +1458,24 @@ fn openai_request_unknown_content_kind(
         OpenAiRequestDialect::Completions => completions_unknown_shape(value),
         OpenAiRequestDialect::StandaloneSearch => standalone_search_unknown_shape(value, visit),
         OpenAiRequestDialect::Embeddings => embeddings_unknown_shape(value),
+        OpenAiRequestDialect::ImageGeneration => required_string_shape(value, "prompt"),
+        OpenAiRequestDialect::AudioSpeech => required_string_shape(value, "input").or_else(|| {
+            value
+                .get("instructions")
+                .filter(|instructions| !instructions.is_string())
+                .map(|_| "non-string optional instructions")
+        }),
+    }
+}
+
+fn required_string_shape(value: &Value, field: &str) -> Option<&'static str> {
+    let Some(object) = value.as_object() else {
+        return Some("non-object request");
+    };
+    match object.get(field) {
+        Some(Value::String(_)) => None,
+        Some(_) => Some("non-string required text"),
+        None => Some("missing required text"),
     }
 }
 
@@ -1701,6 +1772,28 @@ fn mask_completion_prompt(
         }
         _ => Err("OpenAI completion prompt has an unsupported shape".to_string()),
     }
+}
+
+fn mask_json_string_field(
+    value: &mut Value,
+    field: &str,
+    required: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "OpenAI media request is not an object".to_string())?;
+    let Some(value) = object.get_mut(field) else {
+        return if required {
+            Err(format!("OpenAI media request is missing {field}"))
+        } else {
+            Ok(())
+        };
+    };
+    let Value::String(text) = value else {
+        return Err(format!("OpenAI media request {field} is not text"));
+    };
+    mask_text(text, false, masker)
 }
 
 fn mask_embeddings_request(
@@ -3431,6 +3524,10 @@ enum OpenAiEndpoint {
     ChatCompletions,
     Completions,
     Embeddings,
+    ImageGeneration,
+    AudioSpeech,
+    AudioTranscription,
+    AudioTranslation,
     FilesCollection,
     Files,
     Models,
@@ -3448,6 +3545,10 @@ impl OpenAiEndpoint {
             Self::ChatCompletions => "chat-completions",
             Self::Completions => "completions",
             Self::Embeddings => "embeddings",
+            Self::ImageGeneration => "image-generation",
+            Self::AudioSpeech => "audio-speech",
+            Self::AudioTranscription => "audio-transcription",
+            Self::AudioTranslation => "audio-translation",
             Self::FilesCollection => "files-collection",
             Self::Files => "files",
             Self::Models => "models",
@@ -3486,6 +3587,26 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         ["v1", "embeddings"] | ["backend-api", "codex", "embeddings"]
     ) {
         OpenAiEndpoint::Embeddings
+    } else if matches!(
+        segments.as_slice(),
+        ["images", "generations"] | ["v1", "images", "generations"]
+    ) {
+        OpenAiEndpoint::ImageGeneration
+    } else if matches!(
+        segments.as_slice(),
+        ["audio", "speech"] | ["v1", "audio", "speech"]
+    ) {
+        OpenAiEndpoint::AudioSpeech
+    } else if matches!(
+        segments.as_slice(),
+        ["audio", "transcriptions"] | ["v1", "audio", "transcriptions"]
+    ) {
+        OpenAiEndpoint::AudioTranscription
+    } else if matches!(
+        segments.as_slice(),
+        ["audio", "translations"] | ["v1", "audio", "translations"]
+    ) {
+        OpenAiEndpoint::AudioTranslation
     } else if path.ends_with("/files") {
         OpenAiEndpoint::FilesCollection
     } else if is_known_openai_resource_path(&segments, "files") {
@@ -4337,6 +4458,22 @@ mod tests {
             OpenAiEndpoint::ChatCompletions
         );
         assert_eq!(
+            classify_openai_endpoint("/v1/images/generations"),
+            OpenAiEndpoint::ImageGeneration
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/audio/speech"),
+            OpenAiEndpoint::AudioSpeech
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/audio/transcriptions"),
+            OpenAiEndpoint::AudioTranscription
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/audio/translations"),
+            OpenAiEndpoint::AudioTranslation
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/completions"),
             OpenAiEndpoint::Completions
         );
@@ -4391,6 +4528,147 @@ mod tests {
         );
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, true).is_err());
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn media_requests_mask_text_without_rewriting_protocol_fields() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "MEDIA", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let keyed = format!("RUNPOD_API_KEY={secret}");
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+
+        let image = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-image-1",
+                "prompt": format!("draw {keyed}"),
+                "size": "1024x1024"
+            }))
+            .unwrap(),
+        );
+        let protected = protect_openai_request_body(
+            &image,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::ImageGeneration,
+            true,
+        )
+        .unwrap();
+        let image: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert_eq!(image["model"], "gpt-image-1");
+        assert_eq!(image["size"], "1024x1024");
+        assert!(!image["prompt"].as_str().unwrap().contains(&secret));
+        assert!(image.get("instructions").is_none());
+
+        let speech = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o-mini-tts",
+                "voice": "alloy",
+                "input": format!("say {keyed}"),
+                "instructions": format!("style {keyed}")
+            }))
+            .unwrap(),
+        );
+        let protected = protect_openai_request_body(
+            &speech,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::AudioSpeech,
+            true,
+        )
+        .unwrap();
+        let speech: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert_eq!(speech["voice"], "alloy");
+        assert!(!speech["input"].as_str().unwrap().contains(&secret));
+        assert!(!speech["instructions"].as_str().unwrap().contains(&secret));
+    }
+
+    #[test]
+    fn provider_boundary_masks_image_and_speech_requests_before_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "UPSTREAM", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+
+        for (path, body) in [
+            (
+                "images/generations",
+                serde_json::json!({
+                    "model": "gpt-image-1",
+                    "prompt": format!("draw RUNPOD_API_KEY={secret}")
+                }),
+            ),
+            (
+                "audio/speech",
+                serde_json::json!({
+                    "model": "gpt-4o-mini-tts",
+                    "voice": "alloy",
+                    "input": format!("say RUNPOD_API_KEY={secret}")
+                }),
+            ),
+        ] {
+            let (upstream, captured, thread) = mock_chat_upstream();
+            let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+            reqwest::blocking::Client::new()
+                .post(format!("{}/{path}", proxy.base_url()))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&body).unwrap())
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let (headers, request) = captured
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            thread.join().unwrap();
+            assert!(headers.contains(&format!("POST /{path} ")), "{headers}");
+            assert!(!request.contains(&secret), "{path} leaked to upstream");
+            assert!(request.contains("<<KEYED_SECRET_"), "{request}");
+        }
+    }
+
+    #[test]
+    fn audio_uploads_fail_closed_or_mask_prompt_in_compatibility_mode() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "AUDIO", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let body = Bytes::from(format!(
+            "--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-transcribe\r\n--boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nRUNPOD_API_KEY={secret}\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF-audio-bytes\r\n--boundary--\r\n"
+        ));
+        let plugins = pentect_agent::PluginMiddleware::default();
+
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let error = match crate::http_files::protect_audio_multipart_upload_with_plugins(
+            "multipart/form-data; boundary=boundary",
+            &body,
+            &mut masker,
+            &plugins,
+            true,
+        ) {
+            Ok(_) => panic!("strict mode unexpectedly allowed uninspected audio"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("unknown format blocked:"), "{error}");
+
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let protected = crate::http_files::protect_audio_multipart_upload_with_plugins(
+            "multipart/form-data; boundary=boundary",
+            &body,
+            &mut masker,
+            &plugins,
+            false,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Partial);
+        let protected = String::from_utf8(protected.body.to_vec()).unwrap();
+        assert!(!protected.contains(&secret));
+        assert!(protected.contains("<<"));
+        assert!(protected.contains("RIFF-audio-bytes"));
     }
 
     #[test]

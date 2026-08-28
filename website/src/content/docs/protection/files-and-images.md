@@ -19,6 +19,20 @@ because text handles cannot replace pixels.
 Support depends on both the file format and the client API route. A format is
 not protected merely because the desktop app can open it.
 
+## OpenAI image and audio routes
+
+Pentect recognizes OpenAI image generation and speech synthesis requests. It
+checks the image `prompt` and the speech `input` and `instructions` fields while
+leaving protocol fields such as model, voice, size, and output format intact.
+
+Audio transcription and translation upload a binary recording. Pentect can
+check and replace their optional text `prompt`, but it cannot remove secrets
+spoken inside the recording. The default unknown-format policy therefore
+blocks these requests. With `compatibility.unknown_formats = "ignore"`, Pentect
+passes a recognized FLAC, MP3, MP4, MPEG, MPGA, M4A, OGG, WAV, or WebM recording
+through unchanged, marks coverage as `partial`, and still protects the text
+prompt. This is an explicit compatibility tradeoff, not full audio inspection.
+
 ## Files API
 
 Pentect checks and rewrites supported UTF-8 uploads before sending them. It
