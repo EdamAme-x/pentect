@@ -3642,9 +3642,9 @@ mod tests {
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_2\",\"name\":\"Bash\",\"input\":{}}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_one>>\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_1111111111111111>>\\\"}\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_two>>\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_2222222222222222>>\\\"}\"}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n"
         );
@@ -3655,8 +3655,8 @@ mod tests {
         let mut transformer = SseStreamTransformer::new(
             |text: &str| {
                 Ok(text
-                    .replace("<<SECRET_one>>", "first")
-                    .replace("<<SECRET_two>>", "second"))
+                    .replace("<<SECRET_1111111111111111>>", "first")
+                    .replace("<<SECRET_2222222222222222>>", "second"))
             },
             None,
             false,
