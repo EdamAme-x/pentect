@@ -496,6 +496,10 @@ impl MemoryStoreClient {
                 .with_context(|| format!("invalid memory store address: {}", self.addr))?;
             let stream = TcpStream::connect_timeout(&addr, timeout)
                 .with_context(|| format!("could not connect to memory store at {}", self.addr))?;
+            // The protocol is a sequence of tiny request/response lines. Nagle's
+            // algorithm can otherwise combine with delayed ACKs and add tens of
+            // milliseconds to every request on an otherwise idle connection.
+            let _ = stream.set_nodelay(true);
             *connection = Some(BufReader::new(stream));
         }
         let reader = connection
@@ -803,6 +807,7 @@ fn handle_client(
     process_host_write_token: &str,
     state: &Arc<Mutex<MemoryStoreState>>,
 ) -> Result<()> {
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let mut reader = BufReader::new(stream);
@@ -1334,9 +1339,15 @@ mod tests {
     fn client_reuses_one_connection_for_repeated_output_checks() {
         let token = "test-token-persistent".to_string();
         let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
+        let started = Instant::now();
         for _ in 0..1_000 {
             assert_eq!(client.masked_count().unwrap(), 0);
         }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "1,000 persistent memory-store requests took {elapsed:?}; tiny request/response lines must not wait for delayed ACKs"
+        );
     }
 
     #[test]
