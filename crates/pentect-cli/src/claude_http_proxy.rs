@@ -1861,12 +1861,25 @@ fn rewrite_anthropic_json_response(body: &[u8], restore_output: bool) -> Result<
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
     let mut resolve = request_scoped_resolver();
+    restore_anthropic_json_value(&mut value, restore_output, &mut resolve)?;
+    serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+}
+
+pub(crate) fn restore_anthropic_json_value<R>(
+    value: &mut Value,
+    restore_output: bool,
+    resolve: &mut R,
+) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 let tool_name = block.get("name").and_then(Value::as_str).map(str::to_owned);
                 if let Some(input) = block.get_mut("input") {
-                    resolve_tool_input_value(input, tool_name.as_deref(), &mut resolve)?;
+                    resolve_tool_input_value(input, tool_name.as_deref(), resolve)?;
                 }
             } else if restore_output && block.get("type").and_then(Value::as_str) == Some("text") {
                 if let Some(Value::String(text)) = block.get_mut("text") {
@@ -1875,8 +1888,7 @@ fn rewrite_anthropic_json_response(body: &[u8], restore_output: bool) -> Result<
             }
         }
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+    Ok(())
 }
 
 #[derive(Default)]
