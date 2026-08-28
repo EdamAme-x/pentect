@@ -736,6 +736,7 @@ fn run_openai_tool_plugins(
                     Value::Object(object.clone()),
                     Some(serde_json::json!({"provider": "openai", "transport": "http"})),
                 )?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "OpenAI")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin blocked: {}",
