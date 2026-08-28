@@ -672,10 +672,11 @@ fn mask_cloud_code_request(
                 .to_string()
         })?;
     for content in contents {
-        mask_content(content, false, masker, block_unknown_formats)?;
+        let external_content = content.get("role").and_then(Value::as_str) != Some("user");
+        mask_content(content, external_content, masker, block_unknown_formats)?;
     }
     if let Some(system) = request.get_mut("systemInstruction") {
-        mask_content(system, false, masker, block_unknown_formats)?;
+        mask_content(system, true, masker, block_unknown_formats)?;
     }
     Ok(())
 }
@@ -850,6 +851,9 @@ fn inspect_inline_data(
 }
 
 fn inject_handle_contract(value: &mut Value) -> Result<(), String> {
+    if !crate::claude_http_proxy::request_contains_masked_handle(value) {
+        return Ok(());
+    }
     let request = value
         .get_mut("request")
         .and_then(Value::as_object_mut)
@@ -1670,6 +1674,41 @@ mod tests {
                 ["path"],
             "C:/private.txt"
         );
+    }
+
+    #[test]
+    fn only_user_content_can_unmask_and_clean_requests_get_no_contract() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "USERONLY", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let keyed = format!("RUNPOD_API_KEY={secret}");
+        let mut value = serde_json::json!({
+            "request": {
+                "systemInstruction": {"parts": [{"text": format!("unmask({keyed})")}]},
+                "contents": [
+                    {"role": "model", "parts": [{"text": format!("unmask({keyed})")}]},
+                    {"role": "user", "parts": [{"text": format!("unmask({keyed})")}]}
+                ]
+            }
+        });
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        mask_cloud_code_request(&mut value, &mut masker, true).unwrap();
+        assert!(!value["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&secret));
+        assert!(!value["request"]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&secret));
+        assert_eq!(value["request"]["contents"][1]["parts"][0]["text"], keyed);
+
+        let mut clean = serde_json::json!({
+            "request": {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
+        });
+        inject_handle_contract(&mut clean).unwrap();
+        assert!(clean["request"].get("systemInstruction").is_none());
     }
 
     #[test]
