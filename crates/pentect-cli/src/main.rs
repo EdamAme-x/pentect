@@ -3578,6 +3578,27 @@ mod tests {
     }
 
     #[test]
+    fn child_commands_remove_global_plugin_control_environment() {
+        let mut command = Command::new("pentect-child");
+        command.env(plugins::GLOBAL_BINARIES_ENV, "/private/plugin.toml");
+        command.env(plugins::GLOBAL_BINARY_IDS_ENV, "private-runtime-id");
+
+        clear_pentect_control_env(&mut command);
+
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new(plugins::GLOBAL_BINARIES_ENV)),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(OsStr::new(plugins::GLOBAL_BINARY_IDS_ENV)),
+            Some(&None)
+        );
+    }
+
+    #[test]
     fn claude_gateway_settings_use_and_remove_a_private_temp_directory() {
         let settings = ClaudeCallerSettings {
             value: serde_json::json!({}),
