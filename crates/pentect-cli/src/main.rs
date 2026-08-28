@@ -312,7 +312,8 @@ fn run(args: Vec<String>) -> Option<i32> {
     {
         panic!("forced test panic with payload that must not be persisted");
     }
-    let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
+    let inherited_env_is_trusted =
+        command_uses_agent_runtime(&args) && pentect_agent::active_memory_store_ready();
     update::start_update_notification(&args);
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
@@ -325,6 +326,29 @@ fn run(args: Vec<String>) -> Option<i32> {
     drop(_process_host_env);
     drop(process_host);
     exit_code
+}
+
+fn command_uses_agent_runtime(args: &[String]) -> bool {
+    matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        (
+            Some(
+                "exec"
+                    | "resolve"
+                    | "log"
+                    | "hook"
+                    | "bridge"
+                    | "memory-store"
+                    | "purge"
+                    | "__agent-script"
+                    | "__agent-stream"
+            ),
+            _
+        ) | (Some("agent"), Some(_))
+    )
 }
 
 fn catch_cli_exit(operation: impl FnOnce() -> Option<i32>) -> Option<i32> {
@@ -3026,6 +3050,26 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_and_client_commands_skip_memory_store_probe() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(!command_uses_agent_runtime(&args(&[
+            "pentect",
+            "--version"
+        ])));
+        assert!(!command_uses_agent_runtime(&args(&["pentect", "help"])));
+        assert!(!command_uses_agent_runtime(&args(&["pentect", "codex"])));
+        assert!(command_uses_agent_runtime(&args(&["pentect", "exec"])));
+        assert!(command_uses_agent_runtime(&args(&[
+            "pentect", "agent", "hook"
+        ])));
+    }
 
     fn command_test_directory(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()

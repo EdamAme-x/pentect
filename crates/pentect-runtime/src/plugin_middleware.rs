@@ -431,9 +431,13 @@ impl PluginMiddleware {
                     if plugin.required {
                         return Err(error);
                     }
-                    coverage = MiddlewareCoverage::Partial;
-                    eprintln!("[pentect] optional {error}");
-                    continue;
+                    eprintln!("[pentect] optional {error}; blocking instead");
+                    return Ok(MiddlewareRun {
+                        payload,
+                        coverage,
+                        stopped: Some(StopOutcome::Block),
+                        message: response.message.or(Some(error)),
+                    });
                 }
                 Some(outcome)
             } else {
@@ -1658,13 +1662,18 @@ fn resolve_command_executable(value: &str) -> Result<PathBuf, String> {
             value
                 .to_string_lossy()
                 .split(';')
-                .filter(|extension| {
-                    matches!(extension.to_ascii_uppercase().as_str(), ".EXE" | ".COM")
-                })
+                .filter(|extension| windows_command_extension_supported(extension))
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| vec![".EXE".to_string(), ".COM".to_string()]);
+        .unwrap_or_else(|| {
+            vec![
+                ".EXE".to_string(),
+                ".COM".to_string(),
+                ".CMD".to_string(),
+                ".BAT".to_string(),
+            ]
+        });
     #[cfg(not(windows))]
     let extensions = vec![String::new()];
     for directory in std::env::split_paths(&paths) {
@@ -1701,9 +1710,19 @@ fn supported_command_executable(path: &Path) -> bool {
         && path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(extension.to_ascii_lowercase().as_str(), "exe" | "com")
-            })
+            .is_some_and(windows_command_extension_supported)
+}
+
+#[cfg(any(windows, test))]
+fn windows_command_extension_supported(extension: &str) -> bool {
+    matches!(
+        extension
+            .strip_prefix('.')
+            .unwrap_or(extension)
+            .to_ascii_lowercase()
+            .as_str(),
+        "exe" | "com" | "cmd" | "bat"
+    )
 }
 
 fn verify_plugin_approval(
@@ -3649,6 +3668,16 @@ mod tests {
         python_protocol_fixture(&format!("import sys; sys.stdout.buffer.write(b'x' * {bytes})"))
     }
 
+    #[test]
+    fn windows_command_plugins_accept_batch_shims_only() {
+        for extension in [".EXE", "com", ".CMD", "bat"] {
+            assert!(windows_command_extension_supported(extension));
+        }
+        for extension in ["ps1", ".js", "sh", ""] {
+            assert!(!windows_command_extension_supported(extension));
+        }
+    }
+
     fn command_fixture(response: &str) -> Vec<String> {
         #[cfg(windows)]
         {
@@ -4011,6 +4040,36 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("output exceeds its limit"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn optional_non_request_respond_falls_back_to_block() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys; r=json.loads(sys.stdin.readline()); print(json.dumps({'schema':'pentect.plugin.v1','id':r['id'],'type':'result','action':'stop','outcome':'respond'}), flush=True)",
+        ) else {
+            return;
+        };
+        let middleware = PluginMiddleware {
+            plugins: vec![PluginBinary {
+                name: "optional-respond".to_string(),
+                program: PluginProgram::Command(
+                    CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap(),
+                ),
+                hooks: BTreeSet::from([MiddlewareStage::ToolCall]),
+                required: false,
+                command_config: Some(json!({})),
+                timeout: Duration::from_secs(5),
+                startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+                max_output_bytes: 4096,
+                max_spans: DEFAULT_MAX_SPANS,
+            }],
+        };
+        let result = middleware
+            .run(MiddlewareStage::ToolCall, json!({"input": {}}), None)
+            .unwrap();
+        assert_eq!(result.stopped, Some(StopOutcome::Block));
+        assert!(result.message.unwrap().contains("can only respond"));
     }
 
     fn invalid_command_plugin(required: bool) -> PluginBinary {
