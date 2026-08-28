@@ -132,21 +132,25 @@ impl OutputMasker {
             remasked,
             &Kind::Text,
         )?;
-        // Prompt scalars are structurally text, but dotenv assignments can be
-        // embedded in prose. Run the Env parser first so assignment labels are
-        // preserved, then feed the result through the same cached text engine.
-        let env_result = self.prompt_engine.mask(
-            Input {
-                kind: Kind::Env,
-                data: remasked,
-            },
-            &Config {
-                disclose_length: false,
-                ..Config::new(self.store.session.key)
-                    .with_identity_key(self.store.session.identity_key)
-            },
-        );
-        self.track_mask_result("prompt", &env_result);
+        // Prompt scalars are text. Only opt into dotenv parsing when the
+        // payload actually contains assignment syntax; treating every
+        // `Label: prose` sentence as Env turns ordinary messages into secrets.
+        let env_result = prompt_contains_env_assignments(&remasked).then(|| {
+            self.prompt_engine.mask(
+                Input {
+                    kind: Kind::Env,
+                    data: remasked.clone(),
+                },
+                &Config {
+                    disclose_length: false,
+                    ..Config::new(self.store.session.key)
+                        .with_identity_key(self.store.session.identity_key)
+                },
+            )
+        });
+        if let Some(env_result) = &env_result {
+            self.track_mask_result("prompt", env_result);
+        }
         let mut result = mask_read_input_with_engine_plugins_and_identity(
             self.store.session.key,
             self.store.session.identity_key,
@@ -154,10 +158,18 @@ impl OutputMasker {
             &self.plugin_middleware,
             Input {
                 kind: Kind::Text,
-                data: env_result.masked,
+                data: env_result
+                    .as_ref()
+                    .map_or(remasked, |result| result.masked.clone()),
             },
         )?;
-        result.recovery.extend_same_key(env_result.recovery);
+        if let Some(env_result) = env_result {
+            result.recovery.extend_same_key(env_result.recovery);
+            result.summary.masked_count = result
+                .summary
+                .masked_count
+                .saturating_add(env_result.summary.masked_count);
+        }
         let initially_masked = std::mem::take(&mut result.masked);
         let masked = self.run_text_plugins(
             crate::plugin_middleware::MiddlewareStage::Finalize,
@@ -176,10 +188,7 @@ impl OutputMasker {
             },
         );
         merge_final_mask_result(&mut result, final_result);
-        let masked_count = result
-            .summary
-            .masked_count
-            .saturating_add(env_result.summary.masked_count);
+        let masked_count = result.summary.masked_count;
         self.track_mask_result("prompt", &result);
         self.add_masked_count(masked_count);
         let masked = restore_prompt_unmask_markers(
@@ -1144,6 +1153,14 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
         }
     }
     false
+}
+
+fn prompt_contains_env_assignments(text: &str) -> bool {
+    looks_like_sensitive_env_output(text)
+        || looks_like_env_output(text)
+        || text
+            .lines()
+            .any(|line| embedded_sensitive_env_assignment_start(line).is_some())
 }
 
 #[cfg(test)]
