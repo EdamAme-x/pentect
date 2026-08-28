@@ -448,6 +448,11 @@ async fn proxy_request_inner(
             request_coverage = Some(protected.coverage);
             reqwest::Body::from(protected.body)
         } else {
+            let request_streaming = messages_path
+                && serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("stream").and_then(Value::as_bool))
+                    .unwrap_or(false);
             let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
             let body = resolve_anthropic_remote_content(body, &mut remote_budget).await?;
             hydrate_anthropic_attested_files(&body, &account_scope, state).await?;
@@ -474,6 +479,12 @@ async fn proxy_request_inner(
             .map_err(|_| "Claude request protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
             if let Some(response) = protected.local_response {
+                if request_streaming {
+                    return Ok(text_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Plugin local responses are unavailable for streaming Anthropic requests",
+                    ));
+                }
                 return Ok(json_response(StatusCode::OK, response));
             }
             reqwest::Body::from(protected.body)

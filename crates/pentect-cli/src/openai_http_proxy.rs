@@ -493,6 +493,12 @@ async fn proxy_request_inner(
             .map_err(|_| "OpenAI request protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
             if let Some(response) = protected.local_response {
+                if request_streaming {
+                    return Ok(text_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Plugin local responses are unavailable for streaming OpenAI requests",
+                    ));
+                }
                 return Ok(json_response(StatusCode::OK, response));
             }
             reqwest::Body::from(protected.body)

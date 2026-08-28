@@ -304,6 +304,12 @@ async fn proxy_request_inner(
             state.block_unknown_formats,
         )?;
         if let Some(response) = protected.local_response {
+            if is_stream {
+                return Ok(text_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Plugin local responses are unavailable for streaming Google Cloud Code requests",
+                ));
+            }
             return Ok(json_response(StatusCode::OK, response));
         }
         reqwest::Body::from(protected.body)

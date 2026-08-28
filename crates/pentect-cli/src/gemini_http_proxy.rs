@@ -285,6 +285,12 @@ async fn proxy_request_inner(
             state.block_unknown_formats,
         )?;
         if let Some(response) = protected.local_response {
+            if endpoint == GeminiEndpoint::StreamGenerateContent {
+                return Ok(text_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Plugin local responses are unavailable for streaming Gemini requests",
+                ));
+            }
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/json")
