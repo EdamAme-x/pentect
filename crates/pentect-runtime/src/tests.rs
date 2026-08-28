@@ -2990,7 +2990,7 @@ fn view_length_comes_from_recovery_not_label() {
 fn derived_redactions_do_not_claim_to_be_reusable_handles() {
     let (root, session) = empty_session("exec-derived-no-hint");
     let masked = mask_tool_output(&session, "PREFIX_32=rpa_FAKE\n").unwrap();
-    assert_eq!(masked, "PREFIX_32=<<REDACTED_DERIVED>>\n");
+    assert_eq!(masked, "PREFIX_32=<<REDACTED_DERIVED_0000000000000000>>\n");
     assert!(
         first_reusable_env_name(&masked, "PENTECT_").is_none(),
         "{masked}"
@@ -3076,28 +3076,40 @@ fn derived_env_summary_output_does_not_leak_prefix_suffix_or_length() {
         assert!(!masked.contains(leaked), "{masked}");
     }
     assert!(
-        masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
+        masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED_0000000000000000>>"),
         "{masked}"
     );
     assert!(
-        masked.contains("TEST_SECRET=<<REDACTED_DERIVED>>"),
-        "{masked}"
-    );
-    assert!(masked.contains("NOTE=<<REDACTED_DERIVED>>"), "{masked}");
-    assert!(masked.contains("KEY=<<REDACTED_DERIVED>>"), "{masked}");
-    assert!(masked.contains("key=<<REDACTED_DERIVED>>"), "{masked}");
-    assert!(
-        masked.contains("PREFIX_32=<<REDACTED_DERIVED>>"),
+        masked.contains("TEST_SECRET=<<REDACTED_DERIVED_0000000000000000>>"),
         "{masked}"
     );
     assert!(
-        masked.contains("SUFFIX_32=<<REDACTED_DERIVED>>"),
+        masked.contains("NOTE=<<REDACTED_DERIVED_0000000000000000>>"),
         "{masked}"
     );
-    assert!(masked.contains("BASE64=<<REDACTED_DERIVED>>"), "{masked}");
+    assert!(
+        masked.contains("KEY=<<REDACTED_DERIVED_0000000000000000>>"),
+        "{masked}"
+    );
+    assert!(
+        masked.contains("key=<<REDACTED_DERIVED_0000000000000000>>"),
+        "{masked}"
+    );
+    assert!(
+        masked.contains("PREFIX_32=<<REDACTED_DERIVED_0000000000000000>>"),
+        "{masked}"
+    );
+    assert!(
+        masked.contains("SUFFIX_32=<<REDACTED_DERIVED_0000000000000000>>"),
+        "{masked}"
+    );
+    assert!(
+        masked.contains("BASE64=<<REDACTED_DERIVED_0000000000000000>>"),
+        "{masked}"
+    );
     assert_eq!(
         masked
-            .matches("RUNPOD_API_KEY=<<REDACTED_DERIVED>>")
+            .matches("RUNPOD_API_KEY=<<REDACTED_DERIVED_0000000000000000>>")
             .count(),
         2,
         "{masked}"
@@ -3228,10 +3240,13 @@ fn encoded_env_derivatives_do_not_leak() {
     assert!(!masked.contains("68656c6c6f20776f726c64"), "{masked}");
     assert!(masked.contains("<<SECRET_"), "{masked}");
     assert!(
-        masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
+        masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED_0000000000000000>>"),
         "{masked}"
     );
-    assert!(masked.contains("NOTE=<<REDACTED_DERIVED>>"), "{masked}");
+    assert!(
+        masked.contains("NOTE=<<REDACTED_DERIVED_0000000000000000>>"),
+        "{masked}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
