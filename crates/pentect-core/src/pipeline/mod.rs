@@ -5,7 +5,7 @@ mod sweep;
 
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CliCredentialDetector, CredSweeperNativeDetector,
-    DecodeConfig, DecodeDetector, Detector, EnvValueDetector, ExplicitSecretDetector,
+    DecodeConfig, DecodeDetector, Detector, EnvValueDetector, ExplicitSecretDetector, JwtDetector,
     KeyValueDetector, SensitiveKeyDetector, StructuralDetector, UrlDetector, SECRET_VALUE_HINT,
 };
 use crate::model::*;
@@ -707,6 +707,7 @@ impl EngineBuilder {
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
+            .detector(Box::new(JwtDetector))
             .detector(Box::new(KeyValueDetector))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
@@ -728,6 +729,7 @@ impl EngineBuilder {
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
+            .detector(Box::new(JwtDetector))
             .detector(Box::new(KeyValueDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(Bip39Detector))
@@ -2788,5 +2790,23 @@ mod tests {
             &Config::insecure_testing(),
         );
         assert!(!r.masked.contains(secret), "{}", r.masked);
+    }
+
+    #[test]
+    fn strict_masks_jwt_with_only_application_defined_claims() {
+        let token = concat!(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+            "eyJ1c2VyIjoiYWxpY2UiLCJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiYWRtaW4iOnRydWV9.",
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        );
+        let result = Engine::with_profile(Profile::Strict)
+            .mask(Input::text(token), &Config::insecure_testing());
+        assert!(!result.masked.contains(token), "{}", result.masked);
+        assert!(
+            result.masked.contains("<<JSON_WEB_TOKEN_"),
+            "{}",
+            result.masked
+        );
+        assert_eq!(result.summary.masked_count, 1);
     }
 }
