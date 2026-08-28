@@ -2329,11 +2329,25 @@ fn perform_host_request(
                 Err(_) => HostResponse::failed(),
             }
         }
-        HostRequest::FileWrite { path, data } => {
+        HostRequest::FileWrite {
+            path: requested_path,
+            data,
+        } => {
             if data.len() > HOST_MAX_VALUE_BYTES {
                 return HostResponse::failed();
             }
-            let Some(path) = approved_file_path(policy, &path, true) else {
+            let Some(path) = approved_file_path(policy, &requested_path, true) else {
+                return HostResponse::denied();
+            };
+            let Some(parent) = path.parent() else {
+                return HostResponse::denied();
+            };
+            if std::fs::create_dir_all(parent).is_err() {
+                return HostResponse::failed();
+            }
+            // Re-resolve after creating the path so a symlink introduced in an
+            // absent component cannot redirect the write outside its scope.
+            let Some(path) = approved_file_path(policy, &requested_path, true) else {
                 return HostResponse::denied();
             };
             let temporary = path.with_extension(format!(
@@ -2428,20 +2442,26 @@ fn approved_file_path(policy: &PermissionPolicy, value: &str, write: bool) -> Op
         return None;
     }
     let allowed = if write { &policy.write } else { &policy.read };
+    let candidate = root.join(&relative);
     if !allowed.iter().any(|permission| {
         permission.scope == scope
             && if permission.recursive {
                 relative.starts_with(&permission.relative)
+                    || canonical_permission_contains(root, &candidate, permission)
             } else {
                 relative == permission.relative
+                    || canonical_paths_match(root, &candidate, permission)
             }
     }) {
         return None;
     }
-    let candidate = root.join(&relative);
     if write {
-        let parent = candidate.parent()?.canonicalize().ok()?;
-        if !parent.starts_with(root) {
+        let mut existing = candidate.parent()?;
+        while !existing.exists() {
+            existing = existing.parent()?;
+        }
+        let existing = existing.canonicalize().ok()?;
+        if !existing.starts_with(root) {
             return None;
         }
         if candidate.exists() {
@@ -2454,6 +2474,36 @@ fn approved_file_path(policy: &PermissionPolicy, value: &str, write: bool) -> Op
         let canonical = candidate.canonicalize().ok()?;
         (canonical.starts_with(root) && canonical.is_file()).then_some(canonical)
     }
+}
+
+fn canonical_paths_match(root: &Path, candidate: &Path, permission: &PathPermission) -> bool {
+    let Ok(candidate) = candidate.canonicalize() else {
+        return false;
+    };
+    let Ok(allowed) = root.join(&permission.relative).canonicalize() else {
+        return false;
+    };
+    candidate == allowed
+}
+
+fn canonical_permission_contains(
+    root: &Path,
+    candidate: &Path,
+    permission: &PathPermission,
+) -> bool {
+    let Ok(allowed) = root.join(&permission.relative).canonicalize() else {
+        return false;
+    };
+    let mut existing = candidate;
+    while !existing.exists() {
+        let Some(parent) = existing.parent() else {
+            return false;
+        };
+        existing = parent;
+    }
+    existing
+        .canonicalize()
+        .is_ok_and(|candidate| candidate.starts_with(allowed))
 }
 
 fn valid_storage_key(key: &str) -> bool {
@@ -4496,24 +4546,44 @@ disk = "CPU: about 5 GB"
         std::fs::create_dir_all(&storage).unwrap();
         std::fs::write(project.join("allowed.txt"), "visible").unwrap();
         std::fs::write(project.join("denied.txt"), "hidden").unwrap();
+        #[cfg(windows)]
+        {
+            std::fs::create_dir(project.join("Config")).unwrap();
+            std::fs::write(project.join("Config/settings.json"), "case-safe").unwrap();
+        }
         let requested_command = vec!["rustc".to_string(), "--version".to_string()];
         let mut resolved_command = requested_command.clone();
         resolved_command[0] = resolve_command_executable("rustc")
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let policy = PermissionPolicy {
-            name: "fixture".to_string(),
-            read: vec![PathPermission {
+        let read_permissions = vec![
+            PathPermission {
                 scope: PathScope::Project,
                 relative: PathBuf::from("allowed.txt"),
                 recursive: false,
-            }],
-            write: vec![PathPermission {
+            },
+            PathPermission {
                 scope: PathScope::Project,
-                relative: PathBuf::from("written.txt"),
+                relative: PathBuf::from("config/settings.json"),
                 recursive: false,
-            }],
+            },
+        ];
+        let policy = PermissionPolicy {
+            name: "fixture".to_string(),
+            read: read_permissions,
+            write: vec![
+                PathPermission {
+                    scope: PathScope::Project,
+                    relative: PathBuf::from("written.txt"),
+                    recursive: false,
+                },
+                PathPermission {
+                    scope: PathScope::Project,
+                    relative: PathBuf::from("output"),
+                    recursive: true,
+                },
+            ],
             env: BTreeSet::from(["PATH".to_string()]),
             run: BTreeMap::from([(requested_command.clone(), resolved_command)]),
             storage: true,
@@ -4531,6 +4601,20 @@ disk = "CPU: about 5 GB"
         );
         assert!(allowed.ok);
         assert_eq!(allowed.value, Some(Value::String("visible".to_string())));
+        #[cfg(windows)]
+        {
+            let case_variant = perform_host_request(
+                &policy,
+                HostRequest::FileRead {
+                    path: "project:Config/settings.json".to_string(),
+                },
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert_eq!(
+                case_variant.value,
+                Some(Value::String("case-safe".to_string()))
+            );
+        }
         let denied = perform_host_request(
             &policy,
             HostRequest::FileRead {
@@ -4569,6 +4653,19 @@ disk = "CPU: about 5 GB"
         assert_eq!(
             std::fs::read_to_string(project.join("written.txt")).unwrap(),
             "generated"
+        );
+        let nested = perform_host_request(
+            &policy,
+            HostRequest::FileWrite {
+                path: "project:output/session/result.json".to_string(),
+                data: "nested".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(nested.ok);
+        assert_eq!(
+            std::fs::read_to_string(project.join("output/session/result.json")).unwrap(),
+            "nested"
         );
 
         let stored = perform_host_request(
