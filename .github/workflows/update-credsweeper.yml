@@ -6,6 +6,7 @@ on:
     - cron: "17 3 * * 1"
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -27,21 +28,22 @@ jobs:
       - name: Sync latest CredSweeper release
         run: python tools/update_credsweeper.py latest
 
-      - name: Open update pull request
+      - name: Validate candidate against the full official oracle
+        id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if git diff --quiet --ignore-submodules=dirty && [ -z "$(git status --porcelain)" ]; then
             echo "CredSweeper is already current"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          branch="automation/credsweeper-latest"
+          validation_branch="automation/credsweeper-validation-$GITHUB_RUN_ID"
           version="$(python -c 'import json; print(json.load(open("crates/pentect-core/vendors/credsweeper-assets/SOURCE.json"))["version"])')"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$branch"
+          git checkout -B "$validation_branch"
           git add -- \
             crates/pentect-core/vendors/CredSweeper \
             crates/pentect-core/vendors/credsweeper-assets \
@@ -49,6 +51,49 @@ jobs:
             tools/credsweeper-sidecar/patches/lazy-imports.patch \
             THIRD_PARTY_LICENSES.txt
           git commit -m "chore: update CredSweeper to $version"
+          git push origin "HEAD:$validation_branch"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "validation_branch=$validation_branch" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          candidate_sha="$(git rev-parse HEAD)"
+          gh workflow run credsweeper-regression.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$validation_branch" \
+            -f full=true
+          run_id=""
+          for _ in $(seq 1 30); do
+            run_id="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow credsweeper-regression.yml \
+              --event workflow_dispatch \
+              --branch "$validation_branch" \
+              --commit "$candidate_sha" \
+              --limit 10 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty')"
+            [ -n "$run_id" ] && break
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo "Could not locate the dispatched CredSweeper parity run" >&2
+            exit 1
+          fi
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$run_id"
+          echo "Full CredData parity: $run_url" >> "$GITHUB_STEP_SUMMARY"
+          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+
+      - name: Open validated update pull request
+        if: steps.candidate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          VALIDATION_BRANCH: ${{ steps.candidate.outputs.validation_branch }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+          PARITY_RUN_URL: ${{ steps.candidate.outputs.run_url }}
+        run: |
+          branch="automation/credsweeper-latest"
           git push --force-with-lease origin "HEAD:$branch"
 
           if [ "$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$branch" --json number --jq 'length')" -eq 0 ]; then
@@ -56,6 +101,13 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_BRANCH" \
               --head "$branch" \
-              --title "chore: update CredSweeper to $version" \
-              --body "Automated CredSweeper release sync. The CredSweeper regression workflow must pass before this update is merged."
+              --title "chore: update CredSweeper to $VERSION" \
+              --body "Automated CredSweeper release sync. The full 333-repository native/oracle compatibility gate passed before this PR was opened: $PARITY_RUN_URL"
           fi
+
+      - name: Remove temporary validation branch
+        if: always() && steps.candidate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_BRANCH: ${{ steps.candidate.outputs.validation_branch }}
+        run: git push origin --delete "$VALIDATION_BRANCH"
