@@ -543,22 +543,18 @@ pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
 #[cfg(windows)]
 pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
     let journals = read_windows_ca_journals()?;
-    if journals.is_empty() {
-        return Ok(());
-    }
-    if journals
-        .iter()
-        .any(|(_, journal)| windows_ca_owner_is_running(journal.owner))
-    {
-        return Err(
-            "Claude Desktop protection is active; refusing to remove its certificate".to_string(),
-        );
-    }
+    let mut removed = 0usize;
     for (path, journal) in journals {
+        if windows_ca_owner_is_running(journal.owner) {
+            continue;
+        }
         remove_windows_user_ca(&journal.thumbprint)?;
         remove_windows_ca_journal_at(&path)?;
+        removed += 1;
     }
-    eprintln!("[pentect] Removed stale temporary Claude Desktop certificates");
+    if removed > 0 {
+        eprintln!("[pentect] Removed {removed} stale temporary Claude Desktop certificate(s)");
+    }
     Ok(())
 }
 
@@ -4229,18 +4225,18 @@ mod tests {
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
         assert!(windows_ca_journal_path().unwrap().is_file());
         assert!(!windows_ca_cleanup_pending().unwrap());
-        let active_cleanup = cleanup_stale_windows_user_ca().unwrap_err();
-        assert!(active_cleanup.contains("protection is active"));
+        cleanup_stale_windows_user_ca().unwrap();
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, true);
+        assert!(windows_ca_journal_path().unwrap().is_file());
         eprintln!("windows CA round trip: removing");
         drop(guard);
         eprintln!("windows CA round trip: checking final absence from a fresh process");
         assert_windows_ca_visibility_in_fresh_process(&authority.thumbprint, false);
         assert!(!windows_ca_cleanup_pending().unwrap());
 
-        // An upgrade can leave a legacy journal while a newer session writes
-        // the current journal. Each journal must remain paired with, and clean
-        // up, its own certificate.
+        // An upgrade can leave a stale legacy journal while a newer session is
+        // active. Cleanup must remove only the stale certificate and preserve
+        // the active session's certificate and journal.
         let legacy_authority = CertificateAuthority::new().unwrap();
         let legacy_guard = WindowsUserCaGuard::install(
             legacy_authority.issuer.der(),
@@ -4263,20 +4259,19 @@ mod tests {
             &legacy_authority.thumbprint,
         )
         .unwrap();
-        std::fs::write(
-            windows_ca_journal_path().unwrap(),
-            &current_authority.thumbprint,
-        )
-        .unwrap();
         std::mem::forget(legacy_guard);
-        std::mem::forget(current_guard);
 
         assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, true);
         assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, true);
+        assert!(windows_ca_cleanup_pending().unwrap());
         cleanup_stale_windows_user_ca().unwrap();
         assert_windows_ca_visibility_in_fresh_process(&legacy_authority.thumbprint, false);
-        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, false);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, true);
         assert!(!legacy_windows_ca_journal_path().unwrap().exists());
+        assert!(windows_ca_journal_path().unwrap().exists());
+        assert!(!windows_ca_cleanup_pending().unwrap());
+        drop(current_guard);
+        assert_windows_ca_visibility_in_fresh_process(&current_authority.thumbprint, false);
         assert!(!windows_ca_journal_path().unwrap().exists());
         remove_windows_test_ca_store(&store_name);
 
