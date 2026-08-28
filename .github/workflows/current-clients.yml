@@ -2,19 +2,6 @@ name: Current client compatibility
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/current-clients.yml"
-      - ".github/workflows/release.yml"
-      - "crates/pentect-cli/src/client_descriptor.rs"
-      - "tools/client_smoke.py"
-      - "tools/install_client_smoke.sh"
-      - "tools/install_portable_client_smoke.py"
-      - "tools/test_client_smoke_coverage.py"
-      - "tools/verify_client_smoke_log.py"
-      - "tools/codex-app-smoke-fixture.c"
-      - "tools/codex-app-smoke-fixture.cs"
-      - "tools/claude-app-smoke-fixture.c"
-      - "tools/claude-app-smoke-fixture.cs"
   schedule:
     - cron: "29 4 * * *"
   workflow_dispatch:
@@ -27,9 +14,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  changes:
+    name: Current client changes
+    runs-on: ubuntu-latest
+    outputs:
+      clients: ${{ github.event_name != 'pull_request' || steps.filter.outputs.clients }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            clients:
+              - '.github/workflows/current-clients.yml'
+              - '.github/workflows/release.yml'
+              - 'crates/pentect-cli/src/client_descriptor.rs'
+              - 'tools/client_smoke.py'
+              - 'tools/install_client_smoke.sh'
+              - 'tools/install_portable_client_smoke.py'
+              - 'tools/test_client_smoke_coverage.py'
+              - 'tools/verify_client_smoke_log.py'
+              - 'tools/codex-app-smoke-fixture.c'
+              - 'tools/codex-app-smoke-fixture.cs'
+              - 'tools/claude-app-smoke-fixture.c'
+              - 'tools/claude-app-smoke-fixture.cs'
+
   portable:
     name: Portable clients and apps (${{ matrix.os }})
-    if: github.repository == 'EdamAme-x/pentect'
+    needs: changes
+    if: github.repository == 'EdamAme-x/pentect' && needs.changes.outputs.clients == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +71,17 @@ jobs:
         run: |
           $env:PENTECT_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'pentect-client-smoke'
           $env:PENTECT_INSTALL_SKIP_PATH = '1'
-          irm https://pentect.dev/install | iex
+          $installer = $null
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+              $installer = Invoke-RestMethod https://pentect.dev/install
+              break
+            } catch {
+              if ($attempt -eq 5) { throw }
+              Start-Sleep -Seconds 2
+            }
+          }
+          Invoke-Expression $installer
           $binary = Join-Path $env:PENTECT_INSTALL_DIR 'pentect.exe'
           if (-not (Test-Path -LiteralPath $binary)) { throw 'public installer did not produce pentect.exe' }
           $redirects = & curl.exe -fsSI 'https://github.com/EdamAme-x/pentect/releases/latest/download/pentect-windows-x86_64.exe.sha256'
@@ -70,8 +97,10 @@ jobs:
         run: |
           set -eu
           install_dir="$RUNNER_TEMP/pentect-client-smoke"
-          curl -fsSL --proto '=https' --tlsv1.2 https://pentect.dev/install.sh |
-            PENTECT_INSTALL_DIR="$install_dir" sh
+          installer="$RUNNER_TEMP/pentect-install.sh"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 45 \
+            --proto '=https' --tlsv1.2 https://pentect.dev/install.sh -o "$installer"
+          PENTECT_INSTALL_DIR="$install_dir" sh "$installer"
           test -x "$install_dir/pentect"
           latest=$(curl -fsSI https://github.com/EdamAme-x/pentect/releases/latest/download/pentect-linux-x86_64.sha256 |
             sed -n 's#.*[Ll]ocation: .*/download/v\([^/]*\)/.*#\1#p' | tail -n 1 | tr -d '\r')
@@ -148,3 +177,21 @@ jobs:
         run: |
           "$PENTECT_SMOKE_BINARY" uninstall
           test ! -e "$PENTECT_SMOKE_BINARY"
+
+  current-client-gate:
+    name: Current Client Gate
+    if: always()
+    needs: [changes, portable]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require applicable current-client jobs
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          PORTABLE_RESULT: ${{ needs.portable.result }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          case "$PORTABLE_RESULT" in
+            success|skipped) ;;
+            *) exit 1 ;;
+          esac
