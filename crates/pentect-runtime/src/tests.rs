@@ -1569,6 +1569,10 @@ fn session_environment_name_is_reserved_for_internal_use() {
     assert!(is_pentect_control_env_name(
         "PENTECT_ALLOW_INSECURE_UPSTREAM"
     ));
+    assert!(is_pentect_control_env_name(
+        "PENTECT_GLOBAL_PLUGIN_BINARIES"
+    ));
+    assert!(is_pentect_control_env_name("pentect_global_plugin_ids"));
     let mut names = pentect_control_env_names().to_vec();
     names.sort_unstable();
     names.dedup();
