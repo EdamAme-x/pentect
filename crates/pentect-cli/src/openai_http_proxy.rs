@@ -739,31 +739,25 @@ fn run_openai_tool_plugins(
                 && ["arguments", "input"]
                     .iter()
                     .any(|key| object.get(*key).is_some());
-            let chat_call = object.get("type").and_then(Value::as_str) == Some("function")
-                && object
-                    .get("function")
-                    .and_then(Value::as_object)
-                    .is_some_and(|function| function.get("arguments").is_some());
+            let chat_call = match object.get("type").and_then(Value::as_str) {
+                Some("function") => chat_tool_payload_exists(object, "function"),
+                Some("custom" | "custom_tool_call") => chat_tool_payload_exists(object, "custom"),
+                _ => false,
+            };
             let is_call = responses_call || chat_call;
             if is_call {
-                let run = plugins.run(
-                    pentect_agent::MiddlewareStage::ToolCall,
-                    Value::Object(object.clone()),
-                    Some(serde_json::json!({"provider": "openai", "transport": "http"})),
-                )?;
-                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "OpenAI")?;
-                if run.stopped == Some(pentect_agent::StopOutcome::Block) {
-                    return Err(format!(
-                        "plugin blocked: {}",
-                        run.message
-                            .unwrap_or_else(|| "tool call blocked".to_string())
-                    ));
+                run_openai_tool_plugin(object, plugins)?;
+            }
+            if let Some(legacy) = object
+                .get_mut("function_call")
+                .and_then(Value::as_object_mut)
+            {
+                if ["arguments", "input"]
+                    .into_iter()
+                    .any(|key| legacy.contains_key(key))
+                {
+                    run_openai_tool_plugin(legacy, plugins)?;
                 }
-                *object = run
-                    .payload
-                    .as_object()
-                    .cloned()
-                    .ok_or_else(|| "tool_call plugin payload must be an object".to_string())?;
             }
             for child in object.values_mut() {
                 run_openai_tool_plugins(child, plugins)?;
@@ -771,6 +765,42 @@ fn run_openai_tool_plugins(
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn chat_tool_payload_exists(object: &serde_json::Map<String, Value>, key: &str) -> bool {
+    object
+        .get(key)
+        .and_then(Value::as_object)
+        .is_some_and(|payload| {
+            ["arguments", "input"]
+                .into_iter()
+                .any(|key| payload.contains_key(key))
+        })
+}
+
+fn run_openai_tool_plugin(
+    object: &mut serde_json::Map<String, Value>,
+    plugins: &pentect_agent::PluginMiddleware,
+) -> Result<(), String> {
+    let run = plugins.run(
+        pentect_agent::MiddlewareStage::ToolCall,
+        Value::Object(object.clone()),
+        Some(serde_json::json!({"provider": "openai", "transport": "http"})),
+    )?;
+    crate::plugins::enforce_tool_plugin_coverage(run.coverage, "OpenAI")?;
+    if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message
+                .unwrap_or_else(|| "tool call blocked".to_string())
+        ));
+    }
+    *object = run
+        .payload
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "tool_call plugin payload must be an object".to_string())?;
     Ok(())
 }
 
@@ -1796,20 +1826,32 @@ fn mask_chat_messages(
         if let Some(content) = object.get_mut("content") {
             mask_chat_content(content, external_content, masker, files)?;
         }
+        if let Some(function_call) = object
+            .get_mut("function_call")
+            .and_then(Value::as_object_mut)
+        {
+            mask_chat_tool_payload(function_call, masker)?;
+        }
         if let Some(tool_calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut) {
             for call in tool_calls {
-                if let Some(arguments) = call
-                    .get_mut("function")
-                    .and_then(Value::as_object_mut)
-                    .and_then(|function| function.get_mut("arguments"))
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-                {
-                    let mut protected = arguments;
-                    mask_text(&mut protected, true, masker)?;
-                    call["function"]["arguments"] = Value::String(protected);
+                for key in ["function", "custom"] {
+                    if let Some(payload) = call.get_mut(key).and_then(Value::as_object_mut) {
+                        mask_chat_tool_payload(payload, masker)?;
+                    }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn mask_chat_tool_payload(
+    payload: &mut serde_json::Map<String, Value>,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    for key in ["arguments", "input"] {
+        if let Some(Value::String(value)) = payload.get_mut(key) {
+            mask_text(value, true, masker)?;
         }
     }
     Ok(())
@@ -3796,6 +3838,53 @@ mod tests {
         let description = definition["description"].as_str().unwrap();
         assert!(!description.contains(messages[3]["content"].as_str().unwrap()));
         assert!(description.contains("<<"));
+    }
+
+    #[test]
+    fn chat_history_masks_legacy_function_and_custom_tool_payloads() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "CHATTOOLS", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let payload =
+            |prefix: &str| format!(r#"{{\"command\":\"{prefix} RUNPOD_API_KEY={secret}\"}}"#);
+        let mut messages = serde_json::json!([{
+            "role": "assistant",
+            "function_call": {
+                "name": "legacy",
+                "arguments": payload("legacy")
+            },
+            "tool_calls": [{
+                "id": "function-1",
+                "type": "function",
+                "function": {
+                    "name": "modern",
+                    "arguments": payload("modern")
+                }
+            }, {
+                "id": "custom-1",
+                "type": "custom",
+                "custom": {
+                    "name": "custom",
+                    "arguments": payload("custom-arguments"),
+                    "input": payload("custom-input")
+                }
+            }]
+        }]);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+
+        mask_chat_messages(&mut messages, &mut masker, &HashMap::new()).unwrap();
+
+        for path in [
+            &messages[0]["function_call"]["arguments"],
+            &messages[0]["tool_calls"][0]["function"]["arguments"],
+            &messages[0]["tool_calls"][1]["custom"]["arguments"],
+            &messages[0]["tool_calls"][1]["custom"]["input"],
+        ] {
+            let protected = path.as_str().unwrap();
+            assert!(!protected.contains(&secret), "{protected}");
+            assert!(protected.contains("<<"), "{protected}");
+        }
     }
 
     #[test]
