@@ -42,6 +42,7 @@ class CredDataShardsTest(unittest.TestCase):
                 self.write_json(
                     shard_artifact / "report.json",
                     {
+                        "schema": 2,
                         "rust": repository_count,
                         "oracle": repository_count,
                         "common": repository_count,
@@ -68,9 +69,13 @@ class CredDataShardsTest(unittest.TestCase):
             self.assertEqual(summary["credsweeper_version"], "v1.2.3")
             self.assertEqual(summary["missing"], 0)
             self.assertEqual(summary["extra"], 0)
-            self.assertEqual(
-                summary["by_rule"]["Test Rule"]["common"], len(snapshot)
-            )
+            self.assertEqual(summary["schema"], 2)
+            rule = summary["by_rule"]["Test Rule"]
+            self.assertEqual(rule["rust"], len(snapshot))
+            self.assertEqual(rule["oracle"], len(snapshot))
+            self.assertEqual(rule["common"], len(snapshot))
+            self.assertEqual(rule["missing"], 0)
+            self.assertEqual(rule["extra"], 0)
 
     def test_partition_balances_metadata_weight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
