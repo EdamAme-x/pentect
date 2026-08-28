@@ -2517,9 +2517,13 @@ where
             out.push_str(reference);
         } else if shell_safe_secret_token(&resolved) {
             out.push_str(&resolved);
-        } else if allow_direct_posix_secrets
-            && direct_secret_is_safe_in_shell_context(text, absolute_start, end - start, &resolved)
-        {
+        } else if direct_secret_is_safe_in_shell_context(
+            text,
+            absolute_start,
+            end - start,
+            &resolved,
+            allow_direct_posix_secrets,
+        ) {
             if text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'\'')
                 && text.as_bytes().get(absolute_start + end - start) == Some(&b'\'')
             {
@@ -2558,6 +2562,7 @@ fn direct_secret_is_safe_in_shell_context(
     start: usize,
     length: usize,
     value: &str,
+    allow_single_quoted_value: bool,
 ) -> bool {
     if value
         .chars()
@@ -2566,7 +2571,8 @@ fn direct_secret_is_safe_in_shell_context(
         return false;
     }
     let bytes = command.as_bytes();
-    if start > 0
+    if allow_single_quoted_value
+        && start > 0
         && bytes.get(start - 1) == Some(&b'\'')
         && bytes.get(start + length) == Some(&b'\'')
     {
@@ -4301,6 +4307,23 @@ mod tests {
             "{heredoc}"
         );
         assert!(!heredoc.contains("<<KEYED_SECRET_a2c25e122d2e002f>>"));
+
+        let windows_heredoc = resolve_shell_text_safely_with_context(
+            "sudo -S cat ./ROOT_ONLY.txt <<'EOF'\n<<KEYED_SECRET_a2c25e122d2e002f>>\nEOF",
+            false,
+            ShellEnvironmentSyntax::PowerShell,
+            &mut sudo,
+        )
+        .unwrap();
+        assert!(
+            windows_heredoc.contains(&format!("\n{sudo_password}\nEOF")),
+            "{windows_heredoc}"
+        );
+        assert!(!windows_heredoc.contains("$env:"), "{windows_heredoc}");
+        assert!(
+            !windows_heredoc.contains("<<KEYED_SECRET_a2c25e122d2e002f>>"),
+            "{windows_heredoc}"
+        );
 
         let single_quoted = resolve_shell_text_safely(
             "sudo -S cat ./ROOT_ONLY.txt <<< '<<KEYED_SECRET_a2c25e122d2e002f>>'",
