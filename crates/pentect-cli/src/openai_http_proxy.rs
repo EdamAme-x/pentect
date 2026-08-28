@@ -350,6 +350,7 @@ async fn proxy_request_inner(
     }
     let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
     let chat_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::ChatCompletions;
+    let completions_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Completions;
     let standalone_search_path =
         method == hyper::Method::POST && endpoint == OpenAiEndpoint::StandaloneSearch;
     let embeddings_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Embeddings;
@@ -358,12 +359,14 @@ async fn proxy_request_inner(
         OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
     );
     let chat_response = endpoint == OpenAiEndpoint::ChatCompletions;
+    let completions_response = endpoint == OpenAiEndpoint::Completions;
     let protected_request = method == hyper::Method::POST
         && matches!(
             endpoint,
             OpenAiEndpoint::Responses
                 | OpenAiEndpoint::InputTokens
                 | OpenAiEndpoint::ChatCompletions
+                | OpenAiEndpoint::Completions
                 | OpenAiEndpoint::StandaloneSearch
                 | OpenAiEndpoint::Embeddings
         );
@@ -479,6 +482,8 @@ async fn proxy_request_inner(
                     &files,
                     if chat_path {
                         OpenAiRequestDialect::ChatCompletions
+                    } else if completions_path {
+                        OpenAiRequestDialect::Completions
                     } else if standalone_search_path {
                         OpenAiRequestDialect::StandaloneSearch
                     } else if embeddings_path {
@@ -554,11 +559,13 @@ async fn proxy_request_inner(
     // explicit stream flag is authoritative in that case.
     let is_event_stream = response_media_type
         .is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"))
-        || ((responses_path || chat_path) && request_streaming && response_media_type.is_none());
+        || ((responses_path || chat_path || completions_path)
+            && request_streaming
+            && response_media_type.is_none());
     let is_json_response = response_media_type.is_some_and(|value| {
         value.eq_ignore_ascii_case("application/json")
             || value.to_ascii_lowercase().ends_with("+json")
-    }) || ((responses_response || chat_response)
+    }) || ((responses_response || chat_response || completions_response)
         && !request_streaming
         && response_media_type.is_none());
     let restore_output = pentect_agent::output_restore_enabled()?;
@@ -577,7 +584,9 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
-    if is_event_stream || (!(responses_response || chat_response) && !files_upload) {
+    if is_event_stream
+        || (!(responses_response || chat_response || completions_response) && !files_upload)
+    {
         return builder
             .body(streaming_response_body(
                 upstream,
@@ -585,6 +594,8 @@ async fn proxy_request_inner(
                     StreamTransform::Responses
                 } else if status.is_success() && chat_path && is_event_stream {
                     StreamTransform::ChatCompletions
+                } else if status.is_success() && completions_path && is_event_stream {
+                    StreamTransform::Completions
                 } else {
                     StreamTransform::None
                 },
@@ -632,25 +643,29 @@ async fn proxy_request_inner(
             }
         }
     }
-    let response_body =
-        if (responses_response || chat_response) && status.is_success() && is_json_response {
-            let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
-            let rewritten = if chat_response {
-                rewrite_chat_completions_json_response(&response_body, restore_output)
-            } else {
-                rewrite_openai_json_response(&response_body, restore_output)
-            };
-            match rewritten {
-                Ok(rewritten) => Bytes::from(rewritten),
-                Err(error) => {
-                    let _ = error;
-                    proxy_diagnostic("response-restore-skipped");
-                    response_body
-                }
-            }
+    let response_body = if (responses_response || chat_response || completions_response)
+        && status.is_success()
+        && is_json_response
+    {
+        let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
+        let rewritten = if chat_response {
+            rewrite_chat_completions_json_response(&response_body, restore_output)
+        } else if completions_response {
+            rewrite_completions_json_response(&response_body, restore_output)
         } else {
-            response_body
+            rewrite_openai_json_response(&response_body, restore_output)
         };
+        match rewritten {
+            Ok(rewritten) => Bytes::from(rewritten),
+            Err(error) => {
+                let _ = error;
+                proxy_diagnostic("response-restore-skipped");
+                response_body
+            }
+        }
+    } else {
+        response_body
+    };
     builder
         .body(full_body(response_body))
         .map_err(|error| format!("could not build OpenAI response: {error}"))
@@ -815,6 +830,7 @@ fn decode_openai_request_body(
 enum OpenAiRequestDialect {
     Responses,
     ChatCompletions,
+    Completions,
     StandaloneSearch,
     Embeddings,
 }
@@ -906,7 +922,9 @@ fn protect_openai_request_body(
     }
     if matches!(
         dialect,
-        OpenAiRequestDialect::Responses | OpenAiRequestDialect::ChatCompletions
+        OpenAiRequestDialect::Responses
+            | OpenAiRequestDialect::ChatCompletions
+            | OpenAiRequestDialect::Completions
     ) {
         inject_handle_contract(&mut value);
     }
@@ -1354,8 +1372,29 @@ fn openai_request_unknown_content_kind(
             .get("messages")
             .map(visit_chat_messages)
             .unwrap_or(Some("missing messages")),
+        OpenAiRequestDialect::Completions => completions_unknown_shape(value),
         OpenAiRequestDialect::StandaloneSearch => standalone_search_unknown_shape(value, visit),
         OpenAiRequestDialect::Embeddings => embeddings_unknown_shape(value),
+    }
+}
+
+fn completions_unknown_shape(value: &Value) -> Option<&str> {
+    let Some(prompt) = value.as_object().and_then(|object| object.get("prompt")) else {
+        return Some("missing completion prompt");
+    };
+    match prompt {
+        Value::String(_) => None,
+        Value::Array(items) if items.iter().all(Value::is_string) => None,
+        Value::Array(items) if items.iter().all(Value::is_u64) => None,
+        Value::Array(items)
+            if items.iter().all(|item| {
+                item.as_array()
+                    .is_some_and(|tokens| tokens.iter().all(Value::is_u64))
+            }) =>
+        {
+            None
+        }
+        _ => Some("unsupported completion prompt"),
     }
 }
 
@@ -1483,6 +1522,10 @@ fn inject_handle_contract(value: &mut Value) {
         inject_chat_handle_contract(value);
         return;
     }
+    if let Some(prompt) = value.get_mut("prompt") {
+        inject_completion_handle_contract(prompt);
+        return;
+    }
     match value.get_mut("instructions") {
         Some(Value::String(instructions)) if !instructions.contains(HANDLE_CONTRACT) => {
             let existing = std::mem::take(instructions);
@@ -1490,6 +1533,21 @@ fn inject_handle_contract(value: &mut Value) {
         }
         Some(Value::Null) | None => {
             value["instructions"] = Value::String(HANDLE_CONTRACT.to_string());
+        }
+        _ => {}
+    }
+}
+
+fn inject_completion_handle_contract(prompt: &mut Value) {
+    match prompt {
+        Value::String(text) if !text.contains(HANDLE_CONTRACT) => {
+            text.push_str("\n\n");
+            text.push_str(HANDLE_CONTRACT);
+        }
+        Value::Array(items) if items.iter().all(Value::is_string) => {
+            for item in items {
+                inject_completion_handle_contract(item);
+            }
         }
         _ => {}
     }
@@ -1558,6 +1616,9 @@ fn mask_openai_request(
     if let Some(messages) = value.get_mut("messages") {
         mask_chat_messages(messages, masker, files)?;
     }
+    if let Some(prompt) = value.get_mut("prompt") {
+        mask_completion_prompt(prompt, masker)?;
+    }
     // Tool descriptions and JSON Schemas are sent to the model too. MCP and
     // editor integrations commonly generate them from local state, so they
     // must cross the same masking boundary as messages. Keys are structural;
@@ -1582,6 +1643,34 @@ fn mask_openai_request(
         }
     }
     Ok(())
+}
+
+fn mask_completion_prompt(
+    prompt: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match prompt {
+        Value::String(text) => mask_text(text, false, masker),
+        Value::Array(items) if items.iter().all(Value::is_string) => {
+            for item in items {
+                let Value::String(text) = item else {
+                    unreachable!("completion prompt shape checked before masking")
+                };
+                mask_text(text, false, masker)?;
+            }
+            Ok(())
+        }
+        Value::Array(items)
+            if items.iter().all(Value::is_u64)
+                || items.iter().all(|item| {
+                    item.as_array()
+                        .is_some_and(|tokens| tokens.iter().all(Value::is_u64))
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err("OpenAI completion prompt has an unsupported shape".to_string()),
+    }
 }
 
 fn mask_embeddings_request(
@@ -2006,6 +2095,32 @@ fn rewrite_chat_completions_json_response(
     }
     serde_json::to_vec(&value)
         .map_err(|error| format!("could not encode restored Chat Completions response: {error}"))
+}
+
+fn rewrite_completions_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("OpenAI Completions response was not valid JSON: {error}"))?;
+    if restore_output {
+        let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+        restore_completion_output_text(&mut value, &mut resolve)?;
+    }
+    serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Completions response: {error}"))
+}
+
+fn restore_completion_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for choice in choices {
+        if let Some(Value::String(text)) = choice.get_mut("text") {
+            *text = resolve(text)?;
+        }
+    }
+    Ok(())
 }
 
 fn restore_openai_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
@@ -2453,6 +2568,7 @@ struct StreamState {
     ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
     transform: StreamTransform,
     chat: ChatStreamState,
+    completions: CompletionStreamState,
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
@@ -2465,6 +2581,7 @@ enum StreamTransform {
     None,
     Responses,
     ChatCompletions,
+    Completions,
 }
 
 fn streaming_response_body(
@@ -2479,6 +2596,7 @@ fn streaming_response_body(
         ready: VecDeque::new(),
         transform,
         chat: ChatStreamState::default(),
+        completions: CompletionStreamState::default(),
         finished: false,
         plugins,
         restore_output,
@@ -2535,6 +2653,11 @@ fn streaming_response_body(
                                 state.restore_output,
                                 &mut state.output_resolve,
                             ),
+                            StreamTransform::Completions => state.completions.rewrite_block(
+                                &block,
+                                state.restore_output,
+                                &mut state.output_resolve,
+                            ),
                             StreamTransform::None => Ok(vec![Bytes::from(block)]),
                         };
                         match rewritten {
@@ -2577,6 +2700,18 @@ fn streaming_response_body(
                                 error,
                             )))),
                         }
+                    } else if state.transform == StreamTransform::Completions {
+                        match state.completions.finish_output_text("data: {}\n\n") {
+                            Ok(blocks) => {
+                                for block in blocks {
+                                    state.ready.push_back(Ok(Frame::data(block)));
+                                }
+                            }
+                            Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                error,
+                            )))),
+                        }
                     }
                     if !state.pending.is_empty() {
                         state
@@ -2590,6 +2725,108 @@ fn streaming_response_body(
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+#[derive(Default)]
+struct CompletionStreamState {
+    output_text: HashMap<u64, crate::claude_http_proxy::OutputTextRestorer>,
+}
+
+impl CompletionStreamState {
+    fn rewrite_block(
+        &mut self,
+        block: &[u8],
+        restore_output: bool,
+        resolve: &mut HandleResolver,
+    ) -> Result<Vec<Bytes>, String> {
+        let Ok(template) = std::str::from_utf8(block) else {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        };
+        let Some(data) = sse_data(template) else {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        };
+        if data == "[DONE]" {
+            let mut output = self.finish_output_text(template)?;
+            output.push(Bytes::copy_from_slice(block));
+            return Ok(output);
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(data.as_ref()) else {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        };
+        if restore_output {
+            let mut finished = Vec::new();
+            if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
+                for choice in choices {
+                    let Some(choice) = choice.as_object_mut() else {
+                        continue;
+                    };
+                    let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    if let Some(Value::String(text)) = choice.get_mut("text") {
+                        *text = self
+                            .output_text
+                            .entry(index)
+                            .or_default()
+                            .push(text, resolve)?;
+                    }
+                    if choice
+                        .get("finish_reason")
+                        .is_some_and(|reason| !reason.is_null())
+                    {
+                        finished.push(index);
+                    }
+                }
+            }
+            for index in finished {
+                if let Some(mut restorer) = self.output_text.remove(&index) {
+                    let pending = restorer.finish();
+                    if !pending.is_empty() {
+                        if let Some(choice) = value
+                            .get_mut("choices")
+                            .and_then(Value::as_array_mut)
+                            .and_then(|choices| {
+                                choices.iter_mut().find(|choice| {
+                                    choice.as_object().is_some_and(|choice| {
+                                        choice.get("index").and_then(Value::as_u64).unwrap_or(0)
+                                            == index
+                                    })
+                                })
+                            })
+                        {
+                            let text = choice
+                                .as_object_mut()
+                                .expect("choice object was selected above")
+                                .entry("text")
+                                .or_insert_with(|| Value::String(String::new()));
+                            if let Value::String(text) = text {
+                                text.push_str(&pending);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(vec![encode_sse_value(template, &value)?])
+    }
+
+    fn finish_output_text(&mut self, template: &str) -> Result<Vec<Bytes>, String> {
+        let mut pending = self.output_text.drain().collect::<Vec<_>>();
+        pending.sort_by_key(|(index, _)| *index);
+        pending
+            .into_iter()
+            .filter_map(|(index, mut restorer)| {
+                let text = restorer.finish();
+                (!text.is_empty()).then_some((index, text))
+            })
+            .map(|(index, text)| {
+                encode_sse_value(
+                    template,
+                    &serde_json::json!({
+                        "choices": [{"index": index, "text": text, "finish_reason": Value::Null}]
+                    }),
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -3150,6 +3387,7 @@ enum OpenAiEndpoint {
     InputTokens,
     StandaloneSearch,
     ChatCompletions,
+    Completions,
     Embeddings,
     FilesCollection,
     Files,
@@ -3166,6 +3404,7 @@ impl OpenAiEndpoint {
             Self::InputTokens => "input-tokens",
             Self::StandaloneSearch => "standalone-search",
             Self::ChatCompletions => "chat-completions",
+            Self::Completions => "completions",
             Self::Embeddings => "embeddings",
             Self::FilesCollection => "files-collection",
             Self::Files => "files",
@@ -3195,6 +3434,11 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         OpenAiEndpoint::ResponsesResource
     } else if path.ends_with("/chat/completions") {
         OpenAiEndpoint::ChatCompletions
+    } else if matches!(
+        segments.as_slice(),
+        ["completions"] | ["v1", "completions"] | ["backend-api", "codex", "completions"]
+    ) {
+        OpenAiEndpoint::Completions
     } else if matches!(
         segments.as_slice(),
         ["v1", "embeddings"] | ["backend-api", "codex", "embeddings"]
@@ -4001,6 +4245,14 @@ mod tests {
             OpenAiEndpoint::ChatCompletions
         );
         assert_eq!(
+            classify_openai_endpoint("/v1/completions"),
+            OpenAiEndpoint::Completions
+        );
+        assert_eq!(
+            classify_openai_endpoint("/completions?stream=true"),
+            OpenAiEndpoint::Completions
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/embeddings"),
             OpenAiEndpoint::Embeddings
         );
@@ -4047,6 +4299,71 @@ mod tests {
         );
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, true).is_err());
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn legacy_completion_prompts_and_output_are_protected_at_their_schema_boundaries() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "LEGACYOPENAI", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let mut prompt = serde_json::json!([
+            format!("RUNPOD_API_KEY={secret}"),
+            format!("repeat RUNPOD_API_KEY={secret}")
+        ]);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+
+        mask_completion_prompt(&mut prompt, &mut masker).unwrap();
+        assert!(!prompt.to_string().contains(&secret));
+        assert!(prompt
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| pentect_agent::contains_pentect_masked_handle(item.as_str().unwrap())));
+        inject_completion_handle_contract(&mut prompt);
+        assert!(prompt
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.as_str().unwrap().contains(HANDLE_CONTRACT)));
+
+        let mut response = serde_json::json!({
+            "choices": [{"index": 0, "text": "before <<KEYED_SECRET_test>> after"}]
+        });
+        restore_completion_output_text(&mut response, &mut |text| {
+            Ok(text.replace("<<KEYED_SECRET_test>>", "restored"))
+        })
+        .unwrap();
+        assert_eq!(response["choices"][0]["text"], "before restored after");
+    }
+
+    #[test]
+    fn legacy_completion_stream_restores_handles_split_across_deltas() {
+        let mut state = CompletionStreamState::default();
+        let mut resolve: HandleResolver =
+            Box::new(|text| Ok(text.replace("<<KEYED_SECRET_split>>", "restored")));
+        let first = state
+            .rewrite_block(
+                b"data: {\"choices\":[{\"index\":0,\"text\":\"before <<KEYED_\",\"finish_reason\":null}]}\n\n",
+                true,
+                &mut resolve,
+            )
+            .unwrap();
+        let second = state
+            .rewrite_block(
+                b"data: {\"choices\":[{\"index\":0,\"text\":\"SECRET_split>> after\",\"finish_reason\":\"stop\"}]}\n\n",
+                true,
+                &mut resolve,
+            )
+            .unwrap();
+        let output = first
+            .into_iter()
+            .chain(second)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.contains("before "), "{output}");
+        assert!(output.contains("restored after"), "{output}");
+        assert!(!output.contains("KEYED_SECRET_split"), "{output}");
     }
 
     #[test]
