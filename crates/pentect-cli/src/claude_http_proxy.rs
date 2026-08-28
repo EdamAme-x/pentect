@@ -1151,21 +1151,20 @@ fn streaming_response_body(
 struct SseStreamTransformer<R> {
     resolve: R,
     pending: Vec<u8>,
-    active_tool: Option<ActiveToolStream>,
+    tool_buffer: Option<ToolStreamBuffer>,
     passthrough: bool,
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
     restore_output: bool,
-    output_text: HashMap<u64, OutputTextRestorer>,
+    output_text: HashMap<(u64, &'static str), OutputTextRestorer>,
 }
 
-struct ActiveToolStream {
-    index: u64,
-    name: Option<String>,
+struct ToolStreamBuffer {
+    active: HashSet<u64>,
     bytes: Vec<u8>,
 }
 
 enum SseToolBoundary {
-    Start { index: u64, name: Option<String> },
+    Start { index: u64 },
     Stop(u64),
     Other,
 }
@@ -1182,7 +1181,7 @@ where
         Self {
             resolve,
             pending: Vec::new(),
-            active_tool: None,
+            tool_buffer: None,
             passthrough: false,
             plugins,
             restore_output,
@@ -1209,10 +1208,10 @@ where
 
     fn finish(&mut self) -> Vec<Bytes> {
         let mut output = self.finish_output_text();
-        if let Some(mut tool) = self.active_tool.take() {
-            tool.bytes.append(&mut self.pending);
-            if !tool.bytes.is_empty() {
-                output.push(Bytes::from(tool.bytes));
+        if let Some(mut tools) = self.tool_buffer.take() {
+            tools.bytes.append(&mut self.pending);
+            if !tools.bytes.is_empty() {
+                output.push(Bytes::from(tools.bytes));
             }
         } else if !self.pending.is_empty() {
             output.push(Bytes::from(std::mem::take(&mut self.pending)));
@@ -1222,20 +1221,21 @@ where
 
     fn finish_output_text(&mut self) -> Vec<Bytes> {
         let mut streams = self.output_text.drain().collect::<Vec<_>>();
-        streams.sort_by_key(|(index, _)| *index);
+        streams.sort_by_key(|((index, field), _)| (*index, *field));
         streams
             .into_iter()
-            .filter_map(|(index, mut restorer)| {
+            .filter_map(|((index, field), mut restorer)| {
                 let pending = restorer.finish();
                 if pending.is_empty() {
                     return None;
                 }
+                let delta_type = anthropic_output_delta_type(field)?;
                 Some(Bytes::from(render_sse(&[SseBlock {
                     event: Some("content_block_delta".to_string()),
                     data: Some(serde_json::json!({
                         "type": "content_block_delta",
                         "index": index,
-                        "delta": {"type": "text_delta", "text": pending},
+                        "delta": {"type": delta_type, (field): pending},
                     })),
                     passthrough: Vec::new(),
                 }])))
@@ -1244,39 +1244,57 @@ where
     }
 
     fn process_block(&mut self, block: Vec<u8>, output: &mut Vec<Bytes>) -> Result<(), String> {
-        if let Some(active) = &mut self.active_tool {
+        if self.tool_buffer.is_some() {
             match sse_control_event(&block) {
                 SseControlEvent::Ping => {
                     output.push(Bytes::from(block));
                     return Ok(());
                 }
                 SseControlEvent::Error => {
-                    let active = self.active_tool.take().expect("active tool exists");
-                    output.push(Bytes::from(active.bytes));
+                    let tools = self.tool_buffer.take().expect("tool buffer exists");
+                    output.push(Bytes::from(tools.bytes));
                     output.push(Bytes::from(block));
                     self.passthrough = true;
                     return Ok(());
                 }
                 SseControlEvent::Other => {}
             }
-            if active.bytes.len().saturating_add(block.len()) > MAX_PENDING_SSE_BYTES {
+            if self
+                .tool_buffer
+                .as_ref()
+                .expect("tool buffer exists")
+                .bytes
+                .len()
+                .saturating_add(block.len())
+                > MAX_PENDING_SSE_BYTES
+            {
                 diagnostic("sse-tool-limit", "limit", "messages", false);
-                let active = self.active_tool.take().expect("active tool exists");
-                output.push(Bytes::from(active.bytes));
+                let tools = self.tool_buffer.take().expect("tool buffer exists");
+                output.push(Bytes::from(tools.bytes));
                 output.push(Bytes::from(block));
                 self.passthrough = true;
                 return Ok(());
             }
             let boundary = sse_tool_boundary(&block);
-            active.bytes.extend_from_slice(&block);
-            if matches!(boundary, SseToolBoundary::Stop(index) if index == active.index) {
-                let active = self.active_tool.take().expect("active tool exists");
-                let rewritten = std::str::from_utf8(&active.bytes)
+            let tools = self.tool_buffer.as_mut().expect("tool buffer exists");
+            match boundary {
+                SseToolBoundary::Start { index } => {
+                    tools.active.insert(index);
+                }
+                SseToolBoundary::Stop(index) => {
+                    tools.active.remove(&index);
+                }
+                SseToolBoundary::Other => {}
+            }
+            tools.bytes.extend_from_slice(&block);
+            if tools.active.is_empty() {
+                let tools = self.tool_buffer.take().expect("tool buffer exists");
+                let rewritten = std::str::from_utf8(&tools.bytes)
                     .map_err(|error| format!("Claude tool SSE was not UTF-8: {error}"))
                     .and_then(|text| {
                         rewrite_anthropic_sse_with_tool_name(
                             text,
-                            active.name.as_deref(),
+                            None,
                             &mut self.resolve,
                             self.plugins.as_deref(),
                         )
@@ -1287,10 +1305,9 @@ where
         }
 
         match sse_tool_boundary(&block) {
-            SseToolBoundary::Start { index, name } => {
-                self.active_tool = Some(ActiveToolStream {
-                    index,
-                    name,
+            SseToolBoundary::Start { index } => {
+                self.tool_buffer = Some(ToolStreamBuffer {
+                    active: HashSet::from([index]),
                     bytes: block,
                 });
             }
@@ -1312,9 +1329,9 @@ where
     fn fail_open_with(&mut self, chunk: &[u8]) -> Vec<Bytes> {
         let mut output = self.finish_output_text();
         let mut bytes = self
-            .active_tool
+            .tool_buffer
             .take()
-            .map_or_else(Vec::new, |active| active.bytes);
+            .map_or_else(Vec::new, |tools| tools.bytes);
         bytes.append(&mut self.pending);
         bytes.extend_from_slice(chunk);
         self.passthrough = true;
@@ -1325,7 +1342,7 @@ where
 
 fn rewrite_anthropic_output_sse_block<R>(
     block: &[u8],
-    streams: &mut HashMap<u64, OutputTextRestorer>,
+    streams: &mut HashMap<(u64, &'static str), OutputTextRestorer>,
     resolve: &mut R,
 ) -> Result<Option<Vec<u8>>, String>
 where
@@ -1346,61 +1363,75 @@ where
         return Ok(None);
     };
     match event_type.as_deref() {
-        Some("content_block_start")
-            if data
-                .get("content_block")
-                .and_then(|value| value.get("type"))
-                .and_then(Value::as_str)
-                == Some("text") =>
-        {
-            let restorer = streams.entry(index).or_default();
-            if let Some(Value::String(value)) = data
-                .get_mut("content_block")
-                .and_then(Value::as_object_mut)
-                .and_then(|value| value.get_mut("text"))
-            {
-                *value = restorer.push(value, resolve)?;
+        Some("content_block_start") => {
+            let Some(content) = data.get_mut("content_block").and_then(Value::as_object_mut) else {
+                return Ok(None);
+            };
+            let field = match content.get("type").and_then(Value::as_str) {
+                Some("text") => "text",
+                Some("thinking") => "thinking",
+                _ => return Ok(None),
+            };
+            if let Some(Value::String(value)) = content.get_mut(field) {
+                *value = streams
+                    .entry((index, field))
+                    .or_default()
+                    .push(value, resolve)?;
             }
         }
-        Some("content_block_delta")
-            if data
-                .get("delta")
-                .and_then(|value| value.get("type"))
-                .and_then(Value::as_str)
-                == Some("text_delta") =>
-        {
-            let restorer = streams.entry(index).or_default();
-            if let Some(Value::String(value)) = data
-                .get_mut("delta")
-                .and_then(Value::as_object_mut)
-                .and_then(|value| value.get_mut("text"))
-            {
-                *value = restorer.push(value, resolve)?;
+        Some("content_block_delta") => {
+            let Some(delta) = data.get_mut("delta").and_then(Value::as_object_mut) else {
+                return Ok(None);
+            };
+            let field = match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => "text",
+                Some("thinking_delta") => "thinking",
+                _ => return Ok(None),
+            };
+            if let Some(Value::String(value)) = delta.get_mut(field) {
+                *value = streams
+                    .entry((index, field))
+                    .or_default()
+                    .push(value, resolve)?;
             }
         }
         Some("content_block_stop") => {
-            let Some(mut restorer) = streams.remove(&index) else {
-                return Ok(None);
-            };
-            let pending = restorer.finish();
-            if !pending.is_empty() {
-                let prefix = SseBlock {
-                    event: Some("content_block_delta".to_string()),
-                    data: Some(serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "text_delta", "text": pending},
-                    })),
-                    passthrough: Vec::new(),
+            let mut prefixes = Vec::new();
+            for field in ["text", "thinking"] {
+                let Some(mut restorer) = streams.remove(&(index, field)) else {
+                    continue;
                 };
+                let pending = restorer.finish();
+                if !pending.is_empty() {
+                    let delta_type = anthropic_output_delta_type(field).expect("known field");
+                    prefixes.push(SseBlock {
+                        event: Some("content_block_delta".to_string()),
+                        data: Some(serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": delta_type, (field): pending},
+                        })),
+                        passthrough: Vec::new(),
+                    });
+                }
+            }
+            if !prefixes.is_empty() {
                 return Ok(Some(
-                    format!("{}{}", render_sse(&[prefix]), render_sse(&blocks)).into_bytes(),
+                    format!("{}{}", render_sse(&prefixes), render_sse(&blocks)).into_bytes(),
                 ));
             }
         }
         _ => return Ok(None),
     }
     Ok(Some(render_sse(&blocks).into_bytes()))
+}
+
+fn anthropic_output_delta_type(field: &str) -> Option<&'static str> {
+    match field {
+        "text" => Some("text_delta"),
+        "thinking" => Some("thinking_delta"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1419,17 +1450,8 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
             .strip_prefix("event:")
             .map(str::trim)
     });
-    let data_type = text.lines().find_map(|line| {
-        let data = line
-            .trim_end_matches('\r')
-            .strip_prefix("data:")?
-            .trim_start();
-        serde_json::from_str::<Value>(data)
-            .ok()?
-            .get("type")?
-            .as_str()
-            .map(str::to_owned)
-    });
+    let data_type = sse_json_data(text)
+        .and_then(|data| data.get("type").and_then(Value::as_str).map(str::to_owned));
     match (event, data_type.as_deref()) {
         (Some("ping"), _) | (_, Some("ping")) => SseControlEvent::Ping,
         (Some("error"), _) | (_, Some("error")) => SseControlEvent::Error,
@@ -1457,14 +1479,7 @@ fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
     let Ok(text) = std::str::from_utf8(block) else {
         return SseToolBoundary::Other;
     };
-    let Some(data) = text.lines().find_map(|line| {
-        line.trim_end_matches('\r')
-            .strip_prefix("data:")
-            .map(str::trim_start)
-    }) else {
-        return SseToolBoundary::Other;
-    };
-    let Ok(data) = serde_json::from_str::<Value>(data) else {
+    let Some(data) = sse_json_data(text) else {
         return SseToolBoundary::Other;
     };
     let event_type = data.get("type").and_then(Value::as_str);
@@ -1478,14 +1493,7 @@ fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
             .and_then(Value::as_str)
             == Some("tool_use")
     {
-        SseToolBoundary::Start {
-            index,
-            name: data
-                .get("content_block")
-                .and_then(|content| content.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        }
+        SseToolBoundary::Start { index }
     } else if event_type == Some("content_block_stop") {
         SseToolBoundary::Stop(index)
     } else {
@@ -1863,12 +1871,25 @@ fn rewrite_anthropic_json_response(body: &[u8], restore_output: bool) -> Result<
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
     let mut resolve = request_scoped_resolver();
+    restore_anthropic_json_value(&mut value, restore_output, &mut resolve)?;
+    serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+}
+
+pub(crate) fn restore_anthropic_json_value<R>(
+    value: &mut Value,
+    restore_output: bool,
+    resolve: &mut R,
+) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 let tool_name = block.get("name").and_then(Value::as_str).map(str::to_owned);
                 if let Some(input) = block.get_mut("input") {
-                    resolve_tool_input_value(input, tool_name.as_deref(), &mut resolve)?;
+                    resolve_tool_input_value(input, tool_name.as_deref(), resolve)?;
                 }
             } else if restore_output && block.get("type").and_then(Value::as_str) == Some("text") {
                 if let Some(Value::String(text)) = block.get_mut("text") {
@@ -1877,8 +1898,7 @@ fn rewrite_anthropic_json_response(body: &[u8], restore_output: bool) -> Result<
             }
         }
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+    Ok(())
 }
 
 #[derive(Default)]
@@ -2038,21 +2058,41 @@ fn parse_sse(input: &str) -> Vec<SseBlock> {
         .filter(|block| !block.is_empty())
         .map(|block| {
             let mut parsed = SseBlock::default();
+            let mut data_lines = Vec::new();
             for line in block.lines() {
                 if let Some(event) = line.strip_prefix("event:") {
                     parsed.event = Some(event.trim_start().to_string());
                 } else if let Some(data) = line.strip_prefix("data:") {
-                    match serde_json::from_str(data.trim_start()) {
-                        Ok(value) => parsed.data = Some(value),
-                        Err(_) => parsed.passthrough.push(line.to_string()),
-                    }
+                    data_lines.push(data.trim_start().to_string());
                 } else {
                     parsed.passthrough.push(line.to_string());
+                }
+            }
+            if !data_lines.is_empty() {
+                match serde_json::from_str(&data_lines.join("\n")) {
+                    Ok(value) => parsed.data = Some(value),
+                    Err(_) => parsed
+                        .passthrough
+                        .extend(data_lines.into_iter().map(|data| format!("data: {data}"))),
                 }
             }
             parsed
         })
         .collect()
+}
+
+fn sse_json_data(input: &str) -> Option<Value> {
+    let data = input
+        .lines()
+        .filter_map(|line| {
+            line.trim_end_matches('\r')
+                .strip_prefix("data:")
+                .map(str::trim_start)
+        })
+        .collect::<Vec<_>>();
+    (!data.is_empty())
+        .then(|| serde_json::from_str(&data.join("\n")).ok())
+        .flatten()
 }
 
 fn render_sse(blocks: &[SseBlock]) -> String {
@@ -3251,6 +3291,48 @@ mod tests {
     }
 
     #[test]
+    fn multiline_sse_data_is_joined_for_parsing_control_and_tool_boundaries() {
+        let start = concat!(
+            "event: content_block_start\r\n",
+            "data: {\"type\":\"content_block_start\",\r\n",
+            "data: \"index\":4,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\r\n\r\n"
+        );
+        let blocks = parse_sse(start);
+        assert_eq!(blocks[0].data.as_ref().unwrap()["index"], 4);
+        assert!(matches!(
+            sse_tool_boundary(start.as_bytes()),
+            SseToolBoundary::Start { index: 4 }
+        ));
+
+        let ping = "event: message\ndata: {\"type\":\ndata: \"ping\"}\n\n";
+        assert_eq!(sse_control_event(ping.as_bytes()), SseControlEvent::Ping);
+    }
+
+    #[test]
+    fn streaming_thinking_restores_handles_split_across_events() {
+        let events = [
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"before <<CHAR\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"GE_0123456789abcdef>> after\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        ];
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            None,
+            true,
+        );
+        let mut output = Vec::new();
+        for event in events {
+            output.extend(transformer.push(event.as_bytes()).unwrap());
+        }
+        let output = join_bytes(output);
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
+        assert!(output.contains("thinking_delta"), "{output}");
+        assert!(output.contains("\"thinking\""), "{output}");
+    }
+
+    #[test]
     fn known_anthropic_endpoints_are_classified_before_forwarding() {
         assert_eq!(
             classify_anthropic_endpoint("/v1/messages"),
@@ -3550,6 +3632,47 @@ mod tests {
         let output = join_bytes(output);
         assert!(output.contains("actual-secret"));
         assert!(!output.contains("<<SECRET_deadbeefdeadbeef>>"));
+    }
+
+    #[test]
+    fn parallel_tool_blocks_are_buffered_and_resolved_by_index() {
+        let before_last_stop = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_2\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_one>>\\\"}\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_two>>\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n"
+        );
+        let last_stop = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        );
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| {
+                Ok(text
+                    .replace("<<SECRET_one>>", "first")
+                    .replace("<<SECRET_two>>", "second"))
+            },
+            None,
+            false,
+        );
+        assert!(transformer
+            .push(before_last_stop.as_bytes())
+            .unwrap()
+            .is_empty());
+        let output = join_bytes(transformer.push(last_stop.as_bytes()).unwrap());
+        assert!(output.contains("echo first"), "{output}");
+        assert!(output.contains("echo second"), "{output}");
+        assert!(!output.contains("<<SECRET_"), "{output}");
+        assert!(
+            output.find("tool_1").unwrap() < output.find("tool_2").unwrap(),
+            "{output}"
+        );
     }
 
     #[test]
