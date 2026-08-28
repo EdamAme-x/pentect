@@ -1411,19 +1411,54 @@ fn diagnostic_version(value: &str) -> Option<String> {
 }
 
 fn safe_panic_location(value: &str) -> String {
-    value
+    let filtered = value
         .chars()
         .filter(|character| !matches!(character, '\r' | '\n' | '\0'))
         .take(512)
-        .collect()
+        .collect::<String>();
+    basename_source_location(&filtered)
 }
 
 fn safe_backtrace(value: &str) -> String {
-    value
+    let filtered = value
         .chars()
         .filter(|character| *character != '\0')
         .take(16 * 1024)
+        .collect::<String>();
+    filtered
+        .split_inclusive('\n')
+        .map(|line| {
+            let (content, newline) = line
+                .strip_suffix('\n')
+                .map_or((line, ""), |content| (content, "\n"));
+            let indent_len = content.len() - content.trim_start().len();
+            let (indent, trimmed) = content.split_at(indent_len);
+            if let Some(location) = trimmed.strip_prefix("at ") {
+                format!("{indent}at {}{newline}", basename_source_location(location))
+            } else {
+                line.to_string()
+            }
+        })
         .collect()
+}
+
+fn basename_source_location(value: &str) -> String {
+    let mut path_end = value.len();
+    for _ in 0..2 {
+        let Some((prefix, field)) = value[..path_end].rsplit_once(':') else {
+            break;
+        };
+        if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        path_end = prefix.len();
+    }
+    let (path, suffix) = value.split_at(path_end);
+    let basename = path
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or("external");
+    format!("{basename}{suffix}")
 }
 
 fn safe_target(path: &Path) -> String {
@@ -1591,6 +1626,26 @@ mod tests {
             Path::new("/home/name/secret/.env")
         };
         assert_eq!(safe_target(path), ".env");
+    }
+
+    #[test]
+    fn panic_diagnostics_hide_source_parent_directories() {
+        assert_eq!(
+            safe_panic_location("/home/builder/pentect/src/main.rs:305:9"),
+            "main.rs:305:9"
+        );
+        assert_eq!(
+            safe_panic_location(r"C:\Users\builder\pentect\src\main.rs:305:9"),
+            "main.rs:305:9"
+        );
+
+        let backtrace = "  0: pentect::run\n             at /home/builder/pentect/src/main.rs:305:9\n             at C:\\Users\\builder\\.cargo\\registry\\src\\lib.rs:42:7\n";
+        let sanitized = safe_backtrace(backtrace);
+        assert_eq!(
+            sanitized,
+            "  0: pentect::run\n             at main.rs:305:9\n             at lib.rs:42:7\n"
+        );
+        assert!(!sanitized.contains("builder"));
     }
 
     #[test]
