@@ -47,7 +47,8 @@ jobs:
           }
       - name: Validate POSIX installer
         run: |
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
+          sh tools/test_download_recent_stable_debs.sh
           sh tools/test_install.sh
           bash -n .github/scripts/publish-aur.sh
           python tools/test_client_smoke_coverage.py
@@ -335,17 +336,7 @@ jobs:
       - name: Add historical stable packages
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
-          while IFS= read -r tag; do
-            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-              --json assets --jq '.assets[].name' | grep -Eq '^pentect_.*\.deb$'; then
-              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-                --pattern 'pentect_*.deb' --dir debs --skip-existing
-            fi
-          done
+        run: sh tools/download_recent_stable_debs.sh debs 2
           test -n "$(find debs -name 'pentect_*.deb' -print -quit)"
       - name: Import archive signing key
         id: signing
@@ -361,7 +352,12 @@ jobs:
       - name: Build signed repository
         env:
           KEY_FINGERPRINT: ${{ steps.signing.outputs.fingerprint }}
-        run: bash tools/build_apt_repository.sh debs site packaging/apt/pentect-archive-keyring.asc "$KEY_FINGERPRINT"
+        run: |
+          bash tools/build_apt_repository.sh debs site packaging/apt/pentect-archive-keyring.asc "$KEY_FINGERPRINT"
+          bytes=$(du -sb site | awk '{print $1}')
+          packages=$(find site -type f -name '*.deb' | wc -l)
+          echo "APT repository: $packages package files, $bytes bytes"
+          test "$bytes" -le 800000000
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: apt-site
@@ -779,7 +775,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          package-manager-cache: false
       - name: Verify release version
         shell: bash
         run: |
