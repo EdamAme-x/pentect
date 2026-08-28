@@ -2502,6 +2502,36 @@ fn storage_path(root: &Path, key: &str) -> PathBuf {
     ))
 }
 
+struct BoundedCommandStream {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_command_stream<R>(
+    mut reader: R,
+    overflow: mpsc::Sender<()>,
+) -> std::io::Result<BoundedCommandStream>
+where
+    R: Read,
+{
+    let mut bytes = Vec::with_capacity(HOST_MAX_COMMAND_STREAM_BYTES);
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = HOST_MAX_COMMAND_STREAM_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining && !exceeded {
+            exceeded = true;
+            let _ = overflow.send(());
+        }
+    }
+    Ok(BoundedCommandStream { bytes, exceeded })
+}
+
 fn run_brokered_command(
     cwd: &Path,
     argv: &[String],
@@ -2533,20 +2563,10 @@ fn run_brokered_command(
         .stderr
         .take()
         .ok_or_else(|| "stderr unavailable".to_string())?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut value = Vec::new();
-        stdout
-            .take((HOST_MAX_COMMAND_STREAM_BYTES + 1) as u64)
-            .read_to_end(&mut value)
-            .map(|_| value)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut value = Vec::new();
-        stderr
-            .take((HOST_MAX_COMMAND_STREAM_BYTES + 1) as u64)
-            .read_to_end(&mut value)
-            .map(|_| value)
-    });
+    let (overflow_sender, overflow_receiver) = mpsc::channel();
+    let stdout_overflow = overflow_sender.clone();
+    let stdout_reader = std::thread::spawn(move || read_command_stream(stdout, stdout_overflow));
+    let stderr_reader = std::thread::spawn(move || read_command_stream(stderr, overflow_sender));
     if let Some(mut input) = child.stdin.take() {
         let bytes = stdin.as_bytes().to_vec();
         let (sender, receiver) = mpsc::channel();
@@ -2554,24 +2574,43 @@ fn run_brokered_command(
             let result = input.write_all(&bytes);
             let _ = sender.send(result);
         });
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(remaining) {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+        loop {
+            if overflow_receiver.try_recv().is_ok() {
                 tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("approved command input failed".to_string());
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("approved command output exceeds its limit".to_string());
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err("approved command timed out".to_string());
             }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(2))) {
+                Ok(Ok(())) => break,
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    tree.terminate();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("approved command input failed".to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
     let status = loop {
+        if overflow_receiver.try_recv().is_ok() {
+            tree.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("approved command output exceeds its limit".to_string());
+        }
         if let Some(status) = child
             .try_wait()
             .map_err(|_| "approved command wait failed".to_string())?
@@ -2597,15 +2636,14 @@ fn run_brokered_command(
         .join()
         .map_err(|_| "approved command error output failed".to_string())?
         .map_err(|_| "approved command error output failed".to_string())?;
-    if stdout.len() > HOST_MAX_COMMAND_STREAM_BYTES || stderr.len() > HOST_MAX_COMMAND_STREAM_BYTES
-    {
+    if stdout.exceeded || stderr.exceeded {
         return Err("approved command output exceeds its limit".to_string());
     }
     Ok(json!({
         "status": status.code(),
         "success": status.success(),
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
+        "stdout": String::from_utf8_lossy(&stdout.bytes),
+        "stderr": String::from_utf8_lossy(&stderr.bytes),
     }))
 }
 
@@ -3625,6 +3663,13 @@ fn plugin_id(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn oversized_output_command() -> Option<Vec<String>> {
+        let bytes = HOST_MAX_COMMAND_STREAM_BYTES + 64 * 1024;
+        python_protocol_fixture(&format!(
+            "import sys; sys.stdout.buffer.write(b'x' * {bytes})"
+        ))
+    }
+
     #[test]
     fn windows_command_plugins_accept_batch_shims_only() {
         for extension in [".EXE", "com", ".CMD", "bat"] {
@@ -3772,9 +3817,9 @@ mod tests {
     }
 
     #[test]
-    fn command_program_cold_start_consumes_the_chain_deadline() {
+    fn command_program_warm_request_uses_request_timeout_after_cold_start() {
         let Some(command) = python_protocol_fixture(
-            "import json,sys,time; time.sleep(0.15);\nfor line in sys.stdin:\n r=json.loads(line); time.sleep(0.10); print(json.dumps({'id':r['id']}), flush=True)",
+            "import json,sys,time\nfor index,line in enumerate(sys.stdin):\n r=json.loads(line)\n if index: time.sleep(2)\n print(json.dumps({'id':r['id']}), flush=True)",
         ) else {
             return;
         };
@@ -3980,6 +4025,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("mismatched protocol response"), "{error}");
+    }
+
+    #[test]
+    fn brokered_command_fails_promptly_when_output_exceeds_limit() {
+        let Some(command) = oversized_output_command() else {
+            return;
+        };
+        let started = Instant::now();
+        let error = run_brokered_command(
+            &std::env::current_dir().unwrap(),
+            &command,
+            "",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("output exceeds its limit"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
