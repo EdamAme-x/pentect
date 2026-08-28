@@ -15,6 +15,7 @@ mod http_files;
 mod ide_clients;
 mod input;
 mod installation;
+mod model_definition;
 mod openai_client_injection;
 mod openai_clients;
 mod openai_http_proxy;

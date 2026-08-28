@@ -1726,8 +1726,7 @@ fn mask_openai_request(
     // every string value is potentially model-visible text.
     for field in ["tools", "functions", "response_format"] {
         if let Some(definition) = value.get_mut(field) {
-            let mut nodes = 0_usize;
-            mask_model_definition(definition, 0, &mut nodes, masker)?;
+            crate::model_definition::mask_model_definition(definition, "OpenAI", masker)?;
         }
     }
     // Standalone search commands are derived from the current user request.
@@ -1857,43 +1856,6 @@ fn mask_search_value(
         Value::Object(object) => {
             for item in object.values_mut() {
                 mask_search_value(item, external_content, depth + 1, nodes, masker)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn mask_model_definition(
-    value: &mut Value,
-    depth: usize,
-    nodes: &mut usize,
-    masker: &mut pentect_agent::ActiveToolOutputMasker,
-) -> Result<(), String> {
-    const MAX_DEFINITION_DEPTH: usize = 64;
-    const MAX_DEFINITION_NODES: usize = 65_536;
-    if depth > MAX_DEFINITION_DEPTH {
-        return Err("OpenAI model definition exceeds nesting limit".to_string());
-    }
-    *nodes = nodes
-        .checked_add(1)
-        .ok_or_else(|| "OpenAI model definition is too large".to_string())?;
-    if *nodes > MAX_DEFINITION_NODES {
-        return Err("OpenAI model definition exceeds item limit".to_string());
-    }
-    match value {
-        // Tool definitions can originate from an MCP server or extension.
-        // Treat them as external content so they cannot opt out of masking.
-        Value::String(text) => mask_text(text, true, masker),
-        Value::Array(items) => {
-            for item in items {
-                mask_model_definition(item, depth + 1, nodes, masker)?;
-            }
-            Ok(())
-        }
-        Value::Object(object) => {
-            for item in object.values_mut() {
-                mask_model_definition(item, depth + 1, nodes, masker)?;
             }
             Ok(())
         }
@@ -3957,8 +3919,8 @@ mod tests {
         let mut definition = serde_json::json!({
             "description": format!("unmask({})", messages[3]["content"].as_str().unwrap())
         });
-        let mut nodes = 0;
-        mask_model_definition(&mut definition, 0, &mut nodes, &mut masker).unwrap();
+        crate::model_definition::mask_model_definition(&mut definition, "OpenAI", &mut masker)
+            .unwrap();
         let description = definition["description"].as_str().unwrap();
         assert!(!description.contains(messages[3]["content"].as_str().unwrap()));
         assert!(description.contains("<<"));
