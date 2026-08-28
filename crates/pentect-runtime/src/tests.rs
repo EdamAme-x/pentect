@@ -1433,6 +1433,18 @@ fn exec_injects_powershell_env_provider_references() {
 }
 
 #[test]
+fn braced_powershell_environment_reference_excludes_provider_prefix() {
+    assert_eq!(
+        environment_reference_at("${env:PENTECT_KEY_123}", 0),
+        Some((22, "PENTECT_KEY_123"))
+    );
+    assert_eq!(
+        environment_reference_at("${ENV:PENTECT_KEY_123}", 0),
+        Some((22, "PENTECT_KEY_123"))
+    );
+}
+
+#[test]
 fn auto_env_bindings_do_not_override_baseline_environment() {
     let root = temp_root("capability-reserved-env-binding");
     let session = Session::open_capability_at(&root, "t").unwrap();

@@ -188,10 +188,16 @@ pub(crate) fn header_overrides_with_bearer_env(
 
 pub(crate) fn hide_header_source_env(command: &mut std::process::Command, specs: &[String]) {
     for spec in specs {
-        if let Some((_, env_name)) = spec.split_once('=') {
-            command.env_remove(env_name.trim());
+        if let Some(env_name) = header_source_env_name(spec) {
+            command.env_remove(env_name);
         }
     }
+}
+
+pub(crate) fn header_source_env_name(spec: &str) -> Option<&str> {
+    let (_, env_name) = spec.split_once('=')?;
+    let env_name = env_name.trim();
+    (!env_name.is_empty()).then_some(env_name)
 }
 
 fn is_origin_auth_header(name: &str) -> bool {
@@ -279,7 +285,8 @@ pub(crate) fn join_url(
     let mut without_query = base.clone();
     without_query.set_query(None);
     let mut joined = without_query.as_str().trim_end_matches('/').to_string();
-    if !request_path.starts_with('/') {
+    let request_path = strip_duplicate_api_version(&without_query, request_path);
+    if !request_path.starts_with('/') && !request_path.is_empty() {
         joined.push('/');
     }
     joined.push_str(request_path);
@@ -295,6 +302,24 @@ pub(crate) fn join_url(
     };
     joined.set_query(query.as_deref());
     Ok(joined)
+}
+
+fn strip_duplicate_api_version<'a>(base: &reqwest::Url, request_path: &'a str) -> &'a str {
+    let request = request_path.trim_start_matches('/');
+    let (first, remainder) = request.split_once('/').unwrap_or((request, ""));
+    let is_version = first
+        .strip_prefix('v')
+        .and_then(|suffix| suffix.as_bytes().first())
+        .is_some_and(u8::is_ascii_digit)
+        && first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    let base_last = base.path().trim_end_matches('/').rsplit('/').next();
+    if is_version && base_last == Some(first) {
+        remainder
+    } else {
+        request_path
+    }
 }
 
 pub(crate) fn client(protocol: &str) -> Result<reqwest::Client, String> {
@@ -389,6 +414,37 @@ mod tests {
                 .as_str(),
             "http://localhost:8080/anthropic/v1/messages"
         );
+    }
+
+    #[test]
+    fn duplicate_api_version_prefix_is_joined_once() {
+        let base = parse_base("https://gateway.example/openai/v1", "OpenAI Responses").unwrap();
+        assert_eq!(
+            join_url(
+                &base,
+                "/v1/chat/completions?stream=true",
+                "OpenAI Responses"
+            )
+            .unwrap()
+            .as_str(),
+            "https://gateway.example/openai/v1/chat/completions?stream=true"
+        );
+        assert_eq!(
+            join_url(&base, "/api/v1/chat/completions", "OpenAI Responses")
+                .unwrap()
+                .as_str(),
+            "https://gateway.example/openai/v1/api/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn header_source_env_name_extracts_only_the_environment_name() {
+        assert_eq!(
+            header_source_env_name("x-api-key= ANTHROPIC_API_KEY "),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(header_source_env_name("x-api-key="), None);
+        assert_eq!(header_source_env_name("ANTHROPIC_API_KEY"), None);
     }
 
     #[test]

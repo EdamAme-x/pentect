@@ -566,7 +566,13 @@ fn environment_reference_at(text: &str, start: usize) -> Option<(usize, &str)> {
             return (end > name_start).then(|| (end, &text[name_start..end]));
         }
         if bytes.get(start + 1) == Some(&b'{') {
-            let name_start = start + 2;
+            let mut name_start = start + 2;
+            if bytes
+                .get(name_start..name_start.saturating_add(4))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"env:"))
+            {
+                name_start += 4;
+            }
             let end = env_name_end(bytes, name_start);
             if end > name_start && bytes.get(end) == Some(&b'}') {
                 return Some((end + 1, &text[name_start..end]));
