@@ -1206,6 +1206,7 @@ fn rewrite_sse_block(
     } else {
         "\n\n"
     };
+    let line_ending = if ending == "\r\n\r\n" { "\r\n" } else { "\n" };
     let metadata = text
         .lines()
         .filter(|line| !line.starts_with("data:"))
@@ -1214,7 +1215,7 @@ fn rewrite_sse_block(
     let mut output = String::new();
     for line in metadata {
         output.push_str(line);
-        output.push('\n');
+        output.push_str(line_ending);
     }
     output.push_str("data: ");
     output.push_str(&encoded);
@@ -2074,5 +2075,22 @@ mod tests {
         let protected = std::str::from_utf8(&protected.body).unwrap();
         assert!(!protected.contains(&secret));
         assert!(protected.matches("<<").count() >= 2);
+    }
+
+    #[test]
+    fn rewritten_crlf_sse_keeps_crlf_metadata_lines() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let rewritten = rewrite_sse_block(
+            b"event: message\r\ndata: {\"response\":{\"candidates\":[]}}\r\n\r\n",
+            &plugins,
+            true,
+        )
+        .unwrap();
+        let rewritten = std::str::from_utf8(&rewritten).unwrap();
+        assert!(
+            rewritten.starts_with("event: message\r\ndata: "),
+            "{rewritten:?}"
+        );
+        assert!(rewritten.ends_with("\r\n\r\n"), "{rewritten:?}");
     }
 }

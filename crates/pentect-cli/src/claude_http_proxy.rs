@@ -648,7 +648,10 @@ fn run_anthropic_tool_plugins(
             }
         }
         Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("tool_use")
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(anthropic_tool_block_type)
                 && object.get("input").is_some()
             {
                 let run = plugins.run(
@@ -676,6 +679,10 @@ fn run_anthropic_tool_plugins(
         _ => {}
     }
     Ok(())
+}
+
+fn anthropic_tool_block_type(block_type: &str) -> bool {
+    matches!(block_type, "tool_use" | "mcp_tool_use" | "server_tool_use")
 }
 
 async fn resolve_anthropic_remote_content(
@@ -3772,6 +3779,15 @@ mod tests {
         assert!(!is_media_policy_rejection(
             "detector temporarily unavailable"
         ));
+    }
+
+    #[test]
+    fn all_anthropic_tool_use_block_types_enter_tool_middleware() {
+        for block_type in ["tool_use", "mcp_tool_use", "server_tool_use"] {
+            assert!(anthropic_tool_block_type(block_type), "{block_type}");
+        }
+        assert!(!anthropic_tool_block_type("tool_result"));
+        assert!(!anthropic_tool_block_type("mcp_tool_result"));
     }
 
     fn join_bytes(chunks: Vec<Bytes>) -> String {

@@ -2131,13 +2131,13 @@ fn blur_rect(image: &mut image::RgbaImage, rect: PixelRect) {
     let tiny = image::imageops::resize(&crop, tiny_width, tiny_height, FilterType::Triangle);
     let mut redacted =
         image::imageops::resize(&tiny, rect.width, rect.height, FilterType::Triangle);
-    for pixel in redacted.pixels_mut() {
+    for (x, y, pixel) in redacted.enumerate_pixels_mut() {
         let channels = pixel.0;
         pixel.0 = [
             dim_redaction_channel(channels[0]),
             dim_redaction_channel(channels[1]),
             dim_redaction_channel(channels[2]),
-            255,
+            crop.get_pixel(x, y).0[3],
         ];
     }
     image::imageops::replace(image, &redacted, i64::from(rect.left), i64::from(rect.top));
@@ -3638,6 +3638,27 @@ mod tests {
         let outside = image.get_pixel(250, 140).0;
         assert_ne!([inside[0], inside[1], inside[2]], [220, 80, 80]);
         assert_eq!([outside[0], outside[1], outside[2]], [220, 190, 80]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn blur_redaction_preserves_alpha_channel() {
+        let mut image =
+            image::RgbaImage::from_fn(8, 8, |x, y| image::Rgba([120, 80, 40, (x + y * 8) as u8]));
+        let original_alpha = image.pixels().map(|pixel| pixel.0[3]).collect::<Vec<_>>();
+        blur_rect(
+            &mut image,
+            PixelRect {
+                left: 0,
+                top: 0,
+                width: 8,
+                height: 8,
+            },
+        );
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[3]).collect::<Vec<_>>(),
+            original_alpha
+        );
     }
 
     #[cfg(feature = "ocr")]

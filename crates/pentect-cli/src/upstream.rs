@@ -3,6 +3,8 @@
 use std::path::Path;
 use zeroize::Zeroize;
 
+const UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 const CA_CERT_ENV: &str = "PENTECT_UPSTREAM_CA_CERT";
 const IDENTITY_ENV: &str = "PENTECT_UPSTREAM_IDENTITY";
 const AUTHORIZATION_ENV: &str = "PENTECT_UPSTREAM_AUTHORIZATION";
@@ -326,7 +328,7 @@ pub(crate) fn client(protocol: &str) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(60))
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .tcp_nodelay(true);
 
@@ -445,6 +447,11 @@ mod tests {
         );
         assert_eq!(header_source_env_name("x-api-key="), None);
         assert_eq!(header_source_env_name("ANTHROPIC_API_KEY"), None);
+    }
+
+    #[test]
+    fn upstream_read_timeout_allows_long_reasoning_gaps() {
+        assert_eq!(UPSTREAM_READ_TIMEOUT, std::time::Duration::from_secs(600));
     }
 
     #[test]
