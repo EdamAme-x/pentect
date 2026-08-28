@@ -1082,7 +1082,7 @@ fn inject_handle_contract(value: &mut Value, endpoint: AnthropicEndpoint) {
     if endpoint == AnthropicEndpoint::Complete {
         if let Some(prompt) = value
             .get_mut("prompt")
-            .and_then(Value::as_str)
+            .and_then(|prompt| prompt.as_str())
             .map(str::to_owned)
         {
             if !prompt.contains(HANDLE_CONTRACT) {
@@ -1599,7 +1599,7 @@ fn mask_anthropic_request(
     if endpoint == AnthropicEndpoint::Complete {
         let prompt = value
             .get_mut("prompt")
-            .and_then(Value::as_str)
+            .and_then(|prompt| prompt.as_str())
             .ok_or_else(|| "completion request requires a string prompt".to_string())?
             .to_string();
         let mut protected = prompt;
