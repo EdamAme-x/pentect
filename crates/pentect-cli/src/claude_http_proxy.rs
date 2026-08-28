@@ -1043,7 +1043,7 @@ fn anthropic_content_unknown_block_kind(value: &Value) -> Option<&str> {
         if !known {
             return Some(kind);
         }
-        if kind == "tool_result" {
+        if matches!(kind, "tool_result" | "mcp_tool_result") {
             return block
                 .get("content")
                 .and_then(anthropic_content_unknown_block_kind);
@@ -1737,7 +1737,7 @@ fn redact_content_images(
     for mut block in original {
         let note = match block.get("type").and_then(Value::as_str) {
             Some("image") => redact_base64_image_block(&mut block, files)?,
-            Some("tool_result") => {
+            Some("tool_result" | "mcp_tool_result") => {
                 if let Some(nested) = block.get_mut("content") {
                     redact_content_images(nested, files)?;
                 }
@@ -1855,14 +1855,26 @@ fn mask_content(
                             block["text"] = Value::String(protected);
                         }
                     }
-                    "tool_result" => {
+                    "tool_result" | "mcp_tool_result" => {
                         if let Some(content) = block.get_mut("content") {
                             mask_content(content, true, masker, files)?;
                         }
                     }
-                    "tool_use" => {
+                    "tool_use" | "mcp_tool_use" | "server_tool_use" => {
                         if let Some(input) = block.get_mut("input") {
                             mask_value_strings(input, masker)?;
+                        }
+                    }
+                    "code_execution_tool_result"
+                    | "bash_code_execution_tool_result"
+                    | "text_editor_code_execution_tool_result" => {
+                        if let Some(content) = block.get_mut("content") {
+                            mask_execution_result_content(content, masker)?;
+                        }
+                        // Older beta clients used `output` directly instead of
+                        // the current typed `content` result object.
+                        if let Some(output) = block.get_mut("output") {
+                            mask_value_strings(output, masker)?;
                         }
                     }
                     "document" => mask_document_block(block, tool_result, masker, files)?,
@@ -1882,15 +1894,9 @@ fn mask_content(
                     "image"
                     | "thinking"
                     | "redacted_thinking"
-                    | "server_tool_use"
-                    | "mcp_tool_use"
-                    | "mcp_tool_result"
                     | "tool_search_tool_result"
                     | "web_search_tool_result"
                     | "web_fetch_tool_result"
-                    | "code_execution_tool_result"
-                    | "bash_code_execution_tool_result"
-                    | "text_editor_code_execution_tool_result"
                     | "connector_text"
                     | "fallback" => {}
                     _ => {
@@ -1904,6 +1910,42 @@ fn mask_content(
         }
         _ => Ok(()),
     }
+}
+
+fn mask_execution_result_content(
+    content: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let result_type = content
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match result_type {
+        "bash_code_execution_result" | "code_execution_result" => {
+            mask_named_text(content, "stdout", true, masker)?;
+            mask_named_text(content, "stderr", true, masker)?;
+        }
+        "encrypted_code_execution_result" => {
+            // `encrypted_stdout` is provider state and must remain byte-for-byte
+            // intact for a paused server-tool turn to resume.
+            mask_named_text(content, "stderr", true, masker)?;
+        }
+        "text_editor_code_execution_view_result" => {
+            if content.get("file_type").and_then(Value::as_str) == Some("text") {
+                mask_named_text(content, "content", true, masker)?;
+            }
+        }
+        "text_editor_code_execution_str_replace_result" => {
+            if let Some(lines) = content.get_mut("lines") {
+                mask_value_strings(lines, masker)?;
+            }
+        }
+        "text_editor_code_execution_tool_result_error" => {
+            mask_named_text(content, "error_message", true, masker)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn mask_document_block(
@@ -3835,6 +3877,69 @@ mod tests {
         assert!(first_valid_handle(prompt).is_some());
         assert!(prompt.contains(HANDLE_CONTRACT));
         assert!(protected.get("system").is_none());
+    }
+
+    #[test]
+    fn mcp_and_execution_history_masks_only_plaintext_payload_fields() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["AKIA", "CSVC3FV5", "KQHYWH8A"].concat();
+        let encrypted = "opaque-provider-state-must-not-change";
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test",
+                "max_tokens": 8,
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "mcp_tool_use", "id": "mcp_1", "name": "read_file", "server_name": "files", "input": {"path": secret}},
+                        {"type": "server_tool_use", "id": "srv_1", "name": "code_execution", "input": {"code": secret}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "mcp_tool_result", "tool_use_id": "mcp_1", "content": [{"type": "text", "text": secret}]},
+                        {"type": "bash_code_execution_tool_result", "tool_use_id": "bash_1", "content": {"type": "bash_code_execution_result", "content": [], "return_code": 0, "stdout": secret, "stderr": secret}},
+                        {"type": "code_execution_tool_result", "tool_use_id": "code_1", "content": {"type": "encrypted_code_execution_result", "content": [], "return_code": 0, "encrypted_stdout": encrypted, "stderr": secret}},
+                        {"type": "text_editor_code_execution_tool_result", "tool_use_id": "edit_1", "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": secret}},
+                        {"type": "text_editor_code_execution_tool_result", "tool_use_id": "edit_2", "content": {"type": "text_editor_code_execution_str_replace_result", "lines": [secret]}},
+                        {"type": "bash_code_execution_tool_result", "tool_use_id": "legacy_1", "output": secret}
+                    ]}
+                ]
+            }))
+            .unwrap(),
+        );
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let protected = protect_anthropic_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            AnthropicEndpoint::Messages,
+            true,
+        )
+        .unwrap();
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert!(!protected.to_string().contains(&secret), "{protected}");
+        assert_eq!(
+            protected["messages"][1]["content"][2]["content"]["encrypted_stdout"],
+            encrypted
+        );
+    }
+
+    #[test]
+    fn mcp_tool_result_images_enter_the_unscanned_image_policy() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let mut content = serde_json::json!([{
+            "type": "mcp_tool_result",
+            "tool_use_id": "mcp_1",
+            "content": [{"type": "image", "source": {"type": "file_id", "file_id": "unknown"}}]
+        }]);
+        assert_eq!(
+            redact_content_images(&mut content, &HashMap::new()).unwrap_err(),
+            "image blocked: image source could not be scanned"
+        );
     }
 
     #[test]
