@@ -1,0 +1,110 @@
+name: Warm release compiler cache
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "tools/alcatraz-helper/**"
+      - ".github/actions/rust-toolchain/**"
+      - ".github/workflows/release-cache.yml"
+      - ".github/workflows/release.yml"
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-release-compiler-cache-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'EdamAme-x/pentect'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: pentect-windows-x86_64.exe
+          - os: ubuntu-22.04
+            asset: pentect-linux-x86_64
+          - os: ubuntu-22.04-arm
+            asset: pentect-linux-aarch64
+          - os: macos-15-intel
+            asset: pentect-macos-x86_64
+          - os: macos-15
+            asset: pentect-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/alcatraz-helper/go.mod
+          cache-dependency-path: tools/alcatraz-helper/go.sum
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-${{ matrix.asset }}
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+        with:
+          version: "v0.17.0"
+      - name: Build release profile
+        id: release-build
+        shell: pwsh
+        env:
+          PENTECT_REQUIRE_ALCATRAZ: "1"
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_VERSION: pentect-release-v1-${{ matrix.asset }}
+        run: |
+          & $env:SCCACHE_PATH --zero-stats
+          if ($LASTEXITCODE -ne 0) { throw 'could not reset sccache statistics' }
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          cargo build --release --locked --timings -p pentect-cli
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          "Release cache warm-up elapsed: $($timer.Elapsed)"
+          "elapsed_seconds=$([Math]::Round($timer.Elapsed.TotalSeconds, 3))" >> $env:GITHUB_OUTPUT
+          if ($exitCode -ne 0) { exit $exitCode }
+      - name: Record compiler cache statistics
+        if: always()
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_VERSION: pentect-release-v1-${{ matrix.asset }}
+        run: |
+          $stats = (& $env:SCCACHE_PATH --show-stats 2>&1 | Out-String).Trim()
+          $exitCode = $LASTEXITCODE
+          $stats
+          $stats | Set-Content -Encoding utf8 sccache-stats.txt
+          @"
+          ### ${{ matrix.asset }} compiler cache
+
+          - Release build: `${{ steps.release-build.outputs.elapsed_seconds }}` seconds
+
+          ``````text
+          $stats
+          ``````
+          "@ >> $env:GITHUB_STEP_SUMMARY
+          if ($exitCode -ne 0) { exit $exitCode }
+      - name: Upload cache warm-up diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-cache-diagnostics-${{ matrix.asset }}
+          path: |
+            target/cargo-timings/*.html
+            sccache-stats.txt
+          if-no-files-found: warn
+          retention-days: 7
