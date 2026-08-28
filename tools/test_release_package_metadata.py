@@ -79,6 +79,12 @@ def main() -> None:
         assert path in release_workflow
     assert 'git diff --quiet -- "${metadata_paths[@]}"' in release_workflow
     assert 'git add "${metadata_paths[@]}"' in release_workflow
+    assert (
+        "run: |\n"
+        "          sh tools/download_recent_stable_debs.sh debs 2\n"
+        "          test -n \"$(find debs -name 'pentect_*.deb' -print -quit)\""
+        in release_workflow
+    )
 
 
 if __name__ == "__main__":
