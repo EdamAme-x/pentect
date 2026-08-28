@@ -444,16 +444,25 @@ fn profile_path(shell: ShellKind) -> Result<PathBuf, String> {
 }
 
 fn posix_profile_path(shell: ShellKind) -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is unavailable".to_string())?;
+    let home = profile_home(
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+    )?;
+    profile_path_under_home(shell, &home)
+}
+
+fn profile_home(home: Option<PathBuf>, user_profile: Option<PathBuf>) -> Result<PathBuf, String> {
+    home.or(user_profile)
+        .ok_or_else(|| "HOME and USERPROFILE are unavailable".to_string())
+}
+
+fn profile_path_under_home(shell: ShellKind, home: &Path) -> Result<PathBuf, String> {
     match shell {
         ShellKind::Bash => Ok(home.join(".bashrc")),
         ShellKind::Zsh => Ok(home.join(".zshrc")),
         ShellKind::Fish => Ok(home.join(".config").join("fish").join("config.fish")),
-        ShellKind::PowerShell | ShellKind::Pwsh => {
-            Err("PowerShell profiles require Windows".to_string())
-        }
+        ShellKind::Pwsh => Ok(home.join(".config").join("powershell").join("profile.ps1")),
+        ShellKind::PowerShell => Err("Windows PowerShell requires Windows".to_string()),
     }
 }
 
@@ -470,6 +479,29 @@ mod tests {
         );
         assert_eq!(shell_kind_from_name("/usr/bin/zsh"), Some(ShellKind::Zsh));
         assert_eq!(shell_kind_from_name("cmd.exe"), None);
+    }
+
+    #[test]
+    fn posix_pwsh_uses_current_user_all_hosts_profile() {
+        let home = Path::new("/home/pentect");
+        assert_eq!(
+            profile_path_under_home(ShellKind::Pwsh, home).unwrap(),
+            home.join(".config").join("powershell").join("profile.ps1")
+        );
+        assert!(profile_path_under_home(ShellKind::PowerShell, home).is_err());
+    }
+
+    #[test]
+    fn profile_home_prefers_home_and_falls_back_to_user_profile() {
+        assert_eq!(
+            profile_home(Some(PathBuf::from("home")), Some(PathBuf::from("user"))).unwrap(),
+            PathBuf::from("home")
+        );
+        assert_eq!(
+            profile_home(None, Some(PathBuf::from("user"))).unwrap(),
+            PathBuf::from("user")
+        );
+        assert!(profile_home(None, None).is_err());
     }
 
     #[test]
