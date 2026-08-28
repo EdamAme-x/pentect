@@ -799,13 +799,14 @@ fn rewrite_sse_block(
     } else {
         "\n\n"
     };
+    let line_ending = if ending == "\r\n\r\n" { "\r\n" } else { "\n" };
     let mut out = Vec::with_capacity(block.len() + 32);
     for line in text
         .lines()
         .filter(|line| !line.starts_with("data:") && !line.is_empty())
     {
         out.extend_from_slice(line.as_bytes());
-        out.push(b'\n');
+        out.extend_from_slice(line_ending.as_bytes());
     }
     out.extend_from_slice(b"data: ");
     out.extend_from_slice(&rewritten);
@@ -876,6 +877,7 @@ fn should_forward_request_header(name: &str) -> bool {
             | "connection"
             | "proxy-connection"
             | "keep-alive"
+            | "accept-encoding"
             | "transfer-encoding"
             | "upgrade"
             | "te"
@@ -1213,5 +1215,28 @@ mod tests {
             response["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["token"],
             secret
         );
+    }
+
+    #[test]
+    fn compressed_upstream_responses_are_not_requested() {
+        assert!(!should_forward_request_header("Accept-Encoding"));
+        assert!(should_forward_request_header("Accept"));
+    }
+
+    #[test]
+    fn rewritten_crlf_sse_keeps_crlf_metadata_lines() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let rewritten = rewrite_sse_block(
+            b"event: message\r\ndata: {\"candidates\":[]}\r\n\r\n",
+            &plugins,
+            true,
+        )
+        .unwrap();
+        let rewritten = std::str::from_utf8(&rewritten).unwrap();
+        assert!(
+            rewritten.starts_with("event: message\r\ndata: "),
+            "{rewritten:?}"
+        );
+        assert!(rewritten.ends_with("\r\n\r\n"), "{rewritten:?}");
     }
 }

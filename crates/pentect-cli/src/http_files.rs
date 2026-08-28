@@ -1261,7 +1261,10 @@ pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> b
                 value.as_str(),
                 "application/json"
                     | "application/jsonl"
+                    | "application/javascript"
+                    | "application/typescript"
                     | "application/x-ndjson"
+                    | "application/toml"
                     | "application/xml"
                     | "application/yaml"
                     | "application/x-yaml"
@@ -1269,8 +1272,32 @@ pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> b
     }) {
         return true;
     }
-    Path::new(filename)
-        .extension()
+    let path = Path::new(filename);
+    if path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "dockerfile"
+                    | "makefile"
+                    | "justfile"
+                    | "procfile"
+                    | "gemfile"
+                    | "rakefile"
+                    | ".gitignore"
+                    | ".dockerignore"
+                    | ".editorconfig"
+                    | ".npmrc"
+                    | ".yarnrc"
+                    | ".prettierrc"
+                    | ".eslintrc"
+            )
+        })
+    {
+        return true;
+    }
+    path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|extension| {
             matches!(
@@ -1288,6 +1315,64 @@ pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> b
                     | "yml"
                     | "env"
                     | "log"
+                    | "py"
+                    | "pyi"
+                    | "js"
+                    | "mjs"
+                    | "cjs"
+                    | "jsx"
+                    | "ts"
+                    | "mts"
+                    | "cts"
+                    | "tsx"
+                    | "rs"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "c"
+                    | "h"
+                    | "cc"
+                    | "cpp"
+                    | "cxx"
+                    | "hh"
+                    | "hpp"
+                    | "hxx"
+                    | "cs"
+                    | "swift"
+                    | "scala"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "ps1"
+                    | "psm1"
+                    | "bat"
+                    | "cmd"
+                    | "toml"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+                    | "properties"
+                    | "sql"
+                    | "rb"
+                    | "php"
+                    | "pl"
+                    | "pm"
+                    | "lua"
+                    | "r"
+                    | "vue"
+                    | "svelte"
+                    | "astro"
+                    | "css"
+                    | "scss"
+                    | "sass"
+                    | "less"
+                    | "html"
+                    | "htm"
+                    | "graphql"
+                    | "gql"
+                    | "proto"
             )
         })
 }
@@ -1321,6 +1406,22 @@ mod tests {
     fn recognizes_text_files_without_trusting_only_content_type() {
         assert!(supported_text_file("secrets.env", None));
         assert!(supported_text_file("payload.bin", Some("application/json")));
+        for filename in [
+            "main.py",
+            "lib.rs",
+            "app.tsx",
+            "main.go",
+            "build.ps1",
+            "Cargo.toml",
+            "schema.sql",
+            "Dockerfile",
+            ".gitignore",
+        ] {
+            assert!(
+                supported_text_file(filename, Some("application/octet-stream")),
+                "{filename}"
+            );
+        }
         assert!(!supported_text_file("report.pdf", Some("application/pdf")));
         assert!(supported_image_file("photo.jpg", None));
         assert!(supported_image_file("upload.bin", Some("image/png")));
