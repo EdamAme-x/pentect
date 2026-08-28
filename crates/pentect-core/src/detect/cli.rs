@@ -95,11 +95,17 @@ fn inspect_convert_to_secure_string(
     {
         return;
     }
-    let Some(value) = tokens[command_index + 1..]
-        .iter()
-        .take_while(|token| !token.value.starts_with('-'))
-        .find(|token| !token.value.is_empty())
-    else {
+    let arguments = &tokens[command_index + 1..];
+    let value = arguments
+        .windows(2)
+        .find(|pair| pair[0].value.eq_ignore_ascii_case("-String"))
+        .map(|pair| &pair[1])
+        .or_else(|| {
+            arguments
+                .iter()
+                .find(|token| !token.value.is_empty() && !token.value.starts_with('-'))
+        });
+    let Some(value) = value else {
         return;
     };
     push_cli_password(view, out, value, 0);
@@ -248,6 +254,21 @@ mod tests {
         assert_eq!(
             labels("$password = ConvertTo-SecureString 'xngveqs' -AsPlainText -Force;"),
             [("CMD_PASSWORD".to_string(), "xngveqs".to_string())]
+        );
+        assert_eq!(
+            labels("$password = ConvertTo-SecureString -AsPlainText 'MySuperSecret123!' -Force;"),
+            [("CMD_PASSWORD".to_string(), "MySuperSecret123!".to_string())]
+        );
+        assert_eq!(
+            labels(
+                "$password = ConvertTo-SecureString -Force -String '-starts-with-dash' -AsPlainText;"
+            ),
+            [
+                (
+                    "CMD_PASSWORD".to_string(),
+                    "-starts-with-dash".to_string()
+                )
+            ]
         );
     }
 

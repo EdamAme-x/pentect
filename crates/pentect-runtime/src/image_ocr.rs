@@ -2306,10 +2306,7 @@ fn looks_like_base64_image(text: &str) -> bool {
 fn looks_like_base64_image_field_value(text: &str) -> bool {
     let compact = compact_base64(text);
     compact.len() >= 16
-        && compact.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
-        })
+        && decode_base64_prefix(&compact).is_some_and(|prefix| image_signature(&prefix).is_some())
 }
 
 fn decode_base64_limited(text: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
@@ -3127,6 +3124,19 @@ pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::config::{ImageOcrMode, ImageRedactionStyle, UnscannedImagePolicy};
+
+    #[test]
+    fn generic_base64_shaped_fields_require_an_image_signature() {
+        for key in ["data", "bytes", "base64", "imageData", "dataUrl"] {
+            assert!(
+                !skip_text_masking_for_image_field(key, "ghp_0123456789abcdef0123456789abcdef0123"),
+                "{key} must not exempt a token from text masking"
+            );
+        }
+
+        let png_header = data_encoding::BASE64.encode(b"\x89PNG\r\n\x1a\nheader");
+        assert!(skip_text_masking_for_image_field("data", &png_header));
+    }
 
     fn test_config() -> ImageOcrConfig {
         ImageOcrConfig {
