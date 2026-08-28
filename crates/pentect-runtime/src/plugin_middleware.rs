@@ -3665,7 +3665,9 @@ mod tests {
 
     fn oversized_output_command() -> Option<Vec<String>> {
         let bytes = HOST_MAX_COMMAND_STREAM_BYTES + 64 * 1024;
-        python_protocol_fixture(&format!("import sys; sys.stdout.buffer.write(b'x' * {bytes})"))
+        python_protocol_fixture(&format!(
+            "import sys; sys.stdout.buffer.write(b'x' * {bytes})"
+        ))
     }
 
     #[test]
