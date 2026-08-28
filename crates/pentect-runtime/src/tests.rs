@@ -2026,7 +2026,10 @@ fn write_tool_applies_edit_with_masked_old_string_before_tool() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    assert_eq!(
+        output["hookSpecificOutput"]["permissionDecision"], "allow",
+        "{output}"
+    );
     let updated = &output["hookSpecificOutput"]["updatedInput"];
     let old_string = updated["old_string"].as_str().unwrap();
     let new_string = updated["new_string"].as_str().unwrap();
