@@ -214,7 +214,10 @@ fn check_config(name: &'static str, path: PathBuf) -> Check {
             format!("{} uses removed settings", path.display()),
             Repair::MigrateConfig { path },
         ),
-        Ok(None) => Check::ok(name, "ready"),
+        Ok(None) => match pentect_agent::validate_config_file(&path) {
+            Ok(()) => Check::ok(name, "ready"),
+            Err(error) => Check::fail(name, format!("{}: {error}", path.display())),
+        },
         Err(error) => Check::fail(name, format!("{}: {error}", path.display())),
     }
 }
@@ -227,6 +230,15 @@ fn migrate_removed_config_keys(source: &str) -> Result<Option<String>, String> {
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format!("invalid TOML: {error}"))?;
     let mut changed = false;
+
+    if table_has(&document, "environment", "prefix") {
+        let environment = ensure_table(&mut document, "environment")?;
+        environment.remove("prefix");
+        if environment.is_empty() {
+            document.remove("environment");
+        }
+        changed = true;
+    }
 
     if table_has(&document, "handles", "hash_scope") {
         let scope = table_string(&document, "handles", "hash_scope")
@@ -790,6 +802,42 @@ mod tests {
         assert!(migrate_removed_config_keys("[handles]\nhash_scope = \"team\"\n").is_err());
         assert!(migrate_removed_config_keys("[handles]\nhash_scope = 1\n").is_err());
         assert!(migrate_removed_config_keys("not = = toml").is_err());
+    }
+
+    #[test]
+    fn removed_environment_prefix_is_discarded() {
+        let migrated = migrate_removed_config_keys(
+            "[environment]\nprefix = \"PRIVATE_\"\n\n[output]\nrestore = true\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!migrated.contains("environment"), "{migrated}");
+        assert!(migrated.contains("[output]"), "{migrated}");
+        assert!(migrated.contains("restore = true"), "{migrated}");
+    }
+
+    #[test]
+    fn config_check_uses_runtime_value_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-doctor-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(&path, "[output]\nrestore = 3\n").unwrap();
+        let check = check_config("test-config", path.clone());
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("output.restore must be a boolean"));
+
+        std::fs::write(&path, "[output]\nrestore = false\n").unwrap();
+        let check = check_config("test-config", path);
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(check.detail, "ready");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

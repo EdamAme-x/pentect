@@ -148,6 +148,10 @@ pub fn update_check_enabled() -> Result<bool, String> {
     config::update_check_enabled()
 }
 
+pub fn validate_config_file(path: &Path) -> Result<(), String> {
+    config::validate_config_file(path)
+}
+
 pub fn load_environment_variable_prefix() -> Result<String, String> {
     config::environment_variable_prefix()
 }

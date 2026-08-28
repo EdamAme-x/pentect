@@ -59,6 +59,29 @@ fn parse_config_file(path: &Path) -> Result<Option<toml::Value>, String> {
         .map_err(|error| format!("could not parse '{}': {error}", path.display()))
 }
 
+pub(crate) fn validate_config_file(path: &Path) -> Result<(), String> {
+    let Some(value) = parse_config_file(path)? else {
+        return Ok(());
+    };
+    validate_config_value(&value)
+}
+
+fn validate_config_value(value: &toml::Value) -> Result<(), String> {
+    handle_scope_value(value)?;
+    agent_require_pentect_value(value)?;
+    image_ocr_config_value(value)?;
+    let decode = decode_config_value(value)?;
+    merge_decode_config_unchecked(Profile::Strict, decode, DecodeConfigPartial::default())
+        .validate()?;
+    files_remember_value(value)?;
+    activity_share_value(value)?;
+    metrics_enabled_value(value)?;
+    update_check_value(value)?;
+    output_restore_value(value)?;
+    unknown_format_policy_value(value)?;
+    reject_removed_environment_value(value)
+}
+
 fn handle_scope_value(value: &toml::Value) -> Result<Option<HandleScope>, String> {
     let Some(handles) = value.get("handles") else {
         return Ok(None);
@@ -668,6 +691,10 @@ fn reject_removed_environment_config(path: PathBuf) -> Result<(), String> {
     let Some(value) = parse_config_file(&path)? else {
         return Ok(());
     };
+    reject_removed_environment_value(&value)
+}
+
+fn reject_removed_environment_value(value: &toml::Value) -> Result<(), String> {
     if value.get("environment").is_some() {
         return Err(
             "environment.prefix was removed; handle variables always start with PENTECT_"
