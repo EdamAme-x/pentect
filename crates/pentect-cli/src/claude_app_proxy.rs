@@ -1079,6 +1079,7 @@ struct ProxyState {
     masker: Arc<Mutex<pentect_agent::ActiveToolOutputMasker>>,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     block_unknown_formats: bool,
+    restore_output: bool,
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
     file_attestations: crate::http_files::FileAttestationStore,
     pending_files: Mutex<PendingFiles>,
@@ -1140,6 +1141,7 @@ async fn run_proxy(
         )),
         plugins: Arc::new(Mutex::new(plugins)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
+        restore_output: pentect_agent::output_restore_enabled()?,
         files: Mutex::new(HashMap::new()),
         file_attestations: crate::http_files::FileAttestationStore::open_default()?,
         pending_files: Mutex::new(PendingFiles::default()),
@@ -1465,10 +1467,13 @@ async fn forward_inspected_inner(
         .unwrap_or("-");
     eprintln!("[pentect] claude-app < {status} {method} {host}{safe_path} {response_content_type}");
 
-    let transform_chat = protect_chat
+    let transform_chat_sse = protect_chat
         && status.is_success()
         && response_content_type.eq_ignore_ascii_case("text/event-stream");
-    if (transform_chat || upload_coverage.is_some() || prepare_upload)
+    let transform_chat_json = protect_chat
+        && status.is_success()
+        && response_content_type.eq_ignore_ascii_case("application/json");
+    if (transform_chat_sse || transform_chat_json || upload_coverage.is_some() || prepare_upload)
         && response_headers
             .get(hyper::header::CONTENT_ENCODING)
             .is_some_and(|encoding| {
@@ -1485,7 +1490,7 @@ async fn forward_inspected_inner(
 
     let mut builder = Response::builder().status(status);
     for (name, value) in &response_headers {
-        if !transform_chat || name != hyper::header::CONTENT_LENGTH {
+        if !(transform_chat_sse || transform_chat_json) || name != hyper::header::CONTENT_LENGTH {
             builder = builder.header(name, value);
         }
     }
@@ -1583,12 +1588,31 @@ async fn forward_inspected_inner(
             .map_err(|error| format!("could not build Claude App prepare response: {error}"));
     }
 
+    if transform_chat_json {
+        let body = read_response_capped(upstream).await?;
+        let plugins = Arc::clone(&state.plugins);
+        let block_unknown_formats = state.block_unknown_formats;
+        let restore_output = state.restore_output;
+        let body = tokio::task::spawn_blocking(move || {
+            rewrite_chat_json_response(&body, &plugins, block_unknown_formats, restore_output)
+        })
+        .await
+        .map_err(|_| "Claude App JSON response protection task failed".to_string())??;
+        return builder
+            .body(
+                Full::new(body)
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .map_err(|error| format!("could not build Claude App JSON response: {error}"));
+    }
+
     let stream = upstream.bytes_stream().map(move |result| {
         result
             .map(Frame::data)
             .map_err(|error| Box::new(error) as ProxyBodyError)
     });
-    let body = if transform_chat {
+    let body = if transform_chat_sse {
         chat_sse_body(Box::pin(stream), Arc::clone(&state.plugins))
     } else {
         BodyExt::boxed_unsync(StreamBody::new(stream))
@@ -2346,6 +2370,80 @@ struct ChatStreamState {
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     resolve: Option<ChatResolver>,
+}
+
+fn rewrite_chat_json_response(
+    body: &Bytes,
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
+    restore_output: bool,
+) -> Result<Bytes, String> {
+    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    rewrite_chat_json_response_with(
+        body,
+        plugins,
+        block_unknown_formats,
+        restore_output,
+        &mut resolve,
+    )
+}
+
+fn rewrite_chat_json_response_with<R>(
+    body: &Bytes,
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
+    restore_output: bool,
+    resolve: &mut R,
+) -> Result<Bytes, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let mut value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) if block_unknown_formats => {
+            return Err(format!(
+                "unknown format blocked: Claude App Chat response is not valid JSON ({error})"
+            ));
+        }
+        Err(error) => {
+            eprintln!("[pentect] Claude App Chat response protection skipped: {error}");
+            return Ok(body.clone());
+        }
+    };
+    let run = plugins
+        .lock()
+        .map_err(|_| "Claude App plugin lock was poisoned".to_string())?
+        .run(
+            pentect_agent::MiddlewareStage::Response,
+            value,
+            Some(serde_json::json!({"provider": "claude", "transport": "desktop-http"})),
+        )?;
+    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
+        return Err(
+            "unknown format blocked: a Claude App plugin reported partial response coverage"
+                .to_string(),
+        );
+    }
+    if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message
+                .unwrap_or_else(|| "response blocked".to_string())
+        ));
+    }
+    value = run.payload;
+    {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "Claude App plugin lock was poisoned".to_string())?
+            .clone();
+        run_chat_tool_plugins(&mut value, &plugins)?;
+    }
+    resolve_chat_tool_calls(&mut value, resolve)?;
+    crate::claude_http_proxy::restore_anthropic_json_value(&mut value, restore_output, resolve)?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| format!("could not encode Claude App Chat response: {error}"))
 }
 
 fn chat_sse_body<S>(stream: S, plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>) -> ProxyBody
@@ -3462,6 +3560,32 @@ mod tests {
         assert_eq!(
             metadata_path("/v1/code/sessions/cse_01Ni2WadyEAmYhNEa9JK4hLH/events"),
             "/v1/code/sessions/:id/events"
+        );
+    }
+
+    #[test]
+    fn nonstream_chat_response_runs_tool_and_output_restoration() {
+        let handle = "<<SECRET_0011223344556677>>";
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "content": [
+                    {"type": "text", "text": format!("show {handle}")},
+                    {"type": "tool_use", "name": "http", "input": {
+                        "headers": {"x-token": handle}
+                    }}
+                ]
+            }))
+            .unwrap(),
+        );
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let rewritten =
+            rewrite_chat_json_response_with(&body, &plugins, true, true, &mut resolve).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["content"][0]["text"], "show local-value");
+        assert_eq!(
+            value["content"][1]["input"]["headers"]["x-token"],
+            "local-value"
         );
     }
 
