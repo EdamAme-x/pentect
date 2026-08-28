@@ -1154,7 +1154,7 @@ struct SseStreamTransformer<R> {
     passthrough: bool,
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
     restore_output: bool,
-    output_text: HashMap<u64, OutputTextRestorer>,
+    output_text: HashMap<(u64, &'static str), OutputTextRestorer>,
 }
 
 struct ActiveToolStream {
@@ -1221,20 +1221,21 @@ where
 
     fn finish_output_text(&mut self) -> Vec<Bytes> {
         let mut streams = self.output_text.drain().collect::<Vec<_>>();
-        streams.sort_by_key(|(index, _)| *index);
+        streams.sort_by_key(|((index, field), _)| (*index, *field));
         streams
             .into_iter()
-            .filter_map(|(index, mut restorer)| {
+            .filter_map(|((index, field), mut restorer)| {
                 let pending = restorer.finish();
                 if pending.is_empty() {
                     return None;
                 }
+                let delta_type = anthropic_output_delta_type(field)?;
                 Some(Bytes::from(render_sse(&[SseBlock {
                     event: Some("content_block_delta".to_string()),
                     data: Some(serde_json::json!({
                         "type": "content_block_delta",
                         "index": index,
-                        "delta": {"type": "text_delta", "text": pending},
+                        "delta": {"type": delta_type, (field): pending},
                     })),
                     passthrough: Vec::new(),
                 }])))
@@ -1324,7 +1325,7 @@ where
 
 fn rewrite_anthropic_output_sse_block<R>(
     block: &[u8],
-    streams: &mut HashMap<u64, OutputTextRestorer>,
+    streams: &mut HashMap<(u64, &'static str), OutputTextRestorer>,
     resolve: &mut R,
 ) -> Result<Option<Vec<u8>>, String>
 where
@@ -1345,61 +1346,75 @@ where
         return Ok(None);
     };
     match event_type.as_deref() {
-        Some("content_block_start")
-            if data
-                .get("content_block")
-                .and_then(|value| value.get("type"))
-                .and_then(Value::as_str)
-                == Some("text") =>
-        {
-            let restorer = streams.entry(index).or_default();
-            if let Some(Value::String(value)) = data
-                .get_mut("content_block")
-                .and_then(Value::as_object_mut)
-                .and_then(|value| value.get_mut("text"))
-            {
-                *value = restorer.push(value, resolve)?;
+        Some("content_block_start") => {
+            let Some(content) = data.get_mut("content_block").and_then(Value::as_object_mut) else {
+                return Ok(None);
+            };
+            let field = match content.get("type").and_then(Value::as_str) {
+                Some("text") => "text",
+                Some("thinking") => "thinking",
+                _ => return Ok(None),
+            };
+            if let Some(Value::String(value)) = content.get_mut(field) {
+                *value = streams
+                    .entry((index, field))
+                    .or_default()
+                    .push(value, resolve)?;
             }
         }
-        Some("content_block_delta")
-            if data
-                .get("delta")
-                .and_then(|value| value.get("type"))
-                .and_then(Value::as_str)
-                == Some("text_delta") =>
-        {
-            let restorer = streams.entry(index).or_default();
-            if let Some(Value::String(value)) = data
-                .get_mut("delta")
-                .and_then(Value::as_object_mut)
-                .and_then(|value| value.get_mut("text"))
-            {
-                *value = restorer.push(value, resolve)?;
+        Some("content_block_delta") => {
+            let Some(delta) = data.get_mut("delta").and_then(Value::as_object_mut) else {
+                return Ok(None);
+            };
+            let field = match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => "text",
+                Some("thinking_delta") => "thinking",
+                _ => return Ok(None),
+            };
+            if let Some(Value::String(value)) = delta.get_mut(field) {
+                *value = streams
+                    .entry((index, field))
+                    .or_default()
+                    .push(value, resolve)?;
             }
         }
         Some("content_block_stop") => {
-            let Some(mut restorer) = streams.remove(&index) else {
-                return Ok(None);
-            };
-            let pending = restorer.finish();
-            if !pending.is_empty() {
-                let prefix = SseBlock {
-                    event: Some("content_block_delta".to_string()),
-                    data: Some(serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "text_delta", "text": pending},
-                    })),
-                    passthrough: Vec::new(),
+            let mut prefixes = Vec::new();
+            for field in ["text", "thinking"] {
+                let Some(mut restorer) = streams.remove(&(index, field)) else {
+                    continue;
                 };
+                let pending = restorer.finish();
+                if !pending.is_empty() {
+                    let delta_type = anthropic_output_delta_type(field).expect("known field");
+                    prefixes.push(SseBlock {
+                        event: Some("content_block_delta".to_string()),
+                        data: Some(serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": delta_type, (field): pending},
+                        })),
+                        passthrough: Vec::new(),
+                    });
+                }
+            }
+            if !prefixes.is_empty() {
                 return Ok(Some(
-                    format!("{}{}", render_sse(&[prefix]), render_sse(&blocks)).into_bytes(),
+                    format!("{}{}", render_sse(&prefixes), render_sse(&blocks)).into_bytes(),
                 ));
             }
         }
         _ => return Ok(None),
     }
     Ok(Some(render_sse(&blocks).into_bytes()))
+}
+
+fn anthropic_output_delta_type(field: &str) -> Option<&'static str> {
+    match field {
+        "text" => Some("text_delta"),
+        "thinking" => Some("thinking_delta"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1418,17 +1433,8 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
             .strip_prefix("event:")
             .map(str::trim)
     });
-    let data_type = text.lines().find_map(|line| {
-        let data = line
-            .trim_end_matches('\r')
-            .strip_prefix("data:")?
-            .trim_start();
-        serde_json::from_str::<Value>(data)
-            .ok()?
-            .get("type")?
-            .as_str()
-            .map(str::to_owned)
-    });
+    let data_type = sse_json_data(text)
+        .and_then(|data| data.get("type").and_then(Value::as_str).map(str::to_owned));
     match event.or(data_type.as_deref()) {
         Some("ping") => SseControlEvent::Ping,
         Some("error") => SseControlEvent::Error,
@@ -1456,14 +1462,7 @@ fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
     let Ok(text) = std::str::from_utf8(block) else {
         return SseToolBoundary::Other;
     };
-    let Some(data) = text.lines().find_map(|line| {
-        line.trim_end_matches('\r')
-            .strip_prefix("data:")
-            .map(str::trim_start)
-    }) else {
-        return SseToolBoundary::Other;
-    };
-    let Ok(data) = serde_json::from_str::<Value>(data) else {
+    let Some(data) = sse_json_data(text) else {
         return SseToolBoundary::Other;
     };
     let event_type = data.get("type").and_then(Value::as_str);
@@ -2037,21 +2036,41 @@ fn parse_sse(input: &str) -> Vec<SseBlock> {
         .filter(|block| !block.is_empty())
         .map(|block| {
             let mut parsed = SseBlock::default();
+            let mut data_lines = Vec::new();
             for line in block.lines() {
                 if let Some(event) = line.strip_prefix("event:") {
                     parsed.event = Some(event.trim_start().to_string());
                 } else if let Some(data) = line.strip_prefix("data:") {
-                    match serde_json::from_str(data.trim_start()) {
-                        Ok(value) => parsed.data = Some(value),
-                        Err(_) => parsed.passthrough.push(line.to_string()),
-                    }
+                    data_lines.push(data.trim_start().to_string());
                 } else {
                     parsed.passthrough.push(line.to_string());
+                }
+            }
+            if !data_lines.is_empty() {
+                match serde_json::from_str(&data_lines.join("\n")) {
+                    Ok(value) => parsed.data = Some(value),
+                    Err(_) => parsed
+                        .passthrough
+                        .extend(data_lines.into_iter().map(|data| format!("data: {data}"))),
                 }
             }
             parsed
         })
         .collect()
+}
+
+fn sse_json_data(input: &str) -> Option<Value> {
+    let data = input
+        .lines()
+        .filter_map(|line| {
+            line.trim_end_matches('\r')
+                .strip_prefix("data:")
+                .map(str::trim_start)
+        })
+        .collect::<Vec<_>>();
+    (!data.is_empty())
+        .then(|| serde_json::from_str(&data.join("\n")).ok())
+        .flatten()
 }
 
 fn render_sse(blocks: &[SseBlock]) -> String {
@@ -3247,6 +3266,48 @@ mod tests {
         );
         let output = rewrite_anthropic_sse(input).unwrap();
         assert!(output.contains("hello <<SECRET_deadbeef>>"));
+    }
+
+    #[test]
+    fn multiline_sse_data_is_joined_for_parsing_control_and_tool_boundaries() {
+        let start = concat!(
+            "event: content_block_start\r\n",
+            "data: {\"type\":\"content_block_start\",\r\n",
+            "data: \"index\":4,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\r\n\r\n"
+        );
+        let blocks = parse_sse(start);
+        assert_eq!(blocks[0].data.as_ref().unwrap()["index"], 4);
+        assert!(matches!(
+            sse_tool_boundary(start.as_bytes()),
+            SseToolBoundary::Start { index: 4, .. }
+        ));
+
+        let ping = "event: message\ndata: {\"type\":\ndata: \"ping\"}\n\n";
+        assert_eq!(sse_control_event(ping.as_bytes()), SseControlEvent::Ping);
+    }
+
+    #[test]
+    fn streaming_thinking_restores_handles_split_across_events() {
+        let events = [
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"before <<CHAR\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"GE_0123456789abcdef>> after\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        ];
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            None,
+            true,
+        );
+        let mut output = Vec::new();
+        for event in events {
+            output.extend(transformer.push(event.as_bytes()).unwrap());
+        }
+        let output = join_bytes(output);
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
+        assert!(output.contains("thinking_delta"), "{output}");
+        assert!(output.contains("\"thinking\""), "{output}");
     }
 
     #[test]
