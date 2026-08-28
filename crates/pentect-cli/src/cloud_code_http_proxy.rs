@@ -618,6 +618,23 @@ fn protect_request_body(
                 .to_string(),
         );
     }
+    let inline_file_partial = {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "Google Cloud Code plugin lock was poisoned".to_string())?;
+        crate::http_files::run_google_inline_file_stages(
+            &value,
+            &plugins,
+            "google-cloud-code",
+            "http_json",
+        )
+    }?;
+    if block_unknown_formats && inline_file_partial {
+        return Err(
+            "unknown format blocked: a file plugin reported partial Google Cloud Code inline-file coverage"
+                .to_string(),
+        );
+    }
     let mut masker = masker
         .lock()
         .map_err(|_| "Google Cloud Code request masker lock was poisoned".to_string())?;
