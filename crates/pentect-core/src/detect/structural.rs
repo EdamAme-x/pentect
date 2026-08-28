@@ -194,7 +194,9 @@ fn push_environment_span(view: &NormalizedView, spans: &mut Vec<Span>, range: By
         range: view.to_raw(range),
         category: Category::Secret,
         label: labels::KEYED_SECRET.to_string(),
-        confidence: Confidence::High,
+        // This is a structural fallback. Keep equally confident, more-specific
+        // vendor/key-value labels when they already recognize the same value.
+        confidence: Confidence::Medium,
         source: DetectorId::Structural,
     });
 }
