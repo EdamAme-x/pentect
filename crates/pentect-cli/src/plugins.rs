@@ -35,6 +35,30 @@ const MAX_REMOTE_PLUGIN_CACHE_ENTRIES: usize = 256;
 const MAX_PROJECT_PLUGIN_LOCK_BYTES: u64 = 1024 * 1024;
 static PROJECT_LOCK_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn enforce_tool_plugin_coverage(
+    coverage: pentect_agent::MiddlewareCoverage,
+    provider: &str,
+) -> std::result::Result<(), String> {
+    enforce_tool_plugin_coverage_with_policy(
+        coverage,
+        pentect_agent::unknown_formats_should_block()?,
+        provider,
+    )
+}
+
+fn enforce_tool_plugin_coverage_with_policy(
+    coverage: pentect_agent::MiddlewareCoverage,
+    block_unknown_formats: bool,
+    provider: &str,
+) -> std::result::Result<(), String> {
+    if block_unknown_formats && coverage == pentect_agent::MiddlewareCoverage::Partial {
+        return Err(format!(
+            "unknown format blocked: a {provider} ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PluginScope {
     User,
@@ -2675,5 +2699,27 @@ label = "INLINE_SECRET"
         assert!(packs.is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_tool_plugin_coverage_only_blocks_in_strict_mode() {
+        assert!(enforce_tool_plugin_coverage_with_policy(
+            pentect_agent::MiddlewareCoverage::Partial,
+            true,
+            "fixture"
+        )
+        .is_err());
+        assert!(enforce_tool_plugin_coverage_with_policy(
+            pentect_agent::MiddlewareCoverage::Partial,
+            false,
+            "fixture"
+        )
+        .is_ok());
+        assert!(enforce_tool_plugin_coverage_with_policy(
+            pentect_agent::MiddlewareCoverage::Full,
+            true,
+            "fixture"
+        )
+        .is_ok());
     }
 }
