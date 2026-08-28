@@ -209,7 +209,7 @@ fn monitor_handed_off_app(
             terminate_codex_app_processes(app);
             return Err(error);
         }
-        if process_probe.is_running() {
+        if process_probe.app_is_running() {
             if !observed {
                 record_lifecycle(lifecycle_log, "app-process-observed", "running");
                 observed = true;
@@ -218,6 +218,14 @@ fn monitor_handed_off_app(
         } else if observed {
             let since = absent_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed() >= APP_EXIT_GRACE {
+                let terminated = terminate_codex_app_helper_processes(app);
+                if terminated > 0 {
+                    record_lifecycle(
+                        lifecycle_log,
+                        "app-helper-processes-terminated",
+                        &format!("count={terminated}"),
+                    );
+                }
                 record_lifecycle(lifecycle_log, "app-process-exited", "confirmed");
                 return Ok(launcher_status);
             }
@@ -344,10 +352,20 @@ fn terminate_child_process(pid: u32) {
         .status();
 }
 
-fn terminate_codex_app_processes(app: &Path) {
-    for pid in CodexAppProcessProbe::new(app).matching_pids() {
-        terminate_process(pid);
+fn terminate_codex_app_processes(app: &Path) -> usize {
+    let pids = CodexAppProcessProbe::new(app).matching_pids();
+    for pid in &pids {
+        terminate_process(*pid);
     }
+    pids.len()
+}
+
+fn terminate_codex_app_helper_processes(app: &Path) -> usize {
+    let pids = CodexAppProcessProbe::new(app).matching_helper_pids();
+    for pid in &pids {
+        terminate_process(*pid);
+    }
+    pids.len()
 }
 
 #[cfg(windows)]
@@ -1121,6 +1139,22 @@ impl CodexAppProcessProbe {
         !self.matching_pids().is_empty()
     }
 
+    fn app_is_running(&mut self) -> bool {
+        #[cfg(not(windows))]
+        {
+            self.is_running()
+        }
+        #[cfg(windows)]
+        {
+            self.system
+                .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            self.system
+                .processes()
+                .values()
+                .any(|process| self.matches_app(process))
+        }
+    }
+
     fn matching_pids(&mut self) -> Vec<u32> {
         self.system
             .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
@@ -1130,6 +1164,24 @@ impl CodexAppProcessProbe {
             .filter(|(_, process)| self.matches(process))
             .map(|(pid, _)| pid.as_u32())
             .collect()
+    }
+
+    fn matching_helper_pids(&mut self) -> Vec<u32> {
+        #[cfg(not(windows))]
+        {
+            Vec::new()
+        }
+        #[cfg(windows)]
+        {
+            self.system
+                .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            self.system
+                .processes()
+                .iter()
+                .filter(|(_, process)| self.matches(process) && !self.matches_app(process))
+                .map(|(pid, _)| pid.as_u32())
+                .collect()
+        }
     }
 
     fn matches(&self, process: &sysinfo::Process) -> bool {
@@ -1158,8 +1210,32 @@ impl CodexAppProcessProbe {
         })
     }
 
-    fn path_matches(&self, path: &Path, process_name: &str) -> bool {
+    #[cfg(windows)]
+    fn matches_app(&self, process: &sysinfo::Process) -> bool {
+        let process_name = comparable_process_name(&process.name().to_string_lossy());
+        // Windows Store packages do not always expose their executable path to
+        // a non-elevated process. ChatGPT.exe is the visible Codex App process;
+        // codex.exe is a bundled helper and must not keep the session alive
+        // after the UI has exited.
+        if cfg!(windows) && process_name == "chatgpt.exe" {
+            return true;
+        }
+
+        process
+            .exe()
+            .map(comparable_process_path)
+            .is_some_and(|path| self.app_path_matches(&path))
+            || process.cmd().first().is_some_and(|command| {
+                self.app_path_matches(&comparable_process_path(Path::new(command.as_os_str())))
+            })
+    }
+
+    fn app_path_matches(&self, path: &Path) -> bool {
         path == self.expected
+    }
+
+    fn path_matches(&self, path: &Path, process_name: &str) -> bool {
+        self.app_path_matches(path)
             || (self
                 .install_root
                 .as_ref()
@@ -1369,6 +1445,23 @@ mod tests {
     fn process_probe_observes_the_current_executable() {
         let executable = std::env::current_exe().unwrap();
         assert!(CodexAppProcessProbe::new(&executable).is_running());
+    }
+
+    #[test]
+    fn process_probe_does_not_treat_bundled_codex_helper_as_the_app() {
+        let app = PathBuf::from("codex-app-fixture").join("ChatGPT.exe");
+        let probe = CodexAppProcessProbe::new(&app);
+        let expected = comparable_process_path(&app);
+        let helper = comparable_process_path(
+            app.parent()
+                .expect("fixture has an install root")
+                .join("codex.exe")
+                .as_path(),
+        );
+
+        assert!(probe.app_path_matches(&expected));
+        assert!(!probe.app_path_matches(&helper));
+        assert!(probe.path_matches(&helper, "codex.exe"));
     }
 
     #[cfg(windows)]
