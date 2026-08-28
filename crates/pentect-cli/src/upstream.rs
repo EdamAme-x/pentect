@@ -140,7 +140,7 @@ pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, Stri
         }
         let header = sensitive_header_value(&value, env_name);
         value.zeroize();
-        overrides.suppress_origin_auth = true;
+        overrides.suppress_origin_auth |= is_replaceable_origin_auth_header(name.as_str());
         overrides.values.push(HeaderOverride {
             name,
             value: Some(header?),
@@ -585,7 +585,7 @@ mod tests {
         let overrides =
             header_overrides(&["x-bf-vk=PENTECT_TEST_BIFROST_KEY".to_string()]).unwrap();
         assert!(!overrides.forward_incoming_header("X-BF-VK"));
-        assert!(!overrides.forward_incoming_header("authorization"));
+        assert!(overrides.forward_incoming_header("authorization"));
         assert!(overrides.values[0].value.as_ref().unwrap().is_sensitive());
         let request = overrides
             .apply(reqwest::Client::new().get("https://example.test"))
@@ -602,6 +602,46 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(name, value)| name == "PENTECT_TEST_BIFROST_KEY" && value.is_none()));
+    }
+
+    #[test]
+    fn auxiliary_override_preserves_incoming_authorization() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _trace = EnvRestore::set("PENTECT_TEST_REQUEST_ID", "trace-abc-123");
+        let overrides =
+            header_overrides(&["x-request-id=PENTECT_TEST_REQUEST_ID".to_string()]).unwrap();
+        let incoming = [
+            ("authorization", "Bearer real-client-key"),
+            ("x-api-key", "real-api-key"),
+            ("content-type", "application/json"),
+        ];
+        let mut request = reqwest::Client::new().post("https://example.test");
+        for (name, value) in incoming {
+            if overrides.forward_incoming_header(name) {
+                request = request.header(name, value);
+            }
+        }
+        let request = overrides.apply(request).build().unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer real-client-key"
+        );
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "real-api-key");
+        assert_eq!(
+            request.headers().get("x-request-id").unwrap(),
+            "trace-abc-123"
+        );
+    }
+
+    #[test]
+    fn explicit_auth_override_still_suppresses_other_origin_auth() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _key = EnvRestore::set("PENTECT_TEST_UPSTREAM_KEY", "upstream-key");
+        let overrides =
+            header_overrides(&["x-api-key=PENTECT_TEST_UPSTREAM_KEY".to_string()]).unwrap();
+        assert!(!overrides.forward_incoming_header("authorization"));
+        assert!(!overrides.forward_incoming_header("x-api-key"));
+        assert!(overrides.forward_incoming_header("x-request-id"));
     }
 
     #[test]
