@@ -464,6 +464,26 @@ mod tests {
     }
 
     #[test]
+    fn newly_started_in_process_store_registers_without_a_scheduling_race() {
+        for iteration in 0..8 {
+            let root = test_root(&format!("in-process-ready-{iteration}"));
+            let store = crate::memory_store::start_in_process_memory_store().unwrap();
+            let candidate = register_candidate(
+                &root,
+                store.addr(),
+                store.token(),
+                store.process_host_read_token(),
+                store.process_host_write_token(),
+                10_000 + iteration,
+            )
+            .unwrap();
+            assert_eq!(ensure_host_at(&root).unwrap().addr, store.addr());
+            unregister_candidate(&candidate);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn process_host_files_contain_no_activity_events() {
         let root = test_root("metadata");
         let addr = spawn_test_memory_store_with_activity(
