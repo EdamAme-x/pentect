@@ -1239,6 +1239,7 @@ struct SseStreamTransformer<R> {
     pending: Vec<u8>,
     tool_buffer: Option<ToolStreamBuffer>,
     passthrough: bool,
+    max_pending_bytes: usize,
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
     restore_output: bool,
     output_text: HashMap<(u64, &'static str), OutputTextRestorer>,
@@ -1269,6 +1270,7 @@ where
             pending: Vec::new(),
             tool_buffer: None,
             passthrough: false,
+            max_pending_bytes: MAX_PENDING_SSE_BYTES,
             plugins,
             restore_output,
             output_text: HashMap::new(),
@@ -1279,9 +1281,9 @@ where
         if self.passthrough {
             return Ok(vec![Bytes::copy_from_slice(chunk)]);
         }
-        if self.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
+        if self.pending.len().saturating_add(chunk.len()) > self.max_pending_bytes {
             diagnostic("sse-event-limit", "limit", "messages", false);
-            return Ok(self.fail_open_with(chunk));
+            return Err("Anthropic SSE event exceeded inspection limit".to_string());
         }
         self.pending.extend_from_slice(chunk);
         let mut output = Vec::new();
@@ -1352,14 +1354,10 @@ where
                 .bytes
                 .len()
                 .saturating_add(block.len())
-                > MAX_PENDING_SSE_BYTES
+                > self.max_pending_bytes
             {
                 diagnostic("sse-tool-limit", "limit", "messages", false);
-                let tools = self.tool_buffer.take().expect("tool buffer exists");
-                output.push(Bytes::from(tools.bytes));
-                output.push(Bytes::from(block));
-                self.passthrough = true;
-                return Ok(());
+                return Err("Anthropic SSE tool input exceeded inspection limit".to_string());
             }
             let boundary = sse_tool_boundary(&block);
             let tools = self.tool_buffer.as_mut().expect("tool buffer exists");
@@ -1410,19 +1408,6 @@ where
             _ => output.push(Bytes::from(block)),
         }
         Ok(())
-    }
-
-    fn fail_open_with(&mut self, chunk: &[u8]) -> Vec<Bytes> {
-        let mut output = self.finish_output_text();
-        let mut bytes = self
-            .tool_buffer
-            .take()
-            .map_or_else(Vec::new, |tools| tools.bytes);
-        bytes.append(&mut self.pending);
-        bytes.extend_from_slice(chunk);
-        self.passthrough = true;
-        output.push(Bytes::from(bytes));
-        output
     }
 }
 
@@ -3817,6 +3802,35 @@ mod tests {
             .is_empty());
         let output = transformer.push(&event.as_bytes()[split..]).unwrap();
         assert_eq!(output, vec![Bytes::from(event)]);
+    }
+
+    #[test]
+    fn oversized_streaming_event_fails_closed_without_emitting_pending_bytes() {
+        let mut transformer =
+            SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None, false);
+        transformer.max_pending_bytes = 4;
+
+        let error = transformer.push(b"12345").unwrap_err();
+        assert_eq!(error, "Anthropic SSE event exceeded inspection limit");
+    }
+
+    #[test]
+    fn oversized_streaming_tool_input_fails_closed() {
+        let start = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"input\":{}}}\n\n"
+        );
+        let delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"
+        );
+        let mut transformer =
+            SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None, false);
+        transformer.max_pending_bytes = start.len().max(delta.len());
+
+        assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
+        let error = transformer.push(delta.as_bytes()).unwrap_err();
+        assert_eq!(error, "Anthropic SSE tool input exceeded inspection limit");
     }
 
     #[test]
