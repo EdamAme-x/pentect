@@ -336,7 +336,8 @@ jobs:
       - name: Add historical stable packages
         env:
           GH_TOKEN: ${{ github.token }}
-        run: sh tools/download_recent_stable_debs.sh debs 2
+        run: |
+          sh tools/download_recent_stable_debs.sh debs 2
           test -n "$(find debs -name 'pentect_*.deb' -print -quit)"
       - name: Import archive signing key
         id: signing
