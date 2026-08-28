@@ -311,6 +311,35 @@ fn start_opencode_proxy(
     route: &OpenCodeRoute,
     base_header_env: &[String],
 ) -> Result<(OpenCodeProxyGuard, Vec<String>, Option<&'static str>), String> {
+    let (header_env, bearer_env, child_key_env) = opencode_proxy_auth(route, base_header_env);
+    let proxy = match route.protocol {
+        OpenCodeProtocol::OpenAi => OpenCodeProxyGuard::OpenAi(
+            crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
+                route.upstream.clone(),
+                &header_env,
+                bearer_env,
+            )?,
+        ),
+        OpenCodeProtocol::Anthropic => OpenCodeProxyGuard::Anthropic(
+            crate::claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
+                route.upstream.clone(),
+                &header_env,
+            )?,
+        ),
+        OpenCodeProtocol::Gemini => OpenCodeProxyGuard::Gemini(
+            crate::gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
+                route.upstream.clone(),
+                &header_env,
+            )?,
+        ),
+    };
+    Ok((proxy, header_env, child_key_env))
+}
+
+fn opencode_proxy_auth(
+    route: &OpenCodeRoute,
+    base_header_env: &[String],
+) -> (Vec<String>, Option<&'static str>, Option<&'static str>) {
     let mut header_env = base_header_env.to_vec();
     let bearer_env = route.bearer_env.filter(|name| {
         std::env::var_os(name).is_some_and(|value| !value.is_empty())
@@ -352,28 +381,7 @@ fn start_opencode_proxy(
             child_key_env = Some("GOOGLE_API_KEY");
         }
     }
-    let proxy = match route.protocol {
-        OpenCodeProtocol::OpenAi => OpenCodeProxyGuard::OpenAi(
-            crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
-                route.upstream.clone(),
-                &header_env,
-                bearer_env,
-            )?,
-        ),
-        OpenCodeProtocol::Anthropic => OpenCodeProxyGuard::Anthropic(
-            crate::claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
-                route.upstream.clone(),
-                &header_env,
-            )?,
-        ),
-        OpenCodeProtocol::Gemini => OpenCodeProxyGuard::Gemini(
-            crate::gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
-                route.upstream.clone(),
-                &header_env,
-            )?,
-        ),
-    };
-    Ok((proxy, header_env, child_key_env))
+    (header_env, bearer_env, child_key_env)
 }
 
 fn opencode_command(
@@ -810,6 +818,34 @@ function piInputs() {
 mod tests {
     use super::*;
 
+    struct ScopedEnv {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     #[test]
     fn selected_model_only_uses_the_parsed_pentect_option() {
         assert_eq!(selected_model(None).unwrap(), DEFAULT_MODEL);
@@ -1014,6 +1050,8 @@ mod tests {
 
     #[test]
     fn explicit_authorization_header_disables_implicit_key_selection() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _authorization = ScopedEnv::remove("PENTECT_UPSTREAM_AUTHORIZATION");
         assert!(crate::upstream::has_authorization_override(&[
             "authorization=MY_HEADER".to_string()
         ]));
@@ -1023,6 +1061,41 @@ mod tests {
         assert!(!crate::upstream::has_authorization_override(&[
             "X-Api-Key=MY_HEADER".to_string()
         ]));
+    }
+
+    #[test]
+    fn authorization_control_env_prevents_native_provider_key_injection() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _authorization = ScopedEnv::set(
+            "PENTECT_UPSTREAM_AUTHORIZATION",
+            "Bearer custom-upstream-token",
+        );
+        let _anthropic_key = ScopedEnv::set("ANTHROPIC_API_KEY", "anthropic-origin-key");
+        let _gemini_key = ScopedEnv::set("GOOGLE_API_KEY", "google-origin-key");
+
+        for (protocol, forbidden_header, expected_child_key) in [
+            (
+                OpenCodeProtocol::Anthropic,
+                "x-api-key",
+                "ANTHROPIC_API_KEY",
+            ),
+            (OpenCodeProtocol::Gemini, "x-goog-api-key", "GOOGLE_API_KEY"),
+        ] {
+            let route = OpenCodeRoute {
+                provider: "test".to_string(),
+                model: None,
+                upstream: "http://127.0.0.1:1".to_string(),
+                protocol,
+                bearer_env: None,
+            };
+            let (headers, bearer_env, child_key_env) = opencode_proxy_auth(&route, &[]);
+            assert!(
+                !has_header_override(&headers, forbidden_header),
+                "{forbidden_header} must not be added beside an explicit authorization override"
+            );
+            assert_eq!(bearer_env, None);
+            assert_eq!(child_key_env, Some(expected_child_key));
+        }
     }
 
     #[test]
