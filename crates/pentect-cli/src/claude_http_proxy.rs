@@ -659,6 +659,7 @@ fn run_anthropic_tool_plugins(
                     Value::Object(object.clone()),
                     Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
                 )?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin blocked: {}",
@@ -1451,9 +1452,9 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
     });
     let data_type = sse_json_data(text)
         .and_then(|data| data.get("type").and_then(Value::as_str).map(str::to_owned));
-    match event.or(data_type.as_deref()) {
-        Some("ping") => SseControlEvent::Ping,
-        Some("error") => SseControlEvent::Error,
+    match (event, data_type.as_deref()) {
+        (Some("ping"), _) | (_, Some("ping")) => SseControlEvent::Ping,
+        (Some("error"), _) | (_, Some("error")) => SseControlEvent::Error,
         _ => SseControlEvent::Other,
     }
 }
@@ -2017,6 +2018,7 @@ where
                         Some(serde_json::json!({"provider": "anthropic", "transport": "http_sse"})),
                     )
                     .map_err(|error| format!("plugin middleware: {error}"))?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin middleware: blocked: {}",
@@ -3641,9 +3643,9 @@ mod tests {
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_2\",\"name\":\"Bash\",\"input\":{}}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_one>>\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_1111111111111111>>\\\"}\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_two>>\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<SECRET_2222222222222222>>\\\"}\"}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n"
         );
@@ -3654,8 +3656,8 @@ mod tests {
         let mut transformer = SseStreamTransformer::new(
             |text: &str| {
                 Ok(text
-                    .replace("<<SECRET_one>>", "first")
-                    .replace("<<SECRET_two>>", "second"))
+                    .replace("<<SECRET_1111111111111111>>", "first")
+                    .replace("<<SECRET_2222222222222222>>", "second"))
             },
             None,
             false,
