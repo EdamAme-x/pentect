@@ -1270,7 +1270,7 @@ where
             active.bytes.extend_from_slice(&block);
             if matches!(boundary, SseToolBoundary::Stop(index) if index == active.index) {
                 let active = self.active_tool.take().expect("active tool exists");
-                match std::str::from_utf8(&active.bytes)
+                let rewritten = std::str::from_utf8(&active.bytes)
                     .map_err(|error| format!("Claude tool SSE was not UTF-8: {error}"))
                     .and_then(|text| {
                         rewrite_anthropic_sse_with_tool_name(
@@ -1279,16 +1279,8 @@ where
                             &mut self.resolve,
                             self.plugins.as_deref(),
                         )
-                    }) {
-                    Ok(rewritten) => output.push(Bytes::from(rewritten)),
-                    Err(error) => {
-                        if error.starts_with("plugin middleware:") {
-                            return Err(error);
-                        }
-                        diagnostic("sse-restore-skipped", "protection", "messages", false);
-                        output.push(Bytes::from(active.bytes));
-                    }
-                }
+                    })?;
+                output.push(Bytes::from(rewritten));
             }
             return Ok(());
         }
@@ -3557,6 +3549,22 @@ mod tests {
         let output = join_bytes(output);
         assert!(output.contains("actual-secret"));
         assert!(!output.contains("<<SECRET_deadbeefdeadbeef>>"));
+    }
+
+    #[test]
+    fn streaming_tool_restore_failure_aborts_without_emitting_unresolved_input() {
+        let input = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"use <<SECRET_deadbeefdeadbeef>>\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        );
+        let mut transformer =
+            SseStreamTransformer::new(|_| Err("memory store unavailable".to_string()), None, false);
+        let error = transformer.push(input.as_bytes()).unwrap_err();
+        assert!(error.contains("memory store unavailable"), "{error}");
     }
 
     #[test]

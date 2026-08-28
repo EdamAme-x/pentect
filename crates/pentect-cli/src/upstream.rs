@@ -227,7 +227,8 @@ fn sensitive_header_value(
 fn reject_unsafe_override_header(name: &reqwest::header::HeaderName) -> Result<(), String> {
     if matches!(
         name.as_str(),
-        "connection"
+        "accept-encoding"
+            | "connection"
             | "content-length"
             | "host"
             | "proxy-authenticate"
@@ -512,6 +513,9 @@ mod tests {
         std::env::remove_var("PENTECT_TEST_MISSING_KEY");
         assert!(header_overrides(&["x-bf-vk=PENTECT_TEST_MISSING_KEY".to_string()]).is_err());
         assert!(header_overrides(&["host=PENTECT_TEST_MISSING_KEY".to_string()]).is_err());
+        assert!(
+            header_overrides(&["accept-encoding=PENTECT_TEST_MISSING_KEY".to_string()]).is_err()
+        );
     }
 
     #[test]
