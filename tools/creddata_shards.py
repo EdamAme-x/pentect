@@ -121,6 +121,8 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
 
         report_path = manifest_path.with_name("report.json")
         report = load_json(report_path)
+        if report.get("schema") != 2:
+            raise SystemExit(f"unsupported parity report schema: {report_path}")
         for key in totals:
             totals[key] += int(report[key])
         for rule, counts in report["by_rule"].items():

@@ -6937,14 +6937,22 @@ mod tests {
         let certificate = BASE64
             .decode(b"MIIBWDCCAQqgAwIBAgIUJHqHxlYUeJLW/OvjdnQXBwy/eWswBQYDK2VwMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4XDTI2MDYxOTA2MjA1OFoXDTI4MDUxOTA2MjA1OFowFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wKjAFBgMrZXADIQBZeSuQJmHBhe6U7x4GDBUMK4INE8VxqP311K/ejllcnaNqMGgwCQYDVR0TBAIwADAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCwYDVR0PBAQDAgOIMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBSw1lXZ6Gnm3DuRtrFmcWOZEYxdqjAFBgMrZXADQQCicT1reAXWy/i58EABJ2n2zNYdeKP1jyvjlUwzm81sZbNfeaqYNjJoYAK1EBiCW0PGfFIuS++1od7w56YgV+EO")
             .expect("X.509 fixture");
+        let certificate = Certificate::from_der(&certificate).expect("certificate");
+        let alias = certificate.subject().to_owned();
         let chain = PrivateKeyChain::new(
             [1_u8, 2, 3, 4].as_slice(),
             PrivateKey::from_der(&ed25519).expect("private key"),
-            [Certificate::from_der(&certificate).expect("certificate")],
+            [certificate],
         );
         let mut store = KeyStore::new();
-        store.add_entry("shared alias", KeyStoreEntry::PrivateKeyChain(chain));
+        store.add_entry(&alias, KeyStoreEntry::PrivateKeyChain(chain));
         let p12 = store.writer("").write().expect("PKCS#12 fixture");
+        let raw =
+            KeyStore::from_pkcs12(&p12, "", Pkcs12ImportPolicy::Raw).expect("raw PKCS#12 import");
+        assert!(
+            raw.private_key_chain().is_none(),
+            "fixture must reproduce the same-alias overwrite"
+        );
 
         let key = load_der_private_key(&p12).expect("load PKCS#12 key with certificate");
         assert!(private_key_is_valid(&key));
