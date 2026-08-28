@@ -252,7 +252,9 @@ impl PluginCmd {
             }
             "config" => {
                 if approved {
-                    return Err("--yes is only valid for plugins setup".to_string());
+                    return Err(
+                        "--yes is only valid for plugins add, dev, setup, or update".to_string()
+                    );
                 }
                 let spec = values
                     .first()
@@ -3797,6 +3799,22 @@ impl PluginRow {
     }
 }
 
+fn plugin_row(
+    name: String,
+    source: &'static str,
+    active: &plugins::ActivePlugins,
+) -> Option<PluginRow> {
+    if active.config_paths().is_empty() && !active.has_binary() {
+        return None;
+    }
+    Some(PluginRow {
+        name,
+        source: source.to_string(),
+        configs: active.config_paths().len(),
+        binary: active.has_binary(),
+    })
+}
+
 fn plugin_rows() -> Result<Vec<PluginRow>, String> {
     let mut rows = Vec::new();
     rows.extend(plugin_rows_in(
@@ -3830,15 +3848,9 @@ fn plugin_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<PluginRow>,
             .unwrap_or("")
             .to_string();
         let active = active_for_one(&path.to_string_lossy())?;
-        if active.config_paths().is_empty() && active.binary_paths().is_empty() {
-            continue;
+        if let Some(row) = plugin_row(name, source, &active) {
+            rows.push(row);
         }
-        rows.push(PluginRow {
-            name,
-            source: source.to_string(),
-            configs: active.config_paths().len(),
-            binary: !active.binary_paths().is_empty(),
-        });
     }
     Ok(rows)
 }
@@ -4258,6 +4270,18 @@ mod tests {
             PluginCmd::parse(&args).unwrap().action,
             Action::Update { .. }
         ));
+
+        let args = vec![
+            "pentect".into(),
+            "plugins".into(),
+            "config".into(),
+            "example-plugin".into(),
+            "--yes".into(),
+        ];
+        assert_eq!(
+            PluginCmd::parse(&args).unwrap_err(),
+            "--yes is only valid for plugins add, dev, setup, or update"
+        );
     }
 
     #[test]
@@ -4797,6 +4821,39 @@ pattern = "token-[0-9]+"
         assert_eq!(rows[0].name, "rules");
         assert_eq!(rows[0].configs, 1);
         assert!(!rows[0].binary);
+    }
+
+    #[test]
+    fn list_plugins_includes_user_scoped_binary_plugins() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-plugin-list-global-binary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let plugin = root.join("global-command");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join(plugins::PLUGIN_MANIFEST_FILE),
+            "schema = \"pentect.plugin.v1\"\nname = \"global-command\"\ncommand = [\"tool\"]\nhooks = [\"inspect\"]\n",
+        )
+        .unwrap();
+
+        let active = plugins::active_from_scoped_specs(
+            vec![(
+                plugins::PluginScope::User,
+                plugin.to_string_lossy().into_owned(),
+            )],
+            false,
+        )
+        .unwrap();
+        assert!(active.binary_paths().is_empty());
+        assert!(active.has_binary());
+
+        let row = plugin_row("global-command".to_string(), "user", &active)
+            .expect("user-scoped binary should be listed");
+        assert!(row.binary);
+        assert_eq!(row.status(), "ok");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
