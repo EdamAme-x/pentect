@@ -1238,7 +1238,7 @@ struct SseStreamTransformer<R> {
     resolve: R,
     pending: Vec<u8>,
     tool_buffer: Option<ToolStreamBuffer>,
-    passthrough: bool,
+    terminated: bool,
     max_pending_bytes: usize,
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
     restore_output: bool,
@@ -1269,7 +1269,7 @@ where
             resolve,
             pending: Vec::new(),
             tool_buffer: None,
-            passthrough: false,
+            terminated: false,
             max_pending_bytes: MAX_PENDING_SSE_BYTES,
             plugins,
             restore_output,
@@ -1278,8 +1278,8 @@ where
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, String> {
-        if self.passthrough {
-            return Ok(vec![Bytes::copy_from_slice(chunk)]);
+        if self.terminated {
+            return Ok(Vec::new());
         }
         if self.pending.len().saturating_add(chunk.len()) > self.max_pending_bytes {
             diagnostic("sse-event-limit", "limit", "messages", false);
@@ -1290,11 +1290,18 @@ where
         while let Some(end) = first_sse_block_end(&self.pending) {
             let block = self.pending.drain(..end).collect::<Vec<_>>();
             self.process_block(block, &mut output)?;
+            if self.terminated {
+                self.pending.clear();
+                break;
+            }
         }
         Ok(output)
     }
 
     fn finish(&mut self) -> Vec<Bytes> {
+        if self.terminated {
+            return Vec::new();
+        }
         let mut output = self.finish_output_text();
         if let Some(mut tools) = self.tool_buffer.take() {
             tools.bytes.append(&mut self.pending);
@@ -1339,10 +1346,9 @@ where
                     return Ok(());
                 }
                 SseControlEvent::Error => {
-                    let tools = self.tool_buffer.take().expect("tool buffer exists");
-                    output.push(Bytes::from(tools.bytes));
+                    self.tool_buffer.take();
                     output.push(Bytes::from(block));
-                    self.passthrough = true;
+                    self.terminated = true;
                     return Ok(());
                 }
                 SseControlEvent::Other => {}
@@ -4014,25 +4020,33 @@ mod tests {
     }
 
     #[test]
-    fn ping_is_emitted_while_tool_input_is_held_and_error_flushes_unresolved() {
+    fn error_during_tool_input_discards_unresolved_data_and_terminates_stream() {
         let start = concat!(
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n"
         );
+        let delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":\\\"<<SECRET_deadbeef>>\"}}\n\n"
+        );
         let ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
         let error =
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n";
+        let after_error = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let mut transformer = SseStreamTransformer::new(
             |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
             None,
             false,
         );
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
+        assert!(transformer.push(delta.as_bytes()).unwrap().is_empty());
         assert_eq!(join_bytes(transformer.push(ping.as_bytes()).unwrap()), ping);
-        let flushed = join_bytes(transformer.push(error.as_bytes()).unwrap());
-        assert!(flushed.contains("content_block_start"));
-        assert!(flushed.contains("event: error"));
-        assert!(!flushed.contains("must-not-appear"));
+        assert_eq!(
+            join_bytes(transformer.push(error.as_bytes()).unwrap()),
+            error
+        );
+        assert!(transformer.push(after_error.as_bytes()).unwrap().is_empty());
+        assert!(transformer.finish().is_empty());
     }
 
     #[test]
