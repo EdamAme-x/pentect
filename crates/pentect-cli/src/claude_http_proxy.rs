@@ -113,6 +113,8 @@ type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 enum AnthropicEndpoint {
     Messages,
     CountTokens,
+    MessageBatches,
+    Complete,
     Files,
     Models,
     Health,
@@ -124,6 +126,8 @@ impl AnthropicEndpoint {
         match self {
             Self::Messages => "messages",
             Self::CountTokens => "count-tokens",
+            Self::MessageBatches => "message-batches",
+            Self::Complete => "complete",
             Self::Files => "files",
             Self::Models => "models",
             Self::Health => "health",
@@ -394,10 +398,18 @@ async fn proxy_request_inner(
     let credential_material = state.headers.credential_scope_material(&headers);
     let account_scope = state.file_attestations.account_scope(&credential_material);
     let messages_path = endpoint == AnthropicEndpoint::Messages;
+    let batch_create = endpoint == AnthropicEndpoint::MessageBatches
+        && method == hyper::Method::POST
+        && path_and_query
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/v1/messages/batches"));
     let protected_request = matches!(
         endpoint,
         AnthropicEndpoint::Messages | AnthropicEndpoint::CountTokens
-    );
+    ) || (endpoint == AnthropicEndpoint::Complete
+        && method == hyper::Method::POST)
+        || batch_create;
     let files_upload = endpoint == AnthropicEndpoint::Files
         && method == hyper::Method::POST
         && path_and_query
@@ -467,6 +479,7 @@ async fn proxy_request_inner(
                     &masker,
                     &plugins,
                     &files,
+                    endpoint,
                     block_unknown_formats,
                 )
             })
@@ -825,6 +838,7 @@ fn protect_anthropic_request_body(
     masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
     plugins: &StdMutex<pentect_agent::PluginMiddleware>,
     files: &HashMap<String, crate::http_files::Coverage>,
+    endpoint: AnthropicEndpoint,
     block_unknown_formats: bool,
 ) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
@@ -868,7 +882,7 @@ fn protect_anthropic_request_body(
             })
             .map_err(|error| format!("could not encode plugin response: {error}"));
     }
-    let unknown_content_kind = anthropic_request_unknown_content_kind(&value);
+    let unknown_content_kind = anthropic_request_unknown_content_kind(&value, endpoint);
     let partial_schema = unknown_content_kind.is_some();
     if block_unknown_formats && (partial_schema || plugin_partial) {
         let detail = unknown_content_kind
@@ -878,15 +892,15 @@ fn protect_anthropic_request_body(
             "unknown format blocked: Anthropic request contains {detail}; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
         ));
     }
-    warn_provider_mcp_credentials(&value);
+    warn_provider_mcp_credentials(&value, endpoint);
     // Image handling deliberately follows the existing image policy. With
     // the default image.unscanned="block", an uninspectable image is an
     // error; users can explicitly choose allow in configuration.
-    redact_anthropic_base64_images(&mut value, files)?;
+    redact_anthropic_base64_images(&mut value, files, endpoint)?;
     let mut masker = masker
         .lock()
         .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
-    if let Err(error) = mask_anthropic_request(&mut value, &mut masker, files) {
+    if let Err(error) = mask_anthropic_request(&mut value, &mut masker, files, endpoint) {
         // Explicit media-policy decisions are not detector failures. Letting
         // them enter the general fail-open path would send the very PDF/image
         // that the configured policy rejected.
@@ -910,7 +924,7 @@ fn protect_anthropic_request_body(
             local_response: None,
         });
     }
-    inject_handle_contract(&mut value);
+    inject_handle_contract(&mut value, endpoint);
     match serde_json::to_vec(&value) {
         Ok(protected) => Ok(ProtectedJsonBody {
             body: Bytes::from(protected),
@@ -932,7 +946,30 @@ fn protect_anthropic_request_body(
     }
 }
 
-fn anthropic_request_unknown_content_kind(value: &Value) -> Option<&str> {
+fn anthropic_request_unknown_content_kind(
+    value: &Value,
+    endpoint: AnthropicEndpoint,
+) -> Option<&str> {
+    if endpoint == AnthropicEndpoint::MessageBatches {
+        let Some(requests) = value.get("requests").and_then(Value::as_array) else {
+            return Some("<invalid message batch>");
+        };
+        for request in requests {
+            let Some(params) = request.get("params").filter(|params| params.is_object()) else {
+                return Some("<invalid message batch request>");
+            };
+            if let Some(kind) =
+                anthropic_request_unknown_content_kind(params, AnthropicEndpoint::Messages)
+            {
+                return Some(kind);
+            }
+        }
+        return None;
+    }
+    if endpoint == AnthropicEndpoint::Complete {
+        return (!value.get("prompt").is_some_and(Value::is_string))
+            .then_some("<invalid completion prompt>");
+    }
     let mut roots = Vec::new();
     if let Some(system) = value.get("system") {
         roots.push(system);
@@ -989,8 +1026,33 @@ fn is_media_policy_rejection(error: &str) -> bool {
     error.starts_with("document blocked:") || error.starts_with("image blocked:")
 }
 
-fn warn_provider_mcp_credentials(value: &Value) {
-    if value
+fn warn_provider_mcp_credentials(value: &Value, endpoint: AnthropicEndpoint) {
+    let forwarded = if endpoint == AnthropicEndpoint::MessageBatches {
+        value
+            .get("requests")
+            .and_then(Value::as_array)
+            .is_some_and(|requests| {
+                requests.iter().any(|request| {
+                    request
+                        .get("params")
+                        .is_some_and(provider_mcp_credentials_present)
+                })
+            })
+    } else {
+        provider_mcp_credentials_present(value)
+    };
+    if forwarded && !WARNED_PROVIDER_MCP_CREDENTIALS.swap(true, Ordering::Relaxed) {
+        diagnostic(
+            "provider-mcp-credential-forwarded",
+            "credential-forwarding",
+            "messages",
+            false,
+        );
+    }
+}
+
+fn provider_mcp_credentials_present(value: &Value) -> bool {
+    value
         .get("mcp_servers")
         .and_then(Value::as_array)
         .is_some_and(|servers| {
@@ -1001,19 +1063,32 @@ fn warn_provider_mcp_credentials(value: &Value) {
                     .is_some_and(|token| !token.is_empty())
             })
         })
-        && !WARNED_PROVIDER_MCP_CREDENTIALS.swap(true, Ordering::Relaxed)
-    {
-        diagnostic(
-            "provider-mcp-credential-forwarded",
-            "credential-forwarding",
-            "messages",
-            false,
-        );
-    }
 }
 
-fn inject_handle_contract(value: &mut Value) {
+fn inject_handle_contract(value: &mut Value, endpoint: AnthropicEndpoint) {
+    if endpoint == AnthropicEndpoint::MessageBatches {
+        if let Some(requests) = value.get_mut("requests").and_then(Value::as_array_mut) {
+            for request in requests {
+                if let Some(params) = request.get_mut("params") {
+                    inject_handle_contract(params, AnthropicEndpoint::Messages);
+                }
+            }
+        }
+        return;
+    }
     if !request_contains_masked_handle(value) {
+        return;
+    }
+    if endpoint == AnthropicEndpoint::Complete {
+        if let Some(prompt) = value
+            .get_mut("prompt")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            if !prompt.contains(HANDLE_CONTRACT) {
+                value["prompt"] = Value::String(format!("{prompt}\n\n{HANDLE_CONTRACT}"));
+            }
+        }
         return;
     }
     let contract = serde_json::json!({
@@ -1505,7 +1580,33 @@ fn mask_anthropic_request(
     value: &mut Value,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
+    endpoint: AnthropicEndpoint,
 ) -> Result<(), String> {
+    if endpoint == AnthropicEndpoint::MessageBatches {
+        let requests = value
+            .get_mut("requests")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "message batch requires a requests array".to_string())?;
+        for request in requests {
+            let params = request
+                .get_mut("params")
+                .filter(|params| params.is_object())
+                .ok_or_else(|| "message batch request requires params".to_string())?;
+            mask_anthropic_request(params, masker, files, AnthropicEndpoint::Messages)?;
+        }
+        return Ok(());
+    }
+    if endpoint == AnthropicEndpoint::Complete {
+        let prompt = value
+            .get_mut("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "completion request requires a string prompt".to_string())?
+            .to_string();
+        let mut protected = prompt;
+        mask_string(&mut protected, false, masker)?;
+        value["prompt"] = Value::String(protected);
+        return Ok(());
+    }
     // Anthropic system content is client/provider-authored. It must be
     // protected, but prompt-only unmask markers are not trusted here.
     if let Some(system) = value.get_mut("system") {
@@ -1525,7 +1626,25 @@ fn mask_anthropic_request(
 fn redact_anthropic_base64_images(
     value: &mut Value,
     files: &HashMap<String, crate::http_files::Coverage>,
+    endpoint: AnthropicEndpoint,
 ) -> Result<(), String> {
+    if endpoint == AnthropicEndpoint::MessageBatches {
+        let requests = value
+            .get_mut("requests")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "message batch requires a requests array".to_string())?;
+        for request in requests {
+            let params = request
+                .get_mut("params")
+                .filter(|params| params.is_object())
+                .ok_or_else(|| "message batch request requires params".to_string())?;
+            redact_anthropic_base64_images(params, files, AnthropicEndpoint::Messages)?;
+        }
+        return Ok(());
+    }
+    if endpoint == AnthropicEndpoint::Complete {
+        return Ok(());
+    }
     if let Some(system) = value.get_mut("system") {
         redact_content_images(system, files)?;
     }
@@ -2575,6 +2694,10 @@ fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {
         AnthropicEndpoint::Messages
     } else if path.ends_with("/v1/messages/count_tokens") {
         AnthropicEndpoint::CountTokens
+    } else if path.ends_with("/v1/messages/batches") || path.contains("/v1/messages/batches/") {
+        AnthropicEndpoint::MessageBatches
+    } else if path.ends_with("/v1/complete") {
+        AnthropicEndpoint::Complete
     } else if path.ends_with("/v1/files") || path.contains("/v1/files/") {
         AnthropicEndpoint::Files
     } else if path.ends_with("/v1/models") || path.contains("/v1/models/") {
@@ -3361,7 +3484,15 @@ mod tests {
         );
         assert_eq!(
             classify_anthropic_endpoint("/v1/messages/batches"),
-            AnthropicEndpoint::Unknown
+            AnthropicEndpoint::MessageBatches
+        );
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/messages/batches/msgbatch_123/results"),
+            AnthropicEndpoint::MessageBatches
+        );
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/complete"),
+            AnthropicEndpoint::Complete
         );
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, true).is_err());
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, false).is_ok());
@@ -3394,14 +3525,14 @@ mod tests {
             "system": "existing",
             "messages": [{"role": "user", "content": "use <<SECRET_0123456789abcdef>>"}]
         });
-        inject_handle_contract(&mut request);
+        inject_handle_contract(&mut request, AnthropicEndpoint::Messages);
         assert_eq!(request["system"][0]["text"], "existing");
         assert_eq!(request["system"][1]["text"], HANDLE_CONTRACT);
-        inject_handle_contract(&mut request);
+        inject_handle_contract(&mut request, AnthropicEndpoint::Messages);
         assert_eq!(request["system"].as_array().unwrap().len(), 2);
 
         let mut empty = serde_json::json!({"messages": []});
-        inject_handle_contract(&mut empty);
+        inject_handle_contract(&mut empty, AnthropicEndpoint::Messages);
         assert!(empty.get("system").is_none());
     }
 
@@ -3411,7 +3542,7 @@ mod tests {
             "system": "existing",
             "messages": [{"role": "user", "content": "hello"}]
         });
-        inject_handle_contract(&mut clean);
+        inject_handle_contract(&mut clean, AnthropicEndpoint::Messages);
         assert_eq!(clean["system"], "existing");
 
         let mut protected = serde_json::json!({
@@ -3421,7 +3552,7 @@ mod tests {
                 "content": "use <<SECRET_0123456789abcdef>>"
             }]
         });
-        inject_handle_contract(&mut protected);
+        inject_handle_contract(&mut protected, AnthropicEndpoint::Messages);
         assert_eq!(protected["system"][0]["text"], "existing");
         assert_eq!(protected["system"][1]["text"], HANDLE_CONTRACT);
     }
@@ -3435,15 +3566,29 @@ mod tests {
         let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
         let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
         let files = HashMap::new();
-        let error = match protect_anthropic_request_body(&body, &masker, &plugins, &files, true) {
+        let error = match protect_anthropic_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            AnthropicEndpoint::Messages,
+            true,
+        ) {
             Ok(_) => panic!("unknown Anthropic block should be rejected"),
             Err(error) => error,
         };
         assert!(error.starts_with("unknown format blocked:"), "{error}");
         assert!(error.contains("future_block"), "{error}");
 
-        let allowed =
-            protect_anthropic_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        let allowed = protect_anthropic_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            AnthropicEndpoint::Messages,
+            false,
+        )
+        .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
         let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
         let original: Value = serde_json::from_slice(&body).unwrap();
@@ -3463,7 +3608,10 @@ mod tests {
                 ]
             }]
         });
-        assert_eq!(anthropic_request_unknown_content_kind(&value), None);
+        assert_eq!(
+            anthropic_request_unknown_content_kind(&value, AnthropicEndpoint::Messages),
+            None
+        );
     }
 
     #[test]
@@ -3473,11 +3621,108 @@ mod tests {
         let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
         let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
         let files = HashMap::new();
-        assert!(protect_anthropic_request_body(&body, &masker, &plugins, &files, true).is_err());
-        let allowed =
-            protect_anthropic_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        assert!(protect_anthropic_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            AnthropicEndpoint::Messages,
+            true,
+        )
+        .is_err());
+        let allowed = protect_anthropic_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            AnthropicEndpoint::Messages,
+            false,
+        )
+        .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
         assert_eq!(allowed.body, body);
+    }
+
+    #[test]
+    fn batch_and_legacy_completion_prompts_are_masked_at_their_real_boundaries() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = [
+            "rpa_",
+            "ZYXWVUTS",
+            "RQPONMLK",
+            "JIHGFEDC",
+            "BA098765",
+            "4321fedcba",
+        ]
+        .concat();
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::new();
+
+        let batch = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "requests": [{
+                    "custom_id": "request-1",
+                    "params": {
+                        "model": "test",
+                        "max_tokens": 8,
+                        "messages": [{
+                            "role": "user",
+                            "content": format!("RUNPOD_API_KEY={secret}")
+                        }]
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let protected = protect_anthropic_request_body(
+            &batch,
+            &masker,
+            &plugins,
+            &files,
+            AnthropicEndpoint::MessageBatches,
+            true,
+        )
+        .unwrap();
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert!(!protected.to_string().contains(&secret));
+        assert!(first_valid_handle(
+            protected["requests"][0]["params"]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+        )
+        .is_some());
+        assert!(protected.get("system").is_none());
+        assert_eq!(
+            protected["requests"][0]["params"]["system"][0]["text"],
+            HANDLE_CONTRACT
+        );
+
+        let completion = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test",
+                "max_tokens_to_sample": 8,
+                "prompt": format!("RUNPOD_API_KEY={secret}")
+            }))
+            .unwrap(),
+        );
+        let protected = protect_anthropic_request_body(
+            &completion,
+            &masker,
+            &plugins,
+            &files,
+            AnthropicEndpoint::Complete,
+            true,
+        )
+        .unwrap();
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        let prompt = protected["prompt"].as_str().unwrap();
+        assert!(!prompt.contains(&secret));
+        assert!(first_valid_handle(prompt).is_some());
+        assert!(prompt.contains(HANDLE_CONTRACT));
+        assert!(protected.get("system").is_none());
     }
 
     #[test]
