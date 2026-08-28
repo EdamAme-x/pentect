@@ -7,6 +7,7 @@ on:
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "crates/**"
       - "tools/alcatraz-helper/**"
       - ".github/actions/rust-toolchain/**"
@@ -56,7 +57,7 @@ jobs:
         with:
           shared-key: release-${{ matrix.asset }}
       - name: Set up shared compiler cache
-        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: "v0.17.0"
       - name: Build release profile
