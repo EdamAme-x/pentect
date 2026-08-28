@@ -65,6 +65,46 @@ pub(crate) fn protect_multipart_upload_with_plugins(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     plugins: &pentect_agent::PluginMiddleware,
 ) -> Result<ProtectedUpload, String> {
+    protect_multipart_upload_with_mode(
+        content_type,
+        body,
+        masker,
+        plugins,
+        MultipartUploadMode::Files,
+    )
+}
+
+pub(crate) fn protect_audio_multipart_upload_with_plugins(
+    content_type: &str,
+    body: &Bytes,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    plugins: &pentect_agent::PluginMiddleware,
+    block_uninspectable_audio: bool,
+) -> Result<ProtectedUpload, String> {
+    protect_multipart_upload_with_mode(
+        content_type,
+        body,
+        masker,
+        plugins,
+        MultipartUploadMode::Audio {
+            block_uninspectable_audio,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MultipartUploadMode {
+    Files,
+    Audio { block_uninspectable_audio: bool },
+}
+
+fn protect_multipart_upload_with_mode(
+    content_type: &str,
+    body: &Bytes,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    plugins: &pentect_agent::PluginMiddleware,
+    mode: MultipartUploadMode,
+) -> Result<ProtectedUpload, String> {
     if body.len() > MAX_MULTIPART_BYTES {
         return Err("file upload blocked: multipart request is too large".to_string());
     }
@@ -76,9 +116,10 @@ pub(crate) fn protect_multipart_upload_with_plugins(
     next_part_prefix.extend_from_slice(b"\r\n");
     next_part_prefix.extend_from_slice(&delimiter);
     let purpose = multipart_field(body, &delimiter, &next_part_prefix, "purpose");
-    let immutable_dataset = purpose
-        .as_deref()
-        .is_some_and(|purpose| matches!(purpose, "batch" | "fine-tune" | "evals"));
+    let immutable_dataset = matches!(mode, MultipartUploadMode::Files)
+        && purpose
+            .as_deref()
+            .is_some_and(|purpose| matches!(purpose, "batch" | "fine-tune" | "evals"));
     let mut cursor = 0;
     let mut output = Vec::with_capacity(body.len());
     let mut saw_file = false;
@@ -201,6 +242,24 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                     output.extend_from_slice(body_separator);
                     output.extend_from_slice(content);
                 }
+            } else if matches!(mode, MultipartUploadMode::Audio { .. })
+                && supported_audio_file(&file.filename, file.media_type.as_deref())
+            {
+                if matches!(
+                    mode,
+                    MultipartUploadMode::Audio {
+                        block_uninspectable_audio: true
+                    }
+                ) {
+                    return Err(
+                        "unknown format blocked: OpenAI audio content cannot be inspected safely; set compatibility.unknown_formats = \"ignore\" to pass the audio through while still protecting text fields"
+                            .to_string(),
+                    );
+                }
+                output.extend_from_slice(headers);
+                output.extend_from_slice(body_separator);
+                output.extend_from_slice(content);
+                coverage = Coverage::Partial;
             } else {
                 return Err(
                     "file upload blocked: this binary format cannot be inspected safely"
@@ -214,13 +273,28 @@ pub(crate) fn protect_multipart_upload_with_plugins(
             }
             output.extend_from_slice(headers);
             output.extend_from_slice(body_separator);
-            output.extend_from_slice(content);
+            if matches!(mode, MultipartUploadMode::Audio { .. })
+                && multipart_part_name(headers).as_deref() == Some("prompt")
+            {
+                let text = std::str::from_utf8(content).map_err(|_| {
+                    "file upload blocked: audio prompt is not valid UTF-8".to_string()
+                })?;
+                let masked = masker.mask_tool_output(text)?.ok_or_else(|| {
+                    "file upload blocked: audio prompt inspection is unavailable".to_string()
+                })?;
+                extend_protected_output(&mut output, masked.as_bytes())?;
+            } else {
+                output.extend_from_slice(content);
+            }
         }
         cursor = content_end;
     }
 
     if cursor < body.len() {
         output.extend_from_slice(&body[cursor..]);
+    }
+    if matches!(mode, MultipartUploadMode::Audio { .. }) && !saw_file {
+        return Err("file upload blocked: OpenAI audio request has no file part".to_string());
     }
     if !saw_file {
         coverage = Coverage::None;
@@ -376,6 +450,45 @@ fn supported_image_file(filename: &str, media_type: Option<&str>) -> bool {
                 "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
             )
         })
+}
+
+fn supported_audio_file(filename: &str, media_type: Option<&str>) -> bool {
+    if media_type.is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "audio/flac"
+                | "audio/mpeg"
+                | "audio/mp4"
+                | "audio/mpga"
+                | "audio/m4a"
+                | "audio/ogg"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "audio/webm"
+                | "video/mp4"
+                | "video/webm"
+        )
+    }) {
+        return true;
+    }
+    Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "flac" | "mp3" | "mp4" | "mpeg" | "mpga" | "m4a" | "ogg" | "wav" | "webm"
+            )
+        })
+}
+
+fn multipart_part_name(headers: &[u8]) -> Option<String> {
+    let headers = std::str::from_utf8(headers).ok()?;
+    let disposition = headers.lines().find(|line| {
+        line.to_ascii_lowercase()
+            .starts_with("content-disposition:")
+    })?;
+    disposition_parameter(disposition, "name")
 }
 
 fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
