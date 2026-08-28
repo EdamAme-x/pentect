@@ -9,6 +9,7 @@ use super::benign::{
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
+use crate::placeholder::parse_placeholder;
 use data_encoding::BASE64;
 
 const MAX_KEY_CONTEXT_BYTES: usize = 72;
@@ -691,6 +692,16 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         }
     }
     let raw_value = &ctx.text[value.start..value.end];
+    if is_angle_placeholder(raw_value) && !is_rendered_placeholder(raw_value) {
+        ctx.out.push(Span {
+            range: ctx.view.to_raw(ByteRange::new(value.start, value.end)),
+            category: Category::Secret,
+            label: labels::KEYED_SECRET.to_string(),
+            confidence: Confidence::High,
+            source: DetectorId::KeyValue,
+        });
+        return true;
+    }
     if is_self_reference_code_value(semantic_key, raw_value) {
         return false;
     }
@@ -1103,6 +1114,18 @@ fn parse_value_item(
                 quoted: true,
             },
             next: (end + 1).min(line_end),
+        });
+    }
+
+    if text[pos..line_end].starts_with("<<") {
+        let close = text[pos + 2..line_end].find(">>")? + pos + 4;
+        return Some(ParsedValueItem {
+            value: ValueCandidate {
+                start: pos,
+                end: close,
+                quoted: false,
+            },
+            next: close,
         });
     }
 
@@ -1587,6 +1610,12 @@ fn looks_like_secret_value(
     if value.is_empty() || is_rendered_placeholder(value) || is_benign_literal(value) {
         return false;
     }
+    if is_angle_placeholder(value) {
+        // The only safe `<<...>>` value in a sensitive key position is a
+        // syntactically valid Pentect handle, which returned above. Treat every
+        // lookalike as secret regardless of its entropy or character shape.
+        return true;
+    }
     if is_short_dotted_triplet(value) {
         return false;
     }
@@ -1873,10 +1902,21 @@ fn is_short_dotted_triplet(value: &str) -> bool {
 }
 
 fn is_rendered_placeholder(v: &str) -> bool {
-    v.starts_with("<<") && v.ends_with(">>")
+    let value = v.trim();
+    is_angle_placeholder(value) && parse_placeholder(value).is_ok()
+}
+
+fn is_angle_placeholder(value: &str) -> bool {
+    value.starts_with("<<") && value.ends_with(">>")
 }
 
 fn is_benign_literal(value: &str) -> bool {
+    // A valid Pentect handle has already returned above. Do not let the broad
+    // documentation-placeholder heuristic exempt an attacker-controlled
+    // `<<...>>` lookalike in an explicitly sensitive key position.
+    if is_angle_placeholder(value) {
+        return false;
+    }
     if is_placeholder_value(value) {
         return true;
     }
@@ -7369,6 +7409,24 @@ mod tests {
 
     fn has(raw: &str, value: &str) -> bool {
         hits(raw).iter().any(|(_, got)| got == value)
+    }
+
+    #[test]
+    fn only_valid_pentect_handles_are_treated_as_already_masked() {
+        let valid = "<<SECRET_0123456789abcdef>>";
+        assert!(is_rendered_placeholder(valid));
+
+        for invalid in [
+            "<<MY_PASSWORD>>",
+            "<<LABEL_ABCDEF0123456789>>",
+            "<<LABEL_abc123>>",
+            "<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>",
+        ] {
+            assert!(!is_rendered_placeholder(invalid), "{invalid}");
+        }
+
+        let wrapped_pat = "<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>";
+        assert!(has(&format!("password={wrapped_pat}"), wrapped_pat));
     }
 
     #[test]

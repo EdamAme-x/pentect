@@ -2388,6 +2388,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_placeholder_lookalikes_cannot_bypass_env_masking() {
+        let raw = "PASSWORD=<<MY_PASSWORD>>\nTOKEN=<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>\nLOWER=<<my_label_0123456789abcdef>>\nUPPER_HASH=<<LABEL_ABCDEF0123456789>>\nSHORT_HASH=<<LABEL_abc123>>\nVALID=<<SECRET_0123456789abcdef>>\n";
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+
+        for leaked in [
+            "<<MY_PASSWORD>>",
+            "<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>",
+            "<<my_label_0123456789abcdef>>",
+            "<<LABEL_ABCDEF0123456789>>",
+            "<<LABEL_abc123>>",
+        ] {
+            assert!(
+                !result.masked.contains(leaked),
+                "{leaked}: {}",
+                result.masked
+            );
+        }
+        assert!(
+            result.masked.contains("VALID=<<SECRET_0123456789abcdef>>"),
+            "{}",
+            result.masked
+        );
+
+        let wrapped_pat = "ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc";
+        let text_result = m(&format!("password=<<{wrapped_pat}>>"));
+        assert!(
+            !text_result.masked.contains(wrapped_pat),
+            "{}",
+            text_result.masked
+        );
+    }
+
+    #[test]
     fn env_numeric_values_masked_even_when_low_entropy() {
         let raw = "TEST_SECRET=114514810\nFEATURE_FLAG=false\n";
         let r = Engine::with_profile(Profile::Strict).mask(
