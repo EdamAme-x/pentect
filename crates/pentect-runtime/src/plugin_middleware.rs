@@ -431,9 +431,13 @@ impl PluginMiddleware {
                     if plugin.required {
                         return Err(error);
                     }
-                    coverage = MiddlewareCoverage::Partial;
-                    eprintln!("[pentect] optional {error}");
-                    continue;
+                    eprintln!("[pentect] optional {error}; blocking instead");
+                    return Ok(MiddlewareRun {
+                        payload,
+                        coverage,
+                        stopped: Some(StopOutcome::Block),
+                        message: response.message.or(Some(error)),
+                    });
                 }
                 Some(outcome)
             } else {
@@ -3951,6 +3955,36 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("mismatched protocol response"), "{error}");
+    }
+
+    #[test]
+    fn optional_non_request_respond_falls_back_to_block() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys; r=json.loads(sys.stdin.readline()); print(json.dumps({'schema':'pentect.plugin.v1','id':r['id'],'type':'result','action':'stop','outcome':'respond'}), flush=True)",
+        ) else {
+            return;
+        };
+        let middleware = PluginMiddleware {
+            plugins: vec![PluginBinary {
+                name: "optional-respond".to_string(),
+                program: PluginProgram::Command(
+                    CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap(),
+                ),
+                hooks: BTreeSet::from([MiddlewareStage::ToolCall]),
+                required: false,
+                command_config: Some(json!({})),
+                timeout: Duration::from_secs(5),
+                startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+                max_output_bytes: 4096,
+                max_spans: DEFAULT_MAX_SPANS,
+            }],
+        };
+        let result = middleware
+            .run(MiddlewareStage::ToolCall, json!({"input": {}}), None)
+            .unwrap();
+        assert_eq!(result.stopped, Some(StopOutcome::Block));
+        assert!(result.message.unwrap().contains("can only respond"));
     }
 
     fn invalid_command_plugin(required: bool) -> PluginBinary {

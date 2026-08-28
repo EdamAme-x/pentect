@@ -659,6 +659,7 @@ fn run_anthropic_tool_plugins(
                     Value::Object(object.clone()),
                     Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
                 )?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin blocked: {}",
@@ -1429,9 +1430,9 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
             .as_str()
             .map(str::to_owned)
     });
-    match event.or(data_type.as_deref()) {
-        Some("ping") => SseControlEvent::Ping,
-        Some("error") => SseControlEvent::Error,
+    match (event, data_type.as_deref()) {
+        (Some("ping"), _) | (_, Some("ping")) => SseControlEvent::Ping,
+        (Some("error"), _) | (_, Some("error")) => SseControlEvent::Error,
         _ => SseControlEvent::Other,
     }
 }
