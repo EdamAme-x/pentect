@@ -1,4 +1,4 @@
-use super::util::token_runs;
+use super::util::{is_token_byte, token_runs};
 use super::{AuthCodeDetector, Bip39Detector, CredSweeperNativeDetector, Detector};
 use crate::codec::{
     is_rfc1924_base85_byte, is_z85_byte, Ascii85Codec, Base32Codec, Base32HexCodec, Base58Codec,
@@ -543,24 +543,33 @@ fn percent_encoded_runs(text: &str, min_bytes: usize) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut runs = Vec::new();
     let mut cursor = 0usize;
-    while cursor + 2 < bytes.len() {
-        if bytes[cursor] != b'%'
-            || !bytes[cursor + 1].is_ascii_hexdigit()
-            || !bytes[cursor + 2].is_ascii_hexdigit()
-        {
+    while cursor < bytes.len() {
+        if !is_token_byte(bytes[cursor]) && bytes[cursor] != b'%' {
             cursor += 1;
             continue;
         }
         let start = cursor;
-        while cursor + 2 < bytes.len()
-            && bytes[cursor] == b'%'
-            && bytes[cursor + 1].is_ascii_hexdigit()
-            && bytes[cursor + 2].is_ascii_hexdigit()
-        {
-            cursor += 3;
+        let mut valid_escape = false;
+        while cursor < bytes.len() && (is_token_byte(bytes[cursor]) || bytes[cursor] == b'%') {
+            if bytes[cursor] == b'%' {
+                if bytes
+                    .get(cursor + 1..cursor + 3)
+                    .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                {
+                    valid_escape = true;
+                    cursor += 3;
+                } else {
+                    break;
+                }
+            } else {
+                cursor += 1;
+            }
         }
-        if cursor - start >= min_bytes {
+        if valid_escape && cursor - start >= min_bytes {
             runs.push((start, cursor));
+        }
+        if cursor == start {
+            cursor += 1;
         }
     }
     runs
@@ -920,13 +929,50 @@ mod tests {
     }
 
     #[test]
-    fn percent_candidates_require_dense_complete_triplets() {
+    fn percent_candidates_support_mixed_text_and_require_complete_triplets() {
         assert_eq!(
             percent_encoded_runs("x=%41%4B%49%41 end", 12),
-            vec![(2, 14)]
+            vec![(0, 14)]
         );
-        assert!(percent_encoded_runs("https://example.test/%2Fdocs", 12).is_empty());
+        assert_eq!(
+            PercentCodec.decode("AK%49AIOSFODNN7EXAMPLE"),
+            Some(b"AKIAIOSFODNN7EXAMPLE".to_vec())
+        );
+        assert_eq!(
+            percent_encoded_runs("https://example.test/%2Fdocs", 12),
+            vec![(16, 28)]
+        );
         assert!(PercentCodec.decode("%41%4").is_none());
+        assert!(PercentCodec.decode("plain-token").is_none());
+    }
+
+    #[test]
+    fn partially_percent_encoded_secret_masks_and_recovers_the_outer_source() {
+        let encoded = "token=ghp_0123456789%2Babcdef0123456789abcdef0123";
+        let engine = crate::Engine::with_profile_and_decode_config(
+            crate::Profile::Strict,
+            DecodeConfig::default(),
+        );
+        let result = engine.mask(
+            crate::Input {
+                kind: crate::Kind::Text,
+                data: encoded.to_string(),
+            },
+            &crate::Config::insecure_testing(),
+        );
+        assert!(!result.items.is_empty(), "{}", result.masked);
+        assert!(!result.masked.contains(encoded));
+        assert_eq!(result.recovery.resolve(&result.masked), encoded);
+
+        let public_url = "https://example.test/%2Fdocs";
+        let public = engine.mask(
+            crate::Input {
+                kind: crate::Kind::Text,
+                data: public_url.to_string(),
+            },
+            &crate::Config::insecure_testing(),
+        );
+        assert_eq!(public.masked, public_url);
     }
 
     #[test]

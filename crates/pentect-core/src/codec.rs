@@ -105,26 +105,30 @@ impl Codec for HexCodec {
     }
 }
 
-/// A dense RFC 3986 percent-encoded byte sequence. Plain URL characters are
-/// intentionally excluded so normal URLs do not become decode candidates.
+/// An RFC 3986 percent-encoded byte sequence. Unescaped bytes pass through, as
+/// standard URL encoders preserve unreserved characters. At least one complete
+/// escape is required so ordinary tokens are not treated as encoded input.
 pub struct PercentCodec;
 
 impl Codec for PercentCodec {
     fn decode(&self, run: &str) -> Option<Vec<u8>> {
         let bytes = run.as_bytes();
-        if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
-            return None;
-        }
-        let mut out = Vec::with_capacity(bytes.len() / 3);
-        for chunk in bytes.chunks_exact(3) {
-            if chunk[0] != b'%' {
-                return None;
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut cursor = 0;
+        let mut escaped = false;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'%' {
+                let high = hex_nibble(*bytes.get(cursor + 1)?)?;
+                let low = hex_nibble(*bytes.get(cursor + 2)?)?;
+                out.push((high << 4) | low);
+                cursor += 3;
+                escaped = true;
+            } else {
+                out.push(bytes[cursor]);
+                cursor += 1;
             }
-            let high = hex_nibble(chunk[1])?;
-            let low = hex_nibble(chunk[2])?;
-            out.push((high << 4) | low);
         }
-        Some(out)
+        escaped.then_some(out)
     }
 }
 
