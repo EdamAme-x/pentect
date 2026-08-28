@@ -2373,7 +2373,7 @@ struct ChatStreamState {
     upstream: ChatFrameStream,
     pending: Vec<u8>,
     ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
-    passthrough: bool,
+    max_pending_bytes: usize,
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     resolve: Option<ChatResolver>,
@@ -2457,11 +2457,22 @@ fn chat_sse_body<S>(stream: S, plugins: Arc<Mutex<pentect_agent::PluginMiddlewar
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
 {
+    chat_sse_body_with_limit(stream, plugins, MAX_CHAT_BODY_BYTES)
+}
+
+fn chat_sse_body_with_limit<S>(
+    stream: S,
+    plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+    max_pending_bytes: usize,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
+{
     let state = ChatStreamState {
         upstream: Box::pin(stream),
         pending: Vec::new(),
         ready: VecDeque::new(),
-        passthrough: false,
+        max_pending_bytes,
         finished: false,
         plugins,
         resolve: Some(Box::new(crate::claude_http_proxy::request_scoped_resolver())),
@@ -2475,21 +2486,18 @@ where
                 return None;
             }
             match state.upstream.next().await {
-                Some(Ok(frame)) if state.passthrough => {
-                    return Some((Ok(frame), state));
-                }
                 Some(Ok(frame)) => {
                     let Ok(chunk) = frame.into_data() else {
                         continue;
                     };
-                    if state.pending.len().saturating_add(chunk.len()) > MAX_CHAT_BODY_BYTES {
-                        eprintln!(
-                            "[pentect] Claude App Chat restoration disabled: event exceeded limit"
-                        );
-                        let mut bytes = std::mem::take(&mut state.pending);
-                        bytes.extend_from_slice(&chunk);
-                        state.ready.push_back(Ok(Frame::data(Bytes::from(bytes))));
-                        state.passthrough = true;
+                    if state.pending.len().saturating_add(chunk.len()) > state.max_pending_bytes {
+                        eprintln!("[pentect] Claude App Chat response blocked: SSE event exceeded inspection limit");
+                        state.pending.clear();
+                        state.finished = true;
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Claude App Chat SSE event exceeded inspection limit",
+                        ))));
                         continue;
                     }
                     state.pending.extend_from_slice(&chunk);
@@ -3105,6 +3113,29 @@ fn success_status() -> std::process::ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_chat_sse_event_fails_closed_without_emitting_it() {
+        let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
+            Bytes::from_static(b"12345"),
+        ))]);
+        let body = chat_sse_body_with_limit(
+            stream,
+            Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            4,
+        );
+
+        let error = match body.collect().await {
+            Ok(_) => panic!("oversized uninspected event must not be emitted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("SSE event exceeded inspection limit"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn early_exit_diagnostic_does_not_recommend_an_update_or_unsafe_bypass() {
