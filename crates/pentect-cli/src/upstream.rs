@@ -149,6 +149,15 @@ pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, Stri
     Ok(overrides)
 }
 
+pub(crate) fn has_authorization_override(specs: &[String]) -> bool {
+    specs.iter().any(|spec| {
+        spec.split_once('=').is_some_and(|(name, _)| {
+            name.trim()
+                .eq_ignore_ascii_case(reqwest::header::AUTHORIZATION.as_str())
+        })
+    })
+}
+
 pub(crate) fn header_overrides_with_bearer_env(
     specs: &[String],
     bearer_env: Option<&str>,
@@ -417,6 +426,20 @@ mod tests {
                 .as_str(),
             "http://localhost:8080/anthropic/v1/messages"
         );
+    }
+
+    #[test]
+    fn authorization_override_detection_is_case_and_whitespace_insensitive() {
+        assert!(has_authorization_override(&[
+            "authorization=GATEWAY_AUTH".to_string()
+        ]));
+        assert!(has_authorization_override(&[
+            " Authorization = GATEWAY_AUTH ".to_string()
+        ]));
+        assert!(!has_authorization_override(&[
+            "x-api-key=GATEWAY_KEY".to_string()
+        ]));
+        assert!(!has_authorization_override(&["authorization".to_string()]));
     }
 
     #[test]

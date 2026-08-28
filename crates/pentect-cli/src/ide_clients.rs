@@ -45,11 +45,12 @@ pub(crate) fn run(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let standard_key_names = if has_authorization_override(&opts.upstream_header_env) {
-        &[][..]
-    } else {
-        &["OPENAI_API_KEY"][..]
-    };
+    let standard_key_names =
+        if crate::upstream::has_authorization_override(&opts.upstream_header_env) {
+            &[][..]
+        } else {
+            &["OPENAI_API_KEY"][..]
+        };
     let _authorization = crate::upstream_bearer_guard(standard_key_names);
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
         upstream,
@@ -455,13 +456,6 @@ fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
-}
-
-fn has_authorization_override(specs: &[String]) -> bool {
-    specs.iter().any(|spec| {
-        spec.split_once('=')
-            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
-    })
 }
 
 #[derive(Debug)]
