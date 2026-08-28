@@ -2329,11 +2329,25 @@ fn perform_host_request(
                 Err(_) => HostResponse::failed(),
             }
         }
-        HostRequest::FileWrite { path, data } => {
+        HostRequest::FileWrite {
+            path: requested_path,
+            data,
+        } => {
             if data.len() > HOST_MAX_VALUE_BYTES {
                 return HostResponse::failed();
             }
-            let Some(path) = approved_file_path(policy, &path, true) else {
+            let Some(path) = approved_file_path(policy, &requested_path, true) else {
+                return HostResponse::denied();
+            };
+            let Some(parent) = path.parent() else {
+                return HostResponse::denied();
+            };
+            if std::fs::create_dir_all(parent).is_err() {
+                return HostResponse::failed();
+            }
+            // Re-resolve after creating the path so a symlink introduced in an
+            // absent component cannot redirect the write outside its scope.
+            let Some(path) = approved_file_path(policy, &requested_path, true) else {
                 return HostResponse::denied();
             };
             let temporary = path.with_extension(format!(
@@ -2428,20 +2442,26 @@ fn approved_file_path(policy: &PermissionPolicy, value: &str, write: bool) -> Op
         return None;
     }
     let allowed = if write { &policy.write } else { &policy.read };
+    let candidate = root.join(&relative);
     if !allowed.iter().any(|permission| {
         permission.scope == scope
             && if permission.recursive {
                 relative.starts_with(&permission.relative)
+                    || canonical_permission_contains(root, &candidate, permission)
             } else {
                 relative == permission.relative
+                    || canonical_paths_match(root, &candidate, permission)
             }
     }) {
         return None;
     }
-    let candidate = root.join(&relative);
     if write {
-        let parent = candidate.parent()?.canonicalize().ok()?;
-        if !parent.starts_with(root) {
+        let mut existing = candidate.parent()?;
+        while !existing.exists() {
+            existing = existing.parent()?;
+        }
+        let existing = existing.canonicalize().ok()?;
+        if !existing.starts_with(root) {
             return None;
         }
         if candidate.exists() {
@@ -2454,6 +2474,36 @@ fn approved_file_path(policy: &PermissionPolicy, value: &str, write: bool) -> Op
         let canonical = candidate.canonicalize().ok()?;
         (canonical.starts_with(root) && canonical.is_file()).then_some(canonical)
     }
+}
+
+fn canonical_paths_match(root: &Path, candidate: &Path, permission: &PathPermission) -> bool {
+    let Ok(candidate) = candidate.canonicalize() else {
+        return false;
+    };
+    let Ok(allowed) = root.join(&permission.relative).canonicalize() else {
+        return false;
+    };
+    candidate == allowed
+}
+
+fn canonical_permission_contains(
+    root: &Path,
+    candidate: &Path,
+    permission: &PathPermission,
+) -> bool {
+    let Ok(allowed) = root.join(&permission.relative).canonicalize() else {
+        return false;
+    };
+    let mut existing = candidate;
+    while !existing.exists() {
+        let Some(parent) = existing.parent() else {
+            return false;
+        };
+        existing = parent;
+    }
+    existing
+        .canonicalize()
+        .is_ok_and(|candidate| candidate.starts_with(allowed))
 }
 
 fn valid_storage_key(key: &str) -> bool {
@@ -2502,6 +2552,36 @@ fn storage_path(root: &Path, key: &str) -> PathBuf {
     ))
 }
 
+struct BoundedCommandStream {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_command_stream<R>(
+    mut reader: R,
+    overflow: mpsc::Sender<()>,
+) -> std::io::Result<BoundedCommandStream>
+where
+    R: Read,
+{
+    let mut bytes = Vec::with_capacity(HOST_MAX_COMMAND_STREAM_BYTES);
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = HOST_MAX_COMMAND_STREAM_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining && !exceeded {
+            exceeded = true;
+            let _ = overflow.send(());
+        }
+    }
+    Ok(BoundedCommandStream { bytes, exceeded })
+}
+
 fn run_brokered_command(
     cwd: &Path,
     argv: &[String],
@@ -2533,20 +2613,10 @@ fn run_brokered_command(
         .stderr
         .take()
         .ok_or_else(|| "stderr unavailable".to_string())?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut value = Vec::new();
-        stdout
-            .take((HOST_MAX_COMMAND_STREAM_BYTES + 1) as u64)
-            .read_to_end(&mut value)
-            .map(|_| value)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut value = Vec::new();
-        stderr
-            .take((HOST_MAX_COMMAND_STREAM_BYTES + 1) as u64)
-            .read_to_end(&mut value)
-            .map(|_| value)
-    });
+    let (overflow_sender, overflow_receiver) = mpsc::channel();
+    let stdout_overflow = overflow_sender.clone();
+    let stdout_reader = std::thread::spawn(move || read_command_stream(stdout, stdout_overflow));
+    let stderr_reader = std::thread::spawn(move || read_command_stream(stderr, overflow_sender));
     if let Some(mut input) = child.stdin.take() {
         let bytes = stdin.as_bytes().to_vec();
         let (sender, receiver) = mpsc::channel();
@@ -2554,24 +2624,43 @@ fn run_brokered_command(
             let result = input.write_all(&bytes);
             let _ = sender.send(result);
         });
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(remaining) {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+        loop {
+            if overflow_receiver.try_recv().is_ok() {
                 tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("approved command input failed".to_string());
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("approved command output exceeds its limit".to_string());
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err("approved command timed out".to_string());
             }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(2))) {
+                Ok(Ok(())) => break,
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    tree.terminate();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("approved command input failed".to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
     let status = loop {
+        if overflow_receiver.try_recv().is_ok() {
+            tree.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("approved command output exceeds its limit".to_string());
+        }
         if let Some(status) = child
             .try_wait()
             .map_err(|_| "approved command wait failed".to_string())?
@@ -2597,15 +2686,14 @@ fn run_brokered_command(
         .join()
         .map_err(|_| "approved command error output failed".to_string())?
         .map_err(|_| "approved command error output failed".to_string())?;
-    if stdout.len() > HOST_MAX_COMMAND_STREAM_BYTES || stderr.len() > HOST_MAX_COMMAND_STREAM_BYTES
-    {
+    if stdout.exceeded || stderr.exceeded {
         return Err("approved command output exceeds its limit".to_string());
     }
     Ok(json!({
         "status": status.code(),
         "success": status.success(),
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
+        "stdout": String::from_utf8_lossy(&stdout.bytes),
+        "stderr": String::from_utf8_lossy(&stderr.bytes),
     }))
 }
 
@@ -3625,6 +3713,13 @@ fn plugin_id(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn oversized_output_command() -> Option<Vec<String>> {
+        let bytes = HOST_MAX_COMMAND_STREAM_BYTES + 64 * 1024;
+        python_protocol_fixture(&format!(
+            "import sys; sys.stdout.buffer.write(b'x' * {bytes})"
+        ))
+    }
+
     #[test]
     fn windows_command_plugins_accept_batch_shims_only() {
         for extension in [".EXE", "com", ".CMD", "bat"] {
@@ -3772,9 +3867,9 @@ mod tests {
     }
 
     #[test]
-    fn command_program_cold_start_consumes_the_chain_deadline() {
+    fn command_program_warm_request_uses_request_timeout_after_cold_start() {
         let Some(command) = python_protocol_fixture(
-            "import json,sys,time; time.sleep(0.15);\nfor line in sys.stdin:\n r=json.loads(line); time.sleep(0.10); print(json.dumps({'id':r['id']}), flush=True)",
+            "import json,sys,time\nfor index,line in enumerate(sys.stdin):\n r=json.loads(line)\n if index: time.sleep(2)\n print(json.dumps({'id':r['id']}), flush=True)",
         ) else {
             return;
         };
@@ -3980,6 +4075,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("mismatched protocol response"), "{error}");
+    }
+
+    #[test]
+    fn brokered_command_fails_promptly_when_output_exceeds_limit() {
+        let Some(command) = oversized_output_command() else {
+            return;
+        };
+        let started = Instant::now();
+        let error = run_brokered_command(
+            &std::env::current_dir().unwrap(),
+            &command,
+            "",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("output exceeds its limit"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -4434,24 +4546,44 @@ disk = "CPU: about 5 GB"
         std::fs::create_dir_all(&storage).unwrap();
         std::fs::write(project.join("allowed.txt"), "visible").unwrap();
         std::fs::write(project.join("denied.txt"), "hidden").unwrap();
+        #[cfg(windows)]
+        {
+            std::fs::create_dir(project.join("Config")).unwrap();
+            std::fs::write(project.join("Config/settings.json"), "case-safe").unwrap();
+        }
         let requested_command = vec!["rustc".to_string(), "--version".to_string()];
         let mut resolved_command = requested_command.clone();
         resolved_command[0] = resolve_command_executable("rustc")
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let policy = PermissionPolicy {
-            name: "fixture".to_string(),
-            read: vec![PathPermission {
+        let read_permissions = vec![
+            PathPermission {
                 scope: PathScope::Project,
                 relative: PathBuf::from("allowed.txt"),
                 recursive: false,
-            }],
-            write: vec![PathPermission {
+            },
+            PathPermission {
                 scope: PathScope::Project,
-                relative: PathBuf::from("written.txt"),
+                relative: PathBuf::from("config/settings.json"),
                 recursive: false,
-            }],
+            },
+        ];
+        let policy = PermissionPolicy {
+            name: "fixture".to_string(),
+            read: read_permissions,
+            write: vec![
+                PathPermission {
+                    scope: PathScope::Project,
+                    relative: PathBuf::from("written.txt"),
+                    recursive: false,
+                },
+                PathPermission {
+                    scope: PathScope::Project,
+                    relative: PathBuf::from("output"),
+                    recursive: true,
+                },
+            ],
             env: BTreeSet::from(["PATH".to_string()]),
             run: BTreeMap::from([(requested_command.clone(), resolved_command)]),
             storage: true,
@@ -4469,6 +4601,20 @@ disk = "CPU: about 5 GB"
         );
         assert!(allowed.ok);
         assert_eq!(allowed.value, Some(Value::String("visible".to_string())));
+        #[cfg(windows)]
+        {
+            let case_variant = perform_host_request(
+                &policy,
+                HostRequest::FileRead {
+                    path: "project:Config/settings.json".to_string(),
+                },
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert_eq!(
+                case_variant.value,
+                Some(Value::String("case-safe".to_string()))
+            );
+        }
         let denied = perform_host_request(
             &policy,
             HostRequest::FileRead {
@@ -4507,6 +4653,19 @@ disk = "CPU: about 5 GB"
         assert_eq!(
             std::fs::read_to_string(project.join("written.txt")).unwrap(),
             "generated"
+        );
+        let nested = perform_host_request(
+            &policy,
+            HostRequest::FileWrite {
+                path: "project:output/session/result.json".to_string(),
+                data: "nested".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(nested.ok);
+        assert_eq!(
+            std::fs::read_to_string(project.join("output/session/result.json")).unwrap(),
+            "nested"
         );
 
         let stored = perform_host_request(

@@ -277,6 +277,10 @@ async fn proxy_request_inner(
             }
             Err(error) => return Err(format!("could not read Gemini request: {error}")),
         };
+        let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
+        let body =
+            crate::cloud_code_http_proxy::resolve_google_remote_files(body, &mut remote_budget)
+                .await?;
         let protected = protect_request_body(
             &body,
             endpoint,
@@ -285,6 +289,12 @@ async fn proxy_request_inner(
             state.block_unknown_formats,
         )?;
         if let Some(response) = protected.local_response {
+            if endpoint == GeminiEndpoint::StreamGenerateContent {
+                return Ok(text_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Plugin local responses are unavailable for streaming Gemini requests",
+                ));
+            }
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -1141,6 +1151,18 @@ mod tests {
             ),
             "unknown"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_file_data_uses_the_bounded_google_resolver() {
+        let body = Bytes::from_static(
+            br#"{"contents":[{"role":"user","parts":[{"fileData":{"mimeType":"text/plain","fileUri":"https://127.0.0.1/private"}}]}]}"#,
+        );
+        let mut budget = crate::remote_content::RemoteRequestBudget::default();
+        let error = crate::cloud_code_http_proxy::resolve_google_remote_files(body, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(error.contains("non-public address"), "{error}");
     }
 
     #[test]

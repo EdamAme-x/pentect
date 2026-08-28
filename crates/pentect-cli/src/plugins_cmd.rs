@@ -887,6 +887,14 @@ impl NewPluginForm {
     }
 }
 
+fn new_plugin_next_steps(form: NewPluginForm) -> &'static str {
+    match form {
+        NewPluginForm::Manifest => "pentect plugins test .\npentect plugins add .",
+        NewPluginForm::Wasm => "pentect plugins dev .\npentect plugins test .",
+        NewPluginForm::Command => "pentect plugins setup .\npentect plugins test .",
+    }
+}
+
 fn choose_new_plugin_form() -> Result<NewPluginForm, String> {
     if !std::io::stdin().is_terminal() {
         return Err("choose a form: pentect plugins new NAME manifest|wasm|command".to_string());
@@ -932,16 +940,17 @@ fn new_plugin(name: &str, form: Option<NewPluginForm>, json_output: bool) -> Res
         NewPluginForm::Wasm => write_wasm_plugin_template(&root, name, &crate_name)?,
         NewPluginForm::Command => write_command_plugin_template(&root, name)?,
     }
+    let next_steps = new_plugin_next_steps(form);
     std::fs::write(
         root.join("README.md"),
-        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins setup .\npentect plugins test .\n```\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
+        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\n{next_steps}\n```\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
     )
     .map_err(|error| format!("could not write plugin README: {error}"))?;
     println!("created: {}", display_path(&root));
-    println!(
-        "next: cd {} && pentect plugins setup .",
-        display_path(&root)
-    );
+    println!("next: cd {}", display_path(&root));
+    for command in next_steps.lines() {
+        println!("      {command}");
+    }
     Ok(())
 }
 
@@ -3051,6 +3060,13 @@ fn print_permissions(permissions: &PermissionsConfig) {
     }
     if !permissions.env.is_empty() {
         println!("permission-env: {}", permissions.env.join(", "));
+        let sensitive = sensitive_env_permissions(&permissions.env);
+        if !sensitive.is_empty() {
+            println!(
+                "WARNING: credential-like environment access: {}",
+                sensitive.join(", ")
+            );
+        }
     }
     for argv in &permissions.run {
         println!("permission-run: {}", display_command(argv));
@@ -3058,6 +3074,36 @@ fn print_permissions(permissions: &PermissionsConfig) {
     if permissions.storage {
         println!("permission-storage: enabled");
     }
+}
+
+fn sensitive_env_permissions(names: &[String]) -> Vec<&str> {
+    names
+        .iter()
+        .filter(|name| {
+            let upper = name.to_ascii_uppercase();
+            upper == "PASSWORD"
+                || upper == "PASSWD"
+                || upper == "API_KEY"
+                || upper == "SECRET"
+                || upper == "TOKEN"
+                || upper == "CREDENTIAL"
+                || upper == "CREDENTIALS"
+                || upper == "PRIVATE_KEY"
+                || upper == "ACCESS_KEY"
+                || upper.ends_with("_PASSWORD")
+                || upper.ends_with("_PASSWD")
+                || upper.contains("_API_KEY")
+                || upper.ends_with("_SECRET")
+                || upper.contains("_SECRET_")
+                || upper.ends_with("_TOKEN")
+                || upper.contains("_TOKEN_")
+                || upper.ends_with("_CREDENTIAL")
+                || upper.ends_with("_CREDENTIALS")
+                || upper.ends_with("_PRIVATE_KEY")
+                || upper.ends_with("_ACCESS_KEY")
+        })
+        .map(String::as_str)
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3978,6 +4024,42 @@ mod tests {
     }
 
     #[test]
+    fn generated_plugin_steps_match_each_runtime() {
+        assert_eq!(
+            new_plugin_next_steps(NewPluginForm::Manifest),
+            "pentect plugins test .\npentect plugins add ."
+        );
+        assert_eq!(
+            new_plugin_next_steps(NewPluginForm::Wasm),
+            "pentect plugins dev .\npentect plugins test ."
+        );
+        assert_eq!(
+            new_plugin_next_steps(NewPluginForm::Command),
+            "pentect plugins setup .\npentect plugins test ."
+        );
+    }
+
+    #[test]
+    fn wasm_template_bridges_cargo_and_release_artifact_names() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pentect-wasm-template-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        write_wasm_plugin_template(&root, "my-test-plugin", "my_test_plugin").unwrap();
+
+        let manifest = std::fs::read_to_string(root.join("plugin.toml")).unwrap();
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        assert!(manifest.contains("wasm = \"my-test-plugin.wasm\""));
+        assert!(workflow.contains(
+            "cp target/wasm32-unknown-unknown/release/my_test_plugin.wasm my-test-plugin.wasm"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn command_template_uses_the_common_jsonl_envelope() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4815,5 +4897,26 @@ pattern = "token-[0-9]+"
 
         let _ = std::fs::remove_dir_all(data_dir);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn credential_like_environment_permissions_are_highlighted() {
+        let names = vec![
+            "PATH".to_string(),
+            "OPENAI_API_KEY".to_string(),
+            "GITHUB_TOKEN".to_string(),
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "DATABASE_PASSWORD".to_string(),
+            "PUBLIC_ENDPOINT".to_string(),
+        ];
+        assert_eq!(
+            sensitive_env_permissions(&names),
+            [
+                "OPENAI_API_KEY",
+                "GITHUB_TOKEN",
+                "AWS_SECRET_ACCESS_KEY",
+                "DATABASE_PASSWORD"
+            ]
+        );
     }
 }
