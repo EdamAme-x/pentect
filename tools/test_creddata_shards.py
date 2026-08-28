@@ -48,6 +48,15 @@ class CredDataShardsTest(unittest.TestCase):
                         "missing": 0,
                         "extra": 0,
                         "ml_probability_within_tolerance": True,
+                        "by_rule": {
+                            "Test Rule": {
+                                "rust": repository_count,
+                                "oracle": repository_count,
+                                "common": repository_count,
+                                "missing": 0,
+                                "extra": 0,
+                            }
+                        },
                     },
                 )
 
@@ -59,6 +68,9 @@ class CredDataShardsTest(unittest.TestCase):
             self.assertEqual(summary["credsweeper_version"], "v1.2.3")
             self.assertEqual(summary["missing"], 0)
             self.assertEqual(summary["extra"], 0)
+            self.assertEqual(
+                summary["by_rule"]["Test Rule"]["common"], len(snapshot)
+            )
 
     def test_partition_balances_metadata_weight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

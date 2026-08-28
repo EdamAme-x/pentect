@@ -1399,8 +1399,18 @@ impl fmt::Display for CredSweeperParityExample {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+struct CredSweeperParityRuleCounts {
+    rust: usize,
+    oracle: usize,
+    common: usize,
+    missing: usize,
+    extra: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct CredSweeperParityReport {
+    schema: u32,
     dataset: &'static str,
     #[serde(rename = "rust")]
     rust_count: usize,
@@ -1415,6 +1425,7 @@ struct CredSweeperParityReport {
     ml_probability_max_delta: f64,
     ml_probability_tolerance: f64,
     ml_probability_within_tolerance: bool,
+    by_rule: BTreeMap<String, CredSweeperParityRuleCounts>,
     missing_examples: Vec<CredSweeperParityExample>,
     extra_examples: Vec<CredSweeperParityExample>,
 }
@@ -1433,13 +1444,30 @@ impl CredSweeperParityReport {
         let mut extra = 0usize;
         let mut missing_examples = Vec::new();
         let mut extra_examples = Vec::new();
+        let mut by_rule = BTreeMap::<String, CredSweeperParityRuleCounts>::new();
+
+        for (key, seen) in &rust {
+            by_rule.entry(key.rule.clone()).or_default().rust += *seen;
+        }
+        for (key, seen) in &oracle {
+            by_rule.entry(key.rule.clone()).or_default().oracle += *seen;
+        }
 
         for (key, oracle_seen) in &oracle {
             let rust_seen = rust.get(key).copied().unwrap_or(0);
-            common += (*oracle_seen).min(rust_seen);
+            let shared = (*oracle_seen).min(rust_seen);
+            common += shared;
+            by_rule
+                .get_mut(&key.rule)
+                .expect("oracle rule was inventoried")
+                .common += shared;
             if *oracle_seen > rust_seen {
                 let count = *oracle_seen - rust_seen;
                 missing += count;
+                by_rule
+                    .get_mut(&key.rule)
+                    .expect("oracle rule was inventoried")
+                    .missing += count;
                 if missing_examples.len() < example_limit {
                     missing_examples.push(key.to_example(count));
                 }
@@ -1451,6 +1479,10 @@ impl CredSweeperParityReport {
             if *rust_seen > oracle_seen {
                 let count = *rust_seen - oracle_seen;
                 extra += count;
+                by_rule
+                    .get_mut(&key.rule)
+                    .expect("Rust rule was inventoried")
+                    .extra += count;
                 if extra_examples.len() < example_limit {
                     extra_examples.push(key.to_example(count));
                 }
@@ -1465,6 +1497,7 @@ impl CredSweeperParityReport {
             2.0 * precision * recall / (precision + recall)
         };
         Self {
+            schema: 2,
             dataset: "credsweeper-parity",
             rust_count,
             oracle_count,
@@ -1478,6 +1511,7 @@ impl CredSweeperParityReport {
             ml_probability_tolerance: CREDSWEEPER_ML_PROBABILITY_TOLERANCE,
             ml_probability_within_tolerance: ml_probability_max_delta
                 <= CREDSWEEPER_ML_PROBABILITY_TOLERANCE,
+            by_rule,
             missing_examples,
             extra_examples,
         }
@@ -1863,6 +1897,7 @@ mod tests {
         let oracle = credsweeper_parity_multiset(&credentials);
         let report = CredSweeperParityReport::build(rust, oracle, 10, 0.0);
 
+        assert_eq!(report.schema, 2);
         assert_eq!(report.rust_count, 1);
         assert_eq!(report.oracle_count, 1);
         assert_eq!(report.common, 1);
@@ -1870,6 +1905,12 @@ mod tests {
         assert_eq!(report.extra, 0);
         assert_eq!(report.precision, 1.0);
         assert_eq!(report.recall, 1.0);
+        let rule = &report.by_rule["api-key"];
+        assert_eq!(rule.rust, 1);
+        assert_eq!(rule.oracle, 1);
+        assert_eq!(rule.common, 1);
+        assert_eq!(rule.missing, 0);
+        assert_eq!(rule.extra, 0);
     }
 
     #[test]
@@ -1961,6 +2002,12 @@ mod tests {
         assert!(missing.contains("len=17"), "{missing}");
         assert!(extra.contains("len=15"), "{extra}");
         assert!(missing.contains("sha256="), "{missing}");
+        let rule = &report.by_rule["api-key"];
+        assert_eq!(rule.rust, 1);
+        assert_eq!(rule.oracle, 1);
+        assert_eq!(rule.common, 0);
+        assert_eq!(rule.missing, 1);
+        assert_eq!(rule.extra, 1);
     }
 
     #[test]

@@ -102,6 +102,7 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
     seen_indices: set[int] = set()
     seen_repositories: set[str] = set()
     totals = {key: 0 for key in ("rust", "oracle", "common", "missing", "extra")}
+    by_rule: dict[str, dict[str, int]] = {}
     versions: set[str] = set()
     metadata_files = 0
     for manifest_path in manifests:
@@ -122,6 +123,10 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
         report = load_json(report_path)
         for key in totals:
             totals[key] += int(report[key])
+        for rule, counts in report["by_rule"].items():
+            aggregate = by_rule.setdefault(rule, {key: 0 for key in totals})
+            for key in totals:
+                aggregate[key] += int(counts[key])
         if int(report["missing"]) or int(report["extra"]):
             raise SystemExit(f"CredSweeper mismatch in shard {index}: {report_path}")
         if not bool(report["ml_probability_within_tolerance"]):
@@ -140,11 +145,12 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
         raise SystemExit(f"shards used different CredSweeper versions: {sorted(versions)}")
 
     summary = {
-        "schema": 1,
+        "schema": 2,
         "shards": count,
         "repositories": len(seen_repositories),
         "metadata_files": metadata_files,
         "credsweeper_version": versions.pop(),
+        "by_rule": dict(sorted(by_rule.items())),
         **totals,
     }
     write_json(output, summary)
