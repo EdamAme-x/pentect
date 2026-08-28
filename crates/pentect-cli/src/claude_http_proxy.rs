@@ -1234,7 +1234,7 @@ fn streaming_response_body(
     StreamBody::new(stream).boxed_unsync()
 }
 
-struct SseStreamTransformer<R> {
+pub(crate) struct SseStreamTransformer<R> {
     resolve: R,
     pending: Vec<u8>,
     tool_buffer: Option<ToolStreamBuffer>,
@@ -1243,7 +1243,27 @@ struct SseStreamTransformer<R> {
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
     restore_output: bool,
     output_text: HashMap<(u64, &'static str), OutputTextRestorer>,
+    tool_plugin_context: SseToolPluginContext,
 }
+
+#[derive(Clone, Copy)]
+struct SseToolPluginContext {
+    provider: &'static str,
+    transport: &'static str,
+    label: &'static str,
+}
+
+const ANTHROPIC_HTTP_SSE_CONTEXT: SseToolPluginContext = SseToolPluginContext {
+    provider: "anthropic",
+    transport: "http_sse",
+    label: "Claude",
+};
+
+const CLAUDE_APP_SSE_CONTEXT: SseToolPluginContext = SseToolPluginContext {
+    provider: "claude",
+    transport: "desktop-http",
+    label: "Claude App",
+};
 
 struct ToolStreamBuffer {
     active: HashSet<u64>,
@@ -1265,6 +1285,31 @@ where
         plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
         restore_output: bool,
     ) -> Self {
+        Self::new_with_context(resolve, plugins, restore_output, ANTHROPIC_HTTP_SSE_CONTEXT)
+    }
+
+    pub(crate) fn new_for_claude_app(
+        resolve: R,
+        plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
+        restore_output: bool,
+        max_pending_bytes: usize,
+    ) -> Self {
+        let mut transformer = Self::new_with_context(
+            resolve,
+            Some(plugins),
+            restore_output,
+            CLAUDE_APP_SSE_CONTEXT,
+        );
+        transformer.max_pending_bytes = max_pending_bytes;
+        transformer
+    }
+
+    fn new_with_context(
+        resolve: R,
+        plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
+        restore_output: bool,
+        tool_plugin_context: SseToolPluginContext,
+    ) -> Self {
         Self {
             resolve,
             pending: Vec::new(),
@@ -1274,10 +1319,11 @@ where
             plugins,
             restore_output,
             output_text: HashMap::new(),
+            tool_plugin_context,
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, String> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, String> {
         if self.terminated {
             return Ok(Vec::new());
         }
@@ -1298,7 +1344,7 @@ where
         Ok(output)
     }
 
-    fn finish(&mut self) -> Vec<Bytes> {
+    pub(crate) fn finish(&mut self) -> Vec<Bytes> {
         if self.terminated {
             return Vec::new();
         }
@@ -1382,11 +1428,12 @@ where
                 let rewritten = std::str::from_utf8(&tools.bytes)
                     .map_err(|error| format!("Claude tool SSE was not UTF-8: {error}"))
                     .and_then(|text| {
-                        rewrite_anthropic_sse_with_tool_name(
+                        rewrite_anthropic_sse_with_tool_context(
                             text,
                             None,
                             &mut self.resolve,
                             self.plugins.as_deref(),
+                            self.tool_plugin_context,
                         )
                     })?;
                 output.push(Bytes::from(rewritten));
@@ -2048,11 +2095,31 @@ where
     rewrite_anthropic_sse_with_tool_name(input, None, resolve, None)
 }
 
+#[cfg(test)]
 fn rewrite_anthropic_sse_with_tool_name<R>(
     input: &str,
     forced_tool_name: Option<&str>,
     resolve: &mut R,
     plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+) -> Result<String, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    rewrite_anthropic_sse_with_tool_context(
+        input,
+        forced_tool_name,
+        resolve,
+        plugins,
+        ANTHROPIC_HTTP_SSE_CONTEXT,
+    )
+}
+
+fn rewrite_anthropic_sse_with_tool_context<R>(
+    input: &str,
+    forced_tool_name: Option<&str>,
+    resolve: &mut R,
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+    plugin_context: SseToolPluginContext,
 ) -> Result<String, String>
 where
     R: FnMut(&str) -> Result<String, String>,
@@ -2136,10 +2203,13 @@ where
                     .run(
                         pentect_agent::MiddlewareStage::ToolCall,
                         tool_call,
-                        Some(serde_json::json!({"provider": "anthropic", "transport": "http_sse"})),
+                        Some(serde_json::json!({
+                            "provider": plugin_context.provider,
+                            "transport": plugin_context.transport,
+                        })),
                     )
                     .map_err(|error| format!("plugin middleware: {error}"))?;
-                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude")?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, plugin_context.label)?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin middleware: blocked: {}",
