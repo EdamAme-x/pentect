@@ -33,7 +33,7 @@ pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
     match project.or(global).unwrap_or_default() {
         HandleScope::Device => machine_identity_key(),
         HandleScope::Project => {
-            let root = project_identity_root()?;
+            let root = project_root()?;
             Ok(derive_project_identity_key(&machine_identity_key()?, &root))
         }
         HandleScope::Session => random_identity_key(),
@@ -303,7 +303,7 @@ fn restrict_identity_file(_: &Path) -> Result<(), String> {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn project_identity_root() -> Result<PathBuf, String> {
+pub(crate) fn project_root() -> Result<PathBuf, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("could not read current directory: {e}"))?;
     let root = cwd

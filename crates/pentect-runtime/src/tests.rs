@@ -3626,6 +3626,44 @@ fn file_pointer_manager_recovers_read_handle_after_restart() {
 }
 
 #[test]
+fn file_pointer_manager_uses_project_root_across_nested_working_directories() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-pointer-project-root");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let env = root.join(".env");
+    std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let session = Session::open_at(&root, "t").unwrap();
+    let masked_path = masked_read_copy(&session, env.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let root_manager = root.join(".pentect").join("file-pointer-manager");
+    assert!(root_manager.join("index.bin").exists());
+    assert!(root_manager.join("key.bin").exists());
+
+    let nested = root.join("src").join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::env::set_current_dir(&nested).unwrap();
+    let restarted = Session::open_at(&root.join("restart"), "t").unwrap();
+    let store = MemoryStore::for_session(&restarted);
+    assert_eq!(file_pointer_manager::handle_length(&handle), Some(27));
+    assert_eq!(
+        store.resolve_all(&handle).unwrap(),
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+    );
+    assert!(!nested
+        .join(".pentect")
+        .join("file-pointer-manager")
+        .exists());
+
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn file_pointer_manager_refuses_changed_source_file() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-changed");
