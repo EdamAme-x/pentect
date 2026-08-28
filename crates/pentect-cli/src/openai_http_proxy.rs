@@ -3727,6 +3727,7 @@ mod tests {
                 "PENTECT_MEMORY_STORE_TOKEN",
                 "PENTECT_AGENT_LAUNCHED",
                 "PENTECT_HOME",
+                "HOME",
                 "LOCALAPPDATA",
             ];
             let saved = names
@@ -3746,6 +3747,7 @@ mod tests {
             std::env::set_var("PENTECT_MEMORY_STORE_TOKEN", store.token());
             std::env::set_var("PENTECT_AGENT_LAUNCHED", store.token());
             std::env::set_var("PENTECT_HOME", &home);
+            std::env::set_var("HOME", &home);
             std::env::set_var("LOCALAPPDATA", &home);
             let process_host_candidate = Some(
                 pentect_agent::register_process_host_candidate(

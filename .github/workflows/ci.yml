@@ -403,6 +403,8 @@ jobs:
       - name: Format
         if: needs.changes.outputs.rust == 'true'
         run: cargo fmt --all --check
+      - name: Validate required CI gate
+        run: python -m unittest tools/test_ci_results.py
       - name: Verify third-party licenses
         if: needs.changes.outputs.manifests == 'true'
         run: python tools/generate_licenses.py --check
@@ -474,3 +476,25 @@ jobs:
       - name: Full test on main
         if: github.event_name == 'push'
         run: cargo test --all-features --locked
+
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - changes
+      - npm-package
+      - native-ocr
+      - plugin-platform
+      - app-platform
+      - windows-powershell-installer
+      - test
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require every applicable CI job
+        env:
+          PENTECT_CI_NEEDS: ${{ toJSON(needs) }}
+        run: python tools/check_ci_results.py
