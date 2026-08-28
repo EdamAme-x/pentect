@@ -334,8 +334,9 @@ impl Parser for StructuredParser {
     fn parse(&self, raw: &str) -> Option<Vec<Region>> {
         let kubernetes_secret = raw.lines().any(|line| {
             let line = line.trim();
-            line.strip_prefix("kind:")
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("secret"))
+            line.strip_prefix("kind:").is_some_and(|value| {
+                crate::yaml_scalar_without_quotes(value).eq_ignore_ascii_case("secret")
+            })
         });
         let mut regions = Vec::new();
         let mut yaml_stack: Vec<(usize, String)> = Vec::new();

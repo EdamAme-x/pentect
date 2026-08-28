@@ -2519,34 +2519,32 @@ mod tests {
 
     #[test]
     fn kubernetes_secret_schema_masks_low_entropy_values_by_key() {
-        let raw = concat!(
-            "apiVersion: v1\n",
-            "kind: Secret\n",
-            "metadata:\n  name: app\n",
-            "stringData:\n  DB_PASSWORD: plain\n",
-            "data:\n  API_TOKEN: YWJj\n",
-        );
-        let result = Engine::with_profile(Profile::Strict).mask(
-            Input {
-                kind: Kind::Other("structured".into()),
-                data: raw.into(),
-            },
-            &Config::insecure_testing(),
-        );
-        assert!(result.masked.contains("name: app"), "{}", result.masked);
-        assert!(
-            result.masked.contains("DB_PASSWORD: <<DB_PASSWORD_"),
-            "{}",
-            result.masked
-        );
-        assert!(
-            result.masked.contains("API_TOKEN: <<API_TOKEN_"),
-            "{}",
-            result.masked
-        );
-        assert!(!result.masked.contains(": plain"), "{}", result.masked);
-        assert!(!result.masked.contains(": YWJj"), "{}", result.masked);
-        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+        for kind in ["Secret", "\"Secret\"", "'Secret'"] {
+            let raw = format!(
+                "apiVersion: v1\nkind: {kind}\nmetadata:\n  name: app\nstringData:\n  DB_PASSWORD: plain\ndata:\n  API_TOKEN: YWJj\n"
+            );
+            let result = Engine::with_profile(Profile::Strict).mask(
+                Input {
+                    kind: Kind::Other("structured".into()),
+                    data: raw.clone(),
+                },
+                &Config::insecure_testing(),
+            );
+            assert!(result.masked.contains("name: app"), "{}", result.masked);
+            assert!(
+                result.masked.contains("DB_PASSWORD: <<DB_PASSWORD_"),
+                "{}",
+                result.masked
+            );
+            assert!(
+                result.masked.contains("API_TOKEN: <<API_TOKEN_"),
+                "{}",
+                result.masked
+            );
+            assert!(!result.masked.contains(": plain"), "{}", result.masked);
+            assert!(!result.masked.contains(": YWJj"), "{}", result.masked);
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+        }
     }
 
     #[test]
