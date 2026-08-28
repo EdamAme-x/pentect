@@ -399,6 +399,8 @@ enum GeminiEndpoint {
     GenerateContent,
     StreamGenerateContent,
     CountTokens,
+    EmbedContent,
+    BatchEmbedContents,
     Models,
     Unknown,
 }
@@ -409,6 +411,8 @@ impl GeminiEndpoint {
             Self::GenerateContent => "generate-content",
             Self::StreamGenerateContent => "stream-generate-content",
             Self::CountTokens => "count-tokens",
+            Self::EmbedContent => "embed-content",
+            Self::BatchEmbedContents => "batch-embed-contents",
             Self::Models => "models",
             Self::Unknown => "unknown",
         }
@@ -417,7 +421,11 @@ impl GeminiEndpoint {
     fn is_protected(self) -> bool {
         matches!(
             self,
-            Self::GenerateContent | Self::StreamGenerateContent | Self::CountTokens
+            Self::GenerateContent
+                | Self::StreamGenerateContent
+                | Self::CountTokens
+                | Self::EmbedContent
+                | Self::BatchEmbedContents
         )
     }
     fn is_model_response(self) -> bool {
@@ -434,6 +442,10 @@ fn classify_endpoint(path_and_query: &str) -> GeminiEndpoint {
         GeminiEndpoint::GenerateContent
     } else if native_model_route && path.ends_with(":countTokens") {
         GeminiEndpoint::CountTokens
+    } else if native_model_route && path.ends_with(":embedContent") {
+        GeminiEndpoint::EmbedContent
+    } else if native_model_route && path.ends_with(":batchEmbedContents") {
+        GeminiEndpoint::BatchEmbedContents
     } else if path.ends_with("/models") || path.contains("/models/") {
         GeminiEndpoint::Models
     } else {
@@ -519,7 +531,9 @@ fn protect_request_body(
     let mut masker = masker
         .lock()
         .map_err(|_| "Gemini masker lock was poisoned".to_string())?;
-    if let Err(error) = mask_gemini_request(&mut value, &mut masker, block_unknown_formats) {
+    if let Err(error) =
+        mask_gemini_request(&mut value, endpoint, &mut masker, block_unknown_formats)
+    {
         if !block_unknown_formats && error.starts_with("unknown format blocked:") {
             diagnostic("request-protection-skipped");
             return Ok(ProtectedRequest {
@@ -543,9 +557,19 @@ fn protect_request_body(
 
 fn mask_gemini_request(
     value: &mut Value,
+    endpoint: GeminiEndpoint,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     block_unknown_formats: bool,
 ) -> Result<(), String> {
+    match endpoint {
+        GeminiEndpoint::EmbedContent => {
+            return mask_embed_content_request(value, masker, block_unknown_formats);
+        }
+        GeminiEndpoint::BatchEmbedContents => {
+            return mask_batch_embed_contents_request(value, masker, block_unknown_formats);
+        }
+        _ => {}
+    }
     let object = value
         .as_object_mut()
         .ok_or_else(|| "unknown format blocked: Gemini request must be an object".to_string())?;
@@ -565,6 +589,61 @@ fn mask_gemini_request(
     if let Some(system) = object.get_mut("systemInstruction") {
         crate::cloud_code_http_proxy::mask_content(system, true, masker, block_unknown_formats)?;
     }
+    Ok(())
+}
+
+fn mask_embed_content_request(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    block_unknown_formats: bool,
+) -> Result<(), String> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        "unknown format blocked: Gemini embedContent request must be an object".to_string()
+    })?;
+    let content = object.get_mut("content").ok_or_else(|| {
+        "unknown format blocked: Gemini embedContent content is required".to_string()
+    })?;
+    crate::cloud_code_http_proxy::mask_content(content, false, masker, block_unknown_formats)?;
+    mask_embedding_title(object.get_mut("title"), masker)?;
+    if let Some(config) = object.get_mut("embedContentConfig") {
+        let config = config.as_object_mut().ok_or_else(|| {
+            "unknown format blocked: Gemini embedContentConfig must be an object".to_string()
+        })?;
+        mask_embedding_title(config.get_mut("title"), masker)?;
+    }
+    Ok(())
+}
+
+fn mask_batch_embed_contents_request(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    block_unknown_formats: bool,
+) -> Result<(), String> {
+    let requests = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("requests"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            "unknown format blocked: Gemini batchEmbedContents requests must be an array"
+                .to_string()
+        })?;
+    for request in requests {
+        mask_embed_content_request(request, masker, block_unknown_formats)?;
+    }
+    Ok(())
+}
+
+fn mask_embedding_title(
+    title: Option<&mut Value>,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let Some(title) = title else {
+        return Ok(());
+    };
+    let Value::String(title) = title else {
+        return Err("unknown format blocked: Gemini embedding title must be a string".to_string());
+    };
+    crate::claude_http_proxy::mask_string(title, false, masker)?;
     Ok(())
 }
 
@@ -1174,6 +1253,14 @@ mod tests {
             GeminiEndpoint::CountTokens
         );
         assert_eq!(
+            classify_endpoint("/v1beta/models/gemini-embedding-001:embedContent"),
+            GeminiEndpoint::EmbedContent
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/models/gemini-embedding-001:batchEmbedContents"),
+            GeminiEndpoint::BatchEmbedContents
+        );
+        assert_eq!(
             classify_endpoint("/v1internal:generateContent"),
             GeminiEndpoint::Unknown
         );
@@ -1350,7 +1437,13 @@ mod tests {
             ]
         });
         let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
-        mask_gemini_request(&mut value, &mut masker, true).unwrap();
+        mask_gemini_request(
+            &mut value,
+            GeminiEndpoint::GenerateContent,
+            &mut masker,
+            true,
+        )
+        .unwrap();
         assert!(!value["systemInstruction"]["parts"][0]["text"]
             .as_str()
             .unwrap()
@@ -1366,6 +1459,102 @@ mod tests {
         });
         inject_handle_contract(&mut clean).unwrap();
         assert!(clean.get("systemInstruction").is_none());
+    }
+
+    #[test]
+    fn embedding_requests_mask_direct_and_batched_content() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "EMBED", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let mut direct = serde_json::json!({
+            "content": {"parts": [{"text": format!("RUNPOD_API_KEY={secret}")}]},
+            "title": format!("RUNPOD_API_KEY={secret}"),
+            "embedContentConfig": {"title": format!("RUNPOD_API_KEY={secret}")}
+        });
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        mask_gemini_request(&mut direct, GeminiEndpoint::EmbedContent, &mut masker, true).unwrap();
+        assert!(!direct.to_string().contains(&secret));
+        assert!(direct.to_string().contains("<<RUNPOD_API_KEY_"));
+
+        let mut batch = serde_json::json!({
+            "requests": [
+                {
+                    "model": "models/gemini-embedding-001",
+                    "content": {"parts": [{"text": format!("RUNPOD_API_KEY={secret}")}]}
+                },
+                {
+                    "model": "models/gemini-embedding-001",
+                    "content": {"parts": [{"text": format!("second RUNPOD_API_KEY={secret}")}]}
+                }
+            ]
+        });
+        mask_gemini_request(
+            &mut batch,
+            GeminiEndpoint::BatchEmbedContents,
+            &mut masker,
+            true,
+        )
+        .unwrap();
+        assert!(!batch.to_string().contains(&secret));
+        assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn embedding_gateway_never_forwards_plaintext_to_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "GATEWAY", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let (upstream, body_rx, thread) = mock_upstream();
+        let proxy = GeminiHttpProxyGuard::start_with_header_env(upstream, &[]).unwrap();
+        reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1beta/models/gemini-embedding-001:embedContent",
+                proxy.base_url()
+            ))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "content": {"parts": [{
+                        "text": format!("private RUNPOD_API_KEY={secret}")
+                    }]}
+                })
+                .to_string(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let upstream_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(!upstream_body.contains(&secret));
+        assert!(
+            first_handle(&upstream_body).is_some(),
+            "upstream body did not contain a protected handle: {upstream_body}"
+        );
+    }
+
+    #[test]
+    fn malformed_embedding_requests_fail_closed() {
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        assert!(mask_gemini_request(
+            &mut serde_json::json!({"content": "unchecked"}),
+            GeminiEndpoint::EmbedContent,
+            &mut masker,
+            true,
+        )
+        .is_err());
+        assert!(mask_gemini_request(
+            &mut serde_json::json!({"requests": {}}),
+            GeminiEndpoint::BatchEmbedContents,
+            &mut masker,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
