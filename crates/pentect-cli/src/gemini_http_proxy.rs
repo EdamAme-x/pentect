@@ -664,12 +664,32 @@ fn validate_response(value: &Value, block_unknown_formats: bool) -> Result<(), S
     if !block_unknown_formats {
         return Ok(());
     }
-    let candidates = value
-        .get("candidates")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            "unknown format blocked: Gemini response candidates must be an array".to_string()
-        })?;
+    let response = value
+        .as_object()
+        .ok_or_else(|| "unknown format blocked: Gemini response must be an object".to_string())?;
+    let Some(candidates) = response.get("candidates") else {
+        const CANDIDATELESS_FIELDS: &[&str] = &[
+            "promptFeedback",
+            "usageMetadata",
+            "modelVersion",
+            "responseId",
+            "modelStatus",
+        ];
+        if response.is_empty()
+            || response
+                .keys()
+                .any(|key| !CANDIDATELESS_FIELDS.contains(&key.as_str()))
+        {
+            return Err(
+                "unknown format blocked: Gemini response without candidates contains unsupported fields"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    };
+    let candidates = candidates.as_array().ok_or_else(|| {
+        "unknown format blocked: Gemini response candidates must be an array".to_string()
+    })?;
     for candidate in candidates {
         let Some(content) = candidate.get("content") else {
             continue;
@@ -1199,6 +1219,29 @@ mod tests {
         }]}}]});
         assert!(validate_response(&mixed, true).is_err());
         assert!(validate_response(&value, false).is_ok());
+    }
+
+    #[test]
+    fn strict_response_validation_accepts_known_candidate_free_metadata() {
+        let blocked = serde_json::json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {"promptTokenCount": 4},
+            "modelVersion": "gemini-test",
+            "responseId": "response-test"
+        });
+        assert!(validate_response(&blocked, true).is_ok());
+        assert!(validate_response(
+            &serde_json::json!({"usageMetadata": {"totalTokenCount": 4}}),
+            true
+        )
+        .is_ok());
+        assert!(validate_response(&serde_json::json!({}), true).is_err());
+        assert!(validate_response(
+            &serde_json::json!({"futureResponseData": {"text": "unchecked"}}),
+            true
+        )
+        .is_err());
+        assert!(validate_response(&serde_json::json!({"candidates": {}}), true).is_err());
     }
 
     #[test]
