@@ -5,7 +5,8 @@ description: Change Pentect settings for a user or project.
 
 Pentect reads user settings from `~/.pentect/config.toml` and project settings
 from `.pentect/config.toml`. Project settings win when allowed. A repository
-cannot lower the user's protection for unknown formats.
+cannot lower the user's protection for unknown formats, encoded values, or
+unscanned images.
 
 You can leave both files absent. Pentect uses safe defaults. Restart a protected
 client after changing a setting.
@@ -18,10 +19,12 @@ Pentect loads settings in this order:
 2. `~/.pentect/config.toml` for the current user;
 3. `.pentect/config.toml` for the current project.
 
-Project values normally win. Two security rules are different: a project
-cannot change `compatibility.unknown_formats` to `ignore`, and
-`agent.required` becomes true when either file requires it. Plugin approval
-state is managed by the plugin commands, not by copying another user's config.
+Project values normally win. Security-sensitive settings are different: a
+project cannot change `compatibility.unknown_formats` to `ignore`, allow
+unscanned images unless the user already allows them, or reduce active decode
+coverage. `agent.required` becomes true when either file requires it. Plugin
+approval state is managed by the plugin commands, not by copying another
+user's config.
 
 Unknown keys and invalid values cause an error instead of being silently
 ignored.
@@ -105,6 +108,10 @@ fetch_seconds = 8
 Size values are bytes except `max_edge` and `max_pixels`. Keep the defaults
 unless a trusted file is larger than a limit.
 
+A project can change `unscanned` from `allow` to `block`, but it cannot change
+`block` to `allow`. Set `unscanned = "allow"` in the user config when that
+tradeoff is intentional for the whole user account.
+
 ## Encoded values
 
 Pentect can inspect common encoded text and compressed data before detection:
@@ -124,6 +131,10 @@ Use `"unlimited"` for `max_depth`, `max_bytes`, or `max_inflate_bytes` only
 when another limit controls the input. `mask_unknown = true` also masks long
 opaque encoded values that Pentect cannot identify. It can create false
 positives, so it is off by default.
+
+Project decode settings may enable decoding or inspect more data, but they
+cannot disable an active decoder or reduce its depth, size, or unknown-value
+coverage. Put an intentional reduction in the user config instead.
 
 Detection scans both the original text and bounded decoded representations.
 Supported text layers include standard and URL-safe Base64, dense `%XX`

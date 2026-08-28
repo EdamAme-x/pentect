@@ -392,7 +392,7 @@ pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
 pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
     let project = read_image_ocr_config(project_config_path())?;
     let global = read_image_ocr_config(global_config_path()?)?;
-    Ok(merge_image_ocr_config(project, global))
+    merge_image_ocr_config(project, global)
 }
 
 #[cfg(not(test))]
@@ -411,7 +411,7 @@ pub(crate) fn environment_variable_prefix() -> Result<String, String> {
 pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
     let project = read_decode_config(project_config_path())?;
     let global = read_decode_config(global_config_path()?)?;
-    merge_decode_config(profile, project, global).validate()
+    merge_decode_config(profile, project, global)?.validate()
 }
 
 #[cfg(test)]
@@ -420,7 +420,7 @@ pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
         profile,
         DecodeConfigPartial::default(),
         DecodeConfigPartial::default(),
-    )
+    )?
     .validate()
 }
 
@@ -857,8 +857,20 @@ fn config_positive_integer(value: &toml::Value, field: &str) -> Result<i64, Stri
 fn merge_image_ocr_config(
     project: ImageOcrConfigPartial,
     global: ImageOcrConfigPartial,
-) -> ImageOcrConfig {
-    ImageOcrConfig {
+) -> Result<ImageOcrConfig, String> {
+    let baseline_unscanned = global
+        .unscanned_images
+        .unwrap_or(UnscannedImagePolicy::Block);
+    let unscanned_images = project.unscanned_images.unwrap_or(baseline_unscanned);
+    if baseline_unscanned == UnscannedImagePolicy::Block
+        && unscanned_images == UnscannedImagePolicy::Allow
+    {
+        return Err(
+            "image.unscanned = \"allow\" may only be set in the user config at ~/.pentect/config.toml"
+                .to_string(),
+        );
+    }
+    Ok(ImageOcrConfig {
         mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::On),
         redaction: project
             .redaction
@@ -892,14 +904,22 @@ fn merge_image_ocr_config(
             .fetch_seconds
             .or(global.fetch_seconds)
             .unwrap_or(DEFAULT_IMAGE_FETCH_SECONDS),
-        unscanned_images: project
-            .unscanned_images
-            .or(global.unscanned_images)
-            .unwrap_or(UnscannedImagePolicy::Block),
-    }
+        unscanned_images,
+    })
 }
 
 fn merge_decode_config(
+    profile: Profile,
+    project: DecodeConfigPartial,
+    global: DecodeConfigPartial,
+) -> Result<DecodeConfig, String> {
+    let baseline = merge_decode_config_unchecked(profile, DecodeConfigPartial::default(), global);
+    let merged = merge_decode_config_unchecked(profile, project, global);
+    ensure_project_decode_not_weaker(&baseline, &merged)?;
+    Ok(merged)
+}
+
+fn merge_decode_config_unchecked(
     profile: Profile,
     project: DecodeConfigPartial,
     global: DecodeConfigPartial,
@@ -944,6 +964,59 @@ fn merge_decode_config(
         unknown_min_bytes,
         limit_reporter: Some(record_decode_limit),
     }
+}
+
+fn ensure_project_decode_not_weaker(
+    baseline: &DecodeConfig,
+    merged: &DecodeConfig,
+) -> Result<(), String> {
+    if baseline.enabled && !merged.enabled {
+        return Err(
+            "decode.enabled = false may only be set in the user config at ~/.pentect/config.toml"
+                .to_string(),
+        );
+    }
+    // Enabling a decoder disabled by the user is a strict project policy. Its
+    // subordinate limits cannot weaken a decoder that was not running.
+    if !baseline.enabled {
+        return Ok(());
+    }
+    if !optional_limit_is_at_least(merged.max_depth, baseline.max_depth) {
+        return Err(project_decode_limit_error("decode.max_depth"));
+    }
+    if merged.min_bytes > baseline.min_bytes {
+        return Err(project_decode_limit_error("decode.min_bytes"));
+    }
+    if !optional_limit_is_at_least(merged.max_bytes, baseline.max_bytes) {
+        return Err(project_decode_limit_error("decode.max_bytes"));
+    }
+    if !optional_limit_is_at_least(merged.max_inflate_bytes, baseline.max_inflate_bytes) {
+        return Err(project_decode_limit_error("decode.max_inflate_bytes"));
+    }
+    if baseline.mask_unknown && !merged.mask_unknown {
+        return Err(project_decode_limit_error("decode.mask_unknown"));
+    }
+    if baseline.mask_unknown
+        && merged.mask_unknown
+        && merged.unknown_min_bytes > baseline.unknown_min_bytes
+    {
+        return Err(project_decode_limit_error("decode.unknown_min_bytes"));
+    }
+    Ok(())
+}
+
+fn optional_limit_is_at_least<T: Ord>(candidate: Option<T>, baseline: Option<T>) -> bool {
+    match (candidate, baseline) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(candidate), Some(baseline)) => candidate >= baseline,
+    }
+}
+
+fn project_decode_limit_error(field: &str) -> String {
+    format!(
+        "{field} may not reduce decode coverage in project config; set the weaker limit in ~/.pentect/config.toml"
+    )
 }
 
 fn record_decode_limit(reason: pentect_core::DecodeLimitReason) {
@@ -1262,22 +1335,83 @@ unknown_min_bytes = 32
     }
 
     #[test]
-    fn project_decode_config_overrides_global_including_unlimited() {
+    fn project_decode_config_may_only_strengthen_global_coverage() {
         let project = DecodeConfigPartial {
             max_depth: Some(None),
-            max_bytes: Some(Some(2_000_000)),
+            min_bytes: Some(8),
+            max_bytes: Some(None),
             ..DecodeConfigPartial::default()
         };
         let global = DecodeConfigPartial {
             max_depth: Some(Some(9)),
             min_bytes: Some(24),
-            max_bytes: Some(None),
+            max_bytes: Some(Some(2_000_000)),
             ..DecodeConfigPartial::default()
         };
-        let merged = merge_decode_config(Profile::Strict, project, global);
+        let merged = merge_decode_config(Profile::Strict, project, global).unwrap();
         assert_eq!(merged.max_depth, None);
-        assert_eq!(merged.min_bytes, 24);
-        assert_eq!(merged.max_bytes, Some(2_000_000));
+        assert_eq!(merged.min_bytes, 8);
+        assert_eq!(merged.max_bytes, None);
+    }
+
+    #[test]
+    fn project_decode_config_cannot_reduce_any_active_coverage_limit() {
+        let global = DecodeConfigPartial {
+            enabled: Some(true),
+            max_depth: Some(Some(10)),
+            min_bytes: Some(12),
+            max_bytes: Some(Some(1_000_000)),
+            max_inflate_bytes: Some(Some(2_000_000)),
+            mask_unknown: Some(true),
+            unknown_min_bytes: Some(24),
+        };
+        let weaker = [
+            DecodeConfigPartial {
+                enabled: Some(false),
+                ..DecodeConfigPartial::default()
+            },
+            DecodeConfigPartial {
+                max_depth: Some(Some(9)),
+                ..DecodeConfigPartial::default()
+            },
+            DecodeConfigPartial {
+                min_bytes: Some(13),
+                ..DecodeConfigPartial::default()
+            },
+            DecodeConfigPartial {
+                max_bytes: Some(Some(999_999)),
+                ..DecodeConfigPartial::default()
+            },
+            DecodeConfigPartial {
+                max_inflate_bytes: Some(Some(1_999_999)),
+                ..DecodeConfigPartial::default()
+            },
+            DecodeConfigPartial {
+                mask_unknown: Some(false),
+                ..DecodeConfigPartial::default()
+            },
+            DecodeConfigPartial {
+                unknown_min_bytes: Some(25),
+                ..DecodeConfigPartial::default()
+            },
+        ];
+        for project in weaker {
+            assert!(merge_decode_config(Profile::Strict, project, global).is_err());
+        }
+
+        let user_disabled = DecodeConfigPartial {
+            enabled: Some(false),
+            ..global
+        };
+        assert!(merge_decode_config(
+            Profile::Strict,
+            DecodeConfigPartial {
+                max_depth: Some(Some(1)),
+                ..DecodeConfigPartial::default()
+            },
+            user_disabled,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1290,6 +1424,7 @@ unknown_min_bytes = 32
             ..DecodeConfigPartial::default()
         };
         let merged = merge_decode_config(Profile::Strict, project, DecodeConfigPartial::default())
+            .unwrap()
             .validate()
             .unwrap();
         assert_eq!(merged.max_depth, Some(100_000));
@@ -1314,7 +1449,8 @@ unknown_min_bytes = 32
         let cfg = merge_image_ocr_config(
             ImageOcrConfigPartial::default(),
             ImageOcrConfigPartial::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.mode, ImageOcrMode::On);
         assert_eq!(cfg.redaction, ImageRedactionStyle::Black);
         assert_eq!(cfg.max_edge, 2048);
@@ -1325,6 +1461,32 @@ unknown_min_bytes = 32
         assert_eq!(cfg.max_image_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.fetch_seconds, 8);
         assert_eq!(cfg.unscanned_images, UnscannedImagePolicy::Block);
+    }
+
+    #[test]
+    fn project_cannot_allow_unscanned_images_unless_user_policy_allows_them() {
+        let allow = ImageOcrConfigPartial {
+            unscanned_images: Some(UnscannedImagePolicy::Allow),
+            ..ImageOcrConfigPartial::default()
+        };
+        let block = ImageOcrConfigPartial {
+            unscanned_images: Some(UnscannedImagePolicy::Block),
+            ..ImageOcrConfigPartial::default()
+        };
+        assert!(merge_image_ocr_config(allow, ImageOcrConfigPartial::default()).is_err());
+        assert!(merge_image_ocr_config(allow, block).is_err());
+        assert_eq!(
+            merge_image_ocr_config(ImageOcrConfigPartial::default(), allow)
+                .unwrap()
+                .unscanned_images,
+            UnscannedImagePolicy::Allow
+        );
+        assert_eq!(
+            merge_image_ocr_config(block, allow)
+                .unwrap()
+                .unscanned_images,
+            UnscannedImagePolicy::Block
+        );
     }
 
     #[test]
