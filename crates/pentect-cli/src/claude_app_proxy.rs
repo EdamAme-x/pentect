@@ -48,6 +48,7 @@ type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 
 const MAX_CONNECTIONS: usize = 128;
+const MAX_WEBSOCKET_CONNECTIONS: usize = 128;
 const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_UPLOADS: usize = 256;
@@ -1102,6 +1103,7 @@ struct ProxyState {
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
     file_attestations: crate::http_files::FileAttestationStore,
     pending_files: Mutex<PendingFiles>,
+    websocket_connections: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
@@ -1164,6 +1166,7 @@ async fn run_proxy(
         files: Mutex::new(HashMap::new()),
         file_attestations: crate::http_files::FileAttestationStore::open_default()?,
         pending_files: Mutex::new(PendingFiles::default()),
+        websocket_connections: Arc::new(tokio::sync::Semaphore::new(MAX_WEBSOCKET_CONNECTIONS)),
     });
     let _ = ready_tx.send(Ok(format!("http://{address}")));
 
@@ -1293,7 +1296,7 @@ fn is_claude_host(host: &str) -> bool {
 
 async fn serve_inspected<T>(stream: T, host: String, state: Arc<ProxyState>) -> Result<(), String>
 where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let config = state.server_config(&host)?;
     let tls = TlsAcceptor::from(config)
@@ -1306,6 +1309,7 @@ where
         .max_buf_size(64 * 1024)
         .max_headers(128)
         .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+        .with_upgrades()
         .await
         .map_err(|error| format!("inspected HTTP connection failed: {error}"))
 }
@@ -1362,10 +1366,37 @@ async fn forward_inspected_inner(
     let protect_chat = request_kind == ClaudeAppRequest::ChatJson;
     let prepare_upload = request_kind == ClaudeAppRequest::PrepareUploadJson;
     if request_kind == ClaudeAppRequest::UnsupportedModel && state.block_unknown_formats {
+        if is_claude_voice_path(&path) {
+            return Err(
+                "unknown format blocked: Claude App voice uses an opaque WebSocket that Pentect cannot inspect; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through without masking"
+                    .to_string(),
+            );
+        }
         return Err(
             "unknown format blocked: Claude App selected a model transport Pentect cannot inspect; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
-                .to_string(),
+            .to_string(),
         );
+    }
+    if is_claude_voice_path(&path) {
+        if !is_claude_voice_websocket_request(&method, host, &path, request.headers()) {
+            return Err(
+                "unknown format blocked: Claude App voice pass-through requires GET wss://claude.ai/api/ws/voice/.../chat_conversations/... with a valid WebSocket upgrade"
+                    .to_string(),
+            );
+        }
+        eprintln!(
+            "[pentect] claude-app websocket passthrough inspected=no host={host} path={safe_path}"
+        );
+        let url = format!("https://{host}{path_and_query}");
+        return forward_websocket_upgrade(
+            request,
+            &state.client,
+            url,
+            host,
+            &safe_path,
+            Arc::clone(&state.websocket_connections),
+        )
+        .await;
     }
     eprintln!("[pentect] claude-app > {method} {host}{safe_path} {content_type}");
 
@@ -1650,6 +1681,122 @@ async fn forward_inspected_inner(
     builder
         .body(body)
         .map_err(|error| format!("could not build Claude App response: {error}"))
+}
+
+fn is_websocket_upgrade(headers: &hyper::HeaderMap) -> bool {
+    let upgrade = headers
+        .get(hyper::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection = headers
+        .get(hyper::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    upgrade && connection
+}
+
+fn is_claude_voice_websocket_request(
+    method: &Method,
+    host: &str,
+    path: &str,
+    headers: &hyper::HeaderMap,
+) -> bool {
+    *method == Method::GET
+        && host == "claude.ai"
+        && is_claude_voice_path(path)
+        && is_websocket_upgrade(headers)
+}
+
+async fn forward_websocket_upgrade(
+    mut request: Request<Incoming>,
+    client: &reqwest::Client,
+    url: String,
+    host: &str,
+    safe_path: &str,
+    connections: Arc<tokio::sync::Semaphore>,
+) -> Result<Response<ProxyBody>, String> {
+    let permit = connections
+        .try_acquire_owned()
+        .map_err(|_| "Claude App WebSocket capacity exhausted".to_string())?;
+    let client_upgrade = hyper::upgrade::on(&mut request);
+    let mut headers = request.headers().clone();
+    headers.remove(hyper::header::PROXY_AUTHORIZATION);
+    headers.remove("proxy-connection");
+
+    let upstream = client
+        .get(url)
+        .version(hyper::Version::HTTP_11)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "WebSocket upstream request failed for {host}{safe_path}: {}",
+                reqwest_error_summary(&error)
+            )
+        })?;
+    let status = upstream.status();
+    let mut response_headers = upstream.headers().clone();
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        remove_hop_by_hop_headers(&mut response_headers);
+        let mut builder = Response::builder().status(status);
+        for (name, value) in &response_headers {
+            if name != hyper::header::CONTENT_LENGTH {
+                builder = builder.header(name, value);
+            }
+        }
+        let stream = upstream.bytes_stream().map(|result| {
+            result
+                .map(Frame::data)
+                .map_err(|error| Box::new(error) as ProxyBodyError)
+        });
+        return builder
+            .body(BodyExt::boxed_unsync(StreamBody::new(stream)))
+            .map_err(|error| format!("could not build Claude App WebSocket response: {error}"));
+    }
+    if !is_websocket_upgrade(&response_headers) {
+        return Err(
+            "Claude App voice upstream returned an invalid WebSocket upgrade response".to_string(),
+        );
+    }
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = async {
+            let client = client_upgrade
+                .await
+                .map_err(|error| format!("client WebSocket upgrade failed: {error}"))?;
+            let mut client = hyper_util::rt::TokioIo::new(client);
+            let mut upstream = upstream
+                .upgrade()
+                .await
+                .map_err(|error| format!("upstream WebSocket upgrade failed: {error}"))?;
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .map_err(|error| format!("WebSocket relay failed: {error}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("[pentect] claude-app websocket passthrough failed: {error}");
+        }
+    });
+
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &response_headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .map_err(|error| format!("could not build Claude App WebSocket upgrade: {error}"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3457,6 +3604,163 @@ mod tests {
             ),
             ClaudeAppRequest::JsonScan
         );
+    }
+
+    #[test]
+    fn voice_websocket_passthrough_requires_exact_host_path_method_and_upgrade() {
+        let path = "/api/ws/voice/organizations/o/chat_conversations/c";
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+        headers.insert(
+            hyper::header::UPGRADE,
+            hyper::header::HeaderValue::from_static("websocket"),
+        );
+        assert!(is_claude_voice_websocket_request(
+            &Method::GET,
+            "claude.ai",
+            path,
+            &headers
+        ));
+        assert!(!is_claude_voice_websocket_request(
+            &Method::POST,
+            "claude.ai",
+            path,
+            &headers
+        ));
+        assert!(!is_claude_voice_websocket_request(
+            &Method::GET,
+            "voice.claude.ai",
+            path,
+            &headers
+        ));
+        assert!(!is_claude_voice_websocket_request(
+            &Method::GET,
+            "claude.ai.example.test",
+            path,
+            &headers
+        ));
+        assert!(!is_claude_voice_websocket_request(
+            &Method::GET,
+            "claude.ai",
+            "/api/ws/voice/organizations/o/not_conversations/c",
+            &headers
+        ));
+        headers.remove(hyper::header::UPGRADE);
+        assert!(!is_claude_voice_websocket_request(
+            &Method::GET,
+            "claude.ai",
+            path,
+            &headers
+        ));
+    }
+
+    #[tokio::test]
+    async fn relaxed_voice_websocket_completes_handshake_and_relays_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = service_fn(|mut request: Request<Incoming>| async move {
+                assert!(is_websocket_upgrade(request.headers()));
+                let upgraded = hyper::upgrade::on(&mut request);
+                tokio::spawn(async move {
+                    let upgraded = upgraded.await.unwrap();
+                    let mut stream = hyper_util::rt::TokioIo::new(upgraded);
+                    let mut bytes = vec![0_u8; b"opaque-voice-frame".len()];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                });
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                        .header(hyper::header::CONNECTION, "Upgrade")
+                        .header(hyper::header::UPGRADE, "websocket")
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+            });
+            http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades()
+                .await
+                .unwrap();
+        });
+
+        let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let upstream_url =
+            format!("http://{upstream_address}/api/ws/voice/organizations/o/chat_conversations/c");
+        let proxy_task = tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let connections = Arc::new(tokio::sync::Semaphore::new(1));
+            let service = service_fn(move |request| {
+                let client = client.clone();
+                let upstream_url = upstream_url.clone();
+                let connections = Arc::clone(&connections);
+                async move {
+                    let response = forward_websocket_upgrade(
+                        request,
+                        &client,
+                        upstream_url,
+                        "claude.ai",
+                        "/api/ws/voice/:id/chat_conversations/:id",
+                        connections,
+                    )
+                    .await
+                    .unwrap();
+                    Ok::<_, Infallible>(response)
+                }
+            });
+            http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades()
+                .await
+                .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(proxy_address).await.unwrap();
+        client
+            .write_all(
+                concat!(
+                    "GET /api/ws/voice/organizations/o/chat_conversations/c HTTP/1.1\r\n",
+                    "Host: claude.ai\r\n",
+                    "Connection: Upgrade\r\n",
+                    "Upgrade: websocket\r\n",
+                    "Sec-WebSocket-Version: 13\r\n",
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+                    "\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response_head = Vec::new();
+        while !response_head.ends_with(b"\r\n\r\n") {
+            response_head.push(client.read_u8().await.unwrap());
+        }
+        let response_head = String::from_utf8(response_head).unwrap();
+        assert!(response_head.starts_with("HTTP/1.1 101"), "{response_head}");
+
+        client.write_all(b"opaque-voice-frame").await.unwrap();
+        let mut echoed = vec![0_u8; b"opaque-voice-frame".len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"opaque-voice-frame");
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(5), proxy_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), upstream_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

@@ -104,7 +104,9 @@ not acceptable.
 ## Not covered
 
 - ChatGPT Chat, Work, and Voice routes outside supported Codex mode
-- Remote Claude Cowork execution and Voice
+- Remote Claude Cowork execution; Claude Voice content is not inspected (the
+  exact Voice WebSocket can only be relayed after the user enables unknown
+  format pass-through)
 - Copilot, VS Code inline suggestions, and private traffic from other extensions
 - Test binary formats
 - Unknown future routes
