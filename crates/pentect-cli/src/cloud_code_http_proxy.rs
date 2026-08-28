@@ -1655,6 +1655,28 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_user_settings_remain_control_only() {
+        let endpoint = classify_endpoint("/v1internal:setUserSettings");
+        assert_eq!(endpoint, CloudCodeEndpoint::Control);
+        assert!(!endpoint.is_protected());
+
+        // Extracted protobuf schema:
+        // google.internal.cloud.code.v1internal.SetUserSettingsRequest.
+        // UserSettings contains only these three boolean controls; it has no
+        // prompt, custom-instruction, identifier, or other free-form field.
+        let payload = serde_json::json!({
+            "userSettings": {
+                "telemetryEnabled": true,
+                "userDataCollectionForceDisabled": false,
+                "marketingEmailsEnabled": false
+            }
+        });
+        let settings = payload["userSettings"].as_object().unwrap();
+        assert_eq!(settings.len(), 3);
+        assert!(settings.values().all(Value::is_boolean));
+    }
+
+    #[test]
     fn custom_cloud_code_base_path_and_query_are_preserved() {
         let upstream = crate::upstream::parse_base(
             "http://127.0.0.1:8080/team/cloud-code?tenant=demo",
