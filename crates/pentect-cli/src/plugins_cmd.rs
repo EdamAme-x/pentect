@@ -887,6 +887,14 @@ impl NewPluginForm {
     }
 }
 
+fn new_plugin_next_steps(form: NewPluginForm) -> &'static str {
+    match form {
+        NewPluginForm::Manifest => "pentect plugins test .\npentect plugins add .",
+        NewPluginForm::Wasm => "pentect plugins dev .\npentect plugins test .",
+        NewPluginForm::Command => "pentect plugins setup .\npentect plugins test .",
+    }
+}
+
 fn choose_new_plugin_form() -> Result<NewPluginForm, String> {
     if !std::io::stdin().is_terminal() {
         return Err("choose a form: pentect plugins new NAME manifest|wasm|command".to_string());
@@ -932,16 +940,17 @@ fn new_plugin(name: &str, form: Option<NewPluginForm>, json_output: bool) -> Res
         NewPluginForm::Wasm => write_wasm_plugin_template(&root, name, &crate_name)?,
         NewPluginForm::Command => write_command_plugin_template(&root, name)?,
     }
+    let next_steps = new_plugin_next_steps(form);
     std::fs::write(
         root.join("README.md"),
-        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins setup .\npentect plugins test .\n```\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
+        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\n{next_steps}\n```\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
     )
     .map_err(|error| format!("could not write plugin README: {error}"))?;
     println!("created: {}", display_path(&root));
-    println!(
-        "next: cd {} && pentect plugins setup .",
-        display_path(&root)
-    );
+    println!("next: cd {}", display_path(&root));
+    for command in next_steps.lines() {
+        println!("      {command}");
+    }
     Ok(())
 }
 
@@ -4012,6 +4021,42 @@ mod tests {
             ));
         }
         assert!(NewPluginForm::parse("native").is_err());
+    }
+
+    #[test]
+    fn generated_plugin_steps_match_each_runtime() {
+        assert_eq!(
+            new_plugin_next_steps(NewPluginForm::Manifest),
+            "pentect plugins test .\npentect plugins add ."
+        );
+        assert_eq!(
+            new_plugin_next_steps(NewPluginForm::Wasm),
+            "pentect plugins dev .\npentect plugins test ."
+        );
+        assert_eq!(
+            new_plugin_next_steps(NewPluginForm::Command),
+            "pentect plugins setup .\npentect plugins test ."
+        );
+    }
+
+    #[test]
+    fn wasm_template_bridges_cargo_and_release_artifact_names() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pentect-wasm-template-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        write_wasm_plugin_template(&root, "my-test-plugin", "my_test_plugin").unwrap();
+
+        let manifest = std::fs::read_to_string(root.join("plugin.toml")).unwrap();
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        assert!(manifest.contains("wasm = \"my-test-plugin.wasm\""));
+        assert!(workflow.contains(
+            "cp target/wasm32-unknown-unknown/release/my_test_plugin.wasm my-test-plugin.wasm"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
