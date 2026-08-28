@@ -134,6 +134,18 @@ impl AnthropicEndpoint {
             Self::Unknown => "unknown",
         }
     }
+
+    fn supports_streaming_request(self) -> bool {
+        matches!(self, Self::Messages | Self::Complete)
+    }
+}
+
+fn anthropic_request_streaming(endpoint: AnthropicEndpoint, body: &[u8]) -> bool {
+    endpoint.supports_streaming_request()
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("stream").and_then(Value::as_bool))
+            .unwrap_or(false)
 }
 
 pub(crate) struct ClaudeHttpProxyGuard {
@@ -460,11 +472,7 @@ async fn proxy_request_inner(
             request_coverage = Some(protected.coverage);
             reqwest::Body::from(protected.body)
         } else {
-            let request_streaming = messages_path
-                && serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|value| value.get("stream").and_then(Value::as_bool))
-                    .unwrap_or(false);
+            let request_streaming = anthropic_request_streaming(endpoint, &body);
             let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
             let body = resolve_anthropic_remote_content(body, &mut remote_budget).await?;
             hydrate_anthropic_attested_files(&body, &account_scope, state).await?;
@@ -3568,6 +3576,27 @@ mod tests {
         );
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, true).is_err());
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn legacy_complete_streaming_requests_use_the_local_response_guard() {
+        let streaming = br#"{"stream":true}"#;
+        assert!(anthropic_request_streaming(
+            AnthropicEndpoint::Messages,
+            streaming
+        ));
+        assert!(anthropic_request_streaming(
+            AnthropicEndpoint::Complete,
+            streaming
+        ));
+        assert!(!anthropic_request_streaming(
+            AnthropicEndpoint::CountTokens,
+            streaming
+        ));
+        assert!(!anthropic_request_streaming(
+            AnthropicEndpoint::Complete,
+            br#"{"stream":false}"#
+        ));
     }
 
     #[test]

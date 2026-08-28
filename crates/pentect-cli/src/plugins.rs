@@ -201,7 +201,10 @@ pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>> {
     let mut specs = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
-        if args[i] == "--plugins" {
+        if let Some(value) = args[i].strip_prefix("--plugins=") {
+            extend_unique(&mut specs, parse_plugin_value(value)?);
+            i += 1;
+        } else if args[i] == "--plugins" {
             let Some(value) = args.get(i + 1) else {
                 bail!("--plugins requires a value");
             };
@@ -234,7 +237,10 @@ fn strip_exec_like_args(args: &[String]) -> Result<(Vec<String>, Vec<String>)> {
             stripped.extend(args[i..].iter().cloned());
             break;
         }
-        if args[i] == "--plugins" {
+        if let Some(value) = args[i].strip_prefix("--plugins=") {
+            extend_unique(&mut specs, parse_plugin_value(value)?);
+            i += 1;
+        } else if args[i] == "--plugins" {
             let Some(value) = args.get(i + 1) else {
                 bail!("--plugins requires a value");
             };
@@ -269,6 +275,11 @@ fn strip_option_args(args: &[String], value_flags: &[&str]) -> Result<(Vec<Strin
         if args[i] == "--" {
             stripped.extend(args[i..].iter().cloned());
             break;
+        }
+        if let Some(value) = args[i].strip_prefix("--plugins=") {
+            extend_unique(&mut specs, parse_plugin_value(value)?);
+            i += 1;
+            continue;
         }
         if args[i] == "--plugins" {
             let Some(value) = args.get(i + 1) else {
@@ -2666,6 +2677,38 @@ label = "INLINE_SECRET"
                 "Write-Output ok".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn plugins_equals_form_is_consumed_before_child_arguments() {
+        let args = vec![
+            "exec".to_string(),
+            "--plugins=rules,company".to_string(),
+            "--".to_string(),
+            "--plugins=child-owned".to_string(),
+        ];
+        let (stripped, specs) = strip_from_args(&args).unwrap();
+        assert_eq!(specs, ["rules", "company"]);
+        assert_eq!(
+            stripped,
+            ["exec", "--", "--plugins=child-owned"].map(str::to_string)
+        );
+
+        let hook = [
+            "hook".to_string(),
+            "--session".to_string(),
+            "test".to_string(),
+            "--plugins=rules".to_string(),
+        ];
+        let (stripped, specs) = strip_from_args(&hook).unwrap();
+        assert_eq!(specs, ["rules"]);
+        assert_eq!(stripped, ["hook", "--session", "test"].map(str::to_string));
+
+        assert_eq!(
+            collect_from_args(&["mask".to_string(), "--plugins=rules".to_string()]).unwrap(),
+            ["rules"]
+        );
+        assert!(collect_from_args(&["--plugins=".to_string()]).is_err());
     }
 
     #[test]
