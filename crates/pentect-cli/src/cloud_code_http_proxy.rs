@@ -675,6 +675,23 @@ fn mask_cloud_code_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     block_unknown_formats: bool,
 ) -> Result<(), String> {
+    let envelope = value.as_object_mut().ok_or_else(|| {
+        "unknown format blocked: Google Cloud Code request must be an object".to_string()
+    })?;
+    for (key, value) in envelope.iter_mut() {
+        if !matches!(
+            key.as_str(),
+            "request"
+                | "model"
+                | "project"
+                | "user_prompt_id"
+                | "userPromptId"
+                | "enabled_credit_types"
+                | "enabledCreditTypes"
+        ) {
+            mask_value_strings(value, false, masker)?;
+        }
+    }
     let request = value
         .get_mut("request")
         .and_then(Value::as_object_mut)
@@ -1984,6 +2001,59 @@ mod tests {
         assert!(!telemetry.contains(&secret));
         assert!(first_handle(&telemetry).is_some());
         assert!(!telemetry.contains(HANDLE_CONTRACT));
+    }
+
+    #[test]
+    fn generation_masks_extension_envelope_without_rewriting_routing_fields() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "ENVELOPE", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let plugins = pentect_agent::PluginMiddleware::from_env().unwrap();
+        let masker = Mutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone()).unwrap(),
+        );
+        let plugins = Mutex::new(plugins);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gemini-test",
+                "project": "projects/safe-project",
+                "user_prompt_id": "stable-request-id",
+                "enabled_credit_types": ["GOOGLE_ONE_AI"],
+                "clientInfo": {
+                    "customSecret": format!("RUNPOD_API_KEY={secret}")
+                },
+                "userSettings": {
+                    "customPrompt": format!("connect with RUNPOD_API_KEY={secret}")
+                },
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": "safe prompt"}]}]
+                }
+            }))
+            .unwrap(),
+        );
+
+        let protected = protect_request_body(
+            &body,
+            CloudCodeEndpoint::GenerateContent,
+            &masker,
+            &plugins,
+            true,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert_eq!(value["model"], "gemini-test");
+        assert_eq!(value["project"], "projects/safe-project");
+        assert_eq!(value["user_prompt_id"], "stable-request-id");
+        assert_eq!(value["enabled_credit_types"][0], "GOOGLE_ONE_AI");
+        for path in [
+            &value["clientInfo"]["customSecret"],
+            &value["userSettings"]["customPrompt"],
+        ] {
+            let protected = path.as_str().unwrap();
+            assert!(!protected.contains(&secret));
+            assert!(protected.contains("<<"), "{protected}");
+        }
     }
 
     #[test]
