@@ -83,17 +83,120 @@ impl Detector for EnvValueDetector {
                 .hints
                 .iter()
                 .any(|hint| hint == SECRET_VALUE_HINT);
-        if region.span.is_empty() || !explicit_secret || is_rendered_placeholder(view.text()) {
+        if region.span.is_empty() || is_rendered_placeholder(view.text()) {
             return vec![];
         }
-        vec![Span {
-            range: region.span,
-            category: Category::Secret,
-            label: labels::SECRET.to_string(),
-            confidence: Confidence::High,
-            source: DetectorId::Structural,
-        }]
+        if explicit_secret {
+            return vec![Span {
+                range: region.span,
+                category: Category::Secret,
+                label: labels::SECRET.to_string(),
+                confidence: Confidence::High,
+                source: DetectorId::Structural,
+            }];
+        }
+        shell_environment_assignments(view)
     }
+}
+
+fn shell_environment_assignments(view: &NormalizedView) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut line_start = 0;
+    for line in view.text().split_inclusive('\n') {
+        let line_body = line.trim_end_matches(['\r', '\n']);
+        let tokens = super::shell::tokens(line_body, line_start);
+        scan_posix_environment_prefix(&tokens, view, &mut spans);
+        scan_powershell_set_item(&tokens, view, &mut spans);
+        line_start += line.len();
+    }
+    spans
+}
+
+fn scan_posix_environment_prefix(
+    tokens: &[super::shell::Token],
+    view: &NormalizedView,
+    spans: &mut Vec<Span>,
+) {
+    let mut index = usize::from(tokens.first().is_some_and(|token| token.value == "export"));
+    while let Some(token) = tokens.get(index) {
+        let Some((key, value)) = token.value.split_once('=') else {
+            break;
+        };
+        if !valid_environment_name(key) {
+            break;
+        }
+        if is_sensitive_key_name(key) && !value.is_empty() {
+            let value_offset = key.len() + 1;
+            if let Some(range) = token_raw_range(token, value_offset) {
+                push_environment_span(view, spans, range);
+            }
+        }
+        index += 1;
+    }
+}
+
+fn scan_powershell_set_item(
+    tokens: &[super::shell::Token],
+    view: &NormalizedView,
+    spans: &mut Vec<Span>,
+) {
+    let Some(command) = tokens.first() else {
+        return;
+    };
+    if !super::shell::basename(&command.value).eq_ignore_ascii_case("set-item") {
+        return;
+    }
+    let Some((env_index, key)) = tokens.iter().enumerate().find_map(|(index, token)| {
+        let (scope, key) = token.value.split_once(':')?;
+        scope.eq_ignore_ascii_case("env").then_some((index, key))
+    }) else {
+        return;
+    };
+    if !valid_environment_name(key) || !is_sensitive_key_name(key) {
+        return;
+    }
+    let value_index = tokens
+        .iter()
+        .enumerate()
+        .skip(env_index + 1)
+        .find(|(_, token)| token.value.eq_ignore_ascii_case("-Value"))
+        .map(|(index, _)| index + 1)
+        .or_else(|| {
+            tokens
+                .get(env_index + 1)
+                .is_some_and(|token| !token.value.starts_with('-'))
+                .then_some(env_index + 1)
+        });
+    let Some(value) = value_index.and_then(|index| tokens.get(index)) else {
+        return;
+    };
+    if let Some(range) = token_raw_range(value, 0) {
+        push_environment_span(view, spans, range);
+    }
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn token_raw_range(token: &super::shell::Token, value_offset: usize) -> Option<ByteRange> {
+    let start = *token.byte_to_raw.get(value_offset)?;
+    let end = token.byte_to_raw.last()?.checked_add(1)?;
+    (start < end).then_some(ByteRange::new(start, end))
+}
+
+fn push_environment_span(view: &NormalizedView, spans: &mut Vec<Span>, range: ByteRange) {
+    spans.push(Span {
+        range: view.to_raw(range),
+        category: Category::Secret,
+        label: labels::KEYED_SECRET.to_string(),
+        confidence: Confidence::High,
+        source: DetectorId::Structural,
+    });
 }
 
 impl Detector for SensitiveKeyDetector {
@@ -756,6 +859,24 @@ mod tests {
             .is_empty()
     }
 
+    fn shell_env_values(raw: &str) -> Vec<&str> {
+        let region = Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: Context {
+                path: None,
+                key: None,
+                hints: Vec::new(),
+                kind: RegionKind::PlainText,
+                format: Kind::Text,
+            },
+        };
+        EnvValueDetector
+            .detect(&NormalizedView::build(&region, raw))
+            .into_iter()
+            .map(|span| &raw[span.range.start..span.range.end])
+            .collect()
+    }
+
     fn sensitive_key_fires(key: Option<&str>, value: &str) -> Option<String> {
         sensitive_key_fires_with_path(None, key, value)
     }
@@ -869,6 +990,31 @@ mod tests {
             "<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>"
         ));
         assert!(env_fires(Some("TOKEN"), "<<LABEL_ABCDEF0123456789>>"));
+    }
+
+    #[test]
+    fn shell_environment_assignments_mask_unquoted_and_quoted_values() {
+        let raw = concat!(
+            "DYNATRACE_API_TOKEN=SyntheticValue dynatrace-cli\n",
+            "export MAILGUN_API_KEY='mail gun value'; npx server\n",
+            "PUBLIC_MODE=development app\n",
+            "FOO=bar SQUARE_ACCESS_TOKEN=SquareValue node app.js\n",
+        );
+        assert_eq!(
+            shell_env_values(raw),
+            ["SyntheticValue", "mail gun value", "SquareValue"]
+        );
+    }
+
+    #[test]
+    fn powershell_set_item_environment_value_is_masked() {
+        for raw in [
+            "Set-Item -Path Env:SQUARE_ACCESS_TOKEN -Value SyntheticValue",
+            "Set-Item Env:MAILGUN_API_KEY 'mail gun value'",
+        ] {
+            assert_eq!(shell_env_values(raw).len(), 1, "{raw}");
+        }
+        assert!(shell_env_values("Set-Item -Path Env:PUBLIC_MODE -Value development").is_empty());
     }
 
     #[test]
