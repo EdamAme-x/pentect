@@ -103,7 +103,9 @@ client input
   → completed tool_call
 ```
 
-The `file` hook runs when Pentect handles supported file information. Built-in
+The `file` hook runs for multipart uploads and known inline Base64 media in
+Anthropic, Claude App, Gemini, and Google Cloud Code requests. Inline media has
+`filename: null`; `media_type` and `size` describe the decoded payload. Built-in
 checks still run. A regex plugin cannot turn them off.
 
 ## What a plugin can see
