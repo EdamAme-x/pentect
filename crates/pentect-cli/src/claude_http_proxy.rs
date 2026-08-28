@@ -2018,6 +2018,7 @@ where
                         Some(serde_json::json!({"provider": "anthropic", "transport": "http_sse"})),
                     )
                     .map_err(|error| format!("plugin middleware: {error}"))?;
+                crate::plugins::enforce_tool_plugin_coverage(run.coverage, "Claude")?;
                 if run.stopped == Some(pentect_agent::StopOutcome::Block) {
                     return Err(format!(
                         "plugin middleware: blocked: {}",
