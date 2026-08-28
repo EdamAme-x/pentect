@@ -20,6 +20,18 @@ Provider setup and credentials stay under OpenCode's native provider ID. If
 release, reconnect the intended native provider once. Pentect does not guess a
 destination and copy an ambiguous stored credential automatically.
 
+Run OpenCode's native authentication flow through Pentect before the first
+protected conversation when the provider requires an account:
+
+```sh
+pentect opencode auth login
+```
+
+Authentication commands retain OpenCode's complete provider list and do not
+install Pentect's temporary conversation routing. They exchange credentials,
+not conversation content. Subsequent `pentect opencode` launches protect AI
+traffic normally.
+
 Normal OpenCode arguments pass through. A model flag may appear anywhere before
 the explicit `--` separator:
 

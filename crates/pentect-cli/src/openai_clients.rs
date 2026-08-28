@@ -258,6 +258,22 @@ fn run_opencode(
     opts: &crate::AgentToolOpts,
     pentect: &Path,
 ) -> Result<std::process::ExitStatus, String> {
+    // Authentication does not carry conversation content. Let OpenCode own this
+    // flow so its complete native provider catalog remains available and the
+    // credential is stored under the real provider ID. Injecting the protected
+    // conversation config here would restrict first-time setup to the currently
+    // routed provider.
+    if is_opencode_auth_command(&opts.tool_args) {
+        if opts.dry_run {
+            crate::print_dry_run(&opts.command, &opts.tool_args);
+            return Ok(crate::success_status());
+        }
+        let mut command = Command::new(&opts.command);
+        crate::clear_pentect_control_env(&mut command);
+        command.args(&opts.tool_args);
+        return crate::run_native_command_with_guards(command, &opts.command, ());
+    }
+
     let route = OpenCodeRoute::resolve(opts)?;
     let api = ClientApi::parse(opts.api.as_deref())?;
     if opts.dry_run {
@@ -360,6 +376,10 @@ fn run_opencode(
     command.env("OPENCODE_CONFIG_CONTENT", config);
     command.args(&opts.tool_args);
     crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+}
+
+fn is_opencode_auth_command(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "auth")
 }
 
 fn configured_key_env(names: &[&'static str]) -> Option<&'static str> {
@@ -784,6 +804,23 @@ mod tests {
             gateway.model.as_deref(),
             Some("pentect-gateway/anthropic/claude-sonnet")
         );
+    }
+
+    #[test]
+    fn opencode_auth_commands_bypass_conversation_provider_injection() {
+        assert!(is_opencode_auth_command(&[
+            "auth".to_string(),
+            "login".to_string()
+        ]));
+        assert!(is_opencode_auth_command(&[
+            "auth".to_string(),
+            "list".to_string()
+        ]));
+        assert!(!is_opencode_auth_command(&[]));
+        assert!(!is_opencode_auth_command(&[
+            "run".to_string(),
+            "auth".to_string()
+        ]));
     }
 
     #[test]
