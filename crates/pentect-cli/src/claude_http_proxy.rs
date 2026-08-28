@@ -1844,7 +1844,7 @@ pub(crate) fn mask_string(
     Ok(())
 }
 
-fn mask_value_strings(
+pub(crate) fn mask_value_strings(
     value: &mut Value,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
 ) -> Result<(), String> {
