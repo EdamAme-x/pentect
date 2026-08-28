@@ -12,6 +12,12 @@ struct WordToken {
     language_mask: u16,
 }
 
+struct MnemonicCandidate {
+    start: usize,
+    end: usize,
+    boundary_score: u8,
+}
+
 impl Detector for Bip39Detector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
@@ -19,13 +25,9 @@ impl Detector for Bip39Detector {
         if looks_like_reference_wordlist(text, &tokens) {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        let mut covered_until = 0;
+        let mut candidates = Vec::new();
 
         for start in 0..tokens.len() {
-            if tokens[start].start < covered_until {
-                continue;
-            }
             for len in [24usize, 21, 18, 15, 12] {
                 let end = start + len;
                 if end > tokens.len() {
@@ -41,25 +43,52 @@ impl Detector for Bip39Detector {
                     .iter()
                     .map(|token| &text[token.start..token.end])
                     .collect::<Vec<_>>();
-                let norm = ByteRange::new(tokens[start].start, tokens[end - 1].end);
-                if !has_strong_boundary(text, &tokens, start, end)
-                    || !validate::bip39_mnemonic_window(&words)
-                {
+                let Some(boundary_score) = boundary_score(text, &tokens, start, end) else {
+                    continue;
+                };
+                if !validate::bip39_mnemonic_window(&words) {
                     continue;
                 }
-                out.push(Span {
+                candidates.push(MnemonicCandidate {
+                    start,
+                    end,
+                    boundary_score,
+                });
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            right
+                .boundary_score
+                .cmp(&left.boundary_score)
+                .then_with(|| (right.end - right.start).cmp(&(left.end - left.start)))
+                .then_with(|| right.start.cmp(&left.start))
+        });
+        let mut selected = Vec::<MnemonicCandidate>::new();
+        for candidate in candidates {
+            if selected
+                .iter()
+                .any(|existing| candidate.start < existing.end && existing.start < candidate.end)
+            {
+                continue;
+            }
+            selected.push(candidate);
+        }
+        selected.sort_by_key(|candidate| candidate.start);
+        selected
+            .into_iter()
+            .map(|candidate| {
+                let norm =
+                    ByteRange::new(tokens[candidate.start].start, tokens[candidate.end - 1].end);
+                Span {
                     range: view.to_raw(norm),
                     category: Category::Secret,
                     label: labels::BIP39_MNEMONIC.to_string(),
                     confidence: Confidence::High,
                     source: DetectorId::Rule,
-                });
-                covered_until = tokens[end - 1].end;
-                break;
-            }
-        }
-
-        out
+                }
+            })
+            .collect()
     }
 }
 
@@ -83,18 +112,29 @@ fn word_tokens(text: &str) -> Vec<WordToken> {
     tokens
 }
 
-fn has_strong_boundary(text: &str, tokens: &[WordToken], start: usize, end: usize) -> bool {
+fn boundary_score(text: &str, tokens: &[WordToken], start: usize, end: usize) -> Option<u8> {
     let left = if start == 0 {
-        true
+        3
     } else {
-        is_strong_separator(&text[tokens[start - 1].end..tokens[start].start])
+        separator_score(&text[tokens[start - 1].end..tokens[start].start])?
     };
     let right = if end >= tokens.len() {
-        true
+        3
     } else {
-        is_strong_separator(&text[tokens[end - 1].end..tokens[end].start])
+        separator_score(&text[tokens[end - 1].end..tokens[end].start])?
     };
-    left && right
+    Some(left + right)
+}
+
+fn separator_score(value: &str) -> Option<u8> {
+    if !is_strong_separator(value) {
+        return None;
+    }
+    Some(if value.chars().all(char::is_whitespace) {
+        1
+    } else {
+        4
+    })
 }
 
 fn is_strong_separator(value: &str) -> bool {
@@ -166,6 +206,15 @@ mod tests {
     fn detects_plain_multiline_and_numbered_seed_phrases() {
         let plain = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         assert_eq!(hit_values(plain), vec![plain]);
+
+        for prefix in [
+            "bip39: ",
+            "Here is the backup phrase: ",
+            "Please verify this seed: ",
+            "secret phrase: ",
+        ] {
+            assert_eq!(hit_values(&format!("{prefix}{plain}")), vec![plain]);
+        }
 
         let multiline = "Recovery phrase:\nabandon abandon abandon\nabandon abandon abandon\nabandon abandon abandon\nabandon abandon about";
         assert_eq!(
