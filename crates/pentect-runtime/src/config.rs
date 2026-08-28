@@ -456,13 +456,19 @@ pub(crate) fn remember_files_enabled() -> Result<bool, String> {
 pub(crate) fn activity_share_enabled() -> Result<bool, String> {
     let project = read_activity_share(project_config_path())?;
     let global = read_activity_share(global_config_path()?)?;
-    Ok(project.or(global).unwrap_or(true))
+    Ok(local_privacy_setting_enabled(project, global))
 }
 
 pub(crate) fn metrics_enabled() -> Result<bool, String> {
     let project = read_metrics_enabled(project_config_path())?;
     let global = read_metrics_enabled(global_config_path()?)?;
-    Ok(project.or(global).unwrap_or(true))
+    Ok(local_privacy_setting_enabled(project, global))
+}
+
+fn local_privacy_setting_enabled(project: Option<bool>, global: Option<bool>) -> bool {
+    // A repository may narrow local event sharing and metrics visibility, but
+    // it must not re-enable either after the user disabled it globally.
+    global.unwrap_or(true) && project.unwrap_or(true)
 }
 
 pub(crate) fn update_check_enabled() -> Result<bool, String> {
@@ -1729,6 +1735,19 @@ unknown_min_bytes = 32
 
         let invalid = "[metrics]\nenabled = 3".parse::<toml::Value>().unwrap();
         assert!(metrics_enabled_value(&invalid).is_err());
+    }
+
+    #[test]
+    fn local_privacy_settings_default_on_and_either_scope_can_disable_them() {
+        assert!(local_privacy_setting_enabled(None, None));
+        assert!(local_privacy_setting_enabled(Some(true), None));
+        assert!(local_privacy_setting_enabled(None, Some(true)));
+        assert!(local_privacy_setting_enabled(Some(true), Some(true)));
+        assert!(!local_privacy_setting_enabled(Some(false), None));
+        assert!(!local_privacy_setting_enabled(None, Some(false)));
+        assert!(!local_privacy_setting_enabled(Some(false), Some(true)));
+        assert!(!local_privacy_setting_enabled(Some(true), Some(false)));
+        assert!(!local_privacy_setting_enabled(Some(false), Some(false)));
     }
 
     #[test]
