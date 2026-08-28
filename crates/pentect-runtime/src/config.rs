@@ -858,19 +858,17 @@ fn merge_image_ocr_config(
     project: ImageOcrConfigPartial,
     global: ImageOcrConfigPartial,
 ) -> Result<ImageOcrConfig, String> {
-    let baseline_unscanned = global
-        .unscanned_images
-        .unwrap_or(UnscannedImagePolicy::Block);
-    let unscanned_images = project.unscanned_images.unwrap_or(baseline_unscanned);
-    if baseline_unscanned == UnscannedImagePolicy::Block
-        && unscanned_images == UnscannedImagePolicy::Allow
-    {
-        return Err(
-            "image.unscanned = \"allow\" may only be set in the user config at ~/.pentect/config.toml"
-                .to_string(),
-        );
-    }
-    Ok(ImageOcrConfig {
+    let baseline = merge_image_ocr_config_unchecked(ImageOcrConfigPartial::default(), global);
+    let merged = merge_image_ocr_config_unchecked(project, global);
+    ensure_project_image_ocr_not_weaker(&baseline, &merged)?;
+    Ok(merged)
+}
+
+fn merge_image_ocr_config_unchecked(
+    project: ImageOcrConfigPartial,
+    global: ImageOcrConfigPartial,
+) -> ImageOcrConfig {
+    ImageOcrConfig {
         mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::On),
         redaction: project
             .redaction
@@ -904,8 +902,66 @@ fn merge_image_ocr_config(
             .fetch_seconds
             .or(global.fetch_seconds)
             .unwrap_or(DEFAULT_IMAGE_FETCH_SECONDS),
-        unscanned_images,
-    })
+        unscanned_images: project
+            .unscanned_images
+            .or(global.unscanned_images)
+            .unwrap_or(UnscannedImagePolicy::Block),
+    }
+}
+
+fn ensure_project_image_ocr_not_weaker(
+    baseline: &ImageOcrConfig,
+    merged: &ImageOcrConfig,
+) -> Result<(), String> {
+    if baseline.unscanned_images == UnscannedImagePolicy::Block
+        && merged.unscanned_images == UnscannedImagePolicy::Allow
+    {
+        return Err(
+            "image.unscanned = \"allow\" may only be set in the user config at ~/.pentect/config.toml"
+                .to_string(),
+        );
+    }
+    if baseline.mode == ImageOcrMode::On && merged.mode == ImageOcrMode::Off {
+        return Err(
+            "image.ocr = \"off\" may only be set in the user config at ~/.pentect/config.toml"
+                .to_string(),
+        );
+    }
+    if baseline.mode == ImageOcrMode::Off {
+        return Ok(());
+    }
+    for (field, weaker) in [
+        ("image.max_pixels", merged.max_pixels < baseline.max_pixels),
+        ("image.max_edge", merged.max_edge < baseline.max_edge),
+        ("image.max_images", merged.max_images < baseline.max_images),
+        (
+            "image.max_total_bytes",
+            merged.max_total_bytes < baseline.max_total_bytes,
+        ),
+        (
+            "image.max_seconds",
+            merged.max_seconds < baseline.max_seconds,
+        ),
+        (
+            "image.max_image_bytes",
+            merged.max_image_bytes < baseline.max_image_bytes,
+        ),
+        (
+            "image.fetch_seconds",
+            merged.fetch_seconds < baseline.fetch_seconds,
+        ),
+    ] {
+        if weaker {
+            return Err(project_image_limit_error(field));
+        }
+    }
+    Ok(())
+}
+
+fn project_image_limit_error(field: &str) -> String {
+    format!(
+        "{field} may not reduce image inspection coverage in project config; set the weaker limit in ~/.pentect/config.toml"
+    )
 }
 
 fn merge_decode_config(
@@ -1486,6 +1542,100 @@ unknown_min_bytes = 32
                 .unwrap()
                 .unscanned_images,
             UnscannedImagePolicy::Block
+        );
+    }
+
+    #[test]
+    fn project_image_config_cannot_disable_active_user_ocr() {
+        let project = ImageOcrConfigPartial {
+            mode: Some(ImageOcrMode::Off),
+            ..ImageOcrConfigPartial::default()
+        };
+        let error = merge_image_ocr_config(project, ImageOcrConfigPartial::default()).unwrap_err();
+        assert!(error.contains("image.ocr"), "{error}");
+    }
+
+    #[test]
+    fn project_image_config_cannot_reduce_active_inspection_limits() {
+        let cases = [
+            (
+                ImageOcrConfigPartial {
+                    max_pixels: Some(DEFAULT_IMAGE_OCR_MAX_PIXELS - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.max_pixels",
+            ),
+            (
+                ImageOcrConfigPartial {
+                    max_edge: Some(DEFAULT_IMAGE_OCR_MAX_EDGE - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.max_edge",
+            ),
+            (
+                ImageOcrConfigPartial {
+                    max_images: Some(DEFAULT_IMAGE_MAX_IMAGES - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.max_images",
+            ),
+            (
+                ImageOcrConfigPartial {
+                    max_total_bytes: Some(DEFAULT_IMAGE_MAX_TOTAL_BYTES - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.max_total_bytes",
+            ),
+            (
+                ImageOcrConfigPartial {
+                    max_seconds: Some(DEFAULT_IMAGE_MAX_SECONDS - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.max_seconds",
+            ),
+            (
+                ImageOcrConfigPartial {
+                    max_image_bytes: Some(DEFAULT_IMAGE_MAX_IMAGE_BYTES - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.max_image_bytes",
+            ),
+            (
+                ImageOcrConfigPartial {
+                    fetch_seconds: Some(DEFAULT_IMAGE_FETCH_SECONDS - 1),
+                    ..ImageOcrConfigPartial::default()
+                },
+                "image.fetch_seconds",
+            ),
+        ];
+
+        for (project, field) in cases {
+            let error =
+                merge_image_ocr_config(project, ImageOcrConfigPartial::default()).unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn project_image_limits_are_unrestricted_when_user_ocr_is_off() {
+        let global = ImageOcrConfigPartial {
+            mode: Some(ImageOcrMode::Off),
+            ..ImageOcrConfigPartial::default()
+        };
+        let project = ImageOcrConfigPartial {
+            mode: Some(ImageOcrMode::On),
+            max_pixels: Some(1),
+            max_edge: Some(1),
+            max_images: Some(1),
+            max_total_bytes: Some(1),
+            max_seconds: Some(1),
+            max_image_bytes: Some(1),
+            fetch_seconds: Some(1),
+            ..ImageOcrConfigPartial::default()
+        };
+        assert_eq!(
+            merge_image_ocr_config(project, global).unwrap().mode,
+            ImageOcrMode::On
         );
     }
 
