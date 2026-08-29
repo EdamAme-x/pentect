@@ -3755,6 +3755,52 @@ mod tests {
     }
 
     #[test]
+    fn child_environment_keeps_pi_user_options_but_removes_internal_client_state() {
+        let mut command = Command::new("pentect-child");
+        for name in [
+            "PENTECT_PI_REASONING",
+            "PENTECT_PI_CONTEXT_WINDOW",
+            "PENTECT_PI_MAX_TOKENS",
+            "PENTECT_PI_INPUTS",
+        ] {
+            command.env(name, "user-selected-value");
+        }
+        for name in [
+            "PENTECT_ANTHROPIC_UPSTREAM",
+            "PENTECT_JUNIE_API_KEY",
+            "PENTECT_PROXY_URL",
+            "PENTECT_PROVIDER_MODEL",
+            "PENTECT_PROVIDER_API",
+            "PENTECT_GATEWAY_API_KEY",
+            "PENTECT_API_KEY",
+            "PENTECT_LOG_DIR",
+        ] {
+            command.env(name, "stale-inherited-value");
+        }
+
+        clear_pentect_control_env(&mut command);
+
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for name in [
+            "PENTECT_PI_REASONING",
+            "PENTECT_PI_CONTEXT_WINDOW",
+            "PENTECT_PI_MAX_TOKENS",
+            "PENTECT_PI_INPUTS",
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(name)).and_then(|value| *value),
+                Some(OsStr::new("user-selected-value")),
+                "{name}"
+            );
+        }
+        for name in pentect_agent::pentect_control_env_names() {
+            assert_eq!(environment.get(OsStr::new(name)), Some(&None), "{name}");
+        }
+    }
+
+    #[test]
     fn gemini_child_receives_only_local_placeholder_keys_when_gateway_owns_auth() {
         let mut command = Command::new("gemini-child");
         command.env("GEMINI_API_KEY", "inherited-value");
