@@ -26,7 +26,7 @@ struct UpdateCheckRelease {
 #[derive(Debug, Deserialize, Serialize)]
 struct UpdateCheckCache {
     checked_at: u64,
-    latest: String,
+    latest: Option<String>,
 }
 
 pub(crate) struct DownloadedReleaseAsset {
@@ -71,7 +71,9 @@ pub(crate) fn start_update_notification(args: &[String]) {
     let now = unix_seconds();
     if let Some(cache) = read_update_check_cache(&cache_path) {
         if now.saturating_sub(cache.checked_at) < UPDATE_CHECK_INTERVAL.as_secs() {
-            print_update_notice(&cache.latest);
+            if let Some(latest) = cache.latest.as_deref() {
+                print_update_notice(latest);
+            }
             return;
         }
     }
@@ -105,19 +107,24 @@ fn refresh_update_check(path: &Path, now: u64) -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not create update-check client: {error}"))?;
     let release: UpdateCheckRelease = get_response(&client, RELEASE_API, MAX_CHECKSUM_BYTES * 4)?;
-    if release.draft || release.prerelease {
-        return Ok(());
+    let cache = update_check_cache_for_release(&release, now)?;
+    write_update_check_cache(path, &cache)?;
+    if let Some(latest) = cache.latest.as_deref() {
+        print_update_notice(latest);
     }
-    let latest = release_version(&release.tag_name)?.to_string();
-    write_update_check_cache(
-        path,
-        &UpdateCheckCache {
-            checked_at: now,
-            latest: latest.clone(),
-        },
-    )?;
-    print_update_notice(&latest);
     Ok(())
+}
+
+fn update_check_cache_for_release(
+    release: &UpdateCheckRelease,
+    checked_at: u64,
+) -> Result<UpdateCheckCache, String> {
+    let latest = if release.draft || release.prerelease {
+        None
+    } else {
+        Some(release_version(&release.tag_name)?.to_string())
+    };
+    Ok(UpdateCheckCache { checked_at, latest })
 }
 
 fn print_update_notice(latest: &str) {
@@ -931,7 +938,7 @@ mod tests {
         std::fs::write(&stale, b"stale crashed process").unwrap();
         let cache = UpdateCheckCache {
             checked_at: 123,
-            latest: "1.2.3".to_string(),
+            latest: Some("1.2.3".to_string()),
         };
         write_update_check_cache(&path, &cache).unwrap();
         assert!(
@@ -953,10 +960,42 @@ mod tests {
         assert!(random_staging_files.is_empty(), "{random_staging_files:?}");
         let loaded = read_update_check_cache(&path).unwrap();
         assert_eq!(loaded.checked_at, 123);
-        assert_eq!(loaded.latest, "1.2.3");
+        assert_eq!(loaded.latest.as_deref(), Some("1.2.3"));
+
+        let ignored_release_cache = UpdateCheckCache {
+            checked_at: 456,
+            latest: None,
+        };
+        write_update_check_cache(&path, &ignored_release_cache).unwrap();
+        let loaded = read_update_check_cache(&path).unwrap();
+        assert_eq!(loaded.checked_at, 456);
+        assert_eq!(loaded.latest, None);
 
         std::fs::write(&path, vec![b'x'; MAX_UPDATE_CACHE_BYTES as usize + 1]).unwrap();
         assert!(read_update_check_cache(&path).is_none());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn prerelease_and_draft_checks_are_cached_without_update_notices() {
+        for (draft, prerelease) in [(true, false), (false, true)] {
+            let release = UpdateCheckRelease {
+                tag_name: "v99.0.0-beta.1".to_string(),
+                draft,
+                prerelease,
+            };
+            let cache = update_check_cache_for_release(&release, 456).unwrap();
+            assert_eq!(cache.checked_at, 456);
+            assert_eq!(cache.latest, None);
+        }
+
+        let stable = UpdateCheckRelease {
+            tag_name: "v1.2.3".to_string(),
+            draft: false,
+            prerelease: false,
+        };
+        let cache = update_check_cache_for_release(&stable, 789).unwrap();
+        assert_eq!(cache.checked_at, 789);
+        assert_eq!(cache.latest.as_deref(), Some("1.2.3"));
     }
 }
