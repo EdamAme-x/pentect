@@ -47,6 +47,31 @@ revisions, test date, runner platform, finding totals, bounded ML difference,
 and per-rule gaps. Release publication stops if the evidence does not match the
 tag or either implementation reports a finding the other one does not.
 
+## CredSweeper disagreement and rollback
+
+A native/official mismatch is a security regression even when it is only an
+extra finding. Do not silently accept it, weaken the fixture, or describe a
+successful corpus run as proof for unseen input. Before release, the parity
+gate blocks publication. If a mismatch is discovered after release, identify
+the newest earlier Pentect release whose
+`pentect-credsweeper-compatibility.json` evidence names the intended
+CredSweeper version and reports no missing or extra findings, then validate and
+install that exact Pentect version:
+
+```sh
+pentect update v0.0.69 --check
+pentect update v0.0.69
+pentect version
+```
+
+This restores the complete known release binary, not only its rule assets, so
+independently implemented scanner behavior is rolled back as well. Exact
+published tags are selectable even when GitHub marks an older release as a
+prerelease; drafts remain unavailable and artifact checksum verification is
+unchanged. Startup checks only notify, so the selected version is not
+automatically replaced. Package-manager installations must select that exact
+version through their package manager if Pentect cannot replace it directly.
+
 ## Pentect-maintained detectors
 
 These detectors are maintained in this repository. They must not be attributed
