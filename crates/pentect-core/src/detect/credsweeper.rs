@@ -7105,6 +7105,56 @@ mod tests {
     }
 
     #[test]
+    fn vendor_token_rules_match_pinned_credsweeper_fixtures() {
+        // Assemble the public upstream fixtures at runtime so GitHub push
+        // protection does not mistake detector test data for live secrets.
+        let fixtures = vec![
+            (
+                "DOCKER_ACCESS_TOKEN",
+                ["dckr_", "pat_", "mcF-hLK_JoBxXUNJy1kU7-WSbk0"].concat(),
+            ),
+            (
+                "DOCKER_ACCESS_TOKEN",
+                ["dckr_", "oat_", "fXUgJy1nU2WSbk_0vH2S-mcF-hLKJoB-"].concat(),
+            ),
+            (
+                "HASHICORP_VAULT_TOKEN",
+                ["hvs.", "atlasv1-Z28P3STmkBQi1Y-YE7RBqu6VVyQIOq9a1eC3YFU5Elt7ToIr6OwzKAWlCTQ7N4gElXaWou6aPpOIwGCoc0"].concat(),
+            ),
+            (
+                "HASHICORP_VAULT_TOKEN",
+                ["hvb.", "atlasv1-Z28P3STmkBQi1Y-YE7RBqu6VVyQIOq9a1eC3YFU5Elt7ToIr6OwzKAWlCTQ7N4gElXaWou6aPpOIwGCoc0"].concat(),
+            ),
+            (
+                "HASHICORP_VAULT_TOKEN",
+                ["hvr.", "atlasv1-Z28P3STmkBQi1Y-YE7RBqu6VVyQIOq9a1eC3YFU5Elt7ToIr6OwzKAWlCTQ7N4gElXaWou6aPpOIwGCoc0"].concat(),
+            ),
+            (
+                "SENTRY_ORGANIZATION_AUTH_TOKEN",
+                ["sntrys_", "eyJpYXQiOjE3NDEyNjQzNTYuMDAwMCwidXJsIjoiaHR0cHM6Ly9zZW50cnkuaW8iLCJyZWdpb25fdXJsIjoiaHR0cHM6Ly91YS5zZW50cnkuaW8iLCJvcmciOiIifQ==v8D-whr2cUQK91Civi4yNoLRjC3MDZH5I2aMcs_j5GDv"].concat(),
+            ),
+            (
+                "SENTRY_USER_AUTH_TOKEN",
+                ["sntryu_", "b42e3f39e6e16d5c822ac2e6ae368a1bc24fd9678bc6a6411926acdafea59851"].concat(),
+            ),
+        ];
+        let detector = CredSweeperNativeDetector::builtin();
+
+        for (expected_label, fixture) in fixtures {
+            let input = format!("token={fixture}");
+            let input_region = region(&input);
+            let view = NormalizedView::build(&input_region, &input);
+            let findings = detector.detect_findings(&view);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| { finding.label == expected_label && finding.value == fixture }),
+                "{expected_label} did not match its pinned upstream fixture: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn value_grafana_matches_official_fixtures() {
         assert!(!value_grafana_filtered(
             "glc_eyJvIjoiTyIsIm4iOiJOIiwiayI6IksiLCJtIjp7InIiOiIwIn19"
