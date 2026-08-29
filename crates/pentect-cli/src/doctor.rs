@@ -680,15 +680,11 @@ fn update_process_path(directory: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn command_names(name: &str) -> Vec<String> {
-    let has_ext = Path::new(name).extension().is_some();
-    if has_ext {
-        return vec![name.to_string()];
-    }
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    pathext
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .map(|ext| format!("{name}{ext}"))
+    let pathext = std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+    crate::windows_executable_candidates(Path::new(name), &pathext)
+        .into_iter()
+        .map(|candidate| candidate.to_string_lossy().into_owned())
         .collect()
 }
 
