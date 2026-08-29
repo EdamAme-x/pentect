@@ -1690,14 +1690,16 @@ fn validate_permissions(permissions: Option<&PermissionsConfig>) -> Result<(), S
         for path in paths {
             let valid_root = path.starts_with("project:") || path.starts_with("plugin:");
             let relative = path.split_once(':').map(|(_, value)| value).unwrap_or("");
+            let recursive_root = matches!(relative, "**" | "/**");
             if !valid_root
-                || relative.is_empty()
-                || relative.starts_with(['/', '\\'])
-                || relative
-                    .split(['/', '\\'])
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-                || (!relative.ends_with("/**") && relative.contains('*'))
-                || relative.contains('?')
+                || (!recursive_root
+                    && (relative.is_empty()
+                        || relative.starts_with(['/', '\\'])
+                        || relative
+                            .split(['/', '\\'])
+                            .any(|part| part.is_empty() || part == "." || part == "..")
+                        || (!relative.ends_with("/**") && relative.contains('*'))
+                        || relative.contains('?')))
             {
                 return Err(format!(
                     "Wasm permission {kind} path must be project:PATH or plugin:PATH and may only end in /**"
@@ -4426,6 +4428,12 @@ mod tests {
         let broad_glob: PermissionsConfig =
             toml::from_str(r#"read = ["project:**/*.env"]"#).unwrap();
         assert!(validate_permissions(Some(&broad_glob)).is_err());
+
+        for path in ["project:**", "project:/**", "plugin:**", "plugin:/**"] {
+            let recursive_root: PermissionsConfig =
+                toml::from_str(&format!(r#"read = ["{path}"]"#)).unwrap();
+            validate_permissions(Some(&recursive_root)).unwrap();
+        }
     }
 
     #[test]

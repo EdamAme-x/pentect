@@ -178,8 +178,10 @@ storage = true
 ```
 
 `project:` means the current project. `plugin:` means the plugin directory.
-Paths are exact unless they end in `/**`. Parent traversal and general glob
-patterns are rejected. Commands are argv arrays and must match exactly; no
+Paths are exact unless they end in `/**`. Use `project:**` or `project:/**` for
+the whole project recursively, and the equivalent `plugin:` forms for the whole
+plugin directory. Parent traversal and general glob patterns are rejected.
+Commands are argv arrays and must match exactly; no
 shell parses them. Pentect resolves the approved executable to one absolute
 path before the Wasm plugin can request it. `storage = true` enables private
 persistent JSON storage.
