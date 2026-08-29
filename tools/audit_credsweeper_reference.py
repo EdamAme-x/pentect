@@ -106,12 +106,30 @@ def inventory() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--status-output",
+        type=Path,
+        help="also write the matching native filter-status inventory",
+    )
     args = parser.parse_args()
-    rendered = json.dumps(inventory(), indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    result = inventory()
+    rendered = json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")
     else:
         print(rendered, end="")
+    if args.status_output:
+        # Update automation writes this candidate declaration, then blocks the
+        # resulting branch on check_credsweeper_filter_parity.py before a PR is
+        # opened. The declaration alone is not compatibility evidence.
+        status = {
+            "credsweeper_version": result["credsweeper_version"],
+            "filters": {name: "exact" for name in result["filter_classes"]},
+        }
+        args.status_output.write_text(
+            json.dumps(status, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     return 0
 
 
