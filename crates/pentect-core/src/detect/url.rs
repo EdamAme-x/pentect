@@ -165,7 +165,7 @@ fn inspect_curl_user_credentials(view: &NormalizedView, out: &mut Vec<Span>) {
 }
 
 fn inspect_curl_line(view: &NormalizedView, out: &mut Vec<Span>, line_start: usize, line: &str) {
-    if !shell::contains_ascii_ci(line, "curl") || !line.contains("-u") {
+    if !shell::contains_ascii_ci(line, "curl") {
         return;
     }
 
@@ -180,7 +180,10 @@ fn inspect_curl_line(view: &NormalizedView, out: &mut Vec<Span>, line_start: usi
     let mut i = curl_index + 1;
     while i < tokens.len() {
         let token = &tokens[i];
-        if matches!(token.value.as_str(), "-u" | "--user" | "--proxy-user") {
+        if matches!(
+            token.value.as_str(),
+            "-u" | "-U" | "--user" | "--proxy-user"
+        ) {
             if let Some(next) = tokens.get(i + 1) {
                 inspect_curl_user_value(view, out, next, 0);
             }
@@ -199,7 +202,9 @@ fn inspect_curl_line(view: &NormalizedView, out: &mut Vec<Span>, line_start: usi
             })
         {
             inspect_curl_user_value(view, out, token, value_start);
-        } else if token.value.starts_with("-u") && token.value.len() > 2 {
+        } else if (token.value.starts_with("-u") || token.value.starts_with("-U"))
+            && token.value.len() > 2
+        {
             inspect_curl_user_value(view, out, token, 2);
         }
         i += 1;
@@ -1682,6 +1687,21 @@ mod tests {
                 "b9dd-a5us9t-z@dgy1wd".to_string()
             )]
         );
+        for raw in [
+            "curl -U proxyuser:b9dd-a5us9t-z@dgy1wd https://api.service.com",
+            "curl -Uproxyuser:b9dd-a5us9t-z@dgy1wd https://api.service.com",
+            r#"curl -U "proxyuser:b9dd-a5us9t-z@dgy1wd" https://api.service.com"#,
+            r#"C:\Windows\System32\curl.exe -Uproxyuser:b9dd-a5us9t-z@dgy1wd https://api.service.com"#,
+        ] {
+            assert_eq!(
+                labels(raw),
+                [(
+                    "URL_CREDENTIAL".to_string(),
+                    "b9dd-a5us9t-z@dgy1wd".to_string()
+                )],
+                "{raw}"
+            );
+        }
     }
 
     #[test]
@@ -1690,6 +1710,7 @@ mod tests {
             "curl -u username:password https://api.service.com",
             "curl -u idp_admin:idp_admin_pwd https://api.service.com",
             r#"curl --user "$USER:$PASSWORD" https://api.service.com"#,
+            r#"curl -U "$USER:$PASSWORD" https://api.service.com"#,
             "notcurl -u jacknich:b9dd-a5us9t-z@dgy1wd https://api.service.com",
         ] {
             assert!(
