@@ -1,5 +1,7 @@
 use super::util::token_runs;
-use super::{AuthCodeDetector, Bip39Detector, CredSweeperNativeDetector, Detector};
+use super::{
+    is_sensitive_key_name, AuthCodeDetector, Bip39Detector, CredSweeperNativeDetector, Detector,
+};
 use crate::codec::{
     is_rfc1924_base85_byte, is_z85_byte, Ascii85Codec, Base32Codec, Base32HexCodec, Base58Codec,
     Base64Codec, Base85Codec, BinaryCodec, Codec, HexCodec, OctalCodec, PercentCodec, Z85Codec,
@@ -403,7 +405,8 @@ fn consume_depth(remaining: Option<usize>) -> Option<Option<usize>> {
 
 fn looks_like_env_secret_text(text: &str) -> bool {
     let mut assignments = 0usize;
-    let mut strong_key = false;
+    let mut env_style_key = false;
+    let mut sensitive_key = false;
     for line in text.lines().take(256) {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -426,15 +429,16 @@ fn looks_like_env_secret_text(text: &str) -> bool {
         }
         assignments += 1;
         let lower = key.to_ascii_lowercase();
-        strong_key |= key.chars().any(|ch| ch.is_ascii_uppercase())
+        env_style_key |= key.chars().any(|ch| ch.is_ascii_uppercase())
             || lower.contains("secret")
             || lower.contains("token")
             || lower.contains("password")
             || lower.contains("api_key")
             || lower.contains("apikey")
             || lower == "key";
+        sensitive_key |= is_sensitive_key_name(key);
     }
-    assignments >= 2 && strong_key
+    sensitive_key || (assignments >= 2 && env_style_key)
 }
 
 impl Detector for DecodeDetector {
@@ -826,6 +830,37 @@ mod tests {
             spans.iter().any(|span| span.label == labels::SECRET),
             "{spans:?}"
         );
+    }
+
+    #[test]
+    fn encoded_single_sensitive_env_assignment_is_identified() {
+        for raw in [
+            "PASSWORD=mySuperSecretPassword123",
+            "API_KEY=mySuperSecretApiKey123",
+        ] {
+            for encoded in [
+                data_encoding::BASE64.encode(raw.as_bytes()),
+                hex_encode(raw),
+                nested_base64(raw, 2),
+            ] {
+                let spans = DecodeDetector::builtin()
+                    .detect(&NormalizedView::build(&region(&encoded), &encoded));
+                assert!(
+                    spans.iter().any(|span| span.label == labels::SECRET),
+                    "{raw} encoded as {encoded}: {spans:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_single_non_sensitive_env_assignment_is_not_promoted() {
+        let raw = "VERSION=2026.08.29-alpha";
+        let encoded = data_encoding::BASE64.encode(raw.as_bytes());
+        let spans =
+            DecodeDetector::builtin().detect(&NormalizedView::build(&region(&encoded), &encoded));
+
+        assert!(spans.is_empty(), "{spans:?}");
     }
 
     #[test]
