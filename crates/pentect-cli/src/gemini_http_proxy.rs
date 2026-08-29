@@ -435,14 +435,26 @@ impl GeminiEndpoint {
 
 fn classify_endpoint(path_and_query: &str) -> GeminiEndpoint {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
-    let native_model_route = path.starts_with("/v1beta/models/") || path.starts_with("/v1/models/");
-    let tuned_model_route = path
+    let tuned_model_endpoint = path
         .strip_prefix("/v1beta/tunedModels/")
-        .is_some_and(|resource| !resource.is_empty() && !resource.contains('/'));
-    let content_model_route = native_model_route || tuned_model_route;
-    if content_model_route && path.ends_with(":streamGenerateContent") {
+        .and_then(|route| route.split_once(':'))
+        .and_then(|(resource, action)| {
+            if resource.is_empty() || resource.contains('/') || action.contains(':') {
+                return None;
+            }
+            match action {
+                "streamGenerateContent" => Some(GeminiEndpoint::StreamGenerateContent),
+                "generateContent" => Some(GeminiEndpoint::GenerateContent),
+                _ => None,
+            }
+        });
+    if let Some(endpoint) = tuned_model_endpoint {
+        return endpoint;
+    }
+    let native_model_route = path.starts_with("/v1beta/models/") || path.starts_with("/v1/models/");
+    if native_model_route && path.ends_with(":streamGenerateContent") {
         GeminiEndpoint::StreamGenerateContent
-    } else if content_model_route && path.ends_with(":generateContent") {
+    } else if native_model_route && path.ends_with(":generateContent") {
         GeminiEndpoint::GenerateContent
     } else if native_model_route && path.ends_with(":countTokens") {
         GeminiEndpoint::CountTokens
@@ -1301,6 +1313,14 @@ mod tests {
             classify_endpoint(
                 "/v1beta/tunedModels/customer-service/permissions/viewer:generateContent"
             ),
+            GeminiEndpoint::Unknown
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/tunedModels/:generateContent"),
+            GeminiEndpoint::Unknown
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/tunedModels/customer-service:other:generateContent"),
             GeminiEndpoint::Unknown
         );
         assert_eq!(
