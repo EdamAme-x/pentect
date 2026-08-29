@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   expectedChecksum,
-  fetchWithRetry,
+  downloadWithRetry,
   installationPath,
   releaseAsset,
   retryableStatus,
@@ -35,16 +35,54 @@ test('retries only transient download failures', () => {
   assert.equal(retryableStatus(401), false);
 });
 
-test('retries transient responses before returning success', async () => {
+test('retries transient responses before returning a complete body', async () => {
   const statuses = [503, 429, 200];
   const waits = [];
-  const response = await fetchWithRetry('https://example.invalid/pentect', {
-    request: async () => new Response(null, { status: statuses.shift() }),
+  const cancelled = [];
+  const response = await downloadWithRetry('https://example.invalid/pentect', {
+    request: async () => {
+      const status = statuses.shift();
+      if (status === 200) return new Response('pentect', { status });
+      return {
+        ok: false,
+        status,
+        statusText: 'transient',
+        body: { cancel: async () => cancelled.push(status) },
+      };
+    },
     timeout: () => undefined,
     wait: async (milliseconds) => waits.push(milliseconds),
   });
   assert.equal(response.status, 200);
+  assert.equal(response.bytes.toString('utf8'), 'pentect');
   assert.deepEqual(waits, [250, 500]);
+  assert.deepEqual(cancelled, [503, 429]);
+});
+
+test('retries when a successful response fails during body download', async () => {
+  let requests = 0;
+  const waits = [];
+  const response = await downloadWithRetry('https://example.invalid/pentect', {
+    request: async () => {
+      requests += 1;
+      if (requests === 1) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          arrayBuffer: async () => {
+            throw new Error('body download timed out');
+          },
+        };
+      }
+      return new Response('complete', { status: 200 });
+    },
+    timeout: () => undefined,
+    wait: async (milliseconds) => waits.push(milliseconds),
+  });
+  assert.equal(requests, 2);
+  assert.deepEqual(waits, [250]);
+  assert.equal(response.bytes.toString('utf8'), 'complete');
 });
 
 test('uses a user-writable versioned cache for the installed binary', () => {
