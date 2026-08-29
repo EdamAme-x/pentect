@@ -3209,29 +3209,38 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
 }
 
 fn masked_read_copy_path(original: &Path) -> PathBuf {
-    let display_path = masked_read_display_path(original);
-    PathBuf::from(".pentect").join("read").join(display_path)
+    let root = config::project_root().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.canonicalize().ok().or(Some(cwd)))
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let display_path = masked_read_display_path(original, &root);
+    root.join(".pentect").join("read").join(display_path)
 }
 
-fn masked_read_display_path(original: &Path) -> PathBuf {
-    if original.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Ok(relative) = original.strip_prefix(cwd) {
-                return safe_masked_read_path(relative);
-            }
-        }
-        return PathBuf::from("_external")
-            .join(masked_read_path_hash(original))
-            .join(
-                original
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(safe_masked_read_component)
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "file.txt".to_string()),
-            );
+fn masked_read_display_path(original: &Path, project_root: &Path) -> PathBuf {
+    let absolute = if original.is_absolute() {
+        original.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| project_root.to_path_buf())
+            .join(original)
+    };
+    let normalized = absolute.canonicalize().unwrap_or(absolute);
+    if let Ok(relative) = normalized.strip_prefix(project_root) {
+        return safe_masked_read_path(relative);
     }
-    safe_masked_read_path(original)
+    PathBuf::from("_external")
+        .join(masked_read_path_hash(&normalized))
+        .join(
+            normalized
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(safe_masked_read_component)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "file.txt".to_string()),
+        )
 }
 
 fn masked_read_path_hash(path: &Path) -> String {
