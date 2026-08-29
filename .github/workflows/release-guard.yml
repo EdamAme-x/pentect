@@ -26,6 +26,7 @@ jobs:
           required=(
             LICENSE
             THIRD_PARTY_LICENSES.txt
+            pentect-credsweeper-compatibility.json
             pentect-windows-x86_64.exe
             pentect-windows-x86_64.exe.gz
             pentect-windows-x86_64.exe.sha256

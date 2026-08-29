@@ -25,6 +25,8 @@ on:
       - 'tools/credsweeper-rust-port-status.json'
       - 'tools/creddata_shards.py'
       - 'tools/test_creddata_shards.py'
+      - 'tools/test_verify_credsweeper_evidence.py'
+      - 'tools/verify_credsweeper_evidence.py'
       - 'tools/credsweeper-sidecar/**'
       - 'tools/pentect-bench/**'
       - 'tools/update_credsweeper.py'
@@ -49,6 +51,8 @@ on:
       - 'tools/credsweeper-rust-port-status.json'
       - 'tools/creddata_shards.py'
       - 'tools/test_creddata_shards.py'
+      - 'tools/test_verify_credsweeper_evidence.py'
+      - 'tools/verify_credsweeper_evidence.py'
       - 'tools/credsweeper-sidecar/**'
       - 'tools/pentect-bench/**'
       - 'tools/update_credsweeper.py'
@@ -57,6 +61,10 @@ on:
     inputs:
       full:
         description: Run the full 333-repository parity matrix
+        type: boolean
+        default: false
+      sync_latest:
+        description: Test the latest upstream release instead of the version pinned by this ref
         type: boolean
         default: false
 
@@ -119,7 +127,7 @@ jobs:
           python-version: "3.12"
 
       - name: Test CredData shard tooling
-        run: python -m unittest tools/test_creddata_shards.py tools/test_update_credsweeper.py
+        run: python -m unittest tools/test_creddata_shards.py tools/test_update_credsweeper.py tools/test_verify_credsweeper_evidence.py
 
       - name: Install official CredSweeper oracle dependencies
         run: |
@@ -260,6 +268,7 @@ jobs:
           python-version: "3.12"
 
       - name: Sync latest CredSweeper release
+        if: github.event_name == 'schedule' || inputs.sync_latest
         # The parity build and exact oracle comparison below are the validation.
         # Avoid compiling and testing the same Rust code twice in every shard.
         run: python tools/update_credsweeper.py latest --skip-validation
@@ -341,7 +350,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Sync latest CredSweeper release for the scheduled audit
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.sync_latest
         run: python tools/update_credsweeper.py latest --skip-validation
       - name: Install official CredSweeper oracle dependencies
         run: |
@@ -392,7 +401,7 @@ jobs:
   weekly-summary:
     name: Weekly full CredData parity
     if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full))
-    needs: weekly-parity
+    needs: [weekly-parity, full-filter-parity]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -406,15 +415,31 @@ jobs:
           path: ${{ runner.temp }}/weekly-parity
       - name: Verify complete CredData coverage and parity
         run: |
+          test '${{ needs.weekly-parity.result }}' = success
+          test '${{ needs.full-filter-parity.result }}' = success
           python tools/creddata_shards.py summarize \
             --root benchmarks/CredData \
             --artifacts "$RUNNER_TEMP/weekly-parity" \
             --count 16 \
-            --output "$RUNNER_TEMP/weekly-parity-summary.json"
-          test '${{ needs.weekly-parity.result }}' = success
+            --output "$RUNNER_TEMP/pentect-credsweeper-compatibility.json" \
+            --pentect-commit "$GITHUB_SHA" \
+            --tested-ref "$GITHUB_REF_NAME" \
+            --credsweeper-commit "$(git -C crates/pentect-core/vendors/CredSweeper rev-parse HEAD)" \
+            --creddata-commit "$(git -C benchmarks/CredData rev-parse HEAD)" \
+            --tested-at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --runner-os "$RUNNER_OS" \
+            --runner-arch "$RUNNER_ARCH" \
+            --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       - name: Publish summary
         if: always()
         run: |
-          if [ -f "$RUNNER_TEMP/weekly-parity-summary.json" ]; then
-            cat "$RUNNER_TEMP/weekly-parity-summary.json" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/pentect-credsweeper-compatibility.json" ]; then
+            cat "$RUNNER_TEMP/pentect-credsweeper-compatibility.json" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Upload compatibility evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: credsweeper-compatibility-evidence
+          path: ${{ runner.temp }}/pentect-credsweeper-compatibility.json
+          if-no-files-found: error
+          retention-days: 90

@@ -53,7 +53,8 @@ jobs:
           bash -n .github/scripts/publish-aur.sh
           python tools/test_client_smoke_coverage.py
           python tools/test_release_package_metadata.py
-          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
+          python -m unittest tools/test_creddata_shards.py tools/test_verify_credsweeper_evidence.py
+          python -m py_compile tools/client_smoke.py tools/creddata_shards.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/test_verify_credsweeper_evidence.py tools/verify_client_smoke_log.py tools/verify_credsweeper_evidence.py
           cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$RUNNER_TEMP/codex-app-smoke-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           node --check tools/smoke_pi_package.mjs
@@ -106,6 +107,92 @@ jobs:
           path: |
             LICENSE
             THIRD_PARTY_LICENSES.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  credsweeper-evidence:
+    name: CredSweeper release evidence
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Run full parity for the exact release commit
+        id: parity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow credsweeper-regression.yml \
+            --event workflow_dispatch \
+            --commit "$GITHUB_SHA" \
+            --limit 100 \
+            --json databaseId \
+            --jq '.[].databaseId' > "$RUNNER_TEMP/parity-runs-before"
+          gh workflow run credsweeper-regression.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            -f full=true \
+            -f sync_latest=false
+
+          run_id=""
+          for _ in $(seq 1 30); do
+            while IFS= read -r candidate; do
+              if ! grep -Fxq "$candidate" "$RUNNER_TEMP/parity-runs-before"; then
+                run_id="$candidate"
+                break
+              fi
+            done < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow credsweeper-regression.yml \
+              --event workflow_dispatch \
+              --commit "$GITHUB_SHA" \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId')
+            test -n "$run_id" && break
+            sleep 2
+          done
+          if test -z "$run_id"; then
+            echo "Could not locate the dispatched CredSweeper parity run" >&2
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Full release parity: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+            >> "$GITHUB_STEP_SUMMARY"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+      - name: Download and verify release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARITY_RUN_ID: ${{ steps.parity.outputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          gh run download "$PARITY_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name credsweeper-compatibility-evidence \
+            --dir evidence
+          python tools/verify_credsweeper_evidence.py \
+            evidence/pentect-credsweeper-compatibility.json \
+            --source crates/pentect-core/vendors/credsweeper-assets/SOURCE.json \
+            --creddata-snapshot benchmarks/CredData/snapshot.json \
+            --pentect-commit "$GITHUB_SHA" \
+            --tested-ref "$GITHUB_REF_NAME" \
+            --creddata-commit "$(git -C benchmarks/CredData rev-parse HEAD)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: credsweeper-compatibility-evidence
+          path: evidence/pentect-credsweeper-compatibility.json
           if-no-files-found: error
           retention-days: 7
 
@@ -368,7 +455,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [build, compatibility-cli, package-deb]
+    needs: [build, compatibility-cli, package-deb, credsweeper-evidence]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -382,6 +469,10 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-notices
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: credsweeper-compatibility-evidence
           path: dist
       - name: Stage prerelease
         env:

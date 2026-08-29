@@ -90,7 +90,21 @@ def prepare(root: Path, index: int, count: int, manifest: Path, version: str) ->
     print(f"prepared CredData shard {index + 1}/{count}: {len(selected)} repositories")
 
 
-def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
+def summarize(
+    root: Path,
+    artifacts: Path,
+    count: int,
+    output: Path,
+    *,
+    pentect_commit: str,
+    tested_ref: str,
+    credsweeper_commit: str,
+    creddata_commit: str,
+    tested_at: str,
+    runner_os: str,
+    runner_arch: str,
+    workflow_run: str,
+) -> None:
     expected: dict[str, str] = load_json(root / "snapshot.json")
     manifests = sorted(artifacts.glob("shard-*/manifest.json"))
     reports = sorted(artifacts.glob("shard-*/report.json"))
@@ -104,6 +118,8 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
     totals = {key: 0 for key in ("rust", "oracle", "common", "missing", "extra")}
     by_rule: dict[str, dict[str, int]] = {}
     versions: set[str] = set()
+    ml_tolerances: set[float] = set()
+    ml_probability_max_delta = 0.0
     metadata_files = 0
     for manifest_path in manifests:
         manifest = load_json(manifest_path)
@@ -133,6 +149,10 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
             raise SystemExit(f"CredSweeper mismatch in shard {index}: {report_path}")
         if not bool(report["ml_probability_within_tolerance"]):
             raise SystemExit(f"ML probability mismatch in shard {index}: {report_path}")
+        ml_probability_max_delta = max(
+            ml_probability_max_delta, float(report["ml_probability_max_delta"])
+        )
+        ml_tolerances.add(float(report["ml_probability_tolerance"]))
 
     expected_repositories = set(expected)
     missing = expected_repositories - seen_repositories
@@ -145,13 +165,39 @@ def summarize(root: Path, artifacts: Path, count: int, output: Path) -> None:
         raise SystemExit(f"shard index coverage mismatch: {sorted(seen_indices)}")
     if len(versions) != 1:
         raise SystemExit(f"shards used different CredSweeper versions: {sorted(versions)}")
+    if len(ml_tolerances) != 1:
+        raise SystemExit(f"shards used different ML tolerances: {sorted(ml_tolerances)}")
 
+    credsweeper_version = versions.pop()
     summary = {
-        "schema": 2,
+        "schema": 3,
+        "generated_at": tested_at,
+        "pentect": {"commit": pentect_commit, "ref": tested_ref},
+        "reference": {
+            "name": "CredSweeper",
+            "version": credsweeper_version,
+            "commit": credsweeper_commit,
+        },
+        "corpus": {
+            "name": "CredData",
+            "commit": creddata_commit,
+            "repositories": len(seen_repositories),
+            "metadata_files": metadata_files,
+        },
+        "environment": {"os": runner_os, "architecture": runner_arch},
+        "workflow_run": workflow_run,
+        "gates": {
+            "full_creddata_parity": True,
+            "full_filter_inventory_parity": True,
+            "whole_pipeline_fixtures": True,
+        },
         "shards": count,
         "repositories": len(seen_repositories),
         "metadata_files": metadata_files,
-        "credsweeper_version": versions.pop(),
+        "credsweeper_version": credsweeper_version,
+        "ml_probability_max_delta": ml_probability_max_delta,
+        "ml_probability_tolerance": ml_tolerances.pop(),
+        "ml_probability_within_tolerance": True,
         "by_rule": dict(sorted(by_rule.items())),
         **totals,
     }
@@ -173,6 +219,14 @@ def parse_args() -> argparse.Namespace:
     summary_parser.add_argument("--artifacts", type=Path, required=True)
     summary_parser.add_argument("--count", type=int, required=True)
     summary_parser.add_argument("--output", type=Path, required=True)
+    summary_parser.add_argument("--pentect-commit", required=True)
+    summary_parser.add_argument("--tested-ref", required=True)
+    summary_parser.add_argument("--credsweeper-commit", required=True)
+    summary_parser.add_argument("--creddata-commit", required=True)
+    summary_parser.add_argument("--tested-at", required=True)
+    summary_parser.add_argument("--runner-os", required=True)
+    summary_parser.add_argument("--runner-arch", required=True)
+    summary_parser.add_argument("--workflow-run", required=True)
     return parser.parse_args()
 
 
@@ -187,7 +241,20 @@ def main() -> None:
             args.credsweeper_version,
         )
     else:
-        summarize(args.root, args.artifacts, args.count, args.output)
+        summarize(
+            args.root,
+            args.artifacts,
+            args.count,
+            args.output,
+            pentect_commit=args.pentect_commit,
+            tested_ref=args.tested_ref,
+            credsweeper_commit=args.credsweeper_commit,
+            creddata_commit=args.creddata_commit,
+            tested_at=args.tested_at,
+            runner_os=args.runner_os,
+            runner_arch=args.runner_arch,
+            workflow_run=args.workflow_run,
+        )
 
 
 if __name__ == "__main__":
