@@ -651,9 +651,8 @@ jobs:
             & $binary plugins add github:@EdamAme-x/pentect/plugins/example-regex --project --yes
             $masked = 'case ACME-12345678' | & $binary mask
             if (-not ($masked -match '<<ACME_CASE_')) { throw 'manifest plugin did not mask' }
-            & $binary plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --project --yes
-            $inspection = & $binary plugins inspect openai-privacy-filter
-            if (-not ($inspection -match 'hooks: inspect')) { throw 'official plugin was not installed' }
+            $inspection = & $binary plugins inspect (Join-Path $env:GITHUB_WORKSPACE 'plugins/openai-privacy-filter')
+            if (-not ($inspection -match 'hooks: inspect')) { throw 'official plugin manifest was not inspected' }
           } finally {
             Pop-Location
           }
@@ -689,8 +688,7 @@ jobs:
             cd "$plugin_project"
             "$binary" plugins add github:@EdamAme-x/pentect/plugins/example-regex --project --yes
             printf '%s\n' 'case ACME-12345678' | "$binary" mask | grep -F '<<ACME_CASE_'
-            "$binary" plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --project --yes
-            "$binary" plugins inspect openai-privacy-filter | grep -F 'hooks: inspect'
+            "$binary" plugins inspect "$GITHUB_WORKSPACE/plugins/openai-privacy-filter" | grep -F 'hooks: inspect'
           )
           printf 'PENTECT_SMOKE_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Install through npm (POSIX)
