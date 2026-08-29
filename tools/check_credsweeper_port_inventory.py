@@ -17,7 +17,34 @@ def main() -> int:
 
     inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
     status = json.loads(args.status.read_text(encoding="utf-8"))
+    if inventory.get("schema") != 2:
+        raise SystemExit("CredSweeper reference inventory schema must be 2")
+    rules = inventory["rules"]
+    if inventory["rule_count"] != len(rules):
+        raise SystemExit("CredSweeper rule_count does not match the rule inventory")
+    rule_names = [rule["name"] for rule in rules]
+    if len(rule_names) != len(set(rule_names)):
+        raise SystemExit("CredSweeper rule inventory contains duplicate names")
+    typed_rules = {
+        name for names in inventory["rule_types"].values() for name in names
+    }
+    if typed_rules != set(rule_names):
+        raise SystemExit("CredSweeper rule-type inventory does not cover every rule")
+    ml_rules = {rule["name"] for rule in rules if rule["runtime"]["use_ml"]}
+    if ml_rules != set(inventory["ml"]["rules"]):
+        raise SystemExit("CredSweeper ML rule inventory differs from runtime rule state")
+    if not inventory["output_fields"]["candidate"] or not inventory["output_fields"]["line_data"]:
+        raise SystemExit("CredSweeper output-field inventory is empty")
     expected = set(inventory["filter_classes"])
+    definitions = set(inventory["filter_definitions"])
+    referenced = {identifier for rule in rules for identifier in rule["filters"]}
+    grouped = {
+        identifier for identifiers in inventory["filter_groups"].values() for identifier in identifiers
+    }
+    if referenced != definitions:
+        raise SystemExit("CredSweeper rule filter references differ from filter definitions")
+    if not grouped.issubset(definitions):
+        raise SystemExit("CredSweeper filter group references an unknown definition")
     declared = set(status["filters"])
     missing = sorted(expected - declared)
     stale = sorted(declared - expected)
