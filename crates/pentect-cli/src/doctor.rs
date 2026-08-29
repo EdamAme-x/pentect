@@ -181,10 +181,12 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn check_configs() -> Vec<Check> {
-    let project = PathBuf::from(".pentect").join("config.toml");
+    let project = pentect_agent::project_root()
+        .map(|root| check_config("config-project", root.join(".pentect").join("config.toml")))
+        .unwrap_or_else(|error| Check::fail("config-project", error));
     let global = home_dir().map(|home| home.join(".pentect").join("config.toml"));
     vec![
-        check_config("config-project", project),
+        project,
         global.map_or_else(
             || Check::warn("config-user", "home directory unavailable"),
             |path| check_config("config-user", path),
@@ -754,6 +756,23 @@ impl Check {
 mod tests {
     use super::*;
 
+    struct CurrentDirGuard(PathBuf);
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            std::fs::create_dir_all(path).unwrap();
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(previous)
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     #[test]
     fn doctor_rejects_positionals() {
         let args = vec!["pentect".into(), "doctor".into(), "codex".into()];
@@ -833,6 +852,35 @@ mod tests {
         let check = check_config("test-config", path);
         assert_eq!(check.status, Status::Ok);
         assert_eq!(check.detail, "ready");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_checks_the_project_config_from_a_nested_working_directory() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-doctor-project-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = root.join(".pentect");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("config.toml");
+        std::fs::write(&config, "[output]\nrestore = 3\n").unwrap();
+        let nested = root.join("src").join("nested");
+        {
+            let _cwd = CurrentDirGuard::enter(&nested);
+            let check = check_configs()
+                .into_iter()
+                .find(|check| check.name == "config-project")
+                .unwrap();
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.detail.contains(&config.display().to_string()));
+            assert!(check.detail.contains("output.restore must be a boolean"));
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

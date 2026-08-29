@@ -28,7 +28,7 @@ pub(crate) enum HandleScope {
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
-    let project = read_handle_scope(project_config_path())?;
+    let project = read_handle_scope(project_config_path()?)?;
     let global = read_handle_scope(global_config_path()?)?;
     match project.or(global).unwrap_or_default() {
         HandleScope::Device => machine_identity_key(),
@@ -407,20 +407,20 @@ struct DecodeConfigPartial {
 }
 
 pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
-    let project = read_agent_require_pentect(project_config_path())?;
+    let project = read_agent_require_pentect(project_config_path()?)?;
     let global = read_agent_require_pentect(global_config_path()?)?;
     Ok(require_pentect_agent_effective(project, global))
 }
 
 pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
-    let project = read_image_ocr_config(project_config_path())?;
+    let project = read_image_ocr_config(project_config_path()?)?;
     let global = read_image_ocr_config(global_config_path()?)?;
     merge_image_ocr_config(project, global)
 }
 
 #[cfg(not(test))]
 pub(crate) fn environment_variable_prefix() -> Result<String, String> {
-    reject_removed_environment_config(project_config_path())?;
+    reject_removed_environment_config(project_config_path()?)?;
     reject_removed_environment_config(global_config_path()?)?;
     Ok(DEFAULT_ENVIRONMENT_PREFIX.to_string())
 }
@@ -432,7 +432,7 @@ pub(crate) fn environment_variable_prefix() -> Result<String, String> {
 
 #[cfg(not(test))]
 pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
-    let project = read_decode_config(project_config_path())?;
+    let project = read_decode_config(project_config_path()?)?;
     let global = read_decode_config(global_config_path()?)?;
     merge_decode_config(profile, project, global)?.validate()
 }
@@ -448,19 +448,19 @@ pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
 }
 
 pub(crate) fn remember_files_enabled() -> Result<bool, String> {
-    let project = read_files_remember(project_config_path())?;
+    let project = read_files_remember(project_config_path()?)?;
     let global = read_files_remember(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
 pub(crate) fn activity_share_enabled() -> Result<bool, String> {
-    let project = read_activity_share(project_config_path())?;
+    let project = read_activity_share(project_config_path()?)?;
     let global = read_activity_share(global_config_path()?)?;
     Ok(local_privacy_setting_enabled(project, global))
 }
 
 pub(crate) fn metrics_enabled() -> Result<bool, String> {
-    let project = read_metrics_enabled(project_config_path())?;
+    let project = read_metrics_enabled(project_config_path()?)?;
     let global = read_metrics_enabled(global_config_path()?)?;
     Ok(local_privacy_setting_enabled(project, global))
 }
@@ -472,13 +472,13 @@ fn local_privacy_setting_enabled(project: Option<bool>, global: Option<bool>) ->
 }
 
 pub(crate) fn update_check_enabled() -> Result<bool, String> {
-    let project = read_update_check(project_config_path())?;
+    let project = read_update_check(project_config_path()?)?;
     let global = read_update_check(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
 pub(crate) fn output_restore_enabled() -> Result<bool, String> {
-    let project = read_output_restore(project_config_path())?;
+    let project = read_output_restore(project_config_path()?)?;
     let global = read_output_restore(global_config_path()?)?;
     Ok(output_restore_effective(project, global))
 }
@@ -491,7 +491,7 @@ fn output_restore_effective(project: Option<bool>, global: Option<bool>) -> bool
 }
 
 pub(crate) fn unknown_formats_should_block() -> Result<bool, String> {
-    let project = read_unknown_format_policy(project_config_path())?;
+    let project = read_unknown_format_policy(project_config_path()?)?;
     let global = read_unknown_format_policy(global_config_path()?)?;
     unknown_formats_should_block_effective(project, global)
 }
@@ -1135,8 +1135,8 @@ fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     Err(format!("agent config {field} must be a boolean"))
 }
 
-fn project_config_path() -> PathBuf {
-    PathBuf::from(PENTECT_DIR).join(CONFIG_FILE)
+fn project_config_path() -> Result<PathBuf, String> {
+    Ok(project_root()?.join(PENTECT_DIR).join(CONFIG_FILE))
 }
 
 fn global_config_path() -> Result<PathBuf, String> {
