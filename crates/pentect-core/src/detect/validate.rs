@@ -1255,10 +1255,20 @@ fn db_host_without_port(host: &str) -> &str {
     let host = host
         .trim()
         .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if host.starts_with('[') {
+        let Some((without_closing_bracket, port)) = host.rsplit_once("]:") else {
+            return host;
+        };
+        return if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            &host[..without_closing_bracket.len() + 1]
+        } else {
+            host
+        };
+    }
     let Some((without_port, port)) = host.rsplit_once(':') else {
         return host;
     };
-    if port.bytes().all(|b| b.is_ascii_digit()) && !without_port.contains(']') {
+    if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !without_port.contains(':') {
         without_port
     } else {
         host
@@ -1402,9 +1412,26 @@ mod tests {
             "postgresql://testuser:testpwd@localhost" => false,
             "postgres://my-user:my-password@example.com:5432" => false,
             "postgres://user:password@host" => false,
+            "postgres://user:password@[::1]:5432/app" => false,
+            "postgres://admin:s3cr3t@[::1]:5432/app" => true,
             "postgresql://[user[:password]@][host][:port][" => false,
             "mongodb://username:<password>@cluster0.example.com:27017" => false,
             "redis://***:***@localhost:6379" => false);
+    }
+
+    #[test]
+    fn db_host_port_parsing_handles_bracketed_and_unbracketed_ipv6() {
+        vectors!(db_host_without_port,
+            "[::1]:5432" => "[::1]",
+            "[::1]" => "[::1]",
+            "[2001:db8::1]:5432" => "[2001:db8::1]",
+            "[::1]:not-a-port" => "[::1]:not-a-port",
+            "[::1]:" => "[::1]:",
+            "::1" => "::1",
+            "2001:db8::1" => "2001:db8::1",
+            "localhost:5432" => "localhost",
+            "localhost:" => "localhost:",
+            "127.0.0.1:5432" => "127.0.0.1");
     }
 
     #[test]
