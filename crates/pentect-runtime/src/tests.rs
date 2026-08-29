@@ -538,6 +538,25 @@ fn default_session_root_lives_under_project_pentect_dir() {
 }
 
 #[test]
+fn project_config_remains_effective_from_a_nested_working_directory() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("nested-project-config");
+    write_project_config(&root, "[output]\nrestore = false\n");
+    let _home = write_user_config(&root, "");
+    let nested = root.join("src").join("nested");
+    {
+        let _cwd = enter_temp_cwd(&nested);
+        assert!(!output_restore_enabled().unwrap());
+    }
+    write_project_config(&nested, "[output]\nrestore = true\n");
+    {
+        let _cwd = enter_temp_cwd(&nested.join("deeper"));
+        assert!(output_restore_enabled().unwrap());
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn open_at_stays_process_local() {
     let root = temp_root("open-at-in-memory");
     let persisted = Session::open_capability_at(&root, "t").unwrap();
