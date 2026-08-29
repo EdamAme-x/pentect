@@ -3052,6 +3052,8 @@ mod tests {
                 "PENTECT_AGENT_LAUNCHED",
                 "PENTECT_HOME",
                 "LOCALAPPDATA",
+                "HOME",
+                "USERPROFILE",
             ];
             let saved = names
                 .into_iter()
@@ -3071,6 +3073,8 @@ mod tests {
             std::env::set_var("PENTECT_AGENT_LAUNCHED", store.token());
             std::env::set_var("PENTECT_HOME", &home);
             std::env::set_var("LOCALAPPDATA", &home);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
             let process_host_candidate = Some(
                 pentect_agent::register_process_host_candidate(
                     &pentect_agent::process_host_root().unwrap(),
@@ -3292,6 +3296,91 @@ mod tests {
             stream.flush().unwrap();
         });
         (format!("http://{address}"), body_rx, thread)
+    }
+
+    fn mock_anthropic_text_echo_upstream() -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (_, body) = read_http_request(&mut stream);
+            let body = String::from_utf8(body).unwrap();
+            let handle = first_valid_handle(&body)
+                .expect("provider should receive a valid Pentect handle")
+                .to_string();
+            handle_tx.send(handle.clone()).unwrap();
+            let response = serde_json::to_vec(&serde_json::json!({
+                "id": "msg_text_echo",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": handle}],
+                "model": "test",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), handle_rx, thread)
+    }
+
+    #[test]
+    fn anthropic_text_echo_preserves_the_issued_handle_when_restoration_is_disabled() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let env = TestEnv::install(&store);
+        std::fs::create_dir_all(env.home.join(".pentect")).unwrap();
+        std::fs::write(
+            env.home.join(".pentect/config.toml"),
+            "[output]\nrestore = false\n",
+        )
+        .unwrap();
+        let secret = ["sk-", "ABCDEFGHIJKLMNOP", "QRSTUVWX"].concat();
+
+        let (upstream, echoed_handle, upstream_thread) = mock_anthropic_text_echo_upstream();
+        let proxy = ClaudeHttpProxyGuard::start(upstream).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/messages", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "max_tokens": 32,
+                    "messages": [{
+                        "role": "user",
+                        "content": format!("OPENAI_API_KEY={secret}")
+                    }]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        let issued = echoed_handle
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+
+        assert_eq!(response["content"][0]["text"], issued);
+        drop(proxy);
+        upstream_thread.join().unwrap();
     }
 
     fn mock_openai_file_upstream(
