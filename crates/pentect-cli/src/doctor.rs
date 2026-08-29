@@ -208,19 +208,19 @@ fn check_config(name: &'static str, path: PathBuf) -> Check {
     }
     let source = match std::fs::read_to_string(&path) {
         Ok(source) => source,
-        Err(error) => return Check::fail(name, format!("{}: {error}", path.display())),
+        Err(error) => return Check::fail(name, format!("{}: {error}", compact_path(&path))),
     };
     match migrate_removed_config_keys(&source) {
         Ok(Some(_)) => Check::repairable_warn(
             name,
-            format!("{} uses removed settings", path.display()),
+            format!("{} uses removed settings", compact_path(&path)),
             Repair::MigrateConfig { path },
         ),
         Ok(None) => match pentect_agent::validate_config_file(&path) {
             Ok(()) => Check::ok(name, "ready"),
-            Err(error) => Check::fail(name, format!("{}: {error}", path.display())),
+            Err(error) => Check::fail(name, format!("{}: {error}", compact_path(&path))),
         },
-        Err(error) => Check::fail(name, format!("{}: {error}", path.display())),
+        Err(error) => Check::fail(name, format!("{}: {error}", compact_path(&path))),
     }
 }
 
@@ -878,7 +878,8 @@ mod tests {
                 .find(|check| check.name == "config-project")
                 .unwrap();
             assert_eq!(check.status, Status::Fail);
-            assert!(check.detail.contains(&config.display().to_string()));
+            assert!(check.detail.contains("config.toml"));
+            assert!(!check.detail.contains(&root.display().to_string()));
             assert!(check.detail.contains("output.restore must be a boolean"));
         }
         let _ = std::fs::remove_dir_all(root);
