@@ -605,11 +605,14 @@ fn plugin_paths_for_named_scoped(
 
     let mut message = match scope {
         PluginScope::User => format!("global plugin '{name}' was not found in the remote catalog"),
-        PluginScope::Project => format!(
-            "plugin '{name}' was not found at '{}' or '{}'",
-            project_dir.display(),
-            official_dir.display()
-        ),
+        PluginScope::Project => {
+            let project_display = Path::new(PENTECT_DIR).join(PLUGINS_DIR).join(name);
+            format!(
+                "plugin '{name}' was not found at '{}' or '{}'",
+                project_display.display(),
+                official_dir.display()
+            )
+        }
     };
     if let Some(error) = remote_error {
         message.push_str(&format!("; remote lookup failed: {error}"));
@@ -2730,6 +2733,20 @@ label = "INLINE_SECRET"
         );
         let err = plugin_paths_for_named(&name, true).unwrap_err().to_string();
         assert!(err.contains("was not found"), "{err}");
+        assert!(
+            err.contains(
+                &Path::new(PENTECT_DIR)
+                    .join(PLUGINS_DIR)
+                    .join(&name)
+                    .display()
+                    .to_string()
+            ),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&plugins_root().unwrap().display().to_string()),
+            "{err}"
+        );
     }
 
     #[test]
