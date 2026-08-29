@@ -20,6 +20,7 @@ on:
       - 'tools/audit_credsweeper_reference.py'
       - 'tools/check_credsweeper_filter_parity.py'
       - 'tools/check_credsweeper_port_inventory.py'
+      - 'tools/credsweeper_e2e_fixtures.py'
       - 'tools/credsweeper-reference-inventory.json'
       - 'tools/credsweeper-rust-port-status.json'
       - 'tools/creddata_shards.py'
@@ -43,6 +44,7 @@ on:
       - 'tools/audit_credsweeper_reference.py'
       - 'tools/check_credsweeper_filter_parity.py'
       - 'tools/check_credsweeper_port_inventory.py'
+      - 'tools/credsweeper_e2e_fixtures.py'
       - 'tools/credsweeper-reference-inventory.json'
       - 'tools/credsweeper-rust-port-status.json'
       - 'tools/creddata_shards.py'
@@ -183,6 +185,22 @@ jobs:
             python tools/check_credsweeper_filter_parity.py \
               --rust "$RUNNER_TEMP/pentect-bench-candidate" \
               --work "$RUNNER_TEMP/credsweeper-filter-parity"
+
+      - name: Verify dedicated whole-pipeline fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixtures="$RUNNER_TEMP/credsweeper-e2e"
+          python tools/credsweeper_e2e_fixtures.py prepare "$fixtures"
+          xargs "$RUNNER_TEMP/pentect-bench-candidate" credsweeper-scan \
+            < "$fixtures/paths.txt" > "$fixtures/rust.json"
+          python tools/credsweeper_e2e_fixtures.py verify "$fixtures/rust.json" "$fixtures"
+          PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
+            python tools/credsweeper-sidecar/sidecar.py \
+              --paths-file "$fixtures/paths.txt" --output "$fixtures/oracle.json"
+          "$RUNNER_TEMP/pentect-bench-candidate" credsweeper-parity \
+            "$fixtures/rust.json" "$fixtures/oracle.json" \
+            --min-precision 1 --min-recall 1 --json
 
       - name: Check detection quality and speed against baseline
         shell: bash
@@ -354,6 +372,22 @@ jobs:
               --rust "$RUNNER_TEMP/target/release/pentect-bench" \
               --inventory "$RUNNER_TEMP/credsweeper-reference-inventory.json" \
               --work "$RUNNER_TEMP/credsweeper-filter-parity"
+
+      - name: Verify dedicated whole-pipeline fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixtures="$RUNNER_TEMP/credsweeper-e2e"
+          python tools/credsweeper_e2e_fixtures.py prepare "$fixtures"
+          xargs "$RUNNER_TEMP/target/release/pentect-bench" credsweeper-scan \
+            < "$fixtures/paths.txt" > "$fixtures/rust.json"
+          python tools/credsweeper_e2e_fixtures.py verify "$fixtures/rust.json" "$fixtures"
+          PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
+            python tools/credsweeper-sidecar/sidecar.py \
+              --paths-file "$fixtures/paths.txt" --output "$fixtures/oracle.json"
+          "$RUNNER_TEMP/target/release/pentect-bench" credsweeper-parity \
+            "$fixtures/rust.json" "$fixtures/oracle.json" \
+            --min-precision 1 --min-recall 1 --json
 
   weekly-summary:
     name: Weekly full CredData parity
