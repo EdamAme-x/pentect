@@ -2775,36 +2775,16 @@ fn resolve_command_executable(value: &str) -> Result<PathBuf, String> {
     }
     let paths = std::env::var_os("PATH").unwrap_or_default();
     #[cfg(windows)]
-    let extensions = std::env::var_os("PATHEXT")
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .filter(|extension| windows_command_extension_supported(extension))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                ".EXE".to_string(),
-                ".COM".to_string(),
-                ".CMD".to_string(),
-                ".BAT".to_string(),
-            ]
-        });
+    let names = crate::windows_executable_candidates(
+        candidate,
+        &std::env::var_os("PATHEXT")
+            .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD")),
+    );
     #[cfg(not(windows))]
-    let extensions = vec![String::new()];
+    let names = vec![candidate.to_path_buf()];
     for directory in std::env::split_paths(&paths) {
-        for extension in &extensions {
-            let path = if extension.is_empty()
-                || value
-                    .to_ascii_lowercase()
-                    .ends_with(&extension.to_ascii_lowercase())
-            {
-                directory.join(value)
-            } else {
-                directory.join(format!("{value}{extension}"))
-            };
+        for name in &names {
+            let path = directory.join(name);
             if let Ok(path) = path.canonicalize() {
                 if supported_command_executable(&path) {
                     return Ok(path);
@@ -2828,19 +2808,7 @@ fn supported_command_executable(path: &Path) -> bool {
         && path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(windows_command_extension_supported)
-}
-
-#[cfg(any(windows, test))]
-fn windows_command_extension_supported(extension: &str) -> bool {
-    matches!(
-        extension
-            .strip_prefix('.')
-            .unwrap_or(extension)
-            .to_ascii_lowercase()
-            .as_str(),
-        "exe" | "com" | "cmd" | "bat"
-    )
+            .is_some_and(crate::windows_command_extension_supported)
 }
 
 fn stage_remote_command_files(
@@ -3928,14 +3896,11 @@ fn find_command(path: &Path) -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn command_names(name: &str) -> Vec<String> {
-    if Path::new(name).extension().is_some() {
-        return vec![name.to_string()];
-    }
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    pathext
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .map(|ext| format!("{name}{ext}"))
+    let pathext = std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+    crate::windows_executable_candidates(Path::new(name), &pathext)
+        .into_iter()
+        .map(|candidate| candidate.to_string_lossy().into_owned())
         .collect()
 }
 
@@ -3963,10 +3928,10 @@ mod tests {
     #[test]
     fn windows_command_plugins_accept_batch_shims_only() {
         for extension in [".EXE", "com", ".CMD", "bat"] {
-            assert!(windows_command_extension_supported(extension));
+            assert!(crate::windows_command_extension_supported(extension));
         }
         for extension in ["ps1", ".js", "sh", ""] {
-            assert!(!windows_command_extension_supported(extension));
+            assert!(!crate::windows_command_extension_supported(extension));
         }
     }
 

@@ -690,47 +690,7 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
 
 #[cfg(any(windows, test))]
 fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
-    let names = if program.extension().is_none() {
-        let mut extensions = pathext
-            .to_string_lossy()
-            .split(';')
-            .map(str::trim)
-            .filter(|extension| !extension.is_empty())
-            // Command::new can launch PE binaries and cmd/bat shims. A
-            // PowerShell .ps1 entry may appear in PATHEXT but cannot be
-            // executed directly through CreateProcess.
-            .filter(|extension| {
-                matches!(
-                    extension.to_ascii_uppercase().as_str(),
-                    ".COM" | ".EXE" | ".BAT" | ".CMD"
-                )
-            })
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
-            if !extensions
-                .iter()
-                .any(|extension| extension.eq_ignore_ascii_case(fallback))
-            {
-                extensions.push(fallback.to_string());
-            }
-        }
-        let mut names = extensions
-            .into_iter()
-            .map(|extension| {
-                let mut name = program.as_os_str().to_os_string();
-                name.push(extension);
-                PathBuf::from(name)
-            })
-            .collect::<Vec<_>>();
-        // npm installs a POSIX shim without an extension beside the Windows
-        // .cmd/.ps1 shims. It is a file, but Windows cannot execute it. Keep
-        // the raw name only as a final fallback after PATHEXT candidates.
-        names.push(program.to_path_buf());
-        names
-    } else {
-        vec![program.to_path_buf()]
-    };
+    let names = windows_executable_candidates(program, pathext);
 
     let explicit_path = program.is_absolute() || program.components().count() > 1;
     if explicit_path {
@@ -745,6 +705,53 @@ fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -
         }
     }
     None
+}
+
+#[cfg(any(windows, test))]
+fn windows_executable_candidates(program: &Path, pathext: &OsStr) -> Vec<PathBuf> {
+    if program.extension().is_some() {
+        return vec![program.to_path_buf()];
+    }
+    let mut extensions = pathext
+        .to_string_lossy()
+        .split(';')
+        .map(str::trim)
+        .filter(|extension| windows_command_extension_supported(extension))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
+        if !extensions
+            .iter()
+            .any(|extension| extension.eq_ignore_ascii_case(fallback))
+        {
+            extensions.push(fallback.to_string());
+        }
+    }
+    let mut names = extensions
+        .into_iter()
+        .map(|extension| {
+            let mut name = program.as_os_str().to_os_string();
+            name.push(extension);
+            PathBuf::from(name)
+        })
+        .collect::<Vec<_>>();
+    // An extensionless PE executable is valid. Keep the raw name only after
+    // known launchable PATHEXT candidates so npm's POSIX shim cannot shadow
+    // its adjacent cmd shim.
+    names.push(program.to_path_buf());
+    names
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn windows_command_extension_supported(extension: &str) -> bool {
+    matches!(
+        extension
+            .strip_prefix('.')
+            .unwrap_or(extension)
+            .to_ascii_lowercase()
+            .as_str(),
+        "exe" | "com" | "cmd" | "bat"
+    )
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
@@ -3196,6 +3203,26 @@ mod tests {
             .to_string_lossy()
             .eq_ignore_ascii_case("codex.cmd"));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_command_candidates_exclude_script_host_extensions() {
+        let candidates =
+            windows_executable_candidates(Path::new("codex"), OsStr::new(".PS1;.VBS;.JS;.CMD"));
+        let names = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "codex.cmd"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.ends_with(".ps1")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with(".vbs")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|name| name.ends_with(".js")), "{names:?}");
     }
 
     #[cfg(windows)]
