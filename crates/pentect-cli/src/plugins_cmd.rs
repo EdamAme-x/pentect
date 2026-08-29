@@ -630,7 +630,9 @@ fn plugin_config_path(scope: plugins::PluginScope) -> Result<PathBuf, String> {
         plugins::PluginScope::User => {
             plugins::user_plugin_config_path().map_err(|error| error.to_string())
         }
-        plugins::PluginScope::Project => Ok(plugins::project_plugin_config_path()),
+        plugins::PluginScope::Project => {
+            plugins::project_plugin_config_path().map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -3820,7 +3822,7 @@ fn plugin_row(
 fn plugin_rows() -> Result<Vec<PluginRow>, String> {
     let mut rows = Vec::new();
     rows.extend(plugin_rows_in(
-        Path::new(".pentect").join("plugins"),
+        plugins::plugins_root().map_err(|error| error.to_string())?,
         "project",
     )?);
     rows.extend(plugin_rows_in(

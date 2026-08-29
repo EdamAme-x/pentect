@@ -522,12 +522,19 @@ fn session_does_not_create_key_or_recovery_dir() {
 }
 
 #[test]
-fn default_session_root_lives_under_pentect_dir() {
+fn default_session_root_lives_under_project_pentect_dir() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     std::env::set_var("PENTECT_HOME", "attacker-selected-directory");
     let root = session_root("demo").unwrap();
     std::env::remove_var("PENTECT_HOME");
-    assert_eq!(root, PathBuf::from(".pentect").join("agent").join("demo"));
+    assert_eq!(
+        root,
+        config::project_root()
+            .unwrap()
+            .join(".pentect")
+            .join("agent")
+            .join("demo")
+    );
 }
 
 #[test]

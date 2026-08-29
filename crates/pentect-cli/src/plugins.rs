@@ -397,7 +397,7 @@ pub(crate) fn config_specs_scoped() -> Result<Vec<(PluginScope, String)>> {
     let mut specs = Vec::new();
     for (scope, path) in [
         (PluginScope::User, user_plugin_config_path()?),
-        (PluginScope::Project, project_plugin_config_path()),
+        (PluginScope::Project, project_plugin_config_path()?),
     ] {
         for spec in config_specs_at(&path)? {
             if let Some(existing) = specs.iter_mut().find(|(_, value)| value == &spec) {
@@ -426,8 +426,11 @@ fn config_specs_at(path: &Path) -> Result<Vec<String>> {
         .with_context(|| format!("invalid plugin config '{}'", path.display()))
 }
 
-pub(crate) fn project_plugin_config_path() -> PathBuf {
-    PathBuf::from(PENTECT_DIR).join(PENTECT_CONFIG_FILE)
+pub(crate) fn project_plugin_config_path() -> Result<PathBuf> {
+    Ok(pentect_agent::project_root()
+        .map_err(anyhow::Error::msg)?
+        .join(PENTECT_DIR)
+        .join(PENTECT_CONFIG_FILE))
 }
 
 pub(crate) fn user_plugin_config_path() -> Result<PathBuf> {
@@ -548,7 +551,7 @@ fn plugin_paths_for_named_scoped(
     scope: PluginScope,
 ) -> Result<PluginPaths> {
     validate_plugin_name(name)?;
-    let project_dir = plugins_root().join(name);
+    let project_dir = plugins_root()?.join(name);
     let official_dir = official_plugins_root().join(name);
 
     if scope == PluginScope::Project {
@@ -728,8 +731,11 @@ fn canonical_file(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not resolve '{}'", path.display()))
 }
 
-fn plugins_root() -> PathBuf {
-    PathBuf::from(PENTECT_DIR).join(PLUGINS_DIR)
+pub(crate) fn plugins_root() -> Result<PathBuf> {
+    Ok(pentect_agent::project_root()
+        .map_err(anyhow::Error::msg)?
+        .join(PENTECT_DIR)
+        .join(PLUGINS_DIR))
 }
 
 fn official_plugins_root() -> PathBuf {
@@ -956,7 +962,7 @@ fn plugin_source_with_refresh(
     validate_plugin_name(spec)?;
     if scope == PluginScope::Project {
         for (root, repository) in [
-            (plugins_root().join(spec), None),
+            (plugins_root()?.join(spec), None),
             (
                 official_plugins_root().join(spec),
                 Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
@@ -1119,8 +1125,10 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     fetch_remote_plugin_file_with_refresh(url, false)
 }
 
-pub(crate) fn project_plugin_lock_path() -> PathBuf {
-    PathBuf::from(PROJECT_PLUGIN_LOCK_FILE)
+pub(crate) fn project_plugin_lock_path() -> Result<PathBuf> {
+    Ok(pentect_agent::project_root()
+        .map_err(anyhow::Error::msg)?
+        .join(PROJECT_PLUGIN_LOCK_FILE))
 }
 
 pub(crate) fn user_plugin_lock_path() -> Result<PathBuf> {
@@ -1132,7 +1140,7 @@ pub(crate) fn user_plugin_lock_path() -> Result<PathBuf> {
 pub(crate) fn plugin_lock_path(scope: PluginScope) -> Result<PathBuf> {
     match scope {
         PluginScope::User => user_plugin_lock_path(),
-        PluginScope::Project => Ok(project_plugin_lock_path()),
+        PluginScope::Project => project_plugin_lock_path(),
     }
 }
 

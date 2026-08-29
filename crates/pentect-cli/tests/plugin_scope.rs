@@ -121,5 +121,79 @@ fn plugins_are_user_global_by_default_and_project_scope_is_explicit() {
         "{inside_project}"
     );
 
+    let nested = first_project.join("src/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let inside_nested = mask(&home, &nested, "GLOBAL-123456 PROJECT-123456");
+    assert!(inside_nested.contains("<<GLOBAL_TEST_"), "{inside_nested}");
+    assert!(inside_nested.contains("<<PROJECT_TEST_"), "{inside_nested}");
+    assert!(!nested.join(".pentect/config.toml").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_plugin_directory_is_visible_from_nested_working_directory() {
+    let root = temp_dir("plugin-nested-list");
+    let home = root.join("home");
+    let project = root.join("project");
+    let nested = project.join("src/nested");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    write_manifest(
+        &project.join(".pentect/plugins/nested-list"),
+        "nested-list",
+        "NESTED_LIST",
+        r"NESTED-[0-9]{6}",
+    );
+
+    let output = command(&home, &nested)
+        .args(["plugins", "list"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("nested-list: project ok configs=1 binary=no"),
+        "{stdout}"
+    );
+    assert!(!nested.join(".pentect/plugins").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nearest_nested_pentect_directory_defines_a_separate_project_root() {
+    let root = temp_dir("plugin-explicit-nested-root");
+    let home = root.join("home");
+    let project = root.join("project");
+    let nested = project.join("packages/child");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    write_manifest(
+        &project.join(".pentect/plugins/outer"),
+        "outer",
+        "OUTER",
+        r"OUTER-[0-9]{6}",
+    );
+    write_manifest(
+        &nested.join(".pentect/plugins/inner"),
+        "inner",
+        "INNER",
+        r"INNER-[0-9]{6}",
+    );
+
+    let output = command(&home, &nested)
+        .args(["plugins", "list"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("inner: project ok configs=1 binary=no"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("outer:"), "{stdout}");
+
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -75,6 +75,10 @@ added and pinned by a lockfile.
 
 For a repository-owned plugin set, add `--project`. This writes
 `.pentect/config.toml` and `pentect.plugins.lock`; commit both project files.
+Pentect finds the project root by walking upward to the nearest `.pentect` or
+`.git` directory, so project plugins remain active from nested working
+directories. A nested `.pentect` directory intentionally starts a separate
+project scope.
 
 ```sh
 pentect plugins add github:@owner/repository/path@v1.2.3 --project

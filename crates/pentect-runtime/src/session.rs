@@ -139,7 +139,10 @@ impl Drop for Session {
 
 pub(crate) fn session_root(name: &str) -> Result<PathBuf> {
     let name = checked_session_name(name)?;
-    let base = PathBuf::from(PENTECT_DIR).join(AGENT_DIR);
+    let base = crate::config::project_root()
+        .map_err(anyhow::Error::msg)?
+        .join(PENTECT_DIR)
+        .join(AGENT_DIR);
     Ok(base.join(name))
 }
 
