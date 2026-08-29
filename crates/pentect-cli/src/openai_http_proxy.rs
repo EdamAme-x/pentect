@@ -1448,9 +1448,15 @@ fn openai_request_unknown_content_kind(
     }
     match dialect {
         OpenAiRequestDialect::Responses => value
-            .get("input")
-            .map(visit)
-            .unwrap_or(Some("missing input")),
+            .get("instructions")
+            .filter(|instructions| !instructions.is_string() && !instructions.is_null())
+            .map(|_| "non-string response instructions")
+            .or_else(|| {
+                value
+                    .get("input")
+                    .map(visit)
+                    .unwrap_or(Some("missing input"))
+            }),
         OpenAiRequestDialect::ChatCompletions => value
             .get("messages")
             .map(visit_chat_messages)
@@ -5197,6 +5203,61 @@ mod tests {
         let original: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(allowed["input"], original["input"]);
         assert!(allowed.get("instructions").is_none());
+    }
+
+    #[test]
+    fn non_string_response_instructions_are_rejected_before_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+        let secret = ["rpa_", "INSTRUCTIONS", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{}/responses", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "gpt-test",
+                    "instructions": [{
+                        "type": "text",
+                        "text": format!("RUNPOD_API_KEY={secret}")
+                    }],
+                    "input": "hello"
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let error = response.text().unwrap();
+        assert!(
+            error.contains("non-string response instructions"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn response_instructions_accept_only_the_documented_string_or_null_shapes() {
+        for instructions in [Value::String("system text".to_string()), Value::Null] {
+            let request = serde_json::json!({
+                "instructions": instructions,
+                "input": "hello"
+            });
+            assert_eq!(
+                openai_request_unknown_content_kind(&request, OpenAiRequestDialect::Responses),
+                None
+            );
+        }
+        let request = serde_json::json!({
+            "instructions": [{"type": "text", "text": "system text"}],
+            "input": "hello"
+        });
+        assert_eq!(
+            openai_request_unknown_content_kind(&request, OpenAiRequestDialect::Responses),
+            Some("non-string response instructions")
+        );
     }
 
     #[test]
