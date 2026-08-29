@@ -152,6 +152,10 @@ pub fn validate_config_file(path: &Path) -> Result<(), String> {
     config::validate_config_file(path)
 }
 
+pub fn project_root() -> Result<PathBuf, String> {
+    config::project_root()
+}
+
 pub fn load_environment_variable_prefix() -> Result<String, String> {
     config::environment_variable_prefix()
 }
