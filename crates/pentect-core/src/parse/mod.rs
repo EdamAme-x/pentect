@@ -667,7 +667,7 @@ fn inline_env_comment_start(value: &str) -> Option<usize> {
 }
 
 fn is_key_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
+    c.is_alphanumeric() || c == '_' || c == '.' || c == '-'
 }
 
 fn closing_double_quote(value: &str) -> Option<usize> {
@@ -708,6 +708,20 @@ mod tests {
             [
                 (Some("API_KEY".into()), "AKIAIOSFODNN7EXAMPLE".into()),
                 (Some("DB_PASSWORD".into()), "hunter2".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_values_for_unicode_keys_without_losing_byte_boundaries() {
+        let raw = "パスワード=\"秘密の値123\"\n秘密鍵='鍵の値456'\n日本語.キー-1=値789\n";
+
+        assert_eq!(
+            parsed(raw),
+            [
+                (Some("パスワード".into()), "秘密の値123".into()),
+                (Some("秘密鍵".into()), "鍵の値456".into()),
+                (Some("日本語.キー-1".into()), "値789".into()),
             ]
         );
     }

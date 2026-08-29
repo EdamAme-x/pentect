@@ -2391,6 +2391,27 @@ mod tests {
     }
 
     #[test]
+    fn env_values_under_unicode_keys_are_masked_and_reversible() {
+        let raw = "パスワード=\"秘密の値123\"\n秘密鍵='鍵の値456'\nシークレット=値789\n";
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+
+        for value in ["秘密の値123", "鍵の値456", "値789"] {
+            assert!(!result.masked.contains(value), "{}", result.masked);
+        }
+        for key in ["パスワード", "秘密鍵", "シークレット"] {
+            assert!(result.masked.contains(key), "{}", result.masked);
+        }
+        assert_eq!(result.summary.masked_count, 3);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
     fn malformed_placeholder_lookalikes_cannot_bypass_env_masking() {
         let raw = "PASSWORD=<<MY_PASSWORD>>\nTOKEN=<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>\nLOWER=<<my_label_0123456789abcdef>>\nUPPER_HASH=<<LABEL_ABCDEF0123456789>>\nSHORT_HASH=<<LABEL_abc123>>\nVALID=<<SECRET_0123456789abcdef>>\n";
         let result = Engine::with_profile(Profile::Strict).mask(
