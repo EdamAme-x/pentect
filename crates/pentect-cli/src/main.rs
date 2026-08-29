@@ -1314,6 +1314,48 @@ impl AgentToolOpts {
         let mut tool_args = Vec::new();
         let mut i = 2;
         while i < args.len() {
+            let argument = args[i].as_str();
+            if let Some(value) = assigned_option_value(argument, "--pentect")? {
+                pentect = Some(PathBuf::from(value));
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--tool")? {
+                command = PathBuf::from(value);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, tool.path_flag)? {
+                command = PathBuf::from(value);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--upstream")? {
+                upstream = Some(value);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--upstream-header-env")? {
+                upstream_header_env.push(value);
+                i += 1;
+                continue;
+            }
+            if tool.accepts_model {
+                if let Some(value) = assigned_option_value(argument, "--model")?
+                    .or(assigned_option_value(argument, "-m")?)
+                {
+                    model = Some(value);
+                    i += 1;
+                    continue;
+                }
+            }
+            if tool.accepts_api {
+                if let Some(value) = assigned_option_value(argument, "--api")? {
+                    api = Some(value);
+                    i += 1;
+                    continue;
+                }
+            }
             match args[i].as_str() {
                 "--" => {
                     tool_args.extend(args[i + 1..].iter().cloned());
@@ -1395,6 +1437,19 @@ impl AgentToolOpts {
             tool_args,
         })
     }
+}
+
+fn assigned_option_value(argument: &str, option: &str) -> Result<Option<String>, String> {
+    let Some(value) = argument
+        .strip_prefix(option)
+        .and_then(|suffix| suffix.strip_prefix('='))
+    else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(format!("{option} requires a value"));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn extract_opencode_model_arg(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
@@ -3415,6 +3470,63 @@ mod tests {
             Some("https://cloud-code.example/base")
         );
         assert_eq!(antigravity.tool_args, ["--agent", "reviewer"]);
+    }
+
+    #[test]
+    fn agent_options_parse_assignment_forms_before_child_arguments() {
+        let codex = AgentToolOpts::parse(
+            &client_descriptor::CODEX,
+            &[
+                "pentect".to_string(),
+                "codex".to_string(),
+                "--upstream=https://gateway.example/v1".to_string(),
+                "--upstream-header-env=x-api-key=GATEWAY_KEY".to_string(),
+                "--upstream-header-env=x-tenant=TENANT_ID".to_string(),
+                "--codex=/opt/codex".to_string(),
+                "--pentect=/opt/pentect".to_string(),
+                "--".to_string(),
+                "--upstream=https://child.example/v1".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            codex.upstream.as_deref(),
+            Some("https://gateway.example/v1")
+        );
+        assert_eq!(
+            codex.upstream_header_env,
+            ["x-api-key=GATEWAY_KEY", "x-tenant=TENANT_ID"]
+        );
+        assert_eq!(codex.command, PathBuf::from("/opt/codex"));
+        assert_eq!(codex.pentect, Some(PathBuf::from("/opt/pentect")));
+        assert_eq!(codex.tool_args, ["--upstream=https://child.example/v1"]);
+
+        let pi = AgentToolOpts::parse(
+            &client_descriptor::PI,
+            &[
+                "pentect".to_string(),
+                "pi".to_string(),
+                "--model=openai/gpt-5.6".to_string(),
+                "--api=openai-responses".to_string(),
+                "--tool=/opt/pi-custom".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(pi.model.as_deref(), Some("openai/gpt-5.6"));
+        assert_eq!(pi.api.as_deref(), Some("openai-responses"));
+        assert_eq!(pi.command, PathBuf::from("/opt/pi-custom"));
+        assert!(pi.tool_args.is_empty());
+
+        assert!(AgentToolOpts::parse(
+            &client_descriptor::CODEX,
+            &[
+                "pentect".to_string(),
+                "codex".to_string(),
+                "--upstream=".to_string()
+            ]
+        )
+        .unwrap_err()
+        .contains("--upstream requires a value"));
     }
 
     #[test]
