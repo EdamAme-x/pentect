@@ -138,13 +138,18 @@ pub(crate) fn installation_for_executable(
                 marker.display()
             )
         })?;
-        let installation: ManagedInstallation =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                format!(
-                    "invalid installation marker '{}': {error}",
-                    marker.display()
-                )
-            })?;
+        // Windows PowerShell 5.1 writes a UTF-8 BOM for `-Encoding utf8`.
+        // Older official installers used that encoding for this marker, so the
+        // reader must remain able to recover those existing installations.
+        let json = bytes
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(bytes.as_slice());
+        let installation: ManagedInstallation = serde_json::from_slice(json).map_err(|error| {
+            format!(
+                "invalid installation marker '{}': {error}",
+                marker.display()
+            )
+        })?;
         if !valid_installation(&installation) {
             return Err(format!(
                 "installation marker '{}' contains invalid instructions",
@@ -202,6 +207,29 @@ mod tests {
         let marker: ManagedInstallation =
             serde_json::from_str(r#"{"version":1,"path_added":false}"#).unwrap();
         assert!(marker.is_self_managed());
+    }
+
+    #[test]
+    fn reads_a_utf8_bom_marker_written_by_windows_powershell() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-installation-bom-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("pentect.exe");
+        std::fs::write(&executable, b"fixture").unwrap();
+        let mut marker = vec![0xef, 0xbb, 0xbf];
+        marker.extend_from_slice(br#"{"version":1,"manager":"pentect","path_added":false}"#);
+        std::fs::write(root.join(INSTALL_MARKER), marker).unwrap();
+
+        let installation = installation_for_executable(&executable).unwrap().unwrap();
+        assert!(installation.is_self_managed());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
