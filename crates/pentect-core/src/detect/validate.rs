@@ -275,10 +275,12 @@ pub fn jp_my_number(s: &str) -> bool {
 /// Australia ABN: 11 digits, subtract 1 from first, weighted mod-89.
 pub fn au_abn(s: &str) -> bool {
     let mut d = digits(s);
-    if d.len() != 11 {
+    // The ATO specifies that an ABN's first digit is never zero. Reject it
+    // explicitly instead of relying on unsigned underflow during the checksum.
+    if d.len() != 11 || d[0] == 0 {
         return false;
     }
-    d[0] = d[0].wrapping_sub(1);
+    d[0] -= 1;
     let w = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
     wsum(&d, &w) % 89 == 0
 }
@@ -1333,7 +1335,10 @@ mod tests {
         vectors!(kr_rrn, "9001011123459" => true, "9001011123450" => false);
         vectors!(nl_bsn, "111222333" => true, "111222334" => false, "000000000" => false, "200432138" => true);
         vectors!(jp_my_number, "123456789018" => true, "987654321093" => true, "123456789011" => false, "000000000000" => false);
-        vectors!(au_abn, "51824753556" => true, "51824753557" => false);
+        vectors!(au_abn,
+            "51824753556" => true,
+            "51824753557" => false,
+            "00071234567" => false);
         vectors!(au_medicare, "2951234577" => true, "2951234587" => false);
         vectors!(br_cpf, "11144477735" => true, "11144477730" => false, "11111111111" => false);
         vectors!(br_cnpj, "11222333000181" => true, "11222333000180" => false);
