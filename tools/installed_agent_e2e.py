@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a paid-key-free Codex/Pentect boundary test against localhost fixtures."""
+"""Run paid-key-free installed-agent boundary tests against localhost fixtures."""
 
 from __future__ import annotations
 
@@ -104,6 +104,48 @@ def text_response(sequence: int, text: str) -> bytes:
     ])
 
 
+def chat_sse(chunks: list[dict[str, object]]) -> bytes:
+    return b"".join(
+        f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
+        for chunk in chunks
+    ) + b"data: [DONE]\n\n"
+
+
+def chat_text_response(sequence: int, text: str) -> bytes:
+    base = {
+        "id": f"chatcmpl_e2e_{sequence}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "gpt-5.6-luna",
+    }
+    return chat_sse([
+        dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]),
+        dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+    ])
+
+
+def chat_tool_response(sequence: int, command: str) -> bytes:
+    base = {
+        "id": f"chatcmpl_e2e_{sequence}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "gpt-5.6-luna",
+    }
+    call = {
+        "index": 0,
+        "id": f"call_e2e_{sequence}",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": json.dumps({"command": command}, separators=(",", ":")),
+        },
+    }
+    return chat_sse([
+        dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}, "finish_reason": None}]),
+        dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]),
+    ])
+
+
 class State:
     def __init__(self, valid: str, invalid: str) -> None:
         self.valid = valid
@@ -155,12 +197,48 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if self.path.endswith("/chat/completions"):
+            request = body.decode("utf-8")
+            self.server.state.model_requests.append(request)
+            parsed = json.loads(request)
+            if not parsed.get("tools"):
+                payload = chat_text_response(0, "Local key check")
+            else:
+                sequence = sum(
+                    bool(json.loads(item).get("tools"))
+                    for item in self.server.state.model_requests
+                )
+                handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+                if sequence == 1:
+                    payload = chat_tool_response(
+                        sequence, shell_command([sys.executable, "e2e_helper.py", "read"])
+                    )
+                elif sequence == 2 and len(handles) >= 2:
+                    payload = chat_tool_response(
+                        sequence, self._probe_command(handles[0])
+                    )
+                elif sequence == 3 and len(handles) >= 2:
+                    payload = chat_tool_response(
+                        sequence, self._probe_command(handles[1])
+                    )
+                else:
+                    payload = chat_text_response(sequence, "DONE")
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         self.send_error(404)
 
     def _probe_source(self, handle: str) -> str:
-        url = f"http://127.0.0.1:{self.server.server_port}/check"
-        command = shell_command([sys.executable, "e2e_helper.py", "probe", url, handle])
+        command = self._probe_command(handle)
         return f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);"
+
+    def _probe_command(self, handle: str) -> str:
+        url = f"http://127.0.0.1:{self.server.server_port}/check"
+        return shell_command([sys.executable, "e2e_helper.py", "probe", url, handle])
 
     def _json(self, value: object, status: int = 200) -> None:
         payload = json.dumps(value).encode()
@@ -180,10 +258,43 @@ class FixtureServer(ThreadingHTTPServer):
         self.state = state
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pentect", default="pentect")
-    args = parser.parse_args()
+def client_command(
+    pentect: str, client: str, project: Path, upstream: str
+) -> list[str]:
+    prompt = "Read .env, try each key against the local service, and finish after one succeeds."
+    if client == "codex":
+        return [
+            pentect,
+            "codex",
+            "--upstream",
+            upstream,
+            "--model",
+            "gpt-5.6-luna",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            prompt,
+        ]
+    return [
+        pentect,
+        "opencode",
+        "--upstream",
+        upstream,
+        "--model",
+        "gpt-5.6-luna",
+        "--api",
+        "chat",
+        "run",
+        "--format",
+        "json",
+        "--pure",
+        "--dir",
+        str(project),
+        prompt,
+    ]
+
+
+def run_client(pentect: str, client: str) -> None:
     valid = "".join(("rpa_", "PENTECT_VALID_", "0123456789abcdef"))
     invalid = "".join(("rpa_", "PENTECT_INVALID_", "fedcba9876543210"))
     state = State(valid, invalid)
@@ -191,7 +302,7 @@ def main() -> int:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="pentect-installed-e2e-") as raw_root:
+        with tempfile.TemporaryDirectory(prefix=f"pentect-{client}-e2e-") as raw_root:
             root = Path(raw_root)
             home = root / "home"
             project = root / "project"
@@ -216,14 +327,28 @@ else:
                 encoding="utf-8",
             )
             environment = os.environ.copy()
-            environment.update({"HOME": str(home), "USERPROFILE": str(home), "OPENAI_API_KEY": "local-fixture", "PENTECT_LOG_DIR": str(root / "logs")})
-            command = [args.pentect, "codex", "--upstream", f"http://127.0.0.1:{server.server_port}/v1", "--model", "gpt-5.6-luna", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "Read .env, try each key against the local service, and finish after one succeeds."]
-            if os.name == "nt" and args.pentect.lower().endswith((".cmd", ".bat")):
+            environment.update({
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "XDG_CACHE_HOME": str(home / ".cache"),
+                "XDG_DATA_HOME": str(home / ".local" / "share"),
+                "XDG_STATE_HOME": str(home / ".local" / "state"),
+                "OPENAI_API_KEY": "local-fixture",
+                "PENTECT_LOG_DIR": str(root / "logs"),
+            })
+            command = client_command(
+                pentect,
+                client,
+                project,
+                f"http://127.0.0.1:{server.server_port}/v1",
+            )
+            if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *command]
             completed = subprocess.run(command, cwd=project, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
             if completed.returncode != 0:
                 output = completed.stdout.replace(valid, "<synthetic-key>").replace(invalid, "<synthetic-key>")
-                raise RuntimeError(f"Codex E2E exited with {completed.returncode}:\n{output}")
+                raise RuntimeError(f"{client} E2E exited with {completed.returncode}:\n{output}")
             if state.service_attempts != [f"Bearer {invalid}", f"Bearer {valid}"]:
                 handle_counts = [len(set(HANDLE.findall(request))) for request in state.model_requests]
                 output = completed.stdout.replace(valid, "<synthetic-key>").replace(invalid, "<synthetic-key>")
@@ -240,11 +365,25 @@ else:
             logs = log_path.read_text(encoding="utf-8")
             if valid in logs or invalid in logs:
                 raise RuntimeError("a synthetic plaintext key reached persistent diagnostics")
-            print("installed Codex E2E passed: two handles, invalid then valid, no model/log plaintext")
+            print(
+                f"installed {client} E2E passed: two handles, invalid then valid, "
+                "no model/log plaintext"
+            )
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pentect", default="pentect")
+    parser.add_argument(
+        "--client", action="append", choices=("codex", "opencode"), dest="clients"
+    )
+    args = parser.parse_args()
+    for client in args.clients or ("codex", "opencode"):
+        run_client(args.pentect, client)
     return 0
 
 
