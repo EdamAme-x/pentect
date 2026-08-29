@@ -389,18 +389,9 @@ pub(crate) fn download_latest_release_asset(
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("could not create release client: {e}"))?;
-    let allow_prerelease =
-        std::env::var("PENTECT_UPDATE_ALLOW_PRERELEASE").is_ok_and(|value| value == "1");
-    let api = if allow_prerelease {
-        format!(
-            "https://api.github.com/repos/{repository}/releases/tags/v{}",
-            env!("CARGO_PKG_VERSION")
-        )
-    } else {
-        format!("https://api.github.com/repos/{repository}/releases/latest")
-    };
+    let api = latest_release_api(repository);
     let release: Release = get_response(&client, &api, MAX_CHECKSUM_BYTES * 16)?;
-    if release.draft || (release.prerelease && !allow_prerelease) {
+    if release.draft || release.prerelease {
         return Err("latest GitHub release is not a stable release".to_string());
     }
     let version = release_version(&release.tag_name)?;
@@ -435,6 +426,10 @@ pub(crate) fn download_latest_release_asset(
         bytes,
         sha256: expected,
     })
+}
+
+fn latest_release_api(repository: &str) -> String {
+    format!("https://api.github.com/repos/{repository}/releases/latest")
 }
 
 pub(crate) fn validate_repository(repository: &str) -> Result<(), String> {
@@ -825,6 +820,17 @@ mod tests {
         assert!(validate_repository("EdamAme-x/pentect").is_ok());
         assert!(validate_repository("owner/repo/extra").is_err());
         assert!(validate_repository("owner/../repo").is_err());
+    }
+
+    #[test]
+    fn plugin_release_assets_use_the_plugin_latest_stable_release() {
+        let api = latest_release_api("third-party/example-plugin");
+        assert_eq!(
+            api,
+            "https://api.github.com/repos/third-party/example-plugin/releases/latest"
+        );
+        assert!(!api.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!api.contains("/releases/tags/"));
     }
 
     #[test]
