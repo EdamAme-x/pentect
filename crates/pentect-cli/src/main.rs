@@ -966,7 +966,34 @@ fn cmd_mask(args: &[String]) {
 
 fn validate_mask_args(args: &[String]) -> Result<(), String> {
     let mut i = 2usize;
-    while i < args.len() {
+    'arguments: while i < args.len() {
+        let argument = args[i].as_str();
+        for option in [
+            "--kind",
+            "--profile",
+            "--input",
+            "--pack",
+            "--pack-dir",
+            "--plugins",
+        ] {
+            let Some(value) = assigned_option_value(argument, option)? else {
+                continue;
+            };
+            match option {
+                "--kind" => {
+                    parse_kind(&value)?;
+                }
+                "--profile" => {
+                    value.parse::<Profile>()?;
+                }
+                "--plugins" => {
+                    plugins::parse_plugin_value(&value).map_err(|e| e.to_string())?;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue 'arguments;
+        }
         match args[i].as_str() {
             "--kind" | "--profile" | "--input" | "--pack" | "--pack-dir" | "--plugins" => {
                 let Some(value) = args.get(i + 1) else {
@@ -1220,6 +1247,7 @@ enum ReadInputFormat {
     Image,
 }
 
+#[derive(Debug)]
 struct ReadOpts {
     input_format: ReadInputFormat,
     kind: Option<Kind>,
@@ -1239,6 +1267,31 @@ impl ReadOpts {
         let mut path = None;
         let mut i = 2;
         while i < args.len() {
+            let argument = args[i].as_str();
+            if let Some(value) = assigned_option_value(argument, "--input")? {
+                input_format = parse_read_input_format(&value)?;
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--kind")? {
+                kind = Some(parse_kind(&value)?);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--profile")? {
+                profile = value.parse()?;
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--plugins")? {
+                for spec in plugins::parse_plugin_value(&value).map_err(|e| e.to_string())? {
+                    if !plugins.iter().any(|existing| existing == &spec) {
+                        plugins.push(spec);
+                    }
+                }
+                i += 1;
+                continue;
+            }
             match args[i].as_str() {
                 "--input" => {
                     input_format =
@@ -1337,6 +1390,15 @@ impl AgentToolOpts {
             }
             if let Some(value) = assigned_option_value(argument, "--upstream-header-env")? {
                 upstream_header_env.push(value);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = assigned_option_value(argument, "--plugins")? {
+                for name in plugins::parse_plugin_value(&value).map_err(|e| e.to_string())? {
+                    if !plugins.iter().any(|existing| existing == &name) {
+                        plugins.push(name);
+                    }
+                }
                 i += 1;
                 continue;
             }
@@ -1439,7 +1501,10 @@ impl AgentToolOpts {
     }
 }
 
-fn assigned_option_value(argument: &str, option: &str) -> Result<Option<String>, String> {
+pub(crate) fn assigned_option_value(
+    argument: &str,
+    option: &str,
+) -> Result<Option<String>, String> {
     let Some(value) = argument
         .strip_prefix(option)
         .and_then(|suffix| suffix.strip_prefix('='))
@@ -3122,18 +3187,27 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 /// All values following each occurrence of `flag` (so `--pack` can repeat).
 fn arg_values(args: &[String], flag: &str) -> Vec<String> {
-    args.iter()
-        .enumerate()
-        .filter(|(_, a)| a.as_str() == flag)
-        .filter_map(|(i, _)| args.get(i + 1).cloned())
-        .collect()
+    let assigned_prefix = format!("{flag}=");
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == flag {
+            if let Some(value) = args.get(index + 1) {
+                values.push(value.clone());
+            }
+            index += 2;
+        } else {
+            if let Some(value) = args[index].strip_prefix(&assigned_prefix) {
+                values.push(value.to_string());
+            }
+            index += 1;
+        }
+    }
+    values
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
+    arg_values(args, flag).into_iter().next()
 }
 
 fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -3161,6 +3235,83 @@ mod tests {
         assert!(error.contains("standard input"), "{error}");
         assert!(error.contains("pentect mask < FILE"), "{error}");
         assert!(error.contains("may be recorded"), "{error}");
+    }
+
+    #[test]
+    fn mask_and_read_accept_assignment_form_for_all_valued_options() {
+        let mask = [
+            "pentect",
+            "mask",
+            "--kind=json",
+            "--profile=strict",
+            "--input=text",
+            "--pack=rules.toml",
+            "--pack-dir=rules",
+            "--plugins=company-policy,company-policy",
+        ]
+        .map(str::to_string);
+        validate_mask_args(&mask).unwrap();
+        assert_eq!(arg_value(&mask, "--kind").as_deref(), Some("json"));
+        assert_eq!(arg_value(&mask, "--profile").as_deref(), Some("strict"));
+        assert_eq!(arg_value(&mask, "--input").as_deref(), Some("text"));
+        assert_eq!(arg_values(&mask, "--pack"), ["rules.toml"]);
+        assert_eq!(arg_values(&mask, "--pack-dir"), ["rules"]);
+
+        let read = [
+            "pentect",
+            "read",
+            "--input=text",
+            "--kind=json",
+            "--profile=strict",
+            "--plugins=company-policy,company-policy",
+            "fixture.json",
+        ]
+        .map(str::to_string);
+        let options = ReadOpts::parse(&read).unwrap();
+        assert_eq!(options.input_format, ReadInputFormat::Text);
+        assert_eq!(options.kind, Some(Kind::Json));
+        assert_eq!(options.profile, Profile::Strict);
+        assert_eq!(options.plugins, ["company-policy"]);
+        assert_eq!(options.path, PathBuf::from("fixture.json"));
+
+        for option in ["--kind", "--profile", "--input", "--plugins"] {
+            let args = [
+                "pentect".to_string(),
+                "read".to_string(),
+                format!("{option}="),
+            ];
+            assert!(
+                ReadOpts::parse(&args)
+                    .unwrap_err()
+                    .contains(&format!("{option} requires a value")),
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_assignment_plugin_is_activated_instead_of_forwarded() {
+        let args = [
+            "pentect",
+            "codex",
+            "--plugins=company-policy,company-policy",
+            "--",
+            "exec",
+            "hello",
+        ]
+        .map(str::to_string);
+        let options = AgentToolOpts::parse(&client_descriptor::CODEX, &args).unwrap();
+        assert_eq!(options.plugins, ["company-policy"]);
+        assert_eq!(options.tool_args, ["exec", "hello"]);
+
+        let empty = [
+            "pentect".to_string(),
+            "codex".to_string(),
+            "--plugins=".to_string(),
+        ];
+        assert!(AgentToolOpts::parse(&client_descriptor::CODEX, &empty)
+            .unwrap_err()
+            .contains("--plugins requires a value"));
     }
 
     #[test]
