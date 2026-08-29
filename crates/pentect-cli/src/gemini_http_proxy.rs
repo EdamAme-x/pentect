@@ -436,9 +436,13 @@ impl GeminiEndpoint {
 fn classify_endpoint(path_and_query: &str) -> GeminiEndpoint {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
     let native_model_route = path.starts_with("/v1beta/models/") || path.starts_with("/v1/models/");
-    if native_model_route && path.ends_with(":streamGenerateContent") {
+    let tuned_model_route = path
+        .strip_prefix("/v1beta/tunedModels/")
+        .is_some_and(|resource| !resource.is_empty() && !resource.contains('/'));
+    let content_model_route = native_model_route || tuned_model_route;
+    if content_model_route && path.ends_with(":streamGenerateContent") {
         GeminiEndpoint::StreamGenerateContent
-    } else if native_model_route && path.ends_with(":generateContent") {
+    } else if content_model_route && path.ends_with(":generateContent") {
         GeminiEndpoint::GenerateContent
     } else if native_model_route && path.ends_with(":countTokens") {
         GeminiEndpoint::CountTokens
@@ -1256,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_native_gemini_routes_only() {
+    fn recognizes_supported_gemini_model_routes() {
         assert_eq!(
             classify_endpoint("/v1beta/models/gemini-2.5-pro:generateContent"),
             GeminiEndpoint::GenerateContent
@@ -1276,6 +1280,32 @@ mod tests {
         assert_eq!(
             classify_endpoint("/v1beta/models/gemini-embedding-001:batchEmbedContents"),
             GeminiEndpoint::BatchEmbedContents
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/tunedModels/customer-service:generateContent"),
+            GeminiEndpoint::GenerateContent
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/tunedModels/customer-service:streamGenerateContent?alt=sse"),
+            GeminiEndpoint::StreamGenerateContent
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/tunedModels/customer-service:countTokens"),
+            GeminiEndpoint::Unknown
+        );
+        assert_eq!(
+            classify_endpoint("/v1/tunedModels/customer-service:generateContent"),
+            GeminiEndpoint::Unknown
+        );
+        assert_eq!(
+            classify_endpoint(
+                "/v1beta/tunedModels/customer-service/permissions/viewer:generateContent"
+            ),
+            GeminiEndpoint::Unknown
+        );
+        assert_eq!(
+            classify_endpoint("/v1beta/cachedContents/cache:generateContent"),
+            GeminiEndpoint::Unknown
         );
         assert_eq!(
             classify_endpoint("/v1internal:generateContent"),
@@ -1583,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_boundary_masks_prompt_and_restores_only_tool_args() {
+    fn model_and_tuned_model_boundaries_mask_prompt_and_restore_only_tool_args() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = TestEnv::install(&store);
@@ -1596,48 +1626,50 @@ mod tests {
             "4321fedcba",
         ]
         .concat();
-        let (upstream, captured, thread) = mock_upstream();
-        let proxy = GeminiHttpProxyGuard::start_with_header_env(upstream, &[]).unwrap();
-        let response = reqwest::blocking::Client::new()
-            .post(format!(
-                "{}/v1beta/models/gemini-test:generateContent",
-                proxy.base_url()
-            ))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(
-                serde_json::to_vec(&serde_json::json!({
-                    "contents": [{"role": "user", "parts": [{
-                        "text": format!("Use RUNPOD_API_KEY={secret}")
-                    }]}]
-                }))
-                .unwrap(),
-            )
-            .send()
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .text()
-            .unwrap();
-        let response: Value = serde_json::from_str(&response).unwrap();
-        let request = captured
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        thread.join().unwrap();
-        assert!(!request.contains(&secret));
-        let handle = first_handle(&request).unwrap();
-        let protected_request: Value = serde_json::from_str(&request).unwrap();
-        assert_eq!(
-            protected_request["systemInstruction"]["parts"][0]["text"],
-            HANDLE_CONTRACT
-        );
-        assert_eq!(
-            response["candidates"][0]["content"]["parts"][0]["text"],
-            handle
-        );
-        assert_eq!(
-            response["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["token"],
-            secret
-        );
+        for path in [
+            "/v1beta/models/gemini-test:generateContent",
+            "/v1beta/tunedModels/customer-service:generateContent",
+        ] {
+            let (upstream, captured, thread) = mock_upstream();
+            let proxy = GeminiHttpProxyGuard::start_with_header_env(upstream, &[]).unwrap();
+            let response = reqwest::blocking::Client::new()
+                .post(format!("{}{path}", proxy.base_url()))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "contents": [{"role": "user", "parts": [{
+                            "text": format!("Use RUNPOD_API_KEY={secret}")
+                        }]}]
+                    }))
+                    .unwrap(),
+                )
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .text()
+                .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            let request = captured
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            thread.join().unwrap();
+            assert!(!request.contains(&secret), "plaintext reached {path}");
+            let handle = first_handle(&request).unwrap();
+            let protected_request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                protected_request["systemInstruction"]["parts"][0]["text"],
+                HANDLE_CONTRACT
+            );
+            assert_eq!(
+                response["candidates"][0]["content"]["parts"][0]["text"],
+                handle
+            );
+            assert_eq!(
+                response["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["token"],
+                secret
+            );
+        }
     }
 
     #[test]
