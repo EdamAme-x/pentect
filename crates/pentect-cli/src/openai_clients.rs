@@ -375,11 +375,7 @@ fn opencode_proxy_auth(
             child_key_env = Some("ANTHROPIC_API_KEY");
         }
     } else if route.protocol == OpenCodeProtocol::Gemini {
-        if let Some(name) = configured_key_env(&[
-            "GOOGLE_API_KEY",
-            "GOOGLE_GENERATIVE_AI_API_KEY",
-            "GEMINI_API_KEY",
-        ]) {
+        if let Some(name) = configured_key_env(crate::GOOGLE_API_KEY_ENV_NAMES) {
             child_key_env = Some(name);
             if !has_header_override(&header_env, "x-goog-api-key")
                 && !crate::upstream::has_origin_auth_override(&header_env)
@@ -410,10 +406,10 @@ fn opencode_command(
         "OPENCODE_API_KEY",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "GOOGLE_GENERATIVE_AI_API_KEY",
-        "GEMINI_API_KEY",
     ] {
+        command.env_remove(name);
+    }
+    for name in crate::GOOGLE_API_KEY_ENV_NAMES {
         command.env_remove(name);
     }
     crate::apply_plugin_env(&mut command, active_plugins)?;
@@ -1084,7 +1080,12 @@ mod tests {
             "Bearer custom-upstream-token",
         );
         let _anthropic_key = ScopedEnv::set("ANTHROPIC_API_KEY", "anthropic-origin-key");
-        let _gemini_key = ScopedEnv::set("GOOGLE_API_KEY", "google-origin-key");
+        let _google_key = ScopedEnv::remove("GOOGLE_API_KEY");
+        let _generative_key = ScopedEnv::set(
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+            "google-generative-origin-key",
+        );
+        let _gemini_key = ScopedEnv::remove("GEMINI_API_KEY");
 
         for (protocol, forbidden_header, expected_child_key) in [
             (
@@ -1092,7 +1093,11 @@ mod tests {
                 "x-api-key",
                 "ANTHROPIC_API_KEY",
             ),
-            (OpenCodeProtocol::Gemini, "x-goog-api-key", "GOOGLE_API_KEY"),
+            (
+                OpenCodeProtocol::Gemini,
+                "x-goog-api-key",
+                "GOOGLE_GENERATIVE_AI_API_KEY",
+            ),
         ] {
             let route = OpenCodeRoute {
                 provider: "test".to_string(),
