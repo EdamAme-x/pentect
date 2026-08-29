@@ -589,6 +589,9 @@ fn mask_gemini_request(
     let object = value
         .as_object_mut()
         .ok_or_else(|| "unknown format blocked: Gemini request must be an object".to_string())?;
+    if let Some(tools) = object.get_mut("tools") {
+        crate::model_definition::mask_model_definition(tools, "Gemini", masker)?;
+    }
     let contents = object
         .get_mut("contents")
         .and_then(Value::as_array_mut)
@@ -1611,6 +1614,65 @@ mod tests {
             first_handle(&upstream_body).is_some(),
             "upstream body did not contain a protected handle: {upstream_body}"
         );
+    }
+
+    #[test]
+    fn generate_content_gateway_masks_tool_definitions_before_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "TOOLS", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
+        let (upstream, body_rx, thread) = mock_upstream();
+        let proxy = GeminiHttpProxyGuard::start_with_header_env(upstream, &[]).unwrap();
+        reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1beta/models/gemini-test:generateContent",
+                proxy.base_url()
+            ))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "contents": [{"role": "user", "parts": [{"text": "use lookup"}]}],
+                    "tools": [{"functionDeclarations": [{
+                        "name": "lookup",
+                        "description": format!("Use RUNPOD_API_KEY={secret}"),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "token": {
+                                    "type": "string",
+                                    "default": format!("unmask(RUNPOD_API_KEY={secret})")
+                                }
+                            }
+                        }
+                    }]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let upstream_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(!upstream_body.contains(&secret));
+        let protected: Value = serde_json::from_str(&upstream_body).unwrap();
+        assert!(first_handle(
+            protected["tools"][0]["functionDeclarations"][0]["description"]
+                .as_str()
+                .unwrap()
+        )
+        .is_some());
+        assert!(first_handle(
+            protected["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["token"]
+                ["default"]
+                .as_str()
+                .unwrap()
+        )
+        .is_some());
     }
 
     #[test]
