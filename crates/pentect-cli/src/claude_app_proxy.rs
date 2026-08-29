@@ -1838,35 +1838,38 @@ fn classify_claude_app_request(
     if is_claude_voice_path(path) {
         return ClaudeAppRequest::UnsupportedModel;
     }
-    if *method != Method::POST {
-        return ClaudeAppRequest::Other;
-    }
+    let is_post = *method == Method::POST;
     let media_type = content_type
         .split(';')
         .next()
         .map(str::trim)
         .unwrap_or_default();
-    if is_chat_completion_path(path) {
+    if is_post && is_chat_completion_path(path) {
         return if media_type.eq_ignore_ascii_case("application/json") {
             ClaudeAppRequest::ChatJson
         } else {
             ClaudeAppRequest::UnsupportedModel
         };
     }
-    if is_claude_binary_model_path(path) {
+    if is_post && is_claude_binary_model_path(path) {
         return ClaudeAppRequest::UnsupportedModel;
     }
-    if is_claude_prepare_upload_path(path)
+    if is_post
+        && is_claude_prepare_upload_path(path)
         && (media_type.eq_ignore_ascii_case("application/json")
             || media_type.to_ascii_lowercase().ends_with("+json"))
     {
         return ClaudeAppRequest::PrepareUploadJson;
     }
-    if media_type.eq_ignore_ascii_case("multipart/form-data") && is_claude_upload_path(path) {
+    if is_post
+        && media_type.eq_ignore_ascii_case("multipart/form-data")
+        && is_claude_upload_path(path)
+    {
         return ClaudeAppRequest::Upload;
     }
-    if media_type.eq_ignore_ascii_case("application/json")
-        || media_type.to_ascii_lowercase().ends_with("+json")
+    if (is_post || *method == Method::PUT || *method == Method::PATCH)
+        && (media_type.eq_ignore_ascii_case("application/json")
+            || media_type.to_ascii_lowercase().ends_with("+json"))
     {
         return ClaudeAppRequest::JsonScan;
     }
@@ -3655,6 +3658,53 @@ mod tests {
                 "application/json"
             ),
             ClaudeAppRequest::JsonScan
+        );
+    }
+
+    #[test]
+    fn put_and_patch_json_updates_are_classified_and_masked() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = MaskingTestEnv::install(&store);
+        let secret = "rpa_ZYXWVUTSRQPONMLKJIHGFEDCBA0987654321fedcba";
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "instructions": format!("RUNPOD_API_KEY={secret}")
+            }))
+            .unwrap(),
+        );
+
+        for (method, content_type) in [
+            (Method::PUT, "application/json"),
+            (Method::PATCH, "application/merge-patch+json"),
+        ] {
+            assert_eq!(
+                classify_claude_app_request(
+                    &method,
+                    "claude.ai",
+                    "/api/organizations/org/projects/project",
+                    content_type,
+                ),
+                ClaudeAppRequest::JsonScan
+            );
+            let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+            let protected = protect_generic_json_request(&body, &masker, true).unwrap();
+            let protected = String::from_utf8(protected.to_vec()).unwrap();
+            assert!(!protected.contains(secret), "{method} leaked the secret");
+            assert!(
+                protected.contains("<<RUNPOD_API_KEY_"),
+                "{method}: {protected}"
+            );
+        }
+
+        assert_eq!(
+            classify_claude_app_request(
+                &Method::GET,
+                "claude.ai",
+                "/api/organizations/org/projects/project",
+                "application/json",
+            ),
+            ClaudeAppRequest::Other
         );
     }
 
