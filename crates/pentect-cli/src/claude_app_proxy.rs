@@ -54,6 +54,24 @@ const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_UPLOADS: usize = 256;
 const MAX_IDS_PER_UPLOAD: usize = 16;
 const APP_STARTUP_GRACE: Duration = Duration::from_secs(2);
+const APP_MONITOR_INTERVAL: Duration = Duration::from_millis(100);
+
+fn proxy_diagnostic(reason: &str) {
+    let (kind, retryable) = match reason {
+        "gateway-stopped" => ("runtime", false),
+        _ => ("unclassified", false),
+    };
+    pentect_agent::record_http_diagnostic_activity(
+        "claude-app",
+        reason,
+        kind,
+        "gateway",
+        "HTTP",
+        None,
+        retryable,
+        env!("CARGO_PKG_VERSION"),
+    );
+}
 
 pub(crate) fn cmd_claude_app(args: &[String]) -> i32 {
     match run_claude_app(args) {
@@ -165,8 +183,13 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         if let Some(status) = process.try_wait()? {
             return Err(claude_desktop_early_exit_error(status, true));
         }
+        if let Err(error) = ensure_claude_app_gateway_running(&proxy) {
+            terminate_child_process(process.id());
+            let _ = process.wait();
+            return Err(error);
+        }
         print_gateway_ready(&proxy);
-        let status = process.wait()?;
+        let status = monitor_activated_claude_app(&process, &proxy)?;
         drop(proxy);
         drop(anthropic);
         return Ok(status);
@@ -209,13 +232,76 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     {
         return Err(claude_desktop_early_exit_error(status, false));
     }
+    if let Err(error) = ensure_claude_app_gateway_running(&proxy) {
+        terminate_and_reap_child(&mut child);
+        return Err(error);
+    }
     print_gateway_ready(&proxy);
-    let status = child
-        .wait()
-        .map_err(|error| format!("could not wait for Claude Desktop: {error}"))?;
+    let status = monitor_claude_app_child(&mut child, &proxy)?;
     drop(proxy);
     drop(anthropic);
     Ok(status)
+}
+
+#[cfg(windows)]
+fn monitor_activated_claude_app(
+    process: &ActivatedWindowsProcess,
+    proxy: &ClaudeAppProxyGuard,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        if let Some(status) = process.try_wait()? {
+            return Ok(status);
+        }
+        if let Err(error) = ensure_claude_app_gateway_running(proxy) {
+            terminate_child_process(process.id());
+            let _ = process.wait();
+            return Err(error);
+        }
+        thread::sleep(APP_MONITOR_INTERVAL);
+    }
+}
+
+fn monitor_claude_app_child(
+    child: &mut std::process::Child,
+    proxy: &ClaudeAppProxyGuard,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not monitor Claude Desktop: {error}"))?
+        {
+            return Ok(status);
+        }
+        if let Err(error) = ensure_claude_app_gateway_running(proxy) {
+            terminate_and_reap_child(child);
+            return Err(error);
+        }
+        thread::sleep(APP_MONITOR_INTERVAL);
+    }
+}
+
+fn ensure_claude_app_gateway_running(proxy: &ClaudeAppProxyGuard) -> Result<(), String> {
+    if proxy.is_running() {
+        return Ok(());
+    }
+    let reason = proxy
+        .failure_reason()
+        .unwrap_or_else(|| "gateway thread exited unexpectedly".to_string());
+    Err(format!(
+        "Claude App gateway stopped: {reason}; Claude Desktop was terminated and the temporary certificate was removed; inspect `pentect log`"
+    ))
+}
+
+fn terminate_and_reap_child(child: &mut std::process::Child) {
+    terminate_child_process(child.id());
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn claude_desktop_early_exit_error(status: impl std::fmt::Display, packaged: bool) -> String {
@@ -1048,6 +1134,7 @@ struct ClaudeAppProxyGuard {
     ca_thumbprint: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl ClaudeAppProxyGuard {
@@ -1061,6 +1148,8 @@ impl ClaudeAppProxyGuard {
         let ca_thumbprint = authority.thumbprint.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
         let thread = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1069,6 +1158,9 @@ impl ClaudeAppProxyGuard {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!("runtime initialization failed: {error}"));
+                    }
                     let _ = ready_tx.send(Err(format!(
                         "could not start Claude App proxy runtime: {error}"
                     )));
@@ -1077,6 +1169,10 @@ impl ClaudeAppProxyGuard {
             };
             runtime.block_on(async move {
                 if let Err(error) = run_proxy(authority, ready_tx, shutdown_rx).await {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(error.clone());
+                    }
+                    proxy_diagnostic("gateway-stopped");
                     eprintln!("[pentect] Claude App proxy stopped: {error}");
                 }
             });
@@ -1094,6 +1190,7 @@ impl ClaudeAppProxyGuard {
             ca_thumbprint,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            failure,
         })
     }
 
@@ -1114,6 +1211,16 @@ impl ClaudeAppProxyGuard {
     #[cfg(windows)]
     fn ca_thumbprint(&self) -> &str {
         &self.ca_thumbprint
+    }
+
+    fn failure_reason(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
     }
 }
 
@@ -3354,6 +3461,61 @@ fn success_status() -> std::process::ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stopped_proxy(reason: &str) -> ClaudeAppProxyGuard {
+        let thread = std::thread::spawn(|| {});
+        while !thread.is_finished() {
+            std::thread::yield_now();
+        }
+        ClaudeAppProxyGuard {
+            proxy_url: "http://127.0.0.1:1".to_string(),
+            #[cfg(not(windows))]
+            spki_hash: "test-spki".to_string(),
+            #[cfg(windows)]
+            root_certificate_der: Vec::new(),
+            #[cfg(windows)]
+            ca_thumbprint: String::new(),
+            shutdown: None,
+            thread: Some(thread),
+            failure: Arc::new(Mutex::new(Some(reason.to_string()))),
+        }
+    }
+
+    fn long_running_test_child() -> std::process::Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new(crate::windows_system_executable("cmd.exe"));
+            command.args(["/d", "/s", "/c", "ping -n 30 127.0.0.1 >nul"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_child_process(&mut command);
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn stopped_gateway_terminates_the_desktop_process_and_reports_the_reason() {
+        let proxy = stopped_proxy("fixture listener failed");
+        assert!(!proxy.is_running());
+        let mut child = long_running_test_child();
+        let error = monitor_claude_app_child(&mut child, &proxy).unwrap_err();
+        assert!(error.contains("fixture listener failed"), "{error}");
+        assert!(error.contains("Desktop was terminated"), "{error}");
+        assert!(
+            error.contains("temporary certificate was removed"),
+            "{error}"
+        );
+        assert!(child.try_wait().unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn oversized_chat_sse_event_fails_closed_without_emitting_it() {
