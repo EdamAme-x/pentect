@@ -94,6 +94,17 @@ function Expand-PentectGzip {
     }
 }
 
+function Write-PentectManagedInstallMarker {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][bool]$PathAdded
+    )
+
+    $json = @{ version = 1; manager = 'pentect'; path_added = $PathAdded } | ConvertTo-Json -Compress
+    $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $json, $utf8WithoutBom)
+}
+
 $repository = 'EdamAme-x/pentect'
 $requestedVersion = $Version
 if ($requestedVersion) {
@@ -200,7 +211,7 @@ try {
         }
     }
     Write-Output "[4/4] PATH: $pathStatus"
-    @{ version = 1; manager = 'pentect'; path_added = $pathAdded } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 -LiteralPath $marker
+    Write-PentectManagedInstallMarker -Path $marker -PathAdded $pathAdded
     Write-Output ''
     Write-Output "Installed Pentect $releaseTag"
     Write-Output 'Next: pentect doctor'
