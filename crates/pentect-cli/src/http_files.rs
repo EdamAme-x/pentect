@@ -827,12 +827,7 @@ impl FileAttestationStore {
     pub(crate) fn account_scope_for_app_headers(&self, headers: &hyper::HeaderMap) -> String {
         let mut fields = headers
             .iter()
-            .filter(|(name, _)| {
-                matches!(
-                    name.as_str().to_ascii_lowercase().as_str(),
-                    "authorization" | "cookie" | "x-api-key" | "api-key" | "x-goog-api-key"
-                )
-            })
+            .filter(|(name, _)| crate::upstream::is_origin_auth_header(name.as_str()))
             .map(|(name, value)| {
                 (
                     name.as_str().to_ascii_lowercase().into_bytes(),

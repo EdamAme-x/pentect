@@ -63,12 +63,12 @@ pub(crate) fn run(
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
     let standard_key_names = provider_key_env_names(injection);
-    let standard_key_names =
-        if crate::upstream::has_authorization_override(&opts.upstream_header_env) {
-            &[][..]
-        } else {
-            standard_key_names
-        };
+    let standard_key_names = if crate::upstream::has_origin_auth_override(&opts.upstream_header_env)
+    {
+        &[][..]
+    } else {
+        standard_key_names
+    };
     let _authorization = crate::upstream_bearer_guard(standard_key_names);
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
         upstream,
@@ -354,23 +354,23 @@ fn opencode_proxy_auth(
     let mut header_env = base_header_env.to_vec();
     let bearer_env = route.bearer_env.filter(|name| {
         std::env::var_os(name).is_some_and(|value| !value.is_empty())
-            && !crate::upstream::has_authorization_override(&header_env)
+            && !crate::upstream::has_origin_auth_override(&header_env)
     });
     let mut child_key_env = bearer_env.or_else(|| {
         route
             .bearer_env
-            .filter(|_| crate::upstream::has_authorization_override(&header_env))
+            .filter(|_| crate::upstream::has_origin_auth_override(&header_env))
     });
     if route.protocol == OpenCodeProtocol::Anthropic {
         if let Some(name) = configured_key_env(&["ANTHROPIC_API_KEY"]) {
             child_key_env = Some(name);
             if !has_header_override(&header_env, "x-api-key")
-                && !crate::upstream::has_authorization_override(&header_env)
+                && !crate::upstream::has_origin_auth_override(&header_env)
             {
                 header_env.push(format!("x-api-key={name}"));
             }
         } else if has_header_override(&header_env, "x-api-key")
-            || crate::upstream::has_authorization_override(&header_env)
+            || crate::upstream::has_origin_auth_override(&header_env)
         {
             child_key_env = Some("ANTHROPIC_API_KEY");
         }
@@ -382,12 +382,12 @@ fn opencode_proxy_auth(
         ]) {
             child_key_env = Some(name);
             if !has_header_override(&header_env, "x-goog-api-key")
-                && !crate::upstream::has_authorization_override(&header_env)
+                && !crate::upstream::has_origin_auth_override(&header_env)
             {
                 header_env.push(format!("x-goog-api-key={name}"));
             }
         } else if has_header_override(&header_env, "x-goog-api-key")
-            || crate::upstream::has_authorization_override(&header_env)
+            || crate::upstream::has_origin_auth_override(&header_env)
         {
             child_key_env = Some("GOOGLE_API_KEY");
         }
@@ -1062,16 +1062,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_authorization_header_disables_implicit_key_selection() {
+    fn explicit_origin_auth_header_disables_implicit_key_selection() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let _authorization = ScopedEnv::remove("PENTECT_UPSTREAM_AUTHORIZATION");
-        assert!(crate::upstream::has_authorization_override(&[
+        assert!(crate::upstream::has_origin_auth_override(&[
             "authorization=MY_HEADER".to_string()
         ]));
-        assert!(crate::upstream::has_authorization_override(&[
+        assert!(crate::upstream::has_origin_auth_override(&[
             " Authorization =MY_HEADER".to_string()
         ]));
-        assert!(!crate::upstream::has_authorization_override(&[
+        assert!(crate::upstream::has_origin_auth_override(&[
             "X-Api-Key=MY_HEADER".to_string()
         ]));
     }

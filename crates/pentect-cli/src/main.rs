@@ -1207,7 +1207,7 @@ fn cmd_provider(args: &[String]) -> i32 {
 }
 
 fn provider_upstream_key_env_names(header_env: &[String]) -> &'static [&'static str] {
-    if upstream::has_authorization_override(header_env) {
+    if upstream::has_origin_auth_override(header_env) {
         &[]
     } else {
         &["OPENAI_API_KEY"]
@@ -1612,7 +1612,7 @@ fn run_endpoint_env(
                 .iter()
                 .find_map(|name| nonempty_env(name));
             let shield_child_key = google_api_key.is_some()
-                || upstream::has_google_api_key_override(&opts.upstream_header_env);
+                || upstream::has_origin_auth_override(&opts.upstream_header_env);
             let proxy = gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env_and_api_key(
                 upstream,
                 &opts.upstream_header_env,
@@ -3530,13 +3530,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_authorization_override_disables_implicit_openai_bearer() {
+    fn provider_origin_auth_override_disables_implicit_openai_bearer() {
+        for header in ["authorization", "x-api-key", "api-key", "x-goog-api-key"] {
+            assert_eq!(
+                provider_upstream_key_env_names(&[format!("{header}=MY_GATEWAY_AUTH")]),
+                &[] as &[&str]
+            );
+        }
         assert_eq!(
-            provider_upstream_key_env_names(&["authorization=MY_GATEWAY_AUTH".to_string()]),
-            &[] as &[&str]
-        );
-        assert_eq!(
-            provider_upstream_key_env_names(&["x-api-key=MY_GATEWAY_KEY".to_string()]),
+            provider_upstream_key_env_names(&["x-request-id=REQUEST_ID".to_string()]),
             &["OPENAI_API_KEY"]
         );
     }
