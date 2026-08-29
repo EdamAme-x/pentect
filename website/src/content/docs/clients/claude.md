@@ -103,6 +103,12 @@ confirmation for the Root store; Pentect does not bypass it, so this launch
 path is not suitable for unattended automation.
 :::
 
+Pentect monitors the local Claude App gateway for the entire Desktop session.
+If the gateway stops unexpectedly, Pentect terminates the Desktop process tree
+instead of leaving a broken protected session running, removes the temporary
+Windows certificate, and records `warning/claude-app` with
+`reason=gateway-stopped` in `pentect log`.
+
 Desktop protection affects only the launch started by Pentect. Test app
 discovery first. If Pentect cannot find the app, pass its path:
 

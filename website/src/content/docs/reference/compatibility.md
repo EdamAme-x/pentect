@@ -97,6 +97,8 @@ and removes the certificate on exit. The CA private key stays process-local.
 Windows may also show its own Root-store security confirmation, which Pentect
 does not suppress or bypass.
 Crash residue is journaled and removed before the next protected launch. This
+gateway is also monitored after startup; an unexpected gateway exit terminates
+the protected Desktop process and releases its temporary trust state. This
 path still requires a real-account release verification before it is listed as
 fully supported; use `pentect claude` for Claude Code when Desktop coverage is
 not acceptable.
