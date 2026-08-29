@@ -3331,10 +3331,15 @@ fn parse_path_permission(name: &str, value: &str) -> Result<PathPermission, Stri
             ))
         }
     };
-    let recursive = relative.ends_with("/**");
-    let relative = relative.strip_suffix("/**").unwrap_or(relative);
+    let recursive_root = matches!(relative, "**" | "/**");
+    let recursive = recursive_root || relative.ends_with("/**");
+    let relative = if recursive_root {
+        ""
+    } else {
+        relative.strip_suffix("/**").unwrap_or(relative)
+    };
     let relative = PathBuf::from(relative);
-    if relative.as_os_str().is_empty()
+    if (!recursive_root && relative.as_os_str().is_empty())
         || relative
             .components()
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
@@ -4805,6 +4810,64 @@ disk = "CPU: about 5 GB"
             Instant::now() + Duration::from_secs(5),
         );
         assert!(!denied_command.ok);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recursive_root_permissions_reach_nested_files_without_escaping_the_root() {
+        for value in ["project:**", "project:/**"] {
+            let permission = parse_path_permission("fixture", value).unwrap();
+            assert_eq!(permission.scope, PathScope::Project);
+            assert!(permission.relative.as_os_str().is_empty());
+            assert!(permission.recursive);
+        }
+        for value in ["plugin:**", "plugin:/**"] {
+            let permission = parse_path_permission("fixture", value).unwrap();
+            assert_eq!(permission.scope, PathScope::Plugin);
+            assert!(permission.relative.as_os_str().is_empty());
+            assert!(permission.recursive);
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "pentect-plugin-recursive-root-{}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        let plugin = root.join("plugin");
+        let storage = root.join("storage");
+        std::fs::create_dir_all(project.join("nested")).unwrap();
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(project.join("nested/visible.txt"), "visible").unwrap();
+        std::fs::write(root.join("outside.txt"), "hidden").unwrap();
+
+        let policy = PermissionPolicy {
+            name: "fixture".to_string(),
+            read: vec![parse_path_permission("fixture", "project:**").unwrap()],
+            write: Vec::new(),
+            env: BTreeSet::new(),
+            run: BTreeMap::new(),
+            storage: false,
+            project_root: project.canonicalize().unwrap(),
+            plugin_root: plugin.canonicalize().unwrap(),
+            storage_root: storage.canonicalize().unwrap(),
+        };
+        let nested = perform_host_request(
+            &policy,
+            HostRequest::FileRead {
+                path: "project:nested/visible.txt".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(nested.value, Some(Value::String("visible".to_string())));
+        let escaped = perform_host_request(
+            &policy,
+            HostRequest::FileRead {
+                path: "project:../outside.txt".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!escaped.ok);
         let _ = std::fs::remove_dir_all(root);
     }
 
