@@ -6,7 +6,7 @@
 
 <h1 align="center">Pentect</h1>
 
-<p align="center">AI can use your secrets without ever seeing them.</p>
+<p align="center">Local secret handles for supported AI tools.</p>
 
 <p align="center">
   <a href="https://pentect.dev/">Documentation</a> ·

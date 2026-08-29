@@ -2,7 +2,7 @@
 title: Docs - Pentect
 displayTitle: Docs_
 titleTemplate: false
-description: AI can use your secrets without ever seeing them.
+description: Local secret handles for supported AI tools.
 pageClass: docs-hub
 aside: false
 ---

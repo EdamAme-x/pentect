@@ -44,9 +44,11 @@ See [Compatibility](/reference/compatibility/) for the exact boundary.
 | Browser screenshots | Applies the configured OCR and unchecked-media policy before supported results reach the provider |
 | Unknown provider structures | Returns an error by default |
 
-Pentect checks for secrets and personal data. Supported config formats include
-dotenv, Terraform, Kubernetes Secrets, kubeconfig, AWS, npm, PyPI, JSON, and
-other key/value formats.
+Pentect runs a documented set of secret and personal-data detectors. Supported
+config formats include dotenv, Terraform, Kubernetes Secrets, kubeconfig, AWS,
+npm, PyPI, JSON, and other key/value formats. See
+[Detectors and evidence](/protection/detectors/) for the source, version,
+coverage, and limits of every built-in detector.
 
 The built-in personal-data detector covers email addresses, phone numbers,
 payment cards, IBANs, and selected strongly formatted national identifiers:

@@ -16,6 +16,6 @@
   <image href="pentect-logo-dark.png" x="76" y="78" width="116" height="116"/>
   <text x="76" y="352" fill="#f4f2ed" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="700" letter-spacing="-3">Docs - Pentect</text>
   <rect x="76" y="397" width="92" height="8" rx="4" fill="url(#orange)"/>
-  <text x="76" y="473" fill="#aaa8a5" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="400">AI can use your secrets without ever seeing them.</text>
+  <text x="76" y="473" fill="#aaa8a5" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="400">Local secret handles for supported AI tools.</text>
   <text x="1124" y="556" fill="#777679" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" text-anchor="end">pentect.dev</text>
 </svg>

@@ -8,9 +8,12 @@ project-specific rules and optional local models.
 
 ## Built-in protection
 
-The Pentect binary includes CredSweeper-derived secret rules, structured labels
-for dotenv, Terraform, Kubernetes, JSON, and other config formats, plus checks
-for supported documents and images. Plugins cannot disable these checks.
+The Pentect binary includes a native implementation driven by pinned
+CredSweeper assets, Pentect-maintained structured secret checks, and a bundled
+Alcatraz helper for selected personal-data types. These sources have different
+evidence and must not be described as one upstream detector. See
+[Detectors and evidence](/protection/detectors/) for the exact inventory and
+limits. Plugins cannot disable the built-in checks.
 
 ## Plugin catalog
 
