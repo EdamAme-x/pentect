@@ -1,3 +1,4 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -673,14 +674,21 @@ fn is_internal_host(host: &str) -> bool {
     if matches!(host.as_str(), "localhost" | "::1") {
         return true;
     }
-    if let Some((a, b, c, d)) = parse_ipv4(&host) {
-        return a == 10
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 127)
-            || (a == 169 && b == 254)
-            || (a == 100 && (64..=127).contains(&b))
-            || (a == 0 && b == 0 && c == 0 && d == 0);
+    if let Ok(address) = host.parse::<Ipv4Addr>() {
+        return is_internal_ipv4(address);
+    }
+    let ipv6_host = host
+        .split_once('%')
+        .map_or(host.as_str(), |(address, _)| address);
+    if let Ok(address) = ipv6_host.parse::<Ipv6Addr>() {
+        if let Some(mapped) = address.to_ipv4_mapped() {
+            return is_internal_ipv4(mapped);
+        }
+        let first = address.segments()[0];
+        return address.is_loopback()
+            || address.is_unspecified()
+            || first & 0xfe00 == 0xfc00
+            || first & 0xffc0 == 0xfe80;
     }
     if !host.contains('.') {
         return true;
@@ -696,6 +704,17 @@ fn is_internal_host(host: &str) -> bool {
     ]
     .iter()
     .any(|suffix| host.ends_with(suffix))
+}
+
+fn is_internal_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, d] = address.octets();
+    a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || a == 127
+        || (a == 169 && b == 254)
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 0 && b == 0 && c == 0 && d == 0)
 }
 
 fn endpoint_is_display_only(host: &str, text: &str, url_start: usize) -> bool {
@@ -1431,6 +1450,43 @@ mod tests {
         assert!(labels("http://jira/api/users/abc12345")
             .iter()
             .any(|(_, value)| value == "jira"));
+    }
+
+    #[test]
+    fn public_ipv6_urls_do_not_trigger_internal_endpoint_or_path_masking() {
+        for raw in [
+            "https://[2001:4860:4860::8888]/items/12345",
+            "http://[2606:4700:4700::1111]/status",
+            "https://[2001:db8::1]/docs/12345",
+            "https://[::ffff:8.8.8.8]/items/12345",
+        ] {
+            let got = labels(raw);
+            assert!(
+                got.iter()
+                    .all(|(label, _)| label != "INTERNAL_ENDPOINT" && label != "RESOURCE_ID"),
+                "{raw}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_ipv6_urls_remain_internal() {
+        for raw in [
+            "https://[fc00::1]/items/12345",
+            "https://[fd12:3456::1]/items/12345",
+            "https://[fe80::1%25eth0]/items/12345",
+            "https://[::ffff:10.0.0.5]/items/12345",
+        ] {
+            let got = labels(raw);
+            assert!(
+                got.iter().any(|(label, _)| label == "INTERNAL_ENDPOINT"),
+                "{raw}: {got:?}"
+            );
+            assert!(
+                got.iter().any(|(label, _)| label == "RESOURCE_ID"),
+                "{raw}: {got:?}"
+            );
+        }
     }
 
     #[test]
