@@ -3527,7 +3527,12 @@ fn pretool_rewrites_direct_read_tool_to_masked_copy() {
         .unwrap();
     let masked_path_buf = PathBuf::from(masked_path);
     assert!(
-        masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+        masked_path_buf.starts_with(
+            config::project_root()
+                .unwrap()
+                .join(".pentect")
+                .join("read")
+        ),
         "{masked_path}"
     );
     assert!(
@@ -3579,7 +3584,7 @@ fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
         let masked_path = paths[1].as_str().unwrap();
         let masked_path_buf = PathBuf::from(masked_path);
         assert!(
-            masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+            masked_path_buf.starts_with(project.join(".pentect").join("read")),
             "{masked_path}"
         );
         assert!(masked_path_buf.ends_with(&env), "{masked_path}");
@@ -3594,14 +3599,44 @@ fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
 
 #[test]
 fn masked_read_copy_path_mirrors_relative_paths() {
-    let path = masked_read_copy_path(Path::new("nested/.env"));
-    assert_eq!(
-        path,
-        Path::new(".pentect")
-            .join("read")
-            .join("nested")
-            .join(".env")
-    );
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-project-root");
+    let project = root.join("project");
+    let nested = project.join("src").join("nested");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let source = project.join("config.env");
+    std::fs::write(
+        &source,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+
+    let (relative_copy, absolute_copy) = {
+        let _cwd = enter_temp_cwd(&nested);
+        let session = Session::open_at(&project, "t").unwrap();
+        let relative = masked_read_copy(&session, Path::new("../../config.env").to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let absolute = masked_read_copy(&session, source.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        (relative, absolute)
+    };
+
+    let expected = project
+        .canonicalize()
+        .unwrap()
+        .join(".pentect")
+        .join("read")
+        .join("config.env");
+    assert_eq!(relative_copy, expected);
+    assert_eq!(absolute_copy, expected);
+    assert!(!nested.join(".pentect").exists());
+    assert!(std::fs::read_to_string(&expected)
+        .unwrap()
+        .contains("<<RUNPOD_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3638,10 +3673,11 @@ fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     };
 
     assert_ne!(first_masked, second_masked);
-    assert!(first_masked.starts_with(Path::new(".pentect").join("read").join("_external")));
-    assert!(second_masked.starts_with(Path::new(".pentect").join("read").join("_external")));
-    let first_text = std::fs::read_to_string(project.join(&first_masked)).unwrap();
-    let second_text = std::fs::read_to_string(project.join(&second_masked)).unwrap();
+    let external_root = project.join(".pentect").join("read").join("_external");
+    assert!(first_masked.starts_with(&external_root));
+    assert!(second_masked.starts_with(&external_root));
+    let first_text = std::fs::read_to_string(&first_masked).unwrap();
+    let second_text = std::fs::read_to_string(&second_masked).unwrap();
     assert!(first_text.contains("<<RUNPOD_API_KEY_"), "{first_text}");
     assert!(second_text.contains("<<OPENAI_API_KEY_"), "{second_text}");
     let _ = std::fs::remove_dir_all(root);
