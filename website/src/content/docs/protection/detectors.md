@@ -39,6 +39,14 @@ configuration, and configured candidate and line-data output field. Automated
 upstream updates regenerate that inventory and must pass the native/oracle gates
 before opening a pull request.
 
+Every stable release also runs the full 333-repository comparison and the
+complete filter/inventory and whole-pipeline fixture gates against the exact
+tagged commit. A value-free `pentect-credsweeper-compatibility.json` release
+asset records the tagged Pentect commit, pinned CredSweeper and CredData
+revisions, test date, runner platform, finding totals, bounded ML difference,
+and per-rule gaps. Release publication stops if the evidence does not match the
+tag or either implementation reports a finding the other one does not.
+
 ## Pentect-maintained detectors
 
 These detectors are maintained in this repository. They must not be attributed

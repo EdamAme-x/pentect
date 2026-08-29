@@ -48,6 +48,8 @@ class CredDataShardsTest(unittest.TestCase):
                         "common": repository_count,
                         "missing": 0,
                         "extra": 0,
+                        "ml_probability_max_delta": 0.00001,
+                        "ml_probability_tolerance": 0.0001,
                         "ml_probability_within_tolerance": True,
                         "by_rule": {
                             "Test Rule": {
@@ -62,14 +64,39 @@ class CredDataShardsTest(unittest.TestCase):
                 )
 
             output = workspace / "summary.json"
-            creddata_shards.summarize(source, artifacts, count=3, output=output)
+            creddata_shards.summarize(
+                source,
+                artifacts,
+                count=3,
+                output=output,
+                pentect_commit="a" * 40,
+                tested_ref="v9.8.7",
+                credsweeper_commit="b" * 40,
+                creddata_commit="c" * 40,
+                tested_at="2026-08-30T00:00:00Z",
+                runner_os="Linux",
+                runner_arch="X64",
+                workflow_run="https://github.com/example/project/actions/runs/123",
+            )
             summary = json.loads(output.read_text())
             self.assertEqual(summary["repositories"], len(snapshot))
             self.assertEqual(summary["shards"], 3)
             self.assertEqual(summary["credsweeper_version"], "v1.2.3")
             self.assertEqual(summary["missing"], 0)
             self.assertEqual(summary["extra"], 0)
-            self.assertEqual(summary["schema"], 2)
+            self.assertEqual(summary["schema"], 3)
+            self.assertEqual(summary["pentect"]["commit"], "a" * 40)
+            self.assertEqual(summary["pentect"]["ref"], "v9.8.7")
+            self.assertEqual(summary["reference"]["version"], "v1.2.3")
+            self.assertEqual(summary["reference"]["commit"], "b" * 40)
+            self.assertEqual(summary["corpus"]["commit"], "c" * 40)
+            self.assertEqual(
+                summary["environment"], {"os": "Linux", "architecture": "X64"}
+            )
+            self.assertTrue(all(summary["gates"].values()))
+            self.assertEqual(summary["ml_probability_max_delta"], 0.00001)
+            self.assertEqual(summary["ml_probability_tolerance"], 0.0001)
+            self.assertTrue(summary["ml_probability_within_tolerance"])
             rule = summary["by_rule"]["Test Rule"]
             self.assertEqual(rule["rust"], len(snapshot))
             self.assertEqual(rule["oracle"], len(snapshot))
