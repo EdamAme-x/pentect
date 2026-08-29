@@ -149,25 +149,11 @@ pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, Stri
     Ok(overrides)
 }
 
-pub(crate) fn has_authorization_override(specs: &[String]) -> bool {
+pub(crate) fn has_origin_auth_override(specs: &[String]) -> bool {
     std::env::var_os(AUTHORIZATION_ENV).is_some()
         || specs.iter().any(|spec| {
-            spec.split_once('=').is_some_and(|(name, _)| {
-                name.trim()
-                    .eq_ignore_ascii_case(reqwest::header::AUTHORIZATION.as_str())
-            })
-        })
-}
-
-pub(crate) fn has_google_api_key_override(specs: &[String]) -> bool {
-    std::env::var_os(AUTHORIZATION_ENV).is_some()
-        || specs.iter().any(|spec| {
-            spec.split_once('=').is_some_and(|(name, _)| {
-                matches!(
-                    name.trim().to_ascii_lowercase().as_str(),
-                    "authorization" | "x-goog-api-key"
-                )
-            })
+            spec.split_once('=')
+                .is_some_and(|(name, _)| is_replaceable_origin_auth_header(name.trim()))
         })
 }
 
@@ -263,7 +249,7 @@ pub(crate) fn header_source_env_name(spec: &str) -> Option<&str> {
     (!env_name.is_empty()).then_some(env_name)
 }
 
-fn is_origin_auth_header(name: &str) -> bool {
+pub(crate) fn is_origin_auth_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-api-key")
         || name.eq_ignore_ascii_case("api-key")
@@ -490,27 +476,35 @@ mod tests {
     }
 
     #[test]
-    fn authorization_override_detection_is_case_and_whitespace_insensitive() {
+    fn origin_auth_override_detection_is_case_and_whitespace_insensitive() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let _unset = EnvRestore::remove(AUTHORIZATION_ENV);
-        assert!(has_authorization_override(&[
+        assert!(has_origin_auth_override(&[
             "authorization=GATEWAY_AUTH".to_string()
         ]));
-        assert!(has_authorization_override(&[
+        assert!(has_origin_auth_override(&[
             " Authorization = GATEWAY_AUTH ".to_string()
         ]));
-        assert!(!has_authorization_override(&[
-            "x-api-key=GATEWAY_KEY".to_string()
+        for header in ["x-api-key", "api-key", "x-goog-api-key"] {
+            assert!(has_origin_auth_override(&[format!(
+                " {header} = GATEWAY_KEY "
+            )]));
+        }
+        assert!(!has_origin_auth_override(&["authorization".to_string()]));
+        assert!(!has_origin_auth_override(&[
+            "cookie=GATEWAY_COOKIE".to_string()
         ]));
-        assert!(!has_authorization_override(&["authorization".to_string()]));
+        assert!(!has_origin_auth_override(&[
+            "x-request-id=REQUEST_ID".to_string()
+        ]));
         {
             let _authorization = EnvRestore::set(AUTHORIZATION_ENV, "Bearer gateway-token");
-            assert!(has_authorization_override(&[]));
+            assert!(has_origin_auth_override(&[]));
         }
         {
             let _authorization = EnvRestore::set(AUTHORIZATION_ENV, "");
             assert!(
-                has_authorization_override(&[]),
+                has_origin_auth_override(&[]),
                 "an empty control value explicitly removes origin authorization"
             );
         }
@@ -707,7 +701,7 @@ mod tests {
         let _authorization = EnvRestore::remove(AUTHORIZATION_ENV);
         let _explicit = EnvRestore::set("PENTECT_TEST_GOOGLE_OVERRIDE", "explicit-test-key");
         let specs = ["x-goog-api-key=PENTECT_TEST_GOOGLE_OVERRIDE".to_string()];
-        assert!(has_google_api_key_override(&specs));
+        assert!(has_origin_auth_override(&specs));
         let overrides =
             header_overrides_with_google_api_key(&specs, Some("ignored-provider-key".to_string()))
                 .unwrap();
@@ -743,5 +737,29 @@ mod tests {
             .headers()
             .get(reqwest::header::AUTHORIZATION)
             .is_none());
+    }
+
+    #[test]
+    fn explicitly_configured_multiple_origin_auth_headers_are_preserved() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _bearer = EnvRestore::set("PENTECT_TEST_EXPLICIT_BEARER", "Bearer gateway-key");
+        let _native = EnvRestore::set("PENTECT_TEST_EXPLICIT_NATIVE", "native-provider-key");
+        let overrides = header_overrides(&[
+            "authorization=PENTECT_TEST_EXPLICIT_BEARER".to_string(),
+            "x-api-key=PENTECT_TEST_EXPLICIT_NATIVE".to_string(),
+        ])
+        .unwrap();
+        let request = overrides
+            .apply(reqwest::Client::new().get("https://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer gateway-key"
+        );
+        assert_eq!(
+            request.headers().get("x-api-key").unwrap(),
+            "native-provider-key"
+        );
     }
 }

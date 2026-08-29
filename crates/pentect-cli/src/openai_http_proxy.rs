@@ -3853,6 +3853,11 @@ mod tests {
             self.saved.push((name, std::env::var_os(name)));
             std::env::set_var(name, value);
         }
+
+        fn remove(&mut self, name: &'static str) {
+            self.saved.push((name, std::env::var_os(name)));
+            std::env::remove_var(name);
+        }
     }
 
     impl Drop for ProviderBoundaryTestEnv {
@@ -4182,6 +4187,58 @@ mod tests {
         assert!(!command.contains(&secret), "{command}");
         assert!(!command.contains(&handle), "{command}");
         assert!(command.contains("script-b64"), "{command}");
+    }
+
+    #[test]
+    fn explicit_native_auth_header_does_not_forward_ambient_openai_key() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let mut env = ProviderBoundaryTestEnv::install(&store);
+        env.remove("PENTECT_UPSTREAM_AUTHORIZATION");
+        env.set("OPENAI_API_KEY", "ambient-openai-key-must-not-leave");
+        env.set("PENTECT_TEST_NATIVE_KEY", "explicit-native-key");
+        let specs = ["x-api-key=PENTECT_TEST_NATIVE_KEY".to_string()];
+        let _authorization =
+            crate::upstream_bearer_guard(crate::provider_upstream_key_env_names(&specs));
+        let secret = ["rpa_", "AUTHBOUNDARY", "ZYXWVUTS", "1234567890"].concat();
+        let (upstream, captured, thread) = mock_chat_upstream();
+        let proxy = OpenAiHttpProxyGuard::start_with_header_env(upstream, &specs).unwrap();
+
+        reqwest::blocking::Client::new()
+            .post(format!("{}/v1/chat/completions", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "messages": [{
+                        "role": "user",
+                        "content": format!("Use RUNPOD_API_KEY={secret}")
+                    }]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let (headers, _) = captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-api-key: explicit-native-key")),
+            "{headers}"
+        );
+        assert!(
+            !headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
+            "ambient OpenAI authorization reached the upstream:\n{headers}"
+        );
+        assert!(!headers.contains("ambient-openai-key-must-not-leave"));
     }
 
     #[test]
