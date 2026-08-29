@@ -3937,7 +3937,7 @@ fn wrap_shell_command(
     tool_name: &str,
     masked_command: &str,
 ) -> Result<String, String> {
-    let shell = script_shell_for_tool(tool_name);
+    let shell = script_shell_for_tool(provider, tool_name);
     if matches!(provider, HookProvider::Claude | HookProvider::Generic)
         && matches!(shell, ScriptShell::Bash | ScriptShell::PowerShell)
     {
@@ -4047,8 +4047,9 @@ fn powershell_agent_script_fetch(suffix: &str, id: &str) -> String {
     )
 }
 
-fn script_shell_for_tool(tool_name: &str) -> ScriptShell {
+fn script_shell_for_tool(provider: HookProvider, tool_name: &str) -> ScriptShell {
     match tool_name.to_ascii_lowercase().as_str() {
+        "bash" if cfg!(windows) && provider == HookProvider::Generic => ScriptShell::PowerShell,
         "bash" => ScriptShell::Bash,
         "powershell" => ScriptShell::PowerShell,
         _ => ScriptShell::Native,
