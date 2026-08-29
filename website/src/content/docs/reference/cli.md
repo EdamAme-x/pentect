@@ -200,11 +200,24 @@ Treat redirected or in-place resolved output as plaintext secret material.
 | `pentect doctor --json` | Print results as JSON |
 | `pentect doctor --fix` | Show and apply approved fixes |
 | `pentect doctor --fix --yes` | Apply all offered fixes without another prompt |
-| `pentect update [VERSION]` | Update directly or through the recorded package manager |
+| `pentect update [VERSION]` | Install the latest release, or an exact published version for rollback |
 | `pentect update --check` | Check without installing |
 | `pentect update --force` | Reinstall even when the selected version is already present |
 | `pentect uninstall` | Remove Pentect but keep project data |
 | `pentect version` | Print the installed version |
+
+An explicit version is exact: `pentect update v0.0.69 --check` confirms that the
+published tag can be selected without downloading it, and
+`pentect update v0.0.69` downloads and installs that version. Exact selection
+may install a release marked as a prerelease, but never a draft. Installation
+still verifies the platform artifact against its published SHA-256 checksum.
+Pentect does not automatically move the installation back to the latest version
+afterward.
+
+Direct and npm installations perform the exact-version replacement. For apt,
+Homebrew, AUR, or another recorded package manager, Pentect stops and names the
+exact requested version instead of running a generic upgrade command that could
+silently select a different release.
 
 ## Plugins
 

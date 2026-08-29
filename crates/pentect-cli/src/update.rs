@@ -274,9 +274,12 @@ fn update(options: UpdateOptions) -> Result<(), String> {
     let release: Release = get_response(&client, &release_api, MAX_CHECKSUM_BYTES * 16)?;
     let allow_prerelease =
         std::env::var("PENTECT_UPDATE_ALLOW_PRERELEASE").is_ok_and(|value| value == "1");
-    if release.draft || (release.prerelease && !allow_prerelease) {
-        return Err("latest GitHub release is not a stable release".to_string());
-    }
+    validate_release_channel(
+        release.draft,
+        release.prerelease,
+        options.target.is_some(),
+        allow_prerelease,
+    )?;
     let latest = release_version(&release.tag_name)?;
     if options
         .target
@@ -298,7 +301,18 @@ fn update(options: UpdateOptions) -> Result<(), String> {
         println!("installed version {current} is newer than latest release {latest}");
         return Ok(());
     }
-    println!("update available: {current} -> {latest}");
+    let operation = if options.target.is_some() && latest < current {
+        "rollback"
+    } else {
+        "update"
+    };
+    println!("{operation} available: {current} -> {latest}");
+    if release.prerelease && options.target.is_some() && !allow_prerelease {
+        eprintln!(
+            "[pentect] selected explicitly published prerelease {}; exact-version checksum verification remains required",
+            release.tag_name
+        );
+    }
     if options.check {
         return Ok(());
     }
@@ -309,6 +323,12 @@ fn update(options: UpdateOptions) -> Result<(), String> {
     {
         if installation.manager == "npm" {
             return install_npm_update(&latest);
+        }
+        if options.target.is_some() {
+            return Err(format!(
+                "Pentect is managed by {}; install exact version {latest} with that package manager; the recorded update command was not run because it may select a different release",
+                installation.manager
+            ));
         }
         return Err(installation.update_message());
     }
@@ -346,6 +366,21 @@ fn update(options: UpdateOptions) -> Result<(), String> {
         ));
     }
     install_update(&bytes, &latest, &expected)
+}
+
+fn validate_release_channel(
+    draft: bool,
+    prerelease: bool,
+    exact_version: bool,
+    allow_prerelease: bool,
+) -> Result<(), String> {
+    if draft {
+        return Err("selected GitHub release is still a draft".to_string());
+    }
+    if prerelease && !exact_version && !allow_prerelease {
+        return Err("latest GitHub release is not a stable release".to_string());
+    }
+    Ok(())
 }
 
 fn install_npm_update(version: &Version) -> Result<(), String> {
@@ -835,6 +870,14 @@ mod tests {
             hash
         );
         assert!(parse_sha256("abc").is_err());
+    }
+
+    #[test]
+    fn exact_versions_can_select_published_prereleases_for_rollback() {
+        assert!(validate_release_channel(false, true, true, false).is_ok());
+        assert!(validate_release_channel(false, true, false, false).is_err());
+        assert!(validate_release_channel(true, false, true, false).is_err());
+        assert!(validate_release_channel(false, true, false, true).is_ok());
     }
 
     #[test]
