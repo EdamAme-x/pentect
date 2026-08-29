@@ -24,6 +24,21 @@ implementation consumes pinned upstream assets and reimplements their behavior
 in Rust. “CredSweeper-derived” therefore does not mean that every future,
 unseen, or unsupported input is proven identical to official CredSweeper.
 
+The binary embeds unchanged copies of the pinned upstream rule and scanner
+configuration, keyword and morpheme checklists, ONNX model and model
+configuration, and license. Rust code independently performs rule parsing,
+keyword-pattern expansion, candidate and line construction, regular-expression
+matching, filter-group expansion and filter execution, path and target checks,
+multiline and PEM handling, ML feature extraction and inference, and output-span
+construction. The official Python implementation is an Actions oracle; it is
+not installed or used by the released binary.
+
+The version-bound compatibility inventory records every source rule, its
+expanded runtime state, filter and filter group, rule type, ML-gated rule, model
+configuration, and configured candidate and line-data output field. Automated
+upstream updates regenerate that inventory and must pass the native/oracle gates
+before opening a pull request.
+
 ## Pentect-maintained detectors
 
 These detectors are maintained in this repository. They must not be attributed

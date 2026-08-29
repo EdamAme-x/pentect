@@ -78,7 +78,10 @@ def inventory() -> dict[str, Any]:
     rules = [Rule(config, raw) for raw in raw_rules]
     definitions: dict[str, dict[str, Any]] = {}
     rule_records = []
-    for rule in rules:
+    filter_groups: dict[str, set[str]] = {}
+    rule_types: dict[str, list[str]] = {}
+    ml_rules = []
+    for raw, rule in zip(raw_rules, rules):
         filter_ids = []
         for item in rule.filters:
             record = filter_record(item)
@@ -86,19 +89,51 @@ def inventory() -> dict[str, Any]:
             identifier = hashlib.sha256(canonical.encode()).hexdigest()
             definitions[identifier] = record
             filter_ids.append(identifier)
+        raw_filter_type = raw.get(Rule.FILTER_TYPE)
+        if isinstance(raw_filter_type, str):
+            filter_groups.setdefault(raw_filter_type, set()).update(filter_ids)
+        rule_types.setdefault(rule.rule_type.value, []).append(rule.rule_name)
+        if rule.use_ml:
+            ml_rules.append(rule.rule_name)
         rule_records.append(
             {
                 "name": rule.rule_name,
                 "type": rule.rule_type.value,
                 "filters": filter_ids,
+                "source": stable_value(raw),
+                "runtime": {
+                    "confidence": rule.confidence.value,
+                    "min_line_len": rule.min_line_len,
+                    "patterns": stable_value(rule.patterns),
+                    "required_regex": stable_value(rule.required_regex),
+                    "required_substrings": sorted(rule.required_substrings),
+                    "severity": rule.severity.value,
+                    "target": stable_value(rule.target),
+                    "use_ml": rule.use_ml,
+                },
             }
         )
     filter_classes = sorted({record["class"] for record in definitions.values()})
     return {
+        "schema": 2,
         "credsweeper_version": __import__("credsweeper").__version__,
         "rule_count": len(rules),
         "filter_classes": filter_classes,
         "filter_definitions": dict(sorted(definitions.items())),
+        "filter_groups": {
+            name: sorted(identifiers) for name, identifiers in sorted(filter_groups.items())
+        },
+        "ml": {
+            "config": stable_value(Util.json_load(APP_PATH / "ml_model" / "ml_config.json")),
+            "rules": sorted(ml_rules),
+        },
+        "output_fields": {
+            "candidate": list(config.candidate_output),
+            "line_data": list(config.line_data_output),
+        },
+        "rule_types": {
+            name: sorted(rule_names) for name, rule_names in sorted(rule_types.items())
+        },
         "rules": rule_records,
     }
 
