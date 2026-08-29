@@ -140,6 +140,7 @@ pub(crate) fn is_reserved_child_env_name(name: &str) -> bool {
 /// prefix, so the boundary is an explicit case-insensitive list rather than a
 /// blanket prefix ban.
 const PENTECT_CONTROL_ENV_NAMES: &[&str] = &[
+    // Process and session control.
     "PENTECT_BIN",
     "PENTECT_AGENT_LAUNCHED",
     "PENTECT_MEMORY_STORE_ADDR",
@@ -159,8 +160,18 @@ const PENTECT_CONTROL_ENV_NAMES: &[&str] = &[
     "PENTECT_HOME",
     "PENTECT_SESSION",
     "PENTECT_FILE_POINTER_MANAGER_DIR",
+    "PENTECT_LOG_DIR",
+    // Client routing and generated child configuration. Launchers that need
+    // these values set a fresh value after inherited controls are removed.
     "PENTECT_CODEX",
     "PENTECT_CLAUDE",
+    "PENTECT_ANTHROPIC_UPSTREAM",
+    "PENTECT_JUNIE_API_KEY",
+    "PENTECT_PROXY_URL",
+    "PENTECT_PROVIDER_MODEL",
+    "PENTECT_PROVIDER_API",
+    "PENTECT_GATEWAY_API_KEY",
+    "PENTECT_API_KEY",
     "PENTECT_UPSTREAM_AUTHORIZATION",
     "PENTECT_UPSTREAM_CA_CERT",
     "PENTECT_UPSTREAM_IDENTITY",

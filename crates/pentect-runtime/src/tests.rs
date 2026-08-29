@@ -1608,6 +1608,27 @@ fn session_environment_name_is_reserved_for_internal_use() {
         "PENTECT_GLOBAL_PLUGIN_BINARIES"
     ));
     assert!(is_pentect_control_env_name("pentect_global_plugin_ids"));
+    for name in [
+        "PENTECT_ANTHROPIC_UPSTREAM",
+        "PENTECT_JUNIE_API_KEY",
+        "PENTECT_PROXY_URL",
+        "PENTECT_PROVIDER_MODEL",
+        "PENTECT_PROVIDER_API",
+        "PENTECT_GATEWAY_API_KEY",
+        "PENTECT_API_KEY",
+        "PENTECT_LOG_DIR",
+    ] {
+        assert!(is_pentect_control_env_name(name), "{name}");
+        assert!(is_pentect_control_env_name(&name.to_ascii_lowercase()));
+    }
+    for name in [
+        "PENTECT_PI_REASONING",
+        "PENTECT_PI_CONTEXT_WINDOW",
+        "PENTECT_PI_MAX_TOKENS",
+        "PENTECT_PI_INPUTS",
+    ] {
+        assert!(!is_pentect_control_env_name(name), "{name}");
+    }
     let mut names = pentect_control_env_names().to_vec();
     names.sort_unstable();
     names.dedup();
