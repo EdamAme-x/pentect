@@ -165,7 +165,7 @@ fn write_update_check_cache(path: &Path, cache: &UpdateCheckCache) -> Result<(),
         .map_err(|error| format!("could not create update-check cache directory: {error}"))?;
     let bytes = serde_json::to_vec(cache)
         .map_err(|error| format!("could not encode update-check cache: {error}"))?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let temporary = update_cache_staging_path(path)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -176,6 +176,7 @@ fn write_update_check_cache(path: &Path, cache: &UpdateCheckCache) -> Result<(),
     let mut file = options
         .open(&temporary)
         .map_err(|error| format!("could not create update-check cache: {error}"))?;
+    let cleanup = RemoveFileOnDrop(temporary.clone());
     use std::io::Write;
     file.write_all(&bytes)
         .and_then(|_| file.sync_data())
@@ -185,7 +186,28 @@ fn write_update_check_cache(path: &Path, cache: &UpdateCheckCache) -> Result<(),
         let _ = std::fs::remove_file(path);
     }
     std::fs::rename(&temporary, path)
-        .map_err(|error| format!("could not publish update-check cache: {error}"))
+        .map_err(|error| format!("could not publish update-check cache: {error}"))?;
+    drop(cleanup);
+    Ok(())
+}
+
+fn update_cache_staging_path(path: &Path) -> Result<PathBuf, String> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| format!("OS CSPRNG unavailable for update-check cache: {error}"))?;
+    Ok(path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        data_encoding::HEXLOWER.encode(&nonce)
+    )))
+}
+
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -898,15 +920,37 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "pentect-update-cache-test-{}-{}",
             std::process::id(),
-            unix_seconds()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join(UPDATE_CHECK_CACHE);
+        let stale = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&stale, b"stale crashed process").unwrap();
         let cache = UpdateCheckCache {
             checked_at: 123,
             latest: "1.2.3".to_string(),
         };
         write_update_check_cache(&path, &cache).unwrap();
+        assert!(
+            stale.is_file(),
+            "must not delete another process's staging file"
+        );
+        let random_staging_prefix = path
+            .with_extension(format!("tmp-{}-", std::process::id()))
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let random_staging_files = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&random_staging_prefix))
+            .collect::<Vec<_>>();
+        assert!(random_staging_files.is_empty(), "{random_staging_files:?}");
         let loaded = read_update_check_cache(&path).unwrap();
         assert_eq!(loaded.checked_at, 123);
         assert_eq!(loaded.latest, "1.2.3");
