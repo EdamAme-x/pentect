@@ -7137,6 +7137,14 @@ mod tests {
                 "SENTRY_USER_AUTH_TOKEN",
                 ["sntryu_", "b42e3f39e6e16d5c822ac2e6ae368a1bc24fd9678bc6a6411926acdafea59851"].concat(),
             ),
+            (
+                "SUPABASE_CREDENTIALS",
+                ["sbp_", "7558c5a93d6f38dd038df5cc2a7c3d4d7b6bc76d"].concat(),
+            ),
+            (
+                "SUPABASE_CREDENTIALS",
+                ["sbp_", "v0_", "7558c5a93d6f38dd038df5cc2a7c3d4d7b6bc76d"].concat(),
+            ),
         ];
         let detector = CredSweeperNativeDetector::builtin();
 
