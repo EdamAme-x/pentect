@@ -253,8 +253,12 @@ fn ensure_extracted() -> Result<PathBuf, String> {
         .join("alcatraz")
         .join(VERSION)
         .join(EXPECTED_SHA256);
-    fs::create_dir_all(&root).map_err(|e| format!("could not create '{}': {e}", root.display()))?;
-    restrict_directory(&root)?;
+    ensure_extracted_at(&root)
+}
+
+fn ensure_extracted_at(root: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(root).map_err(|e| format!("could not create '{}': {e}", root.display()))?;
+    restrict_directory(root)?;
     let destination = root.join(if cfg!(windows) {
         "alcatraz.exe"
     } else {
@@ -268,21 +272,21 @@ fn ensure_extracted() -> Result<PathBuf, String> {
     if bytes.len() != UNCOMPRESSED_SIZE || sha256_hex(&bytes) != EXPECTED_SHA256 {
         return Err("embedded Alcatraz integrity check failed".to_string());
     }
-    let temporary = root.join(format!(".alcatraz-{}.tmp", std::process::id()));
+    let temporary = alcatraz_staging_path(root)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(|e| format!("could not stage '{}': {e}", temporary.display()))?;
+    let cleanup = RemoveFileOnDrop(temporary.clone());
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|e| format!("could not write '{}': {e}", temporary.display()))?;
+    drop(file);
     make_executable(&temporary)?;
     match fs::rename(&temporary, &destination) {
         Ok(()) => {}
-        Err(_) if valid_file(&destination)? => {
-            let _ = fs::remove_file(&temporary);
-        }
+        Err(_) if valid_file(&destination)? => {}
         Err(error) => {
             return Err(format!(
                 "could not install '{}': {error}",
@@ -290,7 +294,27 @@ fn ensure_extracted() -> Result<PathBuf, String> {
             ))
         }
     }
+    drop(cleanup);
     Ok(destination)
+}
+
+fn alcatraz_staging_path(root: &Path) -> Result<PathBuf, String> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| format!("OS CSPRNG unavailable for Alcatraz staging: {error}"))?;
+    Ok(root.join(format!(
+        ".alcatraz-{}-{}.tmp",
+        std::process::id(),
+        data_encoding::HEXLOWER.encode(&nonce)
+    )))
+}
+
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn valid_file(path: &Path) -> Result<bool, String> {
@@ -363,6 +387,39 @@ fn make_executable(_: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_pid_staging_file_does_not_block_extraction() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-alcatraz-stale-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = root.join(format!(".alcatraz-{}.tmp", std::process::id()));
+        std::fs::write(&stale, b"stale crashed process").unwrap();
+
+        let extracted = ensure_extracted_at(&root).unwrap();
+        assert!(valid_file(&extracted).unwrap());
+        assert!(
+            stale.is_file(),
+            "must not delete another process's staging file"
+        );
+        let random_staging_files = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(&format!(".alcatraz-{}-", std::process::id()))
+                    && name.ends_with(".tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(random_staging_files.is_empty(), "{random_staging_files:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn chunk_ranges_are_bounded_overlapping_and_utf8_aligned() {
