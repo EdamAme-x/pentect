@@ -3554,10 +3554,24 @@ fn valid_pem_private_key_block(block: &str) -> bool {
 
     let mut key_data = String::new();
     let mut saw_end = false;
+    let is_openpgp = block.contains("-----BEGIN PGP ");
+    let mut in_openpgp_headers = is_openpgp;
     for line in text.lines() {
         let line = sanitize_pem_line(line, 5);
+        if line.contains("-----BEGIN") {
+            continue;
+        }
+        if in_openpgp_headers {
+            if line.is_empty() {
+                in_openpgp_headers = false;
+                continue;
+            }
+            if is_openpgp_armor_header(&line) {
+                continue;
+            }
+            in_openpgp_headers = false;
+        }
         if line.is_empty()
-            || line.contains("-----BEGIN")
             || line.contains("Proc-Type")
             || line.contains("Version")
             || line.contains("DEK-Info")
@@ -3577,6 +3591,16 @@ fn valid_pem_private_key_block(block: &str) -> bool {
         key_data.push_str(&line);
     }
     saw_end && pem_payload_is_valid(block, &key_data)
+}
+
+fn is_openpgp_armor_header(line: &str) -> bool {
+    let Some((name, _)) = line.split_once(':') else {
+        return false;
+    };
+    matches!(
+        name.trim(),
+        "Version" | "Comment" | "MessageID" | "Hash" | "Charset"
+    )
 }
 
 fn asn1_size(data: &[u8]) -> Option<usize> {
@@ -7365,7 +7389,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let raw = format!(
-                "-----BEGIN {armor_name}-----\nVersion: GnuPG v2\n\n{body}\n=Ab3d\n-----END {armor_name}-----"
+                "-----BEGIN {armor_name}-----\nVersion: GnuPG v2\nComment: generated fixture\nMessageID: test@example.invalid\nHash: SHA256\nCharset: UTF-8\n\n{body}\n=Ab3d\n-----END {armor_name}-----"
             );
             let input_region = region(&raw);
             let view = NormalizedView::build(&input_region, &raw);
