@@ -313,6 +313,10 @@ fn run(args: Vec<String>) -> Option<i32> {
     {
         panic!("forced test panic with payload that must not be persisted");
     }
+    if let Some(help) = subcommand_help(&args) {
+        print!("{help}");
+        return None;
+    }
     let inherited_env_is_trusted =
         command_uses_agent_runtime(&args) && pentect_agent::active_memory_store_ready();
     update::start_update_notification(&args);
@@ -398,6 +402,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some(command) => match client_descriptor::find(command) {
             Some(tool) => return Some(cmd_agent_tool(tool, &args)),
             None => {
+                eprintln!("[pentect] unknown command: {command}");
                 usage();
                 return Some(2);
             }
@@ -445,6 +450,110 @@ fn usage() {
 
 fn cmd_help() {
     print!("{}", help_text());
+}
+
+fn subcommand_help(args: &[String]) -> Option<String> {
+    let command = args.get(1).map(String::as_str)?;
+    if command == "plugins" {
+        return plugin_help_request(args);
+    }
+    if matches!(command, "codex" | "claude")
+        && args.get(2).is_some_and(|value| value == "app")
+        && contains_help_flag(&args[3..])
+    {
+        return Some(app_help_text(command));
+    }
+    if matches!(command, "codex-app" | "claude-app") && contains_help_flag(&args[2..]) {
+        return Some(app_help_text(command.trim_end_matches("-app")));
+    }
+    let asks_for_help = if command == "exec" {
+        args.get(2).is_some_and(|value| is_help_flag(value))
+    } else {
+        contains_help_flag(&args[2..])
+    };
+    if !asks_for_help {
+        return None;
+    }
+    COMMANDS
+        .iter()
+        .find(|spec| spec.name == command && spec.audience != CommandAudience::Internal)
+        .map(command_help_text)
+}
+
+fn is_help_flag(value: &str) -> bool {
+    matches!(value, "--help" | "-h")
+}
+
+fn contains_help_flag(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|value| value.as_str() != "--")
+        .any(|value| is_help_flag(value))
+}
+
+fn command_help_text(spec: &CommandSpec) -> String {
+    format!("Usage: {}\n\n{}\n", spec.usage, spec.summary)
+}
+
+fn app_help_text(client: &str) -> String {
+    format!(
+        "Usage: pentect {client} app [--check | --app PATH | --install-launcher | --remove-launcher] [--plugins SOURCE]\n"
+    )
+}
+
+fn plugin_help_request(args: &[String]) -> Option<String> {
+    const ACTIONS: &[(&str, &str)] = &[
+        (
+            "add",
+            "pentect plugins add SOURCE [--project] [--profile PROFILE] [--yes] [--json]",
+        ),
+        (
+            "config",
+            "pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY] [--project] [--json]",
+        ),
+        ("dev", "pentect plugins dev NAME|PATH [--yes] [--json]"),
+        ("inspect", "pentect plugins inspect NAME|PATH [--json]"),
+        ("list", "pentect plugins list [--json]"),
+        (
+            "new",
+            "pentect plugins new NAME [manifest|wasm|command] [--json]",
+        ),
+        ("publish", "pentect plugins publish NAME|PATH [--json]"),
+        (
+            "remove",
+            "pentect plugins remove NAME|PATH [--project] [--json]",
+        ),
+        ("search", "pentect plugins search [QUERY] [--json]"),
+        (
+            "setup",
+            "pentect plugins setup NAME|PATH [--project] [--profile PROFILE] [--yes] [--json]",
+        ),
+        ("test", "pentect plugins test NAME|PATH [--json]"),
+        (
+            "update",
+            "pentect plugins update [NAME|PATH] [--project] [--yes] [--json]",
+        ),
+    ];
+    if args.get(1).map(String::as_str) != Some("plugins") {
+        return None;
+    }
+    if args.get(2).is_some_and(|value| is_help_flag(value)) {
+        return Some(format!(
+            "Usage: pentect plugins <COMMAND>\n\nCommands: {}\n",
+            ACTIONS
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !contains_help_flag(args.get(3..).unwrap_or(&[])) {
+        return None;
+    }
+    let action = args.get(2)?;
+    ACTIONS
+        .iter()
+        .find(|(known, _)| known == action)
+        .map(|(_, usage)| format!("Usage: {usage}\n"))
 }
 
 fn help_text() -> String {
@@ -3534,6 +3643,25 @@ mod tests {
                 command.name
             );
         }
+    }
+
+    #[test]
+    fn pentect_help_does_not_consume_client_help_flags() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(subcommand_help(&args(&["pentect", "codex", "--help"])).is_none());
+        assert!(subcommand_help(&args(&["pentect", "claude", "-h"])).is_none());
+        assert!(subcommand_help(&args(&["pentect", "exec", "echo", "--help"])).is_none());
+        assert!(subcommand_help(&args(&["pentect", "codex", "app", "--help"])).is_some());
+        assert!(subcommand_help(&args(&["pentect", "claude", "app", "-h"])).is_some());
+        assert!(subcommand_help(&args(&["pentect", "doctor", "--json", "--help"])).is_some());
+        assert!(
+            subcommand_help(&args(&["pentect", "plugins", "add", "fixture", "--help"])).is_some()
+        );
     }
 
     #[test]
