@@ -54,7 +54,7 @@ export function retryableStatus(status) {
   return status === 408 || status === 429 || status >= 500;
 }
 
-export async function fetchWithRetry(url, options = {}) {
+export async function downloadWithRetry(url, options = {}) {
   const request = options.request || globalThis.fetch;
   const wait = options.wait || ((milliseconds) => new Promise(
     (resolveDelay) => setTimeout(resolveDelay, milliseconds),
@@ -68,9 +68,24 @@ export async function fetchWithRetry(url, options = {}) {
         headers: { 'user-agent': 'pentect-npm-installer' },
         signal: timeout(),
       });
-      if (!retryableStatus(response.status) || attempt === 3) return response;
-      await response.body?.cancel();
-      lastError = new Error(`Download failed (${response.status} ${response.statusText})`);
+      if (!response.ok) {
+        await response.body?.cancel();
+        if (!retryableStatus(response.status) || attempt === 3) {
+          return {
+            ok: false,
+            status: response.status,
+            statusText: response.statusText,
+          };
+        }
+        lastError = new Error(`Download failed (${response.status} ${response.statusText})`);
+      } else {
+        return {
+          ok: true,
+          status: response.status,
+          statusText: response.statusText,
+          bytes: Buffer.from(await response.arrayBuffer()),
+        };
+      }
     } catch (error) {
       lastError = error;
       if (attempt === 3) throw error;
@@ -81,14 +96,14 @@ export async function fetchWithRetry(url, options = {}) {
 }
 
 async function download(url) {
-  const response = await fetchWithRetry(url);
+  const response = await downloadWithRetry(url);
   if (!response.ok) throw new Error(`Download failed (${response.status} ${response.statusText})`);
-  return Buffer.from(await response.arrayBuffer());
+  return response.bytes;
 }
 
 async function downloadBinary(base, asset) {
-  const compressed = await fetchWithRetry(`${base}/${asset}.gz`);
-  if (compressed.ok) return gunzipSync(Buffer.from(await compressed.arrayBuffer()));
+  const compressed = await downloadWithRetry(`${base}/${asset}.gz`);
+  if (compressed.ok) return gunzipSync(compressed.bytes);
   if (compressed.status !== 404) {
     throw new Error(`Download failed (${compressed.status} ${compressed.statusText})`);
   }
