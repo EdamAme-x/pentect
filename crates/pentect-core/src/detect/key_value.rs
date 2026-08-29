@@ -898,6 +898,9 @@ fn trim_key_edge(value: &str) -> &str {
 }
 
 fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
+    if let Some(kind) = localized_sensitive_key_kind(key) {
+        return Some(kind);
+    }
     let name = normalize_key(key);
     if name.is_empty() || is_explicitly_non_sensitive_key(&name) {
         return None;
@@ -983,6 +986,27 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
         return Some(KeyKind::Strong);
     }
     None
+}
+
+fn localized_sensitive_key_kind(key: &str) -> Option<KeyKind> {
+    // Keep this lookup local to structured key/value detection. The shared
+    // identifier normalizer intentionally produces ASCII names for its rule
+    // tables, so changing it to retain arbitrary Unicode would alter unrelated
+    // allowlists and source-code heuristics.
+    let name = key
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect::<String>();
+    match name.as_str() {
+        "パスワード" | "暗証番号" | "秘密鍵" | "シークレット" | "合言葉" => {
+            Some(KeyKind::Strong)
+        }
+        "トークン" => Some(KeyKind::Token),
+        "認証コード" | "確認コード" | "ワンタイムパスワード" | "ワンタイムコード" => {
+            Some(KeyKind::Otp)
+        }
+        _ => None,
+    }
 }
 
 fn trailing_sensitive_key_kind(key: &str) -> Option<KeyKind> {
@@ -7719,6 +7743,41 @@ mod tests {
         assert!(has(r#"password = "6.hours""#, "6.hours"));
         assert!(has(r#"password1: "munpsmt""#, "munpsmt"));
         assert!(has(r#"new_password2: "kmyhawmjaydc""#, "kmyhawmjaydc"));
+    }
+
+    #[test]
+    fn masks_japanese_sensitive_keyed_values() {
+        for (raw, value) in [
+            (
+                r#"パスワード = "mySecretPassword1234""#,
+                "mySecretPassword1234",
+            ),
+            (
+                r#"秘密鍵: "mySecretPrivateKey1234""#,
+                "mySecretPrivateKey1234",
+            ),
+            (
+                r#"シークレット = "mySecretToken12345""#,
+                "mySecretToken12345",
+            ),
+            (r#"トークン: "tok_AbCdEf123456""#, "tok_AbCdEf123456"),
+            (r#"暗証番号 = "847291""#, "847291"),
+            (r#"合言葉: "blue-orchid-2026""#, "blue-orchid-2026"),
+            (r#"認証コード = "A7C9D2""#, "A7C9D2"),
+            (r#"確認 コード: "519204""#, "519204"),
+            (r#"ワンタイムパスワード = "827361""#, "827361"),
+        ] {
+            assert!(has(raw, value), "expected to mask {value:?} in {raw:?}");
+        }
+
+        assert!(!has(
+            r#"公開鍵 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5""#,
+            "ssh-ed25519"
+        ));
+        assert!(!has(
+            r#"パスワードの説明 = "設定画面に表示する文言""#,
+            "設定画面に表示する文言"
+        ));
     }
 
     #[test]
