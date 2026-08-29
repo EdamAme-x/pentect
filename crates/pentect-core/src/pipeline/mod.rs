@@ -2503,6 +2503,26 @@ mod tests {
     }
 
     #[test]
+    fn text_mode_masks_twilio_auth_token_environment_assignment() {
+        for value in [
+            "0123456789abcdef0123456789abcdef",
+            "7f3a9c2e8b1d4f6a0c5e9b2d7a4f8c1e",
+        ] {
+            let raw = format!("TWILIO_AUTH_TOKEN={value}");
+            let result = Engine::with_profile(Profile::Strict)
+                .mask(Input::text(&raw), &Config::insecure_testing());
+            assert_eq!(result.summary.masked_count, 1, "{}", result.masked);
+            assert!(
+                result.masked.starts_with("TWILIO_AUTH_TOKEN=<<") && result.masked.ends_with(">>"),
+                "{}",
+                result.masked
+            );
+            assert!(!result.masked.contains(value), "{}", result.masked);
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+        }
+    }
+
+    #[test]
     fn structured_credentials_mask_only_credential_fields() {
         let raw = concat!(
             "[pypi]\n",
