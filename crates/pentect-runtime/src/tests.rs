@@ -4576,10 +4576,37 @@ fn generic_bridge_bash_uses_the_host_shell() {
         "printf '%s\\n' ok",
     )
     .unwrap();
-    assert!(command.contains("eval"), "{command}");
     assert!(command.contains("__agent-script"), "{command}");
-    assert!(command.contains("__agent-stream"), "{command}");
     assert!(!command.contains("--script-shell"), "{command}");
+    if cfg!(windows) {
+        assert!(command.contains("Invoke-Expression"), "{command}");
+        assert!(command.contains("SCRIPT_RENDER"), "{command}");
+        assert!(!command.contains("set +x"), "{command}");
+    } else {
+        assert!(command.contains("eval"), "{command}");
+        assert!(command.contains("__agent-stream"), "{command}");
+    }
+}
+
+#[test]
+fn only_windows_generic_bash_uses_powershell_semantics() {
+    let expected = if cfg!(windows) {
+        ScriptShell::PowerShell
+    } else {
+        ScriptShell::Bash
+    };
+    assert_eq!(
+        script_shell_for_tool(HookProvider::Generic, "bash"),
+        expected
+    );
+    assert_eq!(
+        script_shell_for_tool(HookProvider::Claude, "Bash"),
+        ScriptShell::Bash
+    );
+    assert_eq!(
+        script_shell_for_tool(HookProvider::Generic, "PowerShell"),
+        ScriptShell::PowerShell
+    );
 }
 
 #[cfg(windows)]
