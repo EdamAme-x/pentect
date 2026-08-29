@@ -25,6 +25,21 @@ try {
     if ($arm64 -ne 'Arm64') {
         throw "expected Arm64 fallback result, received $arm64"
     }
+
+    $marker = Join-Path ([System.IO.Path]::GetTempPath()) ("pentect-marker-test-" + [guid]::NewGuid() + '.json')
+    try {
+        Write-PentectManagedInstallMarker -Path $marker -PathAdded $true
+        $bytes = [System.IO.File]::ReadAllBytes($marker)
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            throw 'managed installation marker contains a UTF-8 BOM'
+        }
+        $decoded = Get-Content -Raw -LiteralPath $marker | ConvertFrom-Json
+        if ($decoded.manager -ne 'pentect' -or -not [bool]$decoded.path_added) {
+            throw 'managed installation marker has unexpected contents'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
+    }
 } finally {
     $env:PENTECT_INSTALL_DRY_RUN = $savedDryRun
     $env:PENTECT_INSTALL_SKIP_PATH = $savedSkipPath
