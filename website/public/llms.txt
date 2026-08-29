@@ -13,6 +13,7 @@ Canonical documentation:
 - /clients/claude/
 - /clients/upstreams/
 - /protection/structured-data/
+- /protection/detectors/
 - /protection/files-and-images/
 - /protection/security-model/
 - /plugins/overview/
@@ -28,5 +29,7 @@ Important behavior:
 - Handles are references, not plaintext and not authorization grants.
 - Unknown provider formats block by default.
 - No detector can guarantee perfect secret or PII detection.
+- CredSweeper compatibility is measured on named test corpora; it is not a
+  general parity guarantee.
 
 Source: https://github.com/EdamAme-x/pentect

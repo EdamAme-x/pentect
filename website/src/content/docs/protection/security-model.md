@@ -13,12 +13,13 @@ permissions.
 
 ## Security properties
 
-- Pentect replaces sensitive values before supported requests leave the local
-  process.
+- Pentect replaces values found by its enabled detectors before supported
+  requests leave the local process.
 - Data needed to restore a handle stays in the local Pentect session. It is not
   added to the model request.
 - Pentect restores known handles only before supported local tools run.
-- Tool output is masked before it returns to the provider.
+- Tool output passes through the same detector configuration before it returns
+  to the provider.
 - Supported MCP and connector text and structured data are checked before they
   enter the next provider request. Media follows the configured OCR and
   `unscanned` policy; allowing unchecked media can bypass inspection.
@@ -90,6 +91,11 @@ a remote service.
 - Revoking a secret already inherited by a child or daemon started by an
   approved command
 - Proof that every OCR engine or detector will find every sensitive value
+
+The exact built-in detector inventory, its upstream versions, and the evidence
+behind each coverage statement are published in
+[Detectors and evidence](/protection/detectors/). Passing a named corpus does
+not prove equivalent behavior for every possible input.
 
 ## Compatibility mode
 
