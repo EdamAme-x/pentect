@@ -7088,13 +7088,18 @@ mod tests {
     }
 
     #[test]
-    fn value_discord_bot_requires_numeric_id_and_signature_entropy() {
-        assert!(!value_discord_bot_filtered(
-            "MTIzNDU2Nzg5MA.abcdefghijklmnopqrstuvwxyz012345"
-        ));
+    fn value_discord_bot_matches_upstream_fixture_and_entropy_filter() {
+        assert!(!value_discord_bot_filtered(concat!(
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.E2-E4_.",
+            "Zig9V5mpMk-JybgCFvqSfgY9EoqWjkA5O_qDje"
+        )));
         assert!(value_discord_bot_filtered(
             "OTk5.abcdefghijklmnopqrstuvwxyz012345"
         ));
+        assert!(value_discord_bot_filtered(concat!(
+            "MTA1NDMyMTA5ODc2NTQzMjEwMA.GAxYzA.",
+            "dGVzdHNpZ25hdHVyZXRlc3RzaWduYXR1cmUxMjM"
+        )));
         assert!(value_discord_bot_filtered("MTIzNDU2Nzg5MA.aaaaaaaaaaaa"));
         assert!(value_discord_bot_filtered("not-a-token"));
     }
