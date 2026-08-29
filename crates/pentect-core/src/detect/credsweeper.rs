@@ -3018,11 +3018,15 @@ fn aws_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
         text,
         &AWS_ID,
         |line_start, line, anchor| {
+            let local_start = anchor.start - line_start;
             let local_end = anchor.end - line_start;
-            !line
-                .as_bytes()
-                .get(local_end)
-                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            !value_pattern_filtered(anchor.value, None)
+                && !morphemes_filtered(anchor.value, None)
+                && !base64_part_filtered(line, anchor.value, local_start, local_end)
+                && !line
+                    .as_bytes()
+                    .get(local_end)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
         },
         |line_start, line, anchor| {
             regex_line_data(line_start, line, &AWS_SECRET)
@@ -3061,11 +3065,15 @@ fn alibaba_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
         text,
         &ALIBABA_ID,
         |line_start, line, anchor| {
+            let local_start = anchor.start - line_start;
             let local_end = anchor.end - line_start;
-            !line
-                .as_bytes()
-                .get(local_end)
-                .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'+' | b'-'))
+            !value_pattern_filtered(anchor.value, None)
+                && !morphemes_filtered(anchor.value, None)
+                && !base64_part_filtered(line, anchor.value, local_start, local_end)
+                && !line
+                    .as_bytes()
+                    .get(local_end)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'+' | b'-'))
         },
         |line_start, line, anchor| {
             regex_line_data(line_start, line, &ALIBABA_SECRET)
@@ -3099,7 +3107,7 @@ fn google_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
     multi_pattern_candidates(
         text,
         &GOOGLE_CLIENT_ID,
-        |_, _, _| true,
+        |_, _, anchor| !value_pattern_filtered(anchor.value, None),
         |line_start, line, anchor| {
             regex_line_data(line_start, line, &GOOGLE_SECRET)
                 .into_iter()
@@ -7816,17 +7824,17 @@ mod tests {
     #[test]
     fn alibaba_multi_reports_the_secret_paired_with_an_access_key_id() {
         let raw = concat!(
-            "access_key_id = LTAI1234567890ABCDEF\n",
-            "access_key_secret = AbCdEfGhIjKlMnOpQrStUvWxYz1234\n",
+            "access_key_id = LTAIaB7kQ9mX2pR8vN4z\n",
+            "access_key_secret = G7mQ9xL2pR8vN4kZaB6cD3fH5jT1wS\n",
         );
         let candidates = alibaba_multi_candidates(raw);
 
         assert!(candidates.iter().any(|candidate| {
-            candidate.value == "AbCdEfGhIjKlMnOpQrStUvWxYz1234"
+            candidate.value == "G7mQ9xL2pR8vN4kZaB6cD3fH5jT1wS"
                 && candidate
                     .line_data
                     .iter()
-                    .any(|part| part.value == "LTAI1234567890ABCDEF")
+                    .any(|part| part.value == "LTAIaB7kQ9mX2pR8vN4z")
         }));
     }
 
@@ -7878,6 +7886,35 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn aws_multi_applies_official_filters_to_the_anchor() {
+        let raw = concat!(
+            "AWS_ACCESS_KEY_ID=AKIAQWERTYUIOP123456\n",
+            "AWS_SECRET_ACCESS_KEY=aB3/aB3/aB3/aB3/aB3/aB3/aB3/aB3/aB3/aB3/\n",
+        );
+
+        assert!(aws_multi_candidates(raw).is_empty());
+    }
+
+    #[test]
+    fn alibaba_multi_applies_official_filters_to_the_anchor() {
+        let raw = concat!(
+            "access_key_id = LTAI1234567890ABCDEF\n",
+            "access_key_secret = G7mQ9xL2pR8vN4kZaB6cD3fH5jT1wS\n",
+        );
+
+        assert!(alibaba_multi_candidates(raw).is_empty());
+    }
+
+    #[test]
+    fn google_multi_applies_official_filters_to_the_anchor() {
+        let google_id = format!("123-{}.apps.googleusercontent.com", "a".repeat(32));
+        let google_secret = ["GO", "CSPX-FAsZauZ28P3STmkBhqQi1Y-EsEaX"].concat();
+        let raw = format!("{google_id}\n{google_secret}\n");
+
+        assert!(google_multi_candidates(&raw).is_empty());
     }
 
     #[test]
@@ -8117,8 +8154,12 @@ mod tests {
 
     #[test]
     fn translated_credsweeper_rules_are_active() {
-        let aws_id = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
-        let aws_secret = "mQ7zR2pL8vN4xY6cT9bH3sK5dF1gJ0aW2eU4rI6o".to_string();
+        let aws_id = ["AKIA", "LJDBECWDLOOWXROV"].concat();
+        let aws_secret = "Lplsx2J0OaHPJoG7U7kpbhGUvnQ7Yv3O7zN3XXus".to_string();
+        let google_id = format!(
+            "123-{}.apps.googleusercontent.com",
+            "abcdeabcdeabcdeabcdeabcdeabcdeab"
+        );
         let google_secret = format!("GOCSPX-{}", "A".repeat(28));
         let jwk_secret = concat!(
             "n7fzJc3_WG59VEOBTkayzuSMM780OJQuZjN_KbH8lOZG25ZoA7T4Bxcc0xQn5oZE5uSCI",
@@ -8127,7 +8168,7 @@ mod tests {
         let base64_key = BASE64.encode(&rsa_fixture_der());
         let raw = format!(
             "aws {aws_id} {aws_secret}\n\
-             google 123-abcdeabcdeabcdeabcdeabcdeabcdeab.apps.googleusercontent.com {google_secret}\n\
+             google {google_id} {google_secret}\n\
              jwk {{\"kty\":\"RSA\",\"d\":\"{jwk_secret}\"}}\n\
              -----BEGIN OPENSSH PRIVATE KEY-----\n\
              {base64_key}\n\
