@@ -1699,11 +1699,12 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let args = opts.tool_args.clone();
+    let caller_settings = ClaudeCallerSettings::from_args(&args)?;
     if opts.dry_run {
+        let args = caller_settings.gateway_args(&args, "<pentect-settings>");
         print_dry_run(&opts.command, &args);
         return Ok(success_status());
     }
-    let caller_settings = ClaudeCallerSettings::from_args(&args)?;
     reject_unsupported_claude_provider(&caller_settings)?;
     preflight_managed_claude_routing()?;
     let upstream = claude_effective_upstream(opts, &caller_settings)?;
@@ -1942,22 +1943,27 @@ impl ClaudeCallerSettings {
             "Claude settings",
         )?;
         let path = file.path().to_string_lossy().into_owned();
-        let mut out = args.to_vec();
-        if let Some(index) = self.settings_at {
-            if self.inline {
-                out[index] = format!("--settings={path}");
-            } else {
-                out[index + 1] = path;
-            }
-        } else {
-            out.insert(0, path);
-            out.insert(0, "--settings".to_string());
-        }
+        let out = self.gateway_args(args, &path);
         Ok(ClaudeGatewaySettings {
             args: out,
             _file: file,
             _directory: directory,
         })
+    }
+
+    fn gateway_args(&self, args: &[String], settings_path: &str) -> Vec<String> {
+        let mut out = args.to_vec();
+        if let Some(index) = self.settings_at {
+            if self.inline {
+                out[index] = format!("--settings={settings_path}");
+            } else {
+                out[index + 1] = settings_path.to_string();
+            }
+        } else {
+            out.insert(0, settings_path.to_string());
+            out.insert(0, "--settings".to_string());
+        }
+        out
     }
 }
 
@@ -4144,6 +4150,28 @@ mod tests {
         drop(gateway);
         assert!(!path.exists());
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn claude_gateway_args_replace_inline_caller_settings() {
+        let settings = ClaudeCallerSettings {
+            value: serde_json::json!({}),
+            effective_env: serde_json::Map::new(),
+            settings_at: Some(0),
+            inline: true,
+        };
+        let args = vec![
+            r#"--settings={"env":{"ANTHROPIC_API_KEY":"secret-sentinel"}}"#.to_string(),
+            "--model=claude-test".to_string(),
+        ];
+
+        assert_eq!(
+            settings.gateway_args(&args, "<pentect-settings>"),
+            vec![
+                "--settings=<pentect-settings>".to_string(),
+                "--model=claude-test".to_string(),
+            ]
+        );
     }
 
     #[cfg(unix)]
