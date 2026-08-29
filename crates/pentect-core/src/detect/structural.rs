@@ -140,6 +140,7 @@ fn scan_powershell_set_item(
     view: &NormalizedView,
     spans: &mut Vec<Span>,
 ) {
+    let tokens = first_shell_command(tokens, view.text());
     let Some(command) = tokens.first() else {
         return;
     };
@@ -158,7 +159,7 @@ fn scan_powershell_set_item(
     let value_index = tokens
         .iter()
         .enumerate()
-        .skip(env_index + 1)
+        .skip(1)
         .find(|(_, token)| token.value.eq_ignore_ascii_case("-Value"))
         .map(|(index, _)| index + 1)
         .or_else(|| {
@@ -173,6 +174,30 @@ fn scan_powershell_set_item(
     if let Some(range) = token_raw_range(value, 0) {
         push_environment_span(view, spans, range);
     }
+}
+
+fn first_shell_command<'a>(
+    tokens: &'a [super::shell::Token],
+    text: &str,
+) -> &'a [super::shell::Token] {
+    let end = tokens
+        .windows(2)
+        .position(|pair| {
+            let Some(start) = pair[0]
+                .byte_to_raw
+                .last()
+                .and_then(|offset| offset.checked_add(1))
+            else {
+                return false;
+            };
+            let Some(end) = pair[1].byte_to_raw.first().copied() else {
+                return false;
+            };
+            text.get(start..end)
+                .is_some_and(|gap| gap.chars().any(|ch| matches!(ch, ';' | '|' | '<' | '>')))
+        })
+        .map_or(tokens.len(), |separator_before| separator_before + 1);
+    &tokens[..end]
 }
 
 fn valid_environment_name(value: &str) -> bool {
@@ -1012,11 +1037,17 @@ mod tests {
     fn powershell_set_item_environment_value_is_masked() {
         for raw in [
             "Set-Item -Path Env:SQUARE_ACCESS_TOKEN -Value SyntheticValue",
+            "Set-Item -Value SyntheticValue -Path Env:SQUARE_ACCESS_TOKEN",
             "Set-Item Env:MAILGUN_API_KEY 'mail gun value'",
+            "Set-Item -Value 'mail; gun value' -Path Env:MAILGUN_API_KEY",
         ] {
             assert_eq!(shell_env_values(raw).len(), 1, "{raw}");
         }
         assert!(shell_env_values("Set-Item -Path Env:PUBLIC_MODE -Value development").is_empty());
+        assert!(shell_env_values(
+            "Set-Item -Path Env:SQUARE_ACCESS_TOKEN; Write-Output -Value NotTheEnvValue"
+        )
+        .is_empty());
     }
 
     #[test]
