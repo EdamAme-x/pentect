@@ -16,7 +16,7 @@ built-in coverage claims.
 
 | Detector | Source and pinned version | Enabled coverage | Evidence and limit |
 | --- | --- | --- | --- |
-| `CredSweeperNativeDetector` | Samsung CredSweeper `v1.17.4`, commit `c7ad63b95ce0941954465a3b759046b14b88807b`; rule, keyword, allowlist, and ML assets are pinned in the binary | Credential and secret rules represented by the pinned assets | Pull requests compare the native result with official Python CredSweeper on one pinned CredData repository. A 16-shard weekly or manually dispatched job is configured to compare all 333 CredData repositories, including rule identity, value and variable spans, path and line context, entropy, and bounded ML probability. This is corpus evidence, not proof of general CredSweeper parity. |
+| `CredSweeperNativeDetector` | Samsung CredSweeper `v1.17.4`, commit `c7ad63b95ce0941954465a3b759046b14b88807b`; rule, keyword, allowlist, and ML assets are pinned in the binary | Credential and secret rules represented by the pinned assets | Pull requests regenerate the complete official rule/filter inventory, exercise every official filter through its upstream tests and deterministic boundary inputs, and compare one pinned CredData repository end to end. A 16-shard weekly or manually dispatched job compares all 333 CredData repositories, including rule identity, value and variable spans, path and line context, entropy, and bounded ML probability. This remains corpus and fixture evidence, not proof of general CredSweeper parity. |
 | `AlcatrazDetector` | Hoop Alcatraz `0.20.2`, commit `cd2e19b7d0f08b113c52ef52d3485c64a0871455`, compiled as a static Go helper and compressed into the Pentect binary | `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD`, `IBAN_CODE`, `UK_NINO`, `IN_PAN`, `IT_FISCAL_CODE`, `ES_NIF`, `ES_NIE`, `SG_FIN`, `KR_RRN`, and `FI_PERSONAL_IDENTITY_CODE` | Helper tests cover each enabled entity and release smoke tests check representative findings on supported release platforms. Other Alcatraz entities are disabled. Alcatraz can still miss valid values or produce false positives. |
 
 Pentect does not call the CredSweeper Python package at runtime. The native
@@ -65,6 +65,7 @@ their own sources. They must not be counted as upstream-detector evidence.
 ## What the checks prove
 
 A passing unit fixture proves only that the named case works. The pinned
+filter comparison proves agreement on the recorded filter invocations, and the
 CredData comparison proves agreement on the exact corpus fields it compares.
 Release smoke tests prove that representative detector behavior is present in
 the produced binaries. None of these proves complete secret detection,
