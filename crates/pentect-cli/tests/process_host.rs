@@ -54,6 +54,51 @@ fn codex_dry_run_routes_through_the_http_gateway() {
 }
 
 #[test]
+fn claude_dry_run_shows_the_generated_gateway_settings() {
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        host_pid: None,
+        command_pids: Vec::new(),
+    };
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
+    command
+        .args(["claude", "--dry-run"])
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("APPDATA", &root)
+        .env("PROGRAMDATA", &root)
+        .env("CLAUDE_CONFIG_DIR", root.join("claude"));
+    for name in PRIVATE_ENV.iter().chain(
+        [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
+        ]
+        .iter(),
+    ) {
+        command.env_remove(name);
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains("--settings"), "{rendered}");
+    assert!(rendered.contains("<pentect-settings>"), "{rendered}");
+    assert!(!rendered.contains("pentect-claude-settings-"), "{rendered}");
+}
+
+#[test]
 fn log_hosts_while_running_but_help_does_not() {
     let root = test_root();
     std::fs::create_dir_all(&root).unwrap();
