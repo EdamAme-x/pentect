@@ -141,10 +141,13 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .filter(|package| paths_equal_case_insensitive(&package.executable, &app))
     {
         let arguments = claude_chromium_arguments(&proxy, &user_data_dir);
-        let environment =
-            ScopedPackageEnvironment::install(anthropic.base_url(), &options.upstream_header_env);
-        let process = activate_windows_package(&package.aumid, &arguments)?;
-        drop(environment);
+        let process = activate_windows_package(
+            &package.full_name,
+            &package.aumid,
+            &arguments,
+            anthropic.base_url(),
+            &options.upstream_header_env,
+        )?;
         let process_id = process.id();
         let ca_thumbprint = proxy.ca_thumbprint().to_string();
         if let Err(error) = ctrlc::set_handler(move || {
@@ -632,48 +635,76 @@ impl Drop for WindowsUserCaGuard {
 }
 
 #[cfg(windows)]
-struct ScopedPackageEnvironment {
-    previous: Vec<(String, Option<std::ffi::OsString>)>,
-}
-
-#[cfg(windows)]
-impl ScopedPackageEnvironment {
-    fn install(anthropic_base_url: &str, hidden: &[String]) -> Self {
-        let mut changes = vec![(
-            "ANTHROPIC_BASE_URL".to_string(),
-            Some(std::ffi::OsString::from(anthropic_base_url)),
-        )];
-        changes.extend(hidden.iter().filter_map(|spec| {
-            crate::upstream::header_source_env_name(spec).map(|name| (name.to_string(), None))
-        }));
-        let mut previous = Vec::with_capacity(changes.len());
-        for (name, value) in changes {
-            previous.push((name.clone(), std::env::var_os(&name)));
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        Self { previous }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ScopedPackageEnvironment {
-    fn drop(&mut self) {
-        for (name, value) in self.previous.drain(..).rev() {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
 struct ActivatedWindowsProcess {
     id: u32,
     handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+struct PackageEnvironmentGuard {
+    debug: windows::Win32::UI::Shell::IPackageDebugSettings,
+    package_full_name: Vec<u16>,
+    active: bool,
+}
+
+#[cfg(windows)]
+impl PackageEnvironmentGuard {
+    fn install(
+        package_full_name: &str,
+        anthropic_base_url: &str,
+        hidden_header_env: &[String],
+    ) -> Result<Self, String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Shell::{IPackageDebugSettings, PackageDebugSettings};
+
+        let debug: IPackageDebugSettings = unsafe {
+            CoCreateInstance(
+                &PackageDebugSettings,
+                None::<&windows::core::IUnknown>,
+                CLSCTX_INPROC_SERVER,
+            )
+        }
+        .map_err(|error| {
+            format!("could not create Windows package environment manager: {error}")
+        })?;
+        let package_full_name = wide_null(package_full_name);
+        let environment = windows_package_environment_block(anthropic_base_url, hidden_header_env)?;
+        unsafe {
+            debug.EnableDebugging(
+                PCWSTR(package_full_name.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR(environment.as_ptr()),
+            )
+        }
+        .map_err(|error| format!("could not set Claude Desktop package environment: {error}"))?;
+        Ok(Self {
+            debug,
+            package_full_name,
+            active: true,
+        })
+    }
+
+    fn clear(&mut self) -> Result<(), windows::core::Error> {
+        if !self.active {
+            return Ok(());
+        }
+        let result = unsafe {
+            self.debug
+                .DisableDebugging(windows::core::PCWSTR(self.package_full_name.as_ptr()))
+        };
+        if result.is_ok() {
+            self.active = false;
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PackageEnvironmentGuard {
+    fn drop(&mut self) {
+        let _ = self.clear();
+    }
 }
 
 #[cfg(windows)]
@@ -723,8 +754,11 @@ impl Drop for ActivatedWindowsProcess {
 
 #[cfg(windows)]
 fn activate_windows_package(
+    package_full_name: &str,
     aumid: &str,
     arguments: &[String],
+    anthropic_base_url: &str,
+    hidden_header_env: &[String],
 ) -> Result<ActivatedWindowsProcess, String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::{
@@ -742,6 +776,12 @@ fn activate_windows_package(
         .ok()
         .map_err(|error| format!("could not initialize Windows app activation: {error}"))?;
     let result = (|| {
+        let mut package_environment = PackageEnvironmentGuard::install(
+            package_full_name,
+            anthropic_base_url,
+            hidden_header_env,
+        )?;
+
         let manager: IApplicationActivationManager = unsafe {
             CoCreateInstance(
                 &ApplicationActivationManager,
@@ -757,14 +797,33 @@ fn activate_windows_package(
             .collect::<Vec<_>>()
             .join(" ");
         let command_line = wide_null(&command_line);
-        let id = unsafe {
+        let activation = unsafe {
             manager.ActivateApplication(
                 PCWSTR(aumid.as_ptr()),
                 PCWSTR(command_line.as_ptr()),
                 AO_NONE,
             )
-        }
-        .map_err(|error| format!("could not activate Claude Desktop package: {error}"))?;
+        };
+        let cleanup = package_environment.clear();
+        let id = match (activation, cleanup) {
+            (Ok(id), Ok(())) => id,
+            (Ok(id), Err(error)) => {
+                terminate_child_process(id);
+                return Err(format!(
+                    "could not clear Claude Desktop package environment after activation: {error}"
+                ));
+            }
+            (Err(activation), Ok(())) => {
+                return Err(format!(
+                    "could not activate Claude Desktop package: {activation}"
+                ));
+            }
+            (Err(activation), Err(cleanup)) => {
+                return Err(format!(
+                    "could not activate Claude Desktop package ({activation}) or clear its temporary package environment ({cleanup})"
+                ));
+            }
+        };
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
@@ -773,6 +832,7 @@ fn activate_windows_package(
             )
         };
         if handle.is_null() {
+            terminate_child_process(id);
             return Err(
                 "Claude Desktop activated but its process could not be observed".to_string(),
             );
@@ -781,6 +841,39 @@ fn activate_windows_package(
     })();
     unsafe { CoUninitialize() };
     result
+}
+
+#[cfg(any(windows, test))]
+fn windows_package_environment_block(
+    anthropic_base_url: &str,
+    hidden_header_env: &[String],
+) -> Result<Vec<u16>, String> {
+    use std::collections::BTreeMap;
+
+    if anthropic_base_url.contains('\0') {
+        return Err("Claude Desktop upstream URL contains a NUL byte".to_string());
+    }
+    let mut values = BTreeMap::new();
+    for spec in hidden_header_env {
+        if let Some(name) = crate::upstream::header_source_env_name(spec) {
+            if name.contains('\0') || name.contains('=') {
+                return Err("Claude Desktop header environment name is invalid".to_string());
+            }
+            values.insert(name.to_ascii_lowercase(), (name, ""));
+        }
+    }
+    values.insert(
+        "anthropic_base_url".to_string(),
+        ("ANTHROPIC_BASE_URL", anthropic_base_url),
+    );
+
+    let mut block = Vec::new();
+    for (_, (name, value)) in values {
+        block.extend(format!("{name}={value}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
 }
 
 #[cfg(windows)]
@@ -3076,6 +3169,7 @@ fn find_windows_claude_app() -> Option<PathBuf> {
 #[derive(Clone, Debug)]
 struct WindowsClaudePackage {
     executable: PathBuf,
+    full_name: String,
     aumid: String,
 }
 
@@ -3128,7 +3222,11 @@ fn find_windows_claude_package() -> Option<WindowsClaudePackage> {
             executable.is_file().then(|| {
                 (
                     windows_package_version(&package_name),
-                    WindowsClaudePackage { executable, aumid },
+                    WindowsClaudePackage {
+                        executable,
+                        full_name: package_name,
+                        aumid,
+                    },
                 )
             })
         })
@@ -4431,6 +4529,34 @@ mod tests {
             "Claude_publisher123!Claude"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_environment_routes_anthropic_and_clears_header_sources() {
+        let block = windows_package_environment_block(
+            "http://127.0.0.1:43123",
+            &[
+                "x-api-key=UPSTREAM_SECRET".to_string(),
+                "x-tenant=Tenant_ID".to_string(),
+                "x-other=upstream_secret".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(block.last(), Some(&0));
+        assert_eq!(block.get(block.len() - 2), Some(&0));
+        let entries = block[..block.len() - 1]
+            .split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf16(entry).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                "ANTHROPIC_BASE_URL=http://127.0.0.1:43123",
+                "Tenant_ID=",
+                "upstream_secret="
+            ]
+        );
     }
 
     #[test]
