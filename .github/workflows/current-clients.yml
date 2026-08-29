@@ -36,6 +36,7 @@ jobs:
               - 'tools/client_smoke.py'
               - 'tools/install_client_smoke.sh'
               - 'tools/install_portable_client_smoke.py'
+              - 'tools/installed_agent_e2e.py'
               - 'tools/test_client_smoke_coverage.py'
               - 'tools/verify_client_smoke_log.py'
               - 'tools/codex-app-smoke-fixture.c'
@@ -112,6 +113,8 @@ jobs:
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
         run: python tools/client_smoke.py --group portable
+      - name: Verify installed Codex handle flow
+        run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_SMOKE_BINARY }}"
       - name: Start both protected desktop app contracts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
