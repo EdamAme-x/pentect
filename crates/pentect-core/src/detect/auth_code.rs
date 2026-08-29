@@ -205,16 +205,16 @@ fn specs() -> Vec<PatternSpec> {
     #[rustfmt::skip]
     let patterns: &[(&str, usize, &[&str])] = &[
         // Literal OTP / verification wording.
-        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, 1, &["otp", "one-time", "one time", "one_time", "verification", "security", "login", "sign", "2fa", "mfa"]),
-        (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, 1, &["認証コード", "確認コード", "ワンタイム", "二段階認証"]),
+        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|confirmation[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, 1, &["otp", "one-time", "one time", "one_time", "verification", "confirmation", "security", "login", "sign", "2fa", "mfa"]),
+        (r#"(?:認証(?:用)?コード|確認(?:用)?コード|セキュリティコード|ワンタイム(?:パスワード|パスコード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, 1, &["認証", "確認", "セキュリティコード", "ワンタイム", "二段階認証"]),
         // Wider prose between the auth word and a numeric code.
-        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1, &["otp", "one-time", "one time", "one_time", "verification", "security", "login", "sign", "2fa", "mfa"]),
-        (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1, &["認証コード", "確認コード", "ワンタイム", "二段階認証"]),
+        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|confirmation[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1, &["otp", "one-time", "one time", "one_time", "verification", "confirmation", "security", "login", "sign", "2fa", "mfa"]),
+        (r#"(?:認証(?:用)?コード|確認(?:用)?コード|セキュリティコード|ワンタイム(?:パスワード|パスコード|コード)|二段階認証)[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1, &["認証", "確認", "セキュリティコード", "ワンタイム", "二段階認証"]),
         // Auth flows may use short or alphanumeric codes without saying "OTP".
         (r#"(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)[^.\r\n]{0,120}(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b"#, 1, &["sign", "log", "login", "authenticate", "authentication", "verify", "account", "security", "two-step", "two step", "two_factor", "two factor", "2fa", "mfa"]),
         (r#"(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)"#, 1, &["sign", "log", "login", "authenticate", "authentication", "verify", "account", "security", "two-step", "two step", "two_factor", "two factor", "2fa", "mfa"]),
         (r#"(?i:\b(?:enter|use|input|type|paste)\b)[^.\r\n]{0,32}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account)\b)"#, 1, &["enter", "use", "input", "type", "paste"]),
-        (r#"(?:ログイン|サインイン|認証|本人確認|二段階認証)[^\r\n]{0,120}([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})"#, 1, &["ログイン", "サインイン", "認証", "本人確認", "二段階認証"]),
+        (r#"(?:ログイン|サインイン|認証|本人確認|二段階認証)[^\r\n]{0,120}?([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})"#, 1, &["ログイン", "サインイン", "認証", "本人確認", "二段階認証"]),
     ];
 
     patterns
@@ -271,6 +271,35 @@ mod tests {
             "サインインするには 7391 を入力してください",
             "7391"
         ));
+        for (raw, expected) in [
+            ("認証用コード: 849201 を入力してください。", "849201"),
+            ("ログイン用コード: 837192", "837192"),
+            ("サインイン用コード: 748291", "748291"),
+            ("Your confirmation code is 849201.", "849201"),
+            ("Amazon confirmation code: 582910", "582910"),
+            ("セキュリティコード: 492018", "492018"),
+            ("ワンタイムパスコード: 492018", "492018"),
+            ("確認用コード: 123456", "123456"),
+        ] {
+            let values = values_for(raw);
+            assert!(!values.is_empty(), "{raw}");
+            assert!(
+                values.iter().all(|value| value == expected),
+                "{raw}: {values:?}"
+            );
+        }
+
+        let raw = "認証用コード: 849201 を入力してください。";
+        let masked = crate::Engine::with_profile(crate::Profile::Strict)
+            .mask(crate::Input::text(raw), &crate::Config::insecure_testing());
+        assert_eq!(masked.summary.masked_count, 1);
+        assert!(
+            masked.masked.starts_with("認証用コード: <<OTP_")
+                && masked.masked.ends_with(">> を入力してください。")
+                && !masked.masked.contains("849201"),
+            "{}",
+            masked.masked
+        );
     }
 
     #[test]
