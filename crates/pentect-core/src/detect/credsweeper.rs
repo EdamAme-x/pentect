@@ -3380,7 +3380,7 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
     };
     let end = begin + end_rel + "KEY-----".len();
     let value = &line[begin..end];
-    if value.contains("PRIVATE") && !value.contains("ENCRYPTED") {
+    if is_private_key_armor_header(value) {
         vec![Candidate {
             start: begin,
             end,
@@ -3400,6 +3400,12 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
     }
 }
 
+fn is_private_key_armor_header(header: &str) -> bool {
+    !header.contains("ENCRYPTED")
+        && header.contains("KEY")
+        && (header.contains("PRIVATE") || header.contains("PGP SECRET KEY BLOCK"))
+}
+
 fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
     const MAX_PEM_LENGTH: usize = 4 * 8000;
 
@@ -3415,7 +3421,7 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
         };
         let header_end = header_search + header_close_rel + "-----".len();
         let header = &text[begin..header_end];
-        if !header.contains("PRIVATE") || header.contains("ENCRYPTED") || !header.contains("KEY") {
+        if !is_private_key_armor_header(header) {
             search_start = header_end;
             continue;
         }
@@ -3548,10 +3554,24 @@ fn valid_pem_private_key_block(block: &str) -> bool {
 
     let mut key_data = String::new();
     let mut saw_end = false;
+    let is_openpgp = block.contains("-----BEGIN PGP ");
+    let mut in_openpgp_headers = is_openpgp;
     for line in text.lines() {
         let line = sanitize_pem_line(line, 5);
+        if line.contains("-----BEGIN") {
+            continue;
+        }
+        if in_openpgp_headers {
+            if line.is_empty() {
+                in_openpgp_headers = false;
+                continue;
+            }
+            if is_openpgp_armor_header(&line) {
+                continue;
+            }
+            in_openpgp_headers = false;
+        }
         if line.is_empty()
-            || line.contains("-----BEGIN")
             || line.contains("Proc-Type")
             || line.contains("Version")
             || line.contains("DEK-Info")
@@ -3571,6 +3591,16 @@ fn valid_pem_private_key_block(block: &str) -> bool {
         key_data.push_str(&line);
     }
     saw_end && pem_payload_is_valid(block, &key_data)
+}
+
+fn is_openpgp_armor_header(line: &str) -> bool {
+    let Some((name, _)) = line.split_once(':') else {
+        return false;
+    };
+    matches!(
+        name.trim(),
+        "Version" | "Comment" | "MessageID" | "Hash" | "Charset"
+    )
 }
 
 fn asn1_size(data: &[u8]) -> Option<usize> {
@@ -7336,6 +7366,51 @@ mod tests {
         let lines = pem_private_key_line_data(text, begin, header_end, end);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].value, &text[begin..end]);
+    }
+
+    #[test]
+    fn pgp_private_key_armor_is_one_private_key_finding() {
+        let mut state = 0x9e37_79b9_u32;
+        let payload = (0..384)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let encoded = BASE64.encode(&payload);
+
+        for armor_name in ["PGP PRIVATE KEY BLOCK", "PGP SECRET KEY BLOCK"] {
+            let body = encoded
+                .as_bytes()
+                .chunks(64)
+                .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let raw = format!(
+                "-----BEGIN {armor_name}-----\nVersion: GnuPG v2\nComment: generated fixture\nMessageID: test@example.invalid\nHash: SHA256\nCharset: UTF-8\n\n{body}\n=Ab3d\n-----END {armor_name}-----"
+            );
+            let input_region = region(&raw);
+            let view = NormalizedView::build(&input_region, &raw);
+            let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| { finding.label == "PEM_PRIVATE_KEY" && finding.value == raw }),
+                "{armor_name}: {findings:?}"
+            );
+
+            let masked = crate::Engine::with_profile(crate::Profile::Strict)
+                .mask(crate::Input::text(&raw), &crate::Config::insecure_testing());
+            assert_eq!(masked.summary.masked_count, 1, "{armor_name}");
+            assert!(
+                masked.masked.starts_with("<<PEM_PRIVATE_KEY_")
+                    && !masked.masked.contains("-----BEGIN"),
+                "{armor_name}: {}",
+                masked.masked
+            );
+        }
     }
 
     #[test]
