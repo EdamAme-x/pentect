@@ -428,8 +428,9 @@ async fn proxy_request_inner(
             .split('?')
             .next()
             .is_some_and(|path| path.ends_with("/v1/files"));
+    let body_forbidden = endpoint == AnthropicEndpoint::Models;
     let mut request_coverage = None;
-    let body = if protected_request || files_upload {
+    let body = if protected_request || files_upload || body_forbidden {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -443,6 +444,12 @@ async fn proxy_request_inner(
             }
             Err(error) => return Err(format!("could not read Claude request body: {error}")),
         };
+        if body_forbidden && !body.is_empty() {
+            return Err(
+                "request body blocked: Anthropic models endpoints do not accept request bodies"
+                    .to_string(),
+            );
+        }
         if body.is_empty() {
             reqwest::Body::from(body)
         } else if files_upload {
@@ -521,7 +528,8 @@ async fn proxy_request_inner(
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
         if state.headers.forward_incoming_header(name.as_str())
-            && ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
+            && ((!(protected_request || files_upload || body_forbidden)
+                && name == hyper::header::CONTENT_LENGTH)
                 || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
@@ -3643,6 +3651,36 @@ mod tests {
         );
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, true).is_err());
         assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn models_request_body_is_rejected_before_anthropic_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let proxy = ClaudeHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+        let secret = ["rpa_", "MODELROUTE", "BODYMUST", "NOTLEAVE", "1234567890"].concat();
+
+        let client = reqwest::blocking::Client::new();
+        for path in ["/v1/models", "/v1/models/model_test"] {
+            let response = client
+                .post(format!("{}{path}", proxy.base_url()))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::json!({"note": secret}).to_string())
+                .send()
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(response
+                .text()
+                .unwrap()
+                .contains("models endpoints do not accept request bodies"));
+        }
+
+        let empty_get = client
+            .get(format!("{}/v1/models", proxy.base_url()))
+            .send()
+            .unwrap();
+        assert_eq!(empty_get.status(), reqwest::StatusCode::BAD_GATEWAY);
     }
 
     #[test]

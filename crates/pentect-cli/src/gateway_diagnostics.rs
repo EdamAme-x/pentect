@@ -92,6 +92,7 @@ pub(crate) fn is_local_rejection(error: &str) -> bool {
         || error.starts_with("file upload blocked:")
         || error.starts_with("Files API upload ")
         || error.starts_with("plugin blocked:")
+        || error.starts_with("request body blocked:")
         || error.starts_with("unknown format blocked:")
 }
 
@@ -154,6 +155,10 @@ mod tests {
             ("connect", true)
         );
         assert_eq!(failure_kind("plugin blocked: fixture"), ("policy", false));
+        assert_eq!(
+            failure_kind("request body blocked: fixture"),
+            ("policy", false)
+        );
         assert_eq!(
             failure_kind("arbitrary secret-bearing detail"),
             ("unclassified", false)

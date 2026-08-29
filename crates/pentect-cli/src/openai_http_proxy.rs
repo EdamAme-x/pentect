@@ -382,6 +382,7 @@ async fn proxy_request_inner(
             endpoint,
             OpenAiEndpoint::AudioTranscription | OpenAiEndpoint::AudioTranslation
         );
+    let body_forbidden = endpoint == OpenAiEndpoint::Models;
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
     let headers = request.headers().clone();
     let credential_material = state.headers.credential_scope_material(&headers);
@@ -389,7 +390,7 @@ async fn proxy_request_inner(
     let mut request_coverage = None;
     let mut request_streaming = false;
     let mut inspect_protected_request = protected_request;
-    let body = if protected_request || files_upload || audio_upload {
+    let body = if protected_request || files_upload || audio_upload || body_forbidden {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -403,6 +404,12 @@ async fn proxy_request_inner(
             }
             Err(error) => return Err(format!("could not read OpenAI request body: {error}")),
         };
+        if body_forbidden && !body.is_empty() {
+            return Err(
+                "request body blocked: OpenAI models endpoints do not accept request bodies"
+                    .to_string(),
+            );
+        }
         let body = if protected_request {
             let original = body.clone();
             match decode_openai_request_body(body, &headers) {
@@ -562,7 +569,7 @@ async fn proxy_request_inner(
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
         if state.headers.forward_incoming_header(name.as_str())
-            && ((!(protected_request || files_upload || audio_upload)
+            && ((!(protected_request || files_upload || audio_upload || body_forbidden)
                 && name == hyper::header::CONTENT_LENGTH)
                 || should_forward_request_header(name.as_str()))
             && (!inspect_protected_request || name != hyper::header::CONTENT_ENCODING)
@@ -4551,6 +4558,36 @@ mod tests {
         );
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, true).is_err());
         assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, false).is_ok());
+    }
+
+    #[test]
+    fn models_request_body_is_rejected_before_openai_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+        let secret = ["rpa_", "MODELROUTE", "BODYMUST", "NOTLEAVE", "1234567890"].concat();
+
+        let client = reqwest::blocking::Client::new();
+        for path in ["/v1/models", "/v1/models/model_test"] {
+            let response = client
+                .post(format!("{}{path}", proxy.base_url()))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::json!({"note": secret}).to_string())
+                .send()
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(response
+                .text()
+                .unwrap()
+                .contains("models endpoints do not accept request bodies"));
+        }
+
+        let empty_get = client
+            .get(format!("{}/v1/models", proxy.base_url()))
+            .send()
+            .unwrap();
+        assert_eq!(empty_get.status(), reqwest::StatusCode::BAD_GATEWAY);
     }
 
     #[test]
