@@ -63,6 +63,7 @@ jobs:
             tools/credsweeper-sidecar/patches/lazy-imports.patch \
             tools/credsweeper-reference-inventory.json \
             tools/credsweeper-rust-port-status.json \
+            website/src/content/docs/protection/detectors.md \
             THIRD_PARTY_LICENSES.txt
           git commit -m "chore: update CredSweeper to $version"
           git push origin "HEAD:$validation_branch"

@@ -27,6 +27,7 @@ on:
       - 'tools/credsweeper-sidecar/**'
       - 'tools/pentect-bench/**'
       - 'tools/update_credsweeper.py'
+      - 'tools/test_update_credsweeper.py'
   pull_request:
     paths:
       - '.github/workflows/credsweeper-regression.yml'
@@ -49,6 +50,7 @@ on:
       - 'tools/credsweeper-sidecar/**'
       - 'tools/pentect-bench/**'
       - 'tools/update_credsweeper.py'
+      - 'tools/test_update_credsweeper.py'
   workflow_dispatch:
     inputs:
       full:
@@ -115,7 +117,7 @@ jobs:
           python-version: "3.12"
 
       - name: Test CredData shard tooling
-        run: python -m unittest tools/test_creddata_shards.py
+        run: python -m unittest tools/test_creddata_shards.py tools/test_update_credsweeper.py
 
       - name: Install official CredSweeper oracle dependencies
         run: |

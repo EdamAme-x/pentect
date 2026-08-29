@@ -26,6 +26,7 @@ ASSETS = {
     "credsweeper/secret/config.json": "secret/config.json",
 }
 SIDECAR_PATCH = Path("tools/credsweeper-sidecar/patches/lazy-imports.patch")
+DETECTOR_DOCS = Path("website/src/content/docs/protection/detectors.md")
 
 
 def run(*args: str, cwd: Path, capture: bool = False) -> str:
@@ -155,6 +156,20 @@ def sync_license_bundle(repo: Path) -> None:
     run(sys.executable, "tools/generate_licenses.py", cwd=repo)
 
 
+def sync_detector_docs(repo: Path, tag: str, commit: str) -> None:
+    path = repo / DETECTOR_DOCS
+    text = path.read_text(encoding="utf-8")
+    updated, count = re.subn(
+        r"(Samsung CredSweeper `)v\d+\.\d+\.\d+(`, commit `)[0-9a-f]{40}(`;)",
+        rf"\g<1>{tag}\g<2>{commit}\g<3>",
+        text,
+        count=1,
+    )
+    if count != 1:
+        raise RuntimeError("detector docs have no unique CredSweeper source reference")
+    path.write_text(updated, encoding="utf-8", newline="\n")
+
+
 def validate(repo: Path) -> None:
     run("cargo", "check", "-p", "pentect-core", cwd=repo)
     run("cargo", "test", "-p", "pentect-core", "migration_coverage_is_explicit", cwd=repo)
@@ -237,6 +252,7 @@ def main() -> int:
     sync_runtime_requirements(submodule, runtime_requirements)
     sync_sidecar_patch(repo, requested)
     sync_license_bundle(repo)
+    sync_detector_docs(repo, requested, commit)
     if not args.skip_validation:
         validate(repo)
     print(f"CredSweeper {requested} synced at {commit}")
