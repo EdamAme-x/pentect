@@ -130,6 +130,7 @@ jobs:
               - 'tools/client_smoke.py'
               - 'tools/install_client_smoke.sh'
               - 'tools/install_portable_client_smoke.py'
+              - 'tools/installed_agent_e2e.py'
               - 'tools/test_client_smoke_coverage.py'
               - 'tools/verify_client_smoke_log.py'
               - 'tools/codex-app-smoke-fixture.c'
@@ -418,7 +419,7 @@ jobs:
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
           python tools/test_client_smoke_coverage.py
           python tools/test_release_package_metadata.py
-          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
+          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/installed_agent_e2e.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
           sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/propose_automation_pr.sh tools/wait_for_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
           sh tools/test_download_recent_stable_debs.sh
           sh tools/test_install.sh
