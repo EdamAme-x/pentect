@@ -872,6 +872,27 @@ impl ClaudeAppOptions {
             2
         };
         while index < args.len() {
+            let argument = args[index].as_str();
+            if let Some(value) = crate::assigned_option_value(argument, "--app")? {
+                app = Some(PathBuf::from(value));
+                index += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--upstream")? {
+                upstream = Some(value);
+                index += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--upstream-header-env")? {
+                upstream_header_env.push(value);
+                index += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--plugins")? {
+                crate::plugins::parse_plugin_value(&value).map_err(|error| error.to_string())?;
+                index += 1;
+                continue;
+            }
             match args[index].as_str() {
                 "--app" => {
                     let value = args
@@ -3465,6 +3486,33 @@ mod tests {
         let options = ClaudeAppOptions::parse(&args).unwrap();
         assert_eq!(options.app, Some(PathBuf::from("Claude.exe")));
         assert!(options.check);
+        assert!(options.assume_yes);
+    }
+
+    #[test]
+    fn options_accept_assignment_form_for_all_valued_options() {
+        let args = [
+            "pentect",
+            "claude",
+            "app",
+            "--plugins=company-policy",
+            "--app=Claude.exe",
+            "--upstream=https://example.test/anthropic",
+            "--upstream-header-env=x-api-key=ANTHROPIC_API_KEY",
+            "--upstream-header-env=x-gateway-key=GATEWAY_KEY",
+            "--yes",
+        ]
+        .map(str::to_string);
+        let options = ClaudeAppOptions::parse(&args).unwrap();
+        assert_eq!(options.app, Some(PathBuf::from("Claude.exe")));
+        assert_eq!(
+            options.upstream.as_deref(),
+            Some("https://example.test/anthropic")
+        );
+        assert_eq!(
+            options.upstream_header_env,
+            ["x-api-key=ANTHROPIC_API_KEY", "x-gateway-key=GATEWAY_KEY"]
+        );
         assert!(options.assume_yes);
     }
 

@@ -903,6 +903,27 @@ impl CodexAppOptions {
             2
         };
         while index < args.len() {
+            let argument = args[index].as_str();
+            if let Some(value) = crate::assigned_option_value(argument, "--app")? {
+                app = Some(PathBuf::from(value));
+                index += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--upstream")? {
+                upstream = Some(value);
+                index += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--upstream-header-env")? {
+                upstream_header_env.push(value);
+                index += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--plugins")? {
+                crate::plugins::parse_plugin_value(&value).map_err(|error| error.to_string())?;
+                index += 1;
+                continue;
+            }
             match args[index].as_str() {
                 "--app" => {
                     let value = args
@@ -1340,6 +1361,34 @@ mod tests {
                 app: None,
                 upstream: None,
                 upstream_header_env: Vec::new(),
+                check: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_assignment_form_for_all_valued_options() {
+        let args = [
+            "pentect",
+            "codex",
+            "app",
+            "--plugins=company-policy",
+            "--app=Codex.exe",
+            "--upstream=https://example.test/v1",
+            "--upstream-header-env=authorization=GATEWAY_AUTH",
+            "--upstream-header-env=x-request-id=REQUEST_ID",
+            "--dry-run",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            CodexAppOptions::parse(&args).unwrap(),
+            CodexAppOptions {
+                app: Some(PathBuf::from("Codex.exe")),
+                upstream: Some("https://example.test/v1".to_string()),
+                upstream_header_env: vec![
+                    "authorization=GATEWAY_AUTH".to_string(),
+                    "x-request-id=REQUEST_ID".to_string(),
+                ],
                 check: true,
             }
         );
