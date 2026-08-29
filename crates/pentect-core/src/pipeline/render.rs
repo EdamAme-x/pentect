@@ -86,7 +86,8 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         let explicit_wrapper = explicit_wrapper_bounds(raw, s);
         let literal_end = explicit_wrapper
             .map(|(start, _)| start)
-            .unwrap_or(s.range.start);
+            .unwrap_or(s.range.start)
+            .max(cursor);
         push_literal(&mut segments, &mut masked, &raw[cursor..literal_end]);
         let val = &raw[s.range.start..s.range.end];
 
@@ -396,6 +397,38 @@ mod tests {
             let r = render(raw, &key, vec![span], false);
             assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
         }
+    }
+
+    #[test]
+    fn explicit_secret_is_masked_when_an_earlier_span_ends_inside_its_wrapper() {
+        let key = [4u8; 32];
+        let raw = "prefix mask(secret) suffix";
+        let spans = vec![
+            Span {
+                // This span consumes `prefix ma` but does not overlap the
+                // explicit value itself. Rendering must not slice backwards
+                // from this cursor to the start of `mask(`.
+                range: ByteRange::new(0, 9),
+                category: Category::Secret,
+                label: "SECRET".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Rule,
+            },
+            Span {
+                range: ByteRange::new(12, 18),
+                category: Category::Secret,
+                label: "SECRET".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Explicit,
+            },
+        ];
+
+        let rendered = render(raw, &key, spans, false);
+
+        assert_eq!(rendered.masked.matches("<<SECRET_").count(), 2);
+        assert!(!rendered.masked.contains("secret"));
+        assert!(rendered.map.values().any(|value| value == "secret"));
+        assert!(rendered.masked.ends_with(" suffix"));
     }
 
     #[test]
