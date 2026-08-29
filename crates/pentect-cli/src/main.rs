@@ -1673,9 +1673,7 @@ fn run_endpoint_env(
             run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
         }
         client_descriptor::Protocol::Gemini => {
-            let google_api_key = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
-                .iter()
-                .find_map(|name| nonempty_env(name));
+            let google_api_key = configured_google_api_key();
             let shield_child_key = google_api_key.is_some()
                 || upstream::has_origin_auth_override(&opts.upstream_header_env);
             let proxy = gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env_and_api_key(
@@ -1693,9 +1691,22 @@ fn run_endpoint_env(
 
 fn shield_google_api_key_env(command: &mut Command, enabled: bool) {
     if enabled {
-        command.env("GEMINI_API_KEY", "pentect-local");
-        command.env("GOOGLE_API_KEY", "pentect-local");
+        for name in GOOGLE_API_KEY_ENV_NAMES {
+            command.env(name, "pentect-local");
+        }
     }
+}
+
+pub(crate) const GOOGLE_API_KEY_ENV_NAMES: &[&str] = &[
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GEMINI_API_KEY",
+];
+
+fn configured_google_api_key() -> Option<String> {
+    GOOGLE_API_KEY_ENV_NAMES
+        .iter()
+        .find_map(|name| nonempty_env(name))
 }
 
 const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
@@ -3953,23 +3964,37 @@ mod tests {
 
     #[test]
     fn gemini_child_receives_only_local_placeholder_keys_when_gateway_owns_auth() {
+        let _lock = TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _google_keys = EnvVarGuard::set_optional([
+            ("GOOGLE_API_KEY", None),
+            (
+                "GOOGLE_GENERATIVE_AI_API_KEY",
+                Some(OsString::from("generative-only-key")),
+            ),
+            ("GEMINI_API_KEY", None),
+        ]);
+        assert_eq!(
+            configured_google_api_key().as_deref(),
+            Some("generative-only-key")
+        );
+
         let mut command = Command::new("gemini-child");
-        command.env("GEMINI_API_KEY", "inherited-value");
-        command.env("GOOGLE_API_KEY", "inherited-value");
+        for name in GOOGLE_API_KEY_ENV_NAMES {
+            command.env(name, "inherited-value");
+        }
 
         shield_google_api_key_env(&mut command, true);
 
         let environment = command
             .get_envs()
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            environment.get(OsStr::new("GEMINI_API_KEY")),
-            Some(&Some(OsStr::new("pentect-local")))
-        );
-        assert_eq!(
-            environment.get(OsStr::new("GOOGLE_API_KEY")),
-            Some(&Some(OsStr::new("pentect-local")))
-        );
+        for name in GOOGLE_API_KEY_ENV_NAMES {
+            assert_eq!(
+                environment.get(OsStr::new(name)),
+                Some(&Some(OsStr::new("pentect-local"))),
+                "{name}"
+            );
+        }
     }
 
     #[test]

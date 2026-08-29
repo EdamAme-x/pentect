@@ -1335,6 +1335,14 @@ mod tests {
         use std::io::{Read, Write};
 
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _google_keys = crate::EnvVarGuard::set_optional([
+            ("GOOGLE_API_KEY", None),
+            (
+                "GOOGLE_GENERATIVE_AI_API_KEY",
+                Some(std::ffi::OsString::from("generative-only-key")),
+            ),
+            ("GEMINI_API_KEY", None),
+        ]);
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = TestEnv::install(&store);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1372,7 +1380,7 @@ mod tests {
         let proxy = GeminiHttpProxyGuard::start_with_header_env_and_api_key(
             format!("http://{address}"),
             &[],
-            Some("upstream-test-key".to_string()),
+            crate::configured_google_api_key(),
         )
         .unwrap();
         reqwest::blocking::Client::new()
@@ -1395,7 +1403,7 @@ mod tests {
         assert!(
             headers
                 .lines()
-                .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: upstream-test-key")),
+                .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: generative-only-key")),
             "upstream did not receive the gateway-owned key"
         );
         assert!(!headers.contains("pentect-local"));
