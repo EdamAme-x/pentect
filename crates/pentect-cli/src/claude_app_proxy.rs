@@ -2729,12 +2729,32 @@ fn inject_chat_contract(value: &mut serde_json::Value) {
         return;
     };
     for key in ["system", "prompt", "custom_system_prompt"] {
-        if let Some(serde_json::Value::String(text)) = object.get_mut(key) {
-            if !text.contains(HANDLE_CONTRACT) {
-                let existing = std::mem::take(text);
-                *text = format!("{HANDLE_CONTRACT}\n\n{existing}");
+        match object.get_mut(key) {
+            Some(serde_json::Value::String(text)) => {
+                if !text.contains(HANDLE_CONTRACT) {
+                    let existing = std::mem::take(text);
+                    *text = format!("{HANDLE_CONTRACT}\n\n{existing}");
+                }
+                return;
             }
-            return;
+            Some(serde_json::Value::Array(blocks)) if key == "system" => {
+                let present = blocks.iter().any(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && block.get("text").and_then(serde_json::Value::as_str)
+                            == Some(HANDLE_CONTRACT)
+                });
+                if !present {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": HANDLE_CONTRACT,
+                    }));
+                }
+                return;
+            }
+            Some(serde_json::Value::Null) | None => {}
+            // Preserve unknown future representations rather than silently
+            // replacing a user-provided instruction.
+            Some(_) => return,
         }
     }
     object.insert(
@@ -4619,6 +4639,42 @@ mod tests {
         let mut value = serde_json::json!({"messages": []});
         inject_chat_contract(&mut value);
         assert_eq!(value["system"], HANDLE_CONTRACT);
+    }
+
+    #[test]
+    fn chat_contract_preserves_system_blocks_and_is_idempotent() {
+        let original = serde_json::json!({"type": "text", "text": "user instruction"});
+        let mut value = serde_json::json!({
+            "system": [original.clone()],
+            "messages": []
+        });
+
+        inject_chat_contract(&mut value);
+        inject_chat_contract(&mut value);
+
+        let blocks = value["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], original);
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], HANDLE_CONTRACT);
+    }
+
+    #[test]
+    fn chat_contract_preserves_unknown_system_representation() {
+        let system = serde_json::json!({
+            "type": "future_system_container",
+            "value": "user instruction"
+        });
+        let mut value = serde_json::json!({
+            "system": system.clone(),
+            "prompt": "fallback prompt",
+            "messages": []
+        });
+
+        inject_chat_contract(&mut value);
+
+        assert_eq!(value["system"], system);
+        assert_eq!(value["prompt"], "fallback prompt");
     }
 
     #[test]
