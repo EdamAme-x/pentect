@@ -2164,8 +2164,13 @@ where
                 if let Some(input) = block.get_mut("input") {
                     resolve_tool_input_value(input, tool_name.as_deref(), resolve)?;
                 }
-            } else if restore_output && block.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(Value::String(text)) = block.get_mut("text") {
+            } else if restore_output {
+                let field = match block.get("type").and_then(Value::as_str) {
+                    Some("text") => "text",
+                    Some("thinking") => "thinking",
+                    _ => continue,
+                };
+                if let Some(Value::String(text)) = block.get_mut(field) {
                     *text = resolve(text)?;
                 }
             }
@@ -2713,6 +2718,48 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonstreaming_anthropic_json_restores_thinking_without_touching_signatures() {
+        let handle = "<<SECRET_0011223344556677>>";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": [
+                {"type": "text", "text": format!("text {handle}")},
+                {"type": "thinking", "thinking": format!("thought {handle}"),
+                    "signature": format!("signed-{handle}")},
+                {"type": "redacted_thinking", "data": format!("opaque-{handle}")},
+                {"type": "future_block", "text": format!("future-{handle}")}
+            ]
+        }))
+        .unwrap();
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let rewritten = rewrite_anthropic_json_response(&body, true, &mut resolve).unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["content"][0]["text"], "text local-value");
+        assert_eq!(value["content"][1]["thinking"], "thought local-value");
+        assert_eq!(value["content"][1]["signature"], format!("signed-{handle}"));
+        assert_eq!(value["content"][2]["data"], format!("opaque-{handle}"));
+        assert_eq!(value["content"][3]["text"], format!("future-{handle}"));
+    }
+
+    #[test]
+    fn disabled_output_restoration_leaves_text_and_thinking_handles_unchanged() {
+        let handle = "<<SECRET_0011223344556677>>";
+        let mut value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": handle},
+                {"type": "thinking", "thinking": handle},
+                {"type": "tool_use", "name": "http", "input": {"token": handle}}
+            ]
+        });
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        restore_anthropic_json_value(&mut value, false, &mut resolve).unwrap();
+
+        assert_eq!(value["content"][0]["text"], handle);
+        assert_eq!(value["content"][1]["thinking"], handle);
+        assert_eq!(value["content"][2]["input"]["token"], "local-value");
+    }
 
     #[test]
     fn anthropic_response_partial_coverage_obeys_strict_and_ignore_policy() {

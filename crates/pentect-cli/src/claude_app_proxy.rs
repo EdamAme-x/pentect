@@ -4701,6 +4701,9 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "content": [
                     {"type": "text", "text": format!("show {handle}")},
+                    {"type": "thinking", "thinking": format!("consider {handle}"),
+                        "signature": format!("signed-{handle}")},
+                    {"type": "redacted_thinking", "data": format!("opaque-{handle}")},
                     {"type": "tool_use", "name": "http", "input": {
                         "headers": {"x-token": handle}
                     }}
@@ -4714,8 +4717,11 @@ mod tests {
             rewrite_chat_json_response_with(&body, &plugins, true, true, &mut resolve).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         assert_eq!(value["content"][0]["text"], "show local-value");
+        assert_eq!(value["content"][1]["thinking"], "consider local-value");
+        assert_eq!(value["content"][1]["signature"], format!("signed-{handle}"));
+        assert_eq!(value["content"][2]["data"], format!("opaque-{handle}"));
         assert_eq!(
-            value["content"][1]["input"]["headers"]["x-token"],
+            value["content"][3]["input"]["headers"]["x-token"],
             "local-value"
         );
     }
