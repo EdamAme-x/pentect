@@ -633,7 +633,8 @@ async fn proxy_request_inner(
         }
     }
     let response_body = if status.is_success() && messages_path {
-        let response_body = run_response_plugins(response_body, &state.plugins)?;
+        let response_body =
+            run_response_plugins(response_body, &state.plugins, state.block_unknown_formats)?;
         match rewrite_anthropic_json_response(&response_body, restore_output, &mut resolve) {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(_error) => {
@@ -652,6 +653,7 @@ async fn proxy_request_inner(
 fn run_response_plugins(
     body: Bytes,
     plugins: &StdMutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
 ) -> Result<Bytes, String> {
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -660,10 +662,35 @@ fn run_response_plugins(
     let plugins = plugins
         .lock()
         .map_err(|_| "Claude plugin lock was poisoned".to_string())?;
-    let run = plugins.run(
+    let mut payload = run_anthropic_response_plugin_with(
+        value,
+        block_unknown_formats,
+        |stage, payload, context| plugins.run(stage, payload, context),
+    )?;
+    run_anthropic_tool_plugins(&mut payload, &plugins)?;
+    serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .map_err(|error| format!("could not encode plugin response payload: {error}"))
+}
+
+fn run_anthropic_response_plugin_with(
+    value: Value,
+    block_unknown_formats: bool,
+    mut run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        Value,
+        Option<Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<Value, String> {
+    let run = run(
         pentect_agent::MiddlewareStage::Response,
         value,
         Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
+    )?;
+    crate::plugins::enforce_response_plugin_coverage(
+        run.coverage,
+        block_unknown_formats,
+        "Claude",
     )?;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
@@ -672,11 +699,7 @@ fn run_response_plugins(
                 .unwrap_or_else(|| "response blocked".to_string())
         ));
     }
-    let mut payload = run.payload;
-    run_anthropic_tool_plugins(&mut payload, &plugins)?;
-    serde_json::to_vec(&payload)
-        .map(Bytes::from)
-        .map_err(|error| format!("could not encode plugin response payload: {error}"))
+    Ok(run.payload)
 }
 
 fn run_anthropic_tool_plugins(
@@ -2690,6 +2713,63 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_response_partial_coverage_obeys_strict_and_ignore_policy() {
+        let strict_error = run_anthropic_response_plugin_with(
+            serde_json::json!({"id": "message"}),
+            true,
+            |stage, payload, context| {
+                assert_eq!(stage, pentect_agent::MiddlewareStage::Response);
+                assert_eq!(
+                    context.unwrap(),
+                    serde_json::json!({
+                        "provider": "anthropic",
+                        "transport": "http"
+                    })
+                );
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Partial,
+                    stopped: None,
+                    message: None,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(strict_error.contains("Claude Response plugin reported partial coverage"));
+
+        let allowed = run_anthropic_response_plugin_with(
+            serde_json::json!({"id": "message"}),
+            false,
+            |_stage, mut payload, _context| {
+                payload["plugin"] = Value::Bool(true);
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Partial,
+                    stopped: None,
+                    message: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(allowed["plugin"], true);
+
+        let stop_error = run_anthropic_response_plugin_with(
+            serde_json::json!({"id": "message"}),
+            true,
+            |_stage, payload, _context| {
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Full,
+                    stopped: Some(pentect_agent::StopOutcome::Block),
+                    message: Some("test policy".to_string()),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(stop_error, "plugin blocked: test policy");
+    }
 
     #[tokio::test]
     async fn uploaded_file_coverage_is_reused_after_anthropic_registry_restart() {

@@ -60,6 +60,19 @@ fn enforce_tool_plugin_coverage_with_policy(
     Ok(())
 }
 
+pub(crate) fn enforce_response_plugin_coverage(
+    coverage: pentect_agent::MiddlewareCoverage,
+    block_unknown_formats: bool,
+    provider: &str,
+) -> std::result::Result<(), String> {
+    if block_unknown_formats && coverage == pentect_agent::MiddlewareCoverage::Partial {
+        return Err(format!(
+            "unknown format blocked: a {provider} Response plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PluginScope {
     User,
@@ -2888,6 +2901,28 @@ label = "INLINE_SECRET"
         )
         .is_ok());
         assert!(enforce_tool_plugin_coverage_with_policy(
+            pentect_agent::MiddlewareCoverage::Full,
+            true,
+            "fixture"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn partial_response_plugin_coverage_only_blocks_in_strict_mode() {
+        assert!(enforce_response_plugin_coverage(
+            pentect_agent::MiddlewareCoverage::Partial,
+            true,
+            "fixture"
+        )
+        .is_err());
+        assert!(enforce_response_plugin_coverage(
+            pentect_agent::MiddlewareCoverage::Partial,
+            false,
+            "fixture"
+        )
+        .is_ok());
+        assert!(enforce_response_plugin_coverage(
             pentect_agent::MiddlewareCoverage::Full,
             true,
             "fixture"
