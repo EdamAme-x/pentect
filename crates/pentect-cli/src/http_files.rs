@@ -599,6 +599,32 @@ pub(crate) fn run_google_inline_file_stages(
     run_inline_file_stages(files, plugins, provider, transport)
 }
 
+pub(crate) fn run_openai_inline_file_stages(
+    value: &serde_json::Value,
+    plugins: &pentect_agent::PluginMiddleware,
+    provider: &str,
+    transport: &str,
+) -> Result<bool, String> {
+    run_openai_inline_file_stages_with(value, provider, transport, |stage, payload, context| {
+        plugins.run(stage, payload, context)
+    })
+}
+
+fn run_openai_inline_file_stages_with(
+    value: &serde_json::Value,
+    provider: &str,
+    transport: &str,
+    run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        serde_json::Value,
+        Option<serde_json::Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<bool, String> {
+    let mut files = Vec::new();
+    collect_openai_inline_files(value, &mut files);
+    run_inline_file_stages_with(files, provider, transport, run)
+}
+
 fn run_inline_file_stages(
     files: Vec<InlineFileMetadata>,
     plugins: &pentect_agent::PluginMiddleware,
@@ -735,6 +761,96 @@ fn collect_google_inline_files(value: &serde_json::Value, output: &mut Vec<Inlin
                     "inlineData" | "functionCall" | "functionResponse"
                 ) {
                     collect_google_inline_files(child, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_openai_inline_files(value: &serde_json::Value, output: &mut Vec<InlineFileMetadata>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_openai_inline_files(value, output);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            match object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+            {
+                "input_file" => {
+                    if let Some(data) = object.get("file_data").and_then(serde_json::Value::as_str)
+                    {
+                        if data.starts_with("data:") {
+                            push_data_uri_file(output, object_filename(object), data);
+                        } else {
+                            push_inline_file(
+                                output,
+                                object_filename(object),
+                                object_media_type(object),
+                                Some(data),
+                            );
+                        }
+                    }
+                    return;
+                }
+                "input_image" => {
+                    if let Some(data) = object
+                        .get("image_url")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|data| data.starts_with("data:"))
+                    {
+                        push_data_uri_file(output, object_filename(object), data);
+                    }
+                    return;
+                }
+                "image_url" => {
+                    if let Some(image) = object
+                        .get("image_url")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        if let Some(data) = image
+                            .get("url")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|data| data.starts_with("data:"))
+                        {
+                            push_data_uri_file(
+                                output,
+                                object_filename(object).or_else(|| object_filename(image)),
+                                data,
+                            );
+                        }
+                    }
+                    return;
+                }
+                "file" => {
+                    if let Some(file) = object.get("file").and_then(serde_json::Value::as_object) {
+                        if let Some(data) =
+                            file.get("file_data").and_then(serde_json::Value::as_str)
+                        {
+                            if data.starts_with("data:") {
+                                push_data_uri_file(output, object_filename(file), data);
+                            } else {
+                                push_inline_file(
+                                    output,
+                                    object_filename(file),
+                                    object_media_type(file),
+                                    Some(data),
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+
+            for (key, child) in object {
+                if !matches!(key.as_str(), "tools" | "functions") {
+                    collect_openai_inline_files(child, output);
                 }
             }
         }
@@ -1898,6 +2014,96 @@ mod tests {
                 size: 5,
             }]
         );
+    }
+
+    #[test]
+    fn openai_inline_files_reach_file_middleware_without_schema_false_positives() {
+        let value = serde_json::json!({
+            "input": [{"content": [
+                {"type": "input_file", "filename": "report.pdf",
+                    "file_data": "data:application/pdf;base64,aGVsbG8="},
+                {"type": "input_file", "filename": "notes.txt",
+                    "media_type": "text/plain", "file_data": "YWJj"},
+                {"type": "input_image", "image_url": "data:image/png;base64,YWJjZA=="},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64,YWJjZGU=", "name": "photo.jpg"
+                }},
+                {"type": "file", "file": {
+                    "filename": "chat.txt", "file_data": "data:text/plain;base64,aGk="
+                }},
+                {"type": "input_image", "image_url": "https://example.com/remote.png"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/remote.png"}},
+                {"type": "profile", "file_data": "data:text/plain;base64,aGlkZGVu"}
+            ]}],
+            "tools": [{"type": "function", "function": {"parameters": {
+                "example": {"type": "input_file", "file_data": "data:text/plain;base64,aGlkZGVu"}
+            }}}]
+        });
+        let mut seen = Vec::new();
+        let partial = run_openai_inline_file_stages_with(
+            &value,
+            "openai",
+            "http_json",
+            |stage, payload, context| {
+                assert_eq!(stage, pentect_agent::MiddlewareStage::File);
+                let context = context.unwrap();
+                assert_eq!(context["provider"], "openai");
+                assert_eq!(context["transport"], "http_json");
+                assert_eq!(context["inline"], true);
+                assert_eq!(context["encoding"], "base64");
+                seen.push((
+                    payload["filename"].as_str().map(str::to_string),
+                    payload["media_type"].as_str().unwrap().to_string(),
+                    payload["size"].as_u64().unwrap(),
+                ));
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Partial,
+                    stopped: None,
+                    message: None,
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(partial);
+        assert_eq!(
+            seen,
+            [
+                (
+                    Some("report.pdf".to_string()),
+                    "application/pdf".to_string(),
+                    5
+                ),
+                (Some("notes.txt".to_string()), "text/plain".to_string(), 3),
+                (None, "image/png".to_string(), 4),
+                (Some("photo.jpg".to_string()), "image/jpeg".to_string(), 5),
+                (Some("chat.txt".to_string()), "text/plain".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_inline_file_honors_file_middleware_stop() {
+        let value = serde_json::json!({
+            "type": "input_file",
+            "file_data": "data:application/pdf;base64,aGVsbG8="
+        });
+        let error = run_openai_inline_file_stages_with(
+            &value,
+            "openai",
+            "http_json",
+            |_stage, payload, _context| {
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Full,
+                    stopped: Some(pentect_agent::StopOutcome::Block),
+                    message: Some("test policy".to_string()),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "file upload blocked: test policy");
     }
 
     #[test]
