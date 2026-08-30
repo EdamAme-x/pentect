@@ -990,10 +990,10 @@ fn protect_anthropic_request_body(
         .lock()
         .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
     if let Err(error) = mask_anthropic_request(&mut value, &mut masker, files, endpoint) {
-        // Explicit media-policy decisions are not detector failures. Letting
-        // them enter the general fail-open path would send the very PDF/image
-        // that the configured policy rejected.
-        if is_media_policy_rejection(&error) {
+        // Explicit content-policy decisions are not detector failures. Letting
+        // them enter the general compatibility path would send the exact media
+        // or provider-history plaintext that the policy rejected.
+        if is_media_policy_rejection(&error) || is_provider_history_rejection(&error) {
             return Err(error);
         }
         if block_unknown_formats {
@@ -1107,12 +1107,84 @@ fn anthropic_content_unknown_block_kind(value: &Value) -> Option<&str> {
                 .get("content")
                 .and_then(anthropic_content_unknown_block_kind);
         }
+        if matches!(
+            kind,
+            "tool_search_tool_result" | "web_search_tool_result" | "web_fetch_tool_result"
+        ) {
+            return provider_history_unknown_kind(block, kind);
+        }
         None
     })
 }
 
+fn provider_history_unknown_kind<'a>(block: &'a Value, kind: &str) -> Option<&'a str> {
+    let Some(content) = block.get("content") else {
+        return Some("<missing provider history content>");
+    };
+    match kind {
+        "tool_search_tool_result" => {
+            let nested = content
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<invalid tool_search_tool_result>");
+            if !matches!(
+                nested,
+                "tool_search_tool_search_result" | "tool_search_tool_result_error"
+            ) {
+                return Some(nested);
+            }
+            if nested == "tool_search_tool_search_result" {
+                let Some(references) = content.get("tool_references").and_then(Value::as_array)
+                else {
+                    return Some("<invalid tool references>");
+                };
+                return references.iter().find_map(|reference| {
+                    let reference_type = reference
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<invalid tool reference>");
+                    (reference_type != "tool_reference").then_some(reference_type)
+                });
+            }
+        }
+        "web_search_tool_result" => {
+            if let Some(results) = content.as_array() {
+                return results.iter().find_map(|result| {
+                    let result_type = result
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<invalid web_search_tool_result>");
+                    (result_type != "web_search_result").then_some(result_type)
+                });
+            }
+            let nested = content
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<invalid web_search_tool_result>");
+            if nested != "web_search_tool_result_error" {
+                return Some(nested);
+            }
+        }
+        "web_fetch_tool_result" => {
+            let nested = content
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<invalid web_fetch_tool_result>");
+            if !matches!(nested, "web_fetch_result" | "web_fetch_tool_result_error") {
+                return Some(nested);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 fn is_media_policy_rejection(error: &str) -> bool {
     error.starts_with("document blocked:") || error.starts_with("image blocked:")
+}
+
+fn is_provider_history_rejection(error: &str) -> bool {
+    error.starts_with("provider history blocked:")
 }
 
 fn warn_provider_mcp_credentials(value: &Value, endpoint: AnthropicEndpoint) {
@@ -2042,23 +2114,216 @@ fn mask_content(
                             mask_content(content, tool_result, masker, files)?;
                         }
                     }
-                    // These blocks are provider-produced or binary protocol
-                    // payloads. They are either handled by the media pass
-                    // above or intentionally remain opaque here.
-                    "image"
-                    | "thinking"
-                    | "redacted_thinking"
-                    | "tool_search_tool_result"
-                    | "web_search_tool_result"
-                    | "web_fetch_tool_result"
-                    | "connector_text"
-                    | "fallback" => {}
+                    // Thinking, fallback, and image payloads are opaque here.
+                    "image" | "thinking" | "redacted_thinking" | "fallback" => {}
+                    // Server-tool history must remain byte-stable for paused
+                    // turns, so detected plaintext is blocked rather than
+                    // rewritten. Provider-owned encrypted fields are not read.
+                    "connector_text" => reject_sensitive_provider_named_text(
+                        block,
+                        "text",
+                        "connector_text.text",
+                        masker,
+                    )?,
+                    "tool_search_tool_result" => {
+                        inspect_tool_search_history_plaintext(block, masker)?
+                    }
+                    "web_search_tool_result" => {
+                        inspect_web_search_history_plaintext(block, masker)?
+                    }
+                    "web_fetch_tool_result" => inspect_web_fetch_history_plaintext(block, masker)?,
                     _ => {
                         if !WARNED_UNKNOWN_CONTENT_BLOCK.swap(true, Ordering::Relaxed) {
                             diagnostic("unknown-content-block", "protocol", "messages", false);
                         }
                     }
                 }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn unsupported_provider_history_shape(location: &str) -> String {
+    format!(
+        "provider history blocked: {location} has an unsupported shape and must remain unchanged"
+    )
+}
+
+fn inspect_tool_search_history_plaintext(
+    block: &Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let Some(content) = block.get("content") else {
+        return Err(unsupported_provider_history_shape(
+            "tool_search_tool_result.content",
+        ));
+    };
+    match content.get("type").and_then(Value::as_str) {
+        Some("tool_search_tool_search_result") => {
+            let Some(references) = content.get("tool_references").and_then(Value::as_array) else {
+                return Err(unsupported_provider_history_shape(
+                    "tool_search_tool_result.tool_references",
+                ));
+            };
+            if references.iter().any(|reference| {
+                reference.get("type").and_then(Value::as_str) != Some("tool_reference")
+            }) {
+                return Err(unsupported_provider_history_shape(
+                    "tool_search_tool_result.tool_references",
+                ));
+            }
+            Ok(())
+        }
+        Some("tool_search_tool_result_error") => reject_sensitive_provider_named_text(
+            content,
+            "error_message",
+            "tool_search_tool_result.error_message",
+            masker,
+        ),
+        _ => Err(unsupported_provider_history_shape(
+            "tool_search_tool_result.content",
+        )),
+    }
+}
+
+fn reject_sensitive_provider_text(
+    text: &str,
+    location: &str,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let sensitive = masker
+        .tool_output_contains_sensitive_text(text)?
+        .ok_or_else(|| "content inspection is unavailable".to_string())?;
+    if sensitive {
+        return Err(format!(
+            "provider history blocked: {location} contains sensitive plaintext and must remain unchanged"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_sensitive_provider_named_text(
+    value: &Value,
+    key: &str,
+    location: &str,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    if let Some(text) = value.get(key).and_then(Value::as_str) {
+        reject_sensitive_provider_text(text, location, masker)?;
+    }
+    Ok(())
+}
+
+fn inspect_web_search_history_plaintext(
+    block: &Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let Some(content) = block.get("content") else {
+        return Err(unsupported_provider_history_shape(
+            "web_search_tool_result.content",
+        ));
+    };
+    if content.get("type").and_then(Value::as_str) == Some("web_search_tool_result_error") {
+        return Ok(());
+    }
+    let Some(results) = content.as_array() else {
+        return Err(unsupported_provider_history_shape(
+            "web_search_tool_result.content",
+        ));
+    };
+    for result in results {
+        if result.get("type").and_then(Value::as_str) != Some("web_search_result") {
+            return Err(unsupported_provider_history_shape(
+                "web_search_tool_result.content",
+            ));
+        }
+        reject_sensitive_provider_named_text(result, "title", "web_search_result.title", masker)?;
+        reject_sensitive_provider_named_text(result, "url", "web_search_result.url", masker)?;
+    }
+    Ok(())
+}
+
+fn inspect_web_fetch_history_plaintext(
+    block: &Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let Some(result) = block.get("content").and_then(Value::as_object) else {
+        return Err(unsupported_provider_history_shape(
+            "web_fetch_tool_result.content",
+        ));
+    };
+    match result.get("type").and_then(Value::as_str) {
+        Some("web_fetch_tool_result_error") => return Ok(()),
+        Some("web_fetch_result") => {}
+        _ => {
+            return Err(unsupported_provider_history_shape(
+                "web_fetch_tool_result.content",
+            ));
+        }
+    }
+    if let Some(url) = result.get("url").and_then(Value::as_str) {
+        reject_sensitive_provider_text(url, "web_fetch_result.url", masker)?;
+    }
+    if let Some(document) = result.get("content") {
+        inspect_provider_document_plaintext(document, masker)?;
+    }
+    Ok(())
+}
+
+fn inspect_provider_document_plaintext(
+    document: &Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    reject_sensitive_provider_named_text(document, "title", "web_fetch_result.title", masker)?;
+    reject_sensitive_provider_named_text(document, "context", "web_fetch_result.context", masker)?;
+    let Some(source) = document.get("source") else {
+        return Ok(());
+    };
+    match source.get("type").and_then(Value::as_str) {
+        Some("text") => reject_sensitive_provider_named_text(
+            source,
+            "data",
+            "web_fetch_result.source.data",
+            masker,
+        ),
+        Some("content") => {
+            if let Some(content) = source.get("content") {
+                inspect_provider_content_text(content, masker)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn inspect_provider_content_text(
+    value: &Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => {
+            reject_sensitive_provider_text(text, "web_fetch_result.source.content", masker)
+        }
+        Value::Array(items) => {
+            for item in items {
+                inspect_provider_content_text(item, masker)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = object.get("text").and_then(Value::as_str) {
+                    reject_sensitive_provider_text(
+                        text,
+                        "web_fetch_result.source.content.text",
+                        masker,
+                    )?;
+                }
+            }
+            if let Some(content) = object.get("content") {
+                inspect_provider_content_text(content, masker)?;
             }
             Ok(())
         }
@@ -4030,7 +4295,14 @@ mod tests {
             "messages": [{
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": {}},
+                    {
+                        "type": "tool_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": {
+                            "type": "tool_search_tool_search_result",
+                            "tool_references": []
+                        }
+                    },
                     {"type": "connector_text", "text": "working"},
                     {"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}}
                 ]
@@ -4040,6 +4312,72 @@ mod tests {
             anthropic_request_unknown_content_kind(&value, AnthropicEndpoint::Messages),
             None
         );
+    }
+
+    #[test]
+    fn unknown_nested_provider_history_blocks_even_in_compatibility_mode() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let blocks = [
+            serde_json::json!({
+                "type": "tool_search_tool_result",
+                "tool_use_id": "srvtoolu_tools",
+                "content": {"type": "future_tool_search_result", "data": "opaque"}
+            }),
+            serde_json::json!({
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_search",
+                "content": [{"type": "future_web_search_result", "data": "opaque"}]
+            }),
+            serde_json::json!({
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "srvtoolu_fetch",
+                "content": {"type": "future_web_fetch_result", "data": "opaque"}
+            }),
+        ];
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+
+        for block in blocks {
+            let body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "max_tokens": 8,
+                    "messages": [{"role": "assistant", "content": [block]}]
+                }))
+                .unwrap(),
+            );
+            let strict = match protect_anthropic_request_body(
+                &body,
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                AnthropicEndpoint::Messages,
+                true,
+            ) {
+                Ok(_) => panic!("unknown nested provider history passed strict mode"),
+                Err(error) => error,
+            };
+            assert!(strict.starts_with("unknown format blocked:"), "{strict}");
+
+            let compatible = match protect_anthropic_request_body(
+                &body,
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                AnthropicEndpoint::Messages,
+                false,
+            ) {
+                Ok(_) => panic!("unknown nested provider history passed compatibility mode"),
+                Err(error) => error,
+            };
+            assert!(
+                compatible.starts_with("provider history blocked:"),
+                "{compatible}"
+            );
+            assert!(compatible.contains("unsupported shape"), "{compatible}");
+        }
     }
 
     #[test]
@@ -4196,6 +4534,226 @@ mod tests {
         assert!(!protected.to_string().contains(&secret), "{protected}");
         assert_eq!(
             protected["messages"][1]["content"][2]["content"]["encrypted_stdout"],
+            encrypted
+        );
+    }
+
+    #[test]
+    fn provider_server_history_fails_closed_on_sensitive_plaintext_fields() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["AKIA", "HISTORY", "BOUNDARY", "1234"].concat();
+        let cases = [
+            (
+                "tool_search_tool_result.error_message",
+                serde_json::json!({
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_search_error",
+                    "content": {
+                        "type": "tool_search_tool_result_error",
+                        "error_code": "unavailable",
+                        "error_message": format!("RUNPOD_API_KEY={secret}")
+                    }
+                }),
+            ),
+            (
+                "connector_text.text",
+                serde_json::json!({
+                    "type": "connector_text",
+                    "text": format!("RUNPOD_API_KEY={secret}")
+                }),
+            ),
+            (
+                "web_search_result.title",
+                serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_search",
+                    "content": [{
+                        "type": "web_search_result",
+                        "title": format!("RUNPOD_API_KEY={secret}"),
+                        "url": "https://example.com/public",
+                        "encrypted_content": "opaque-provider-state"
+                    }]
+                }),
+            ),
+            (
+                "web_search_result.url",
+                serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_search_url",
+                    "content": [{
+                        "type": "web_search_result",
+                        "title": "Public result",
+                        "url": format!("https://example.com/?token={secret}"),
+                        "encrypted_content": "opaque-provider-state"
+                    }]
+                }),
+            ),
+            (
+                "web_fetch_result.url",
+                serde_json::json!({
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": "srvtoolu_fetch_url",
+                    "content": {
+                        "type": "web_fetch_result",
+                        "url": format!("https://example.com/?token={secret}"),
+                        "content": {
+                            "type": "document",
+                            "source": {"type": "text", "media_type": "text/plain", "data": "public"}
+                        }
+                    }
+                }),
+            ),
+            (
+                "web_fetch_result.source.data",
+                serde_json::json!({
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": "srvtoolu_fetch",
+                    "content": {
+                        "type": "web_fetch_result",
+                        "url": "https://example.com/public",
+                        "retrieved_at": "2026-08-31T00:00:00Z",
+                        "content": {
+                            "type": "document",
+                            "source": {
+                                "type": "text",
+                                "media_type": "text/plain",
+                                "data": format!("RUNPOD_API_KEY={secret}")
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                "web_fetch_result.source.content",
+                serde_json::json!({
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": "srvtoolu_fetch_content",
+                    "content": {
+                        "type": "web_fetch_result",
+                        "url": "https://example.com/public",
+                        "content": {
+                            "type": "document",
+                            "source": {
+                                "type": "content",
+                                "content": format!("RUNPOD_API_KEY={secret}")
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                "web_fetch_result.source.content.text",
+                serde_json::json!({
+                    "type": "web_fetch_tool_result",
+                    "tool_use_id": "srvtoolu_fetch_text_block",
+                    "content": {
+                        "type": "web_fetch_result",
+                        "url": "https://example.com/public",
+                        "content": {
+                            "type": "document",
+                            "source": {
+                                "type": "content",
+                                "content": [{
+                                    "type": "text",
+                                    "text": format!("RUNPOD_API_KEY={secret}")
+                                }]
+                            }
+                        }
+                    }
+                }),
+            ),
+        ];
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+
+        for (location, block) in cases {
+            let body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "max_tokens": 8,
+                    "messages": [{"role": "assistant", "content": [block]}]
+                }))
+                .unwrap(),
+            );
+            for block_unknown_formats in [true, false] {
+                let error = match protect_anthropic_request_body(
+                    &body,
+                    &masker,
+                    &plugins,
+                    &HashMap::new(),
+                    AnthropicEndpoint::Messages,
+                    block_unknown_formats,
+                ) {
+                    Ok(_) => panic!("sensitive provider history passed at {location}"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error,
+                    format!(
+                        "provider history blocked: {location} contains sensitive plaintext and must remain unchanged"
+                    )
+                );
+                assert!(!error.contains(&secret));
+            }
+        }
+    }
+
+    #[test]
+    fn provider_server_history_keeps_protocol_state_byte_stable() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let encrypted = ["AKIA", "OPAQUE12", "STATE345", "6789"].concat();
+        let blocks = serde_json::json!([
+            {
+                "type": "tool_search_tool_result",
+                "tool_use_id": "srvtoolu_tools",
+                "content": {
+                    "type": "tool_search_tool_search_result",
+                    "tool_references": [{
+                        "type": "tool_reference",
+                        "tool_name": "get_weather"
+                    }]
+                }
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_search",
+                "content": [{
+                    "type": "web_search_result",
+                    "title": "Public result",
+                    "url": "https://example.com/public",
+                    "page_age": null,
+                    "encrypted_content": encrypted
+                }]
+            },
+            {"type": "connector_text", "text": "Continuing with the tool result."}
+        ]);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test",
+                "max_tokens": 8,
+                "messages": [{"role": "assistant", "content": blocks}]
+            }))
+            .unwrap(),
+        );
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let protected = protect_anthropic_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            AnthropicEndpoint::Messages,
+            true,
+        )
+        .unwrap();
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        assert_eq!(protected["messages"][0]["content"], blocks);
+        assert_eq!(
+            protected["messages"][0]["content"][1]["content"][0]["encrypted_content"],
             encrypted
         );
     }

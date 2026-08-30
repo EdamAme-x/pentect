@@ -72,6 +72,19 @@ environment bindings. The instructions contain labels and syntax, not real
 secret values. Claude can use a binding directly in a tool call instead of
 rereading the source file.
 
+Local `tool_use`, MCP input/result, and supported execution-result plaintext is
+checked before conversation history is sent again. Detected values in those
+rewriteable fields become handles.
+
+Anthropic server-tool history has a different constraint. Tool-search
+references and encrypted result state must be returned unchanged for a paused
+turn to resume. Pentect leaves those protocol fields byte-stable. It checks the
+model-visible narration and tool-search error message, web-search title and URL,
+and web-fetch plaintext document fields without changing them. If one contains a detected value,
+Pentect stops the request with `provider history blocked` and names the field;
+it does not include the value in the error. Unknown-format compatibility does
+not bypass this decision or allow unknown nested provider-history blocks.
+
 ## Custom gateways
 
 ```sh

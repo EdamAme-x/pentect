@@ -722,6 +722,15 @@ impl ActiveToolOutputMasker {
         Ok(Some(masked))
     }
 
+    /// Return whether tool-output text would be protected, without creating a
+    /// handle or changing masking activity/metrics.
+    pub fn tool_output_contains_sensitive_text(&self, text: &str) -> Result<Option<bool>, String> {
+        self.masker
+            .as_ref()
+            .map(|masker| masker.tool_output_contains_sensitive_text(text))
+            .transpose()
+    }
+
     pub fn mask_prompt_text(&mut self, text: &str) -> Result<Option<String>, String> {
         let Some(masker) = &mut self.masker else {
             return Ok(None);

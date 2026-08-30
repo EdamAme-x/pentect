@@ -99,6 +99,22 @@ If auto-discovery fails, pass the executable with `--app PATH`.
 another trusted system. It sends unchecked content and should not be the first
 fix. See [Files and images](/protection/files-and-images/).
 
+## Provider history was blocked
+
+This error means a provider-owned history block contains detected plaintext,
+but the block must remain unchanged for a paused server-tool turn to resume.
+Pentect did not send the request and reports only the block and field name.
+
+Start a new turn without the affected server-tool history, or remove the value
+at its original source before retrying. `compatibility.unknown_formats =
+"ignore"` does not disable this block because the format is known and the
+plaintext check already found a value. Tool-search references and encrypted
+provider state are not decoded or rewritten.
+
+Pentect also uses this error for an unknown nested server-history shape, even in
+unknown-format compatibility mode. Pentect cannot safely rewrite or inspect an
+unrecognized provider-owned block while preserving resumable history.
+
 ## A plugin does not run
 
 ```sh
