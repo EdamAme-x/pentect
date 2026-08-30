@@ -32,9 +32,10 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -55,10 +56,12 @@ const MAX_PENDING_UPLOADS: usize = 256;
 const MAX_IDS_PER_UPLOAD: usize = 16;
 const APP_STARTUP_GRACE: Duration = Duration::from_secs(2);
 const APP_MONITOR_INTERVAL: Duration = Duration::from_millis(100);
+const APP_CONNECTION_WARNING_AFTER: Duration = Duration::from_secs(30);
 
 fn proxy_diagnostic(reason: &str) {
     let (kind, retryable) = match reason {
         "gateway-stopped" => ("runtime", false),
+        "no-protected-connection" => ("client-connection", true),
         _ => ("unclassified", false),
     };
     pentect_agent::record_http_diagnostic_activity(
@@ -248,6 +251,7 @@ fn monitor_activated_claude_app(
     process: &ActivatedWindowsProcess,
     proxy: &ClaudeAppProxyGuard,
 ) -> Result<std::process::ExitStatus, String> {
+    let mut connection_reporter = ClaudeAppConnectionReporter::new(Instant::now());
     loop {
         if let Some(status) = process.try_wait()? {
             return Ok(status);
@@ -257,6 +261,7 @@ fn monitor_activated_claude_app(
             let _ = process.wait();
             return Err(error);
         }
+        report_claude_app_connection(proxy, &mut connection_reporter);
         thread::sleep(APP_MONITOR_INTERVAL);
     }
 }
@@ -265,6 +270,7 @@ fn monitor_claude_app_child(
     child: &mut std::process::Child,
     proxy: &ClaudeAppProxyGuard,
 ) -> Result<std::process::ExitStatus, String> {
+    let mut connection_reporter = ClaudeAppConnectionReporter::new(Instant::now());
     loop {
         if let Some(status) = child
             .try_wait()
@@ -276,7 +282,68 @@ fn monitor_claude_app_child(
             terminate_and_reap_child(child);
             return Err(error);
         }
+        report_claude_app_connection(proxy, &mut connection_reporter);
         thread::sleep(APP_MONITOR_INTERVAL);
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ClaudeAppConnectionNotice {
+    Protected,
+    NotObserved,
+}
+
+struct ClaudeAppConnectionReporter {
+    started_at: Instant,
+    protected_reported: bool,
+    warning_reported: bool,
+}
+
+impl ClaudeAppConnectionReporter {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            protected_reported: false,
+            warning_reported: false,
+        }
+    }
+
+    fn next_notice(
+        &mut self,
+        protected_connection_observed: bool,
+        now: Instant,
+    ) -> Option<ClaudeAppConnectionNotice> {
+        if protected_connection_observed && !self.protected_reported {
+            self.protected_reported = true;
+            return Some(ClaudeAppConnectionNotice::Protected);
+        }
+        if !protected_connection_observed
+            && !self.protected_reported
+            && !self.warning_reported
+            && now.duration_since(self.started_at) >= APP_CONNECTION_WARNING_AFTER
+        {
+            self.warning_reported = true;
+            return Some(ClaudeAppConnectionNotice::NotObserved);
+        }
+        None
+    }
+}
+
+fn report_claude_app_connection(
+    proxy: &ClaudeAppProxyGuard,
+    reporter: &mut ClaudeAppConnectionReporter,
+) {
+    match reporter.next_notice(proxy.protected_connection_observed(), Instant::now()) {
+        Some(ClaudeAppConnectionNotice::Protected) => eprintln!(
+            "[pentect] Claude Desktop connected through the inspected gateway; supported traffic is protected"
+        ),
+        Some(ClaudeAppConnectionNotice::NotObserved) => {
+            eprintln!(
+                "[pentect] warning: Claude Desktop has not established a protected connection after 30 seconds; confirm that this is the protected app instance before sending sensitive data"
+            );
+            proxy_diagnostic("no-protected-connection");
+        }
+        None => {}
     }
 }
 
@@ -338,7 +405,7 @@ fn print_gateway_ready(proxy: &ClaudeAppProxyGuard) {
         proxy.proxy_url()
     );
     eprintln!(
-        "[pentect] Supported Claude Desktop Chat and attachment traffic is protected; bodies are not logged"
+        "[pentect] Waiting for Claude Desktop to establish a protected connection; bodies are not logged"
     );
 }
 
@@ -1135,6 +1202,7 @@ struct ClaudeAppProxyGuard {
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
     failure: Arc<Mutex<Option<String>>>,
+    protected_connection_observed: Arc<AtomicBool>,
 }
 
 impl ClaudeAppProxyGuard {
@@ -1150,6 +1218,8 @@ impl ClaudeAppProxyGuard {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let failure = Arc::new(Mutex::new(None));
         let thread_failure = Arc::clone(&failure);
+        let protected_connection_observed = Arc::new(AtomicBool::new(false));
+        let thread_protected_connection_observed = Arc::clone(&protected_connection_observed);
         let thread = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1168,7 +1238,14 @@ impl ClaudeAppProxyGuard {
                 }
             };
             runtime.block_on(async move {
-                if let Err(error) = run_proxy(authority, ready_tx, shutdown_rx).await {
+                if let Err(error) = run_proxy(
+                    authority,
+                    ready_tx,
+                    shutdown_rx,
+                    thread_protected_connection_observed,
+                )
+                .await
+                {
                     if let Ok(mut failure) = thread_failure.lock() {
                         *failure = Some(error.clone());
                     }
@@ -1191,6 +1268,7 @@ impl ClaudeAppProxyGuard {
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
             failure,
+            protected_connection_observed,
         })
     }
 
@@ -1221,6 +1299,10 @@ impl ClaudeAppProxyGuard {
         self.thread
             .as_ref()
             .is_some_and(|thread| !thread.is_finished())
+    }
+
+    fn protected_connection_observed(&self) -> bool {
+        self.protected_connection_observed.load(Ordering::Acquire)
     }
 }
 
@@ -1321,6 +1403,7 @@ struct ProxyState {
     file_attestations: crate::http_files::FileAttestationStore,
     pending_files: Mutex<PendingFiles>,
     websocket_connections: Arc<tokio::sync::Semaphore>,
+    protected_connection_observed: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -1353,6 +1436,7 @@ async fn run_proxy(
     authority: CertificateAuthority,
     ready_tx: mpsc::Sender<Result<String, String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    protected_connection_observed: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1384,6 +1468,7 @@ async fn run_proxy(
         file_attestations: crate::http_files::FileAttestationStore::open_default()?,
         pending_files: Mutex::new(PendingFiles::default()),
         websocket_connections: Arc::new(tokio::sync::Semaphore::new(MAX_WEBSOCKET_CONNECTIONS)),
+        protected_connection_observed,
     });
     let _ = ready_tx.send(Ok(format!("http://{address}")));
 
@@ -1520,6 +1605,9 @@ where
         .accept(stream)
         .await
         .map_err(|error| format!("TLS handshake failed for {host}: {error}"))?;
+    state
+        .protected_connection_observed
+        .store(true, Ordering::Release);
     let service =
         service_fn(move |request| forward_inspected(request, host.clone(), Arc::clone(&state)));
     http1::Builder::new()
@@ -3478,6 +3566,7 @@ mod tests {
             shutdown: None,
             thread: Some(thread),
             failure: Arc::new(Mutex::new(Some(reason.to_string()))),
+            protected_connection_observed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3515,6 +3604,48 @@ mod tests {
             "{error}"
         );
         assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn missing_protected_connection_warns_once_and_later_reports_recovery() {
+        let started_at = Instant::now();
+        let mut reporter = ClaudeAppConnectionReporter::new(started_at);
+
+        assert_eq!(
+            reporter.next_notice(false, started_at + Duration::from_secs(29)),
+            None
+        );
+        assert_eq!(
+            reporter.next_notice(false, started_at + APP_CONNECTION_WARNING_AFTER),
+            Some(ClaudeAppConnectionNotice::NotObserved)
+        );
+        assert_eq!(
+            reporter.next_notice(false, started_at + Duration::from_secs(31)),
+            None
+        );
+        assert_eq!(
+            reporter.next_notice(true, started_at + Duration::from_secs(32)),
+            Some(ClaudeAppConnectionNotice::Protected)
+        );
+        assert_eq!(
+            reporter.next_notice(true, started_at + Duration::from_secs(33)),
+            None
+        );
+    }
+
+    #[test]
+    fn observed_protected_connection_does_not_emit_a_late_warning() {
+        let started_at = Instant::now();
+        let mut reporter = ClaudeAppConnectionReporter::new(started_at);
+
+        assert_eq!(
+            reporter.next_notice(true, started_at + Duration::from_secs(1)),
+            Some(ClaudeAppConnectionNotice::Protected)
+        );
+        assert_eq!(
+            reporter.next_notice(false, started_at + APP_CONNECTION_WARNING_AFTER),
+            None
+        );
     }
 
     #[tokio::test]
