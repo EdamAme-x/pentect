@@ -2827,15 +2827,23 @@ fn before_tool_updated_input_lazy(
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     let mut updated = tool_input.clone();
-    if is_read_like_tool_name(tool_name) {
-        let session = open_hook_session(cli, session_name)?;
-        if let Some(updated) = apply_masked_read_before_tool(&session, tool_input)? {
+    let read_like = is_read_like_tool_name(tool_name);
+    let write_like = is_write_or_edit_like_tool_name(tool_name);
+    let has_handle = value_contains_pentect_masked_handle(tool_input);
+    let session = if read_like || write_like || has_handle {
+        Some(open_hook_session(cli, session_name)?)
+    } else {
+        None
+    };
+    if read_like {
+        let session = session.as_ref().expect("read tools open a session");
+        if let Some(updated) = apply_masked_read_before_tool(session, tool_input)? {
             return Ok((updated, true));
         }
     }
-    if is_write_or_edit_like_tool_name(tool_name) {
-        let session = open_hook_session(cli, session_name)?;
-        validate_masked_write_before_tool(&session, tool_name, tool_input)?;
+    if write_like {
+        let session = session.as_ref().expect("write tools open a session");
+        validate_masked_write_before_tool(session, tool_name, tool_input)?;
     }
     if is_shell_tool_name(tool_name) {
         if let Some(command) = updated.get("command").and_then(Value::as_str) {
@@ -2848,10 +2856,21 @@ fn before_tool_updated_input_lazy(
             }
         }
     }
-    let session = open_hook_session(cli, session_name)?;
-    resolve_known_value(&MemoryStore::for_session(&session), &mut updated)?;
+    if has_handle {
+        let session = session.as_ref().expect("handle inputs open a session");
+        resolve_known_value(&MemoryStore::for_session(session), &mut updated)?;
+    }
     let changed = updated != *tool_input;
     Ok((updated, changed))
+}
+
+fn value_contains_pentect_masked_handle(value: &Value) -> bool {
+    match value {
+        Value::String(text) => contains_pentect_masked_handle(text),
+        Value::Array(values) => values.iter().any(value_contains_pentect_masked_handle),
+        Value::Object(object) => object.values().any(value_contains_pentect_masked_handle),
+        _ => false,
+    }
 }
 
 fn resolve_known_value(store: &MemoryStore, value: &mut Value) -> Result<(), String> {

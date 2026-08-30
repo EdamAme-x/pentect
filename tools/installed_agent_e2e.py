@@ -265,11 +265,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload = anthropic_tool_response(
                     sequence, shell_command(["python", "e2e_helper.py", "read"])
                 )
-            elif attempts == 0:
+            elif attempts == 0 and sequence <= 3:
                 payload = anthropic_tool_response(
                     sequence, self._probe_command(handles[0])
                 )
-            elif attempts == 1:
+            elif attempts == 1 and sequence <= 4:
                 payload = anthropic_tool_response(
                     sequence, self._probe_command(handles[1])
                 )

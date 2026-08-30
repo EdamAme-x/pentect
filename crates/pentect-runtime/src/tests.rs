@@ -2153,9 +2153,15 @@ fn write_tool_applies_multiedit_with_masked_old_string_before_tool() {
     assert!(rendered.contains(raw), "{rendered}");
     assert!(!rendered.contains("<<"), "{rendered}");
     assert_eq!(updated["edits"].as_array().unwrap().len(), 2);
-    std::fs::write(&config, "name=new\ntoken=rotated\n").unwrap();
-    let written = std::fs::read_to_string(&config).unwrap();
-    assert_eq!(written, "name=new\ntoken=rotated\n");
+    let mut current = std::fs::read_to_string(&config).unwrap();
+    for edit in updated["edits"].as_array().unwrap() {
+        current = current.replace(
+            edit["old_string"].as_str().unwrap(),
+            edit["new_string"].as_str().unwrap(),
+        );
+    }
+    std::fs::write(&config, &current).unwrap();
+    assert_eq!(current, "name=new\ntoken=rotated\n");
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
