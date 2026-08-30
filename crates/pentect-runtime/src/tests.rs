@@ -760,6 +760,56 @@ fn active_tool_output_masker_reuses_in_memory_state() {
 }
 
 #[test]
+fn active_tool_output_inspection_has_no_recovery_or_metric_side_effects() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-masker-inspection");
+
+    let client = MemoryStoreClient::from_env().unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+
+    assert_eq!(
+        masker
+            .tool_output_contains_sensitive_text(&format!("OPENAI_API_KEY={raw}\n"))
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        masker
+            .tool_output_contains_sensitive_text("ordinary provider history")
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(client.masked_count().unwrap(), 0);
+    assert_eq!(masker.reported_masked_count, 0);
+    assert!(masker.cache.is_empty());
+
+    let masked = masker
+        .mask_tool_output(&format!("OPENAI_API_KEY={raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert!(!masked.contains(raw), "{masked}");
+    assert_eq!(client.masked_count().unwrap(), 1);
+
+    let arbitrary = "cabbage";
+    masker
+        .mask_tool_output(&format!("TEST_SECRET={arbitrary}\n"))
+        .unwrap()
+        .unwrap();
+    let count_before_known_value_inspection = client.masked_count().unwrap();
+    assert_eq!(
+        masker
+            .tool_output_contains_sensitive_text(&format!("provider repeated {arbitrary}"))
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        client.masked_count().unwrap(),
+        count_before_known_value_inspection
+    );
+}
+
+#[test]
 fn active_prompt_masks_keyed_and_vendor_secrets_in_prose() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-keyed-detector");

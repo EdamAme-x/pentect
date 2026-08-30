@@ -130,6 +130,25 @@ impl OutputMasker {
         self.mask_text(text, kind)
     }
 
+    /// Inspect tool-output text with the same masking stages without recording
+    /// recovery material, activity, or metrics. Provider-owned history cannot
+    /// be rewritten safely, so gateways use this to decide whether to reject it.
+    pub(crate) fn tool_output_contains_sensitive_text(&self, text: &str) -> Result<bool, String> {
+        let remask_recoveries = self.store.snapshot().map_err(|error| error.to_string())?;
+        let mut preview = Self {
+            store: self.store.clone(),
+            engine: self.engine,
+            prompt_engine: self.prompt_engine,
+            plugin_middleware: self.plugin_middleware.clone(),
+            environment_prefix: self.environment_prefix.clone(),
+            mode: OutputMaskerMode::Deferred { remask_recoveries },
+            pending: Recovery::empty_for_key(&self.store.session.key),
+            masked_count: 0,
+            activity: BTreeMap::new(),
+        };
+        Ok(preview.mask_tool_output(text)? != text)
+    }
+
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
         // Protect an explicit user-authored exception before remasking values
         // already known to the session. Otherwise a value first seen in tool,
