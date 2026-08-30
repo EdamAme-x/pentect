@@ -99,7 +99,11 @@ does not suppress or bypass.
 Crash residue is journaled and removed before the next protected launch. This
 gateway is also monitored after startup; an unexpected gateway exit terminates
 the protected Desktop process and releases its temporary trust state. This
-path still requires a real-account release verification before it is listed as
+command reports protection as active only after Claude Desktop accepts the
+session certificate and establishes an inspected connection. If that does not
+happen within 30 seconds, Pentect warns without terminating an app that may
+still be waiting for login or user input. This path still requires a
+real-account release verification before it is listed as
 fully supported; use `pentect claude` for Claude Code when Desktop coverage is
 not acceptable.
 
