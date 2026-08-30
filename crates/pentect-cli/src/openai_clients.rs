@@ -62,6 +62,16 @@ pub(crate) fn run(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let _bash_dialect = crate::EnvVarGuard::set_optional([(
+        "PENTECT_AGENT_BASH_DIALECT",
+        Some(OsString::from(
+            if injection == crate::client_descriptor::OpenAiInjection::TempExtension {
+                "bash"
+            } else {
+                "powershell"
+            },
+        )),
+    )]);
     let standard_key_names = provider_key_env_names(injection);
     let standard_key_names = if crate::upstream::has_origin_auth_override(&opts.upstream_header_env)
     {
@@ -295,6 +305,10 @@ fn run_opencode(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let _bash_dialect = crate::EnvVarGuard::set_optional([(
+        "PENTECT_AGENT_BASH_DIALECT",
+        Some(OsString::from("powershell")),
+    )]);
     if opts.model.is_none() && opts.upstream.is_none() {
         return run_opencode_picker(opts, pentect, &active_plugins, memory_store);
     }

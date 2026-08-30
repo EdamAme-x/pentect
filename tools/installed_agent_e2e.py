@@ -177,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
             self.server.state.model_requests.append(request)
             sequence = len(self.server.state.model_requests)
             if sequence == 1:
-                command = shell_command([sys.executable, "e2e_helper.py", "read"])
+                command = shell_command(["python", "e2e_helper.py", "read"])
                 payload = tool_response(
                     sequence,
                     f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
@@ -211,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
                 handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
                 if sequence == 1:
                     payload = chat_tool_response(
-                        sequence, shell_command([sys.executable, "e2e_helper.py", "read"])
+                        sequence, shell_command(["python", "e2e_helper.py", "read"])
                     )
                 elif sequence == 2 and len(handles) >= 2:
                     payload = chat_tool_response(
@@ -238,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _probe_command(self, handle: str) -> str:
         url = f"http://127.0.0.1:{self.server.server_port}/check"
-        return shell_command([sys.executable, "e2e_helper.py", "probe", url, handle])
+        return shell_command(["python", "e2e_helper.py", "probe", url, handle])
 
     def _json(self, value: object, status: int = 200) -> None:
         payload = json.dumps(value).encode()
@@ -273,6 +273,23 @@ def client_command(
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
+            prompt,
+        ]
+    if client == "pi":
+        return [
+            pentect,
+            "pi",
+            "--upstream",
+            upstream,
+            "--model",
+            "gpt-5.6-luna",
+            "--api",
+            "chat",
+            "--print",
+            "--no-session",
+            "--no-context-files",
+            "--tools",
+            "bash",
             prompt,
         ]
     return [
@@ -379,10 +396,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pentect", default="pentect")
     parser.add_argument(
-        "--client", action="append", choices=("codex", "opencode"), dest="clients"
+        "--client",
+        action="append",
+        choices=("codex", "opencode", "pi"),
+        dest="clients",
     )
     args = parser.parse_args()
-    for client in args.clients or ("codex", "opencode"):
+    for client in args.clients or ("codex", "opencode", "pi"):
         run_client(args.pentect, client)
     return 0
 

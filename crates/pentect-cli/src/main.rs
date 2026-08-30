@@ -1715,6 +1715,8 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let _bash_dialect =
+        EnvVarGuard::set_optional([("PENTECT_AGENT_BASH_DIALECT", Some(OsString::from("bash")))]);
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
     upstream::hide_header_source_env(&mut cmd, &opts.upstream_header_env);
