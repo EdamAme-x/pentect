@@ -491,7 +491,31 @@ else:
             )
             if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *command]
-            completed = subprocess.run(command, cwd=project, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=45,
+                )
+            except subprocess.TimeoutExpired as error:
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                output = output.replace(valid, "<synthetic-key>").replace(
+                    invalid, "<synthetic-key>"
+                )
+                handle_counts = [
+                    len(set(HANDLE.findall(request)))
+                    for request in state.model_requests
+                ]
+                raise RuntimeError(
+                    f"{client} E2E timed out; service attempts={len(state.service_attempts)}; "
+                    f"model requests={len(state.model_requests)} handles={handle_counts}\n{output}"
+                ) from error
             if completed.returncode != 0:
                 output = completed.stdout.replace(valid, "<synthetic-key>").replace(invalid, "<synthetic-key>")
                 raise RuntimeError(f"{client} E2E exited with {completed.returncode}:\n{output}")
