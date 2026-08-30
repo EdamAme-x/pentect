@@ -469,9 +469,11 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
         "{thumbprint}\n{}\n{owner_creation_time}\n",
         std::process::id()
     );
-    std::fs::write(&path, journal)
-        .map_err(|error| format!("could not write Claude Desktop CA cleanup journal: {error}"))?;
-    crate::secure_temp::restrict_to_current_user(&path)
+    crate::secure_temp::atomic_owner_only_write(
+        &path,
+        journal.as_bytes(),
+        "Claude Desktop CA cleanup journal",
+    )
 }
 
 #[cfg(windows)]
