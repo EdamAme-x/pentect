@@ -756,11 +756,11 @@ jobs:
           claude_fixture="$RUNNER_TEMP/claude-app-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$claude_fixture"
           "$PENTECT_SMOKE_BINARY" claude app --yes --app "$claude_fixture" --upstream https://api.anthropic.com
-      - name: Verify installed Codex, OpenCode, and Pi handle flows (Windows)
+      - name: Verify installed Codex, Claude, OpenCode, and Pi handle flows (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: python tools/installed_agent_e2e.py --pentect $env:PENTECT_SMOKE_BINARY
-      - name: Verify installed Codex, OpenCode, and Pi handle flows (POSIX)
+      - name: Verify installed Codex, Claude, OpenCode, and Pi handle flows (POSIX)
         if: runner.os != 'Windows'
         run: python tools/installed_agent_e2e.py --pentect "$PENTECT_SMOKE_BINARY"
       - name: Verify persistent diagnostics (Windows)

@@ -146,6 +146,85 @@ def chat_tool_response(sequence: int, command: str) -> bytes:
     ])
 
 
+def anthropic_sse(events: list[dict[str, object]]) -> bytes:
+    return b"".join(
+        f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+        for event in events
+    )
+
+
+def anthropic_message(sequence: int) -> dict[str, object]:
+    return {
+        "id": f"msg_e2e_{sequence}",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "claude-sonnet-4-5",
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 1,
+        },
+    }
+
+
+def anthropic_tool_response(sequence: int, command: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Bash",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps({"command": command}, separators=(",", ":")),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
+def anthropic_text_response(sequence: int, text: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
 class State:
     def __init__(self, valid: str, invalid: str) -> None:
         self.valid = valid
@@ -171,6 +250,37 @@ class Handler(BaseHTTPRequestHandler):
             self.server.state.service_attempts.append(authorization)
             status = 200 if authorization == f"Bearer {self.server.state.valid}" else 401
             self._json({"ok": status == 200}, status)
+            return
+        request_path = self.path.split("?", 1)[0]
+        if request_path.endswith("/messages/count_tokens"):
+            self._json({"input_tokens": 1})
+            return
+        if request_path.endswith("/messages"):
+            request = body.decode("utf-8")
+            self.server.state.model_requests.append(request)
+            sequence = len(self.server.state.model_requests)
+            handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+            attempts = len(self.server.state.service_attempts)
+            if len(handles) < 2:
+                payload = anthropic_tool_response(
+                    sequence, shell_command(["python", "e2e_helper.py", "read"])
+                )
+            elif attempts == 0:
+                payload = anthropic_tool_response(
+                    sequence, self._probe_command(handles[0])
+                )
+            elif attempts == 1:
+                payload = anthropic_tool_response(
+                    sequence, self._probe_command(handles[1])
+                )
+            else:
+                payload = anthropic_text_response(sequence, "DONE")
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if self.path.endswith("/responses"):
             request = body.decode("utf-8")
@@ -292,6 +402,24 @@ def client_command(
             "bash",
             prompt,
         ]
+    if client == "claude":
+        return [
+            pentect,
+            "claude",
+            "--upstream",
+            upstream.removesuffix("/v1"),
+            "--bare",
+            "--print",
+            "--output-format",
+            "text",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--tools",
+            "Bash",
+            "--model",
+            "claude-sonnet-4-5",
+            prompt,
+        ]
     return [
         pentect,
         "opencode",
@@ -352,6 +480,7 @@ else:
                 "XDG_DATA_HOME": str(home / ".local" / "share"),
                 "XDG_STATE_HOME": str(home / ".local" / "state"),
                 "OPENAI_API_KEY": "local-fixture",
+                "ANTHROPIC_API_KEY": "local-fixture",
                 "PENTECT_LOG_DIR": str(root / "logs"),
             })
             command = client_command(
@@ -398,11 +527,11 @@ def main() -> int:
     parser.add_argument(
         "--client",
         action="append",
-        choices=("codex", "opencode", "pi"),
+        choices=("codex", "claude", "opencode", "pi"),
         dest="clients",
     )
     args = parser.parse_args()
-    for client in args.clients or ("codex", "opencode", "pi"):
+    for client in args.clients or ("codex", "claude", "opencode", "pi"):
         run_client(args.pentect, client)
     return 0
 
