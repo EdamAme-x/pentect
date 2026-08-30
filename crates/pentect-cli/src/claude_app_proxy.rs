@@ -173,8 +173,9 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         let ca_thumbprint = proxy.ca_thumbprint().to_string();
         if let Err(error) = ctrlc::set_handler(move || {
             terminate_child_process(process_id);
-            let _ = remove_windows_user_ca(&ca_thumbprint);
-            let _ = remove_windows_ca_journal();
+            if let Err(error) = cleanup_windows_user_ca_session(&ca_thumbprint) {
+                eprintln!("[pentect] {error}");
+            }
             std::process::exit(130);
         }) {
             terminate_child_process(process_id);
@@ -217,8 +218,9 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         terminate_child_process(child_id);
         #[cfg(windows)]
         {
-            let _ = remove_windows_user_ca(&ca_thumbprint);
-            let _ = remove_windows_ca_journal();
+            if let Err(error) = cleanup_windows_user_ca_session(&ca_thumbprint) {
+                eprintln!("[pentect] {error}");
+            }
         }
         std::process::exit(130);
     }) {
@@ -485,6 +487,12 @@ fn remove_windows_ca_journal_at(path: &std::path::Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_windows_user_ca_session(thumbprint: &str) -> Result<(), String> {
+    remove_windows_user_ca(thumbprint)?;
+    remove_windows_ca_journal()
 }
 
 #[cfg(windows)]
@@ -776,11 +784,7 @@ impl WindowsUserCaGuard {
 #[cfg(windows)]
 impl Drop for WindowsUserCaGuard {
     fn drop(&mut self) {
-        if let Err(error) = remove_windows_user_ca(&self.thumbprint) {
-            eprintln!("[pentect] {error}");
-            return;
-        }
-        if let Err(error) = remove_windows_ca_journal() {
+        if let Err(error) = cleanup_windows_user_ca_session(&self.thumbprint) {
             eprintln!("[pentect] {error}");
         }
         self.thumbprint.zeroize();
@@ -4631,6 +4635,37 @@ mod tests {
         ] {
             assert!(validate_ca_thumbprint(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_ca_removal_preserves_the_recovery_journal() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("LOCALAPPDATA");
+        let state = std::env::temp_dir().join(format!(
+            "pentect-claude-ca-failed-cleanup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("LOCALAPPDATA", &state);
+
+        let valid_thumbprint = "00112233445566778899AABBCCDDEEFF00112233";
+        write_windows_ca_journal(valid_thumbprint).unwrap();
+        let journal = windows_ca_journal_path().unwrap();
+        assert!(journal.is_file());
+
+        let error = cleanup_windows_user_ca_session("invalid-thumbprint").unwrap_err();
+        assert!(error.contains("cleanup journal is invalid"), "{error}");
+        assert!(
+            journal.is_file(),
+            "failed CA removal must leave the recovery journal available for retry"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        let _ = std::fs::remove_dir_all(state);
     }
 
     #[cfg(windows)]
