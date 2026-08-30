@@ -39,9 +39,10 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
@@ -65,8 +66,12 @@ const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const GATEWAY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+const NATIVE_CHILD_POLL: Duration = Duration::from_millis(20);
 const MAX_MEMORY_STORE_STARTUP_STDERR: usize = 64 * 1024;
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
+static NATIVE_COMMAND_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static NATIVE_INTERRUPT_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandAudience {
@@ -2312,11 +2317,54 @@ fn run_native_command_with_guards<G>(
     display: &Path,
     _guards: G,
 ) -> Result<std::process::ExitStatus, String> {
+    install_native_interrupt_handler()?;
+    NATIVE_COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    cmd.status()
-        .map_err(|error| format!("could not run '{}': {error}", display.display()))
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("could not run '{}': {error}", display.display()))?;
+    let status = wait_for_native_child(
+        &mut child,
+        &NATIVE_COMMAND_INTERRUPTED,
+        NATIVE_INTERRUPT_GRACE,
+    )
+    .map_err(|error| format!("could not wait for '{}': {error}", display.display()))?;
+    NATIVE_COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
+    Ok(status)
+}
+
+fn install_native_interrupt_handler() -> Result<(), String> {
+    NATIVE_INTERRUPT_HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| {
+                NATIVE_COMMAND_INTERRUPTED.store(true, Ordering::SeqCst);
+            })
+            .map_err(|error| format!("could not install client cleanup handler: {error}"))
+        })
+        .clone()
+}
+
+fn wait_for_native_child(
+    child: &mut Child,
+    interrupted: &AtomicBool,
+    grace: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut interrupted_at = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if interrupted.load(Ordering::SeqCst) {
+            let started = interrupted_at.get_or_insert_with(Instant::now);
+            if started.elapsed() >= grace {
+                let _ = child.kill();
+                return child.wait();
+            }
+        }
+        thread::sleep(NATIVE_CHILD_POLL);
+    }
 }
 
 struct MemoryStoreGuard {
@@ -4027,6 +4075,48 @@ mod tests {
         let (reason, action) = classify_memory_store_startup_stderr(b"unexpected child crash");
         assert_eq!(reason, "child-exited");
         assert!(action.contains("pentect log"));
+    }
+
+    #[test]
+    fn interrupted_native_child_is_forced_down_after_the_grace_period() {
+        let interrupted = std::sync::Arc::new(AtomicBool::new(false));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "trap '' INT TERM; sleep 30"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupted);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let status =
+            wait_for_native_child(&mut child, &interrupted, Duration::from_millis(50)).unwrap();
+        trigger.join().unwrap();
+
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

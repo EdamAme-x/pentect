@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -226,9 +227,12 @@ def anthropic_text_response(sequence: int, text: str) -> bytes:
 
 
 class State:
-    def __init__(self, valid: str, invalid: str) -> None:
+    def __init__(self, valid: str, invalid: str, *, hold_model: bool = False) -> None:
         self.valid = valid
         self.invalid = invalid
+        self.hold_model = hold_model
+        self.model_request_seen = threading.Event()
+        self.release_model_request = threading.Event()
         self.model_requests: list[str] = []
         self.service_attempts: list[str] = []
         self.anthropic_probe_responses = [0, 0]
@@ -309,6 +313,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.endswith("/responses"):
             request = body.decode("utf-8")
             self.server.state.model_requests.append(request)
+            if self.server.state.hold_model:
+                self.server.state.model_request_seen.set()
+                self.server.state.release_model_request.wait(timeout=30)
+                return
             sequence = len(self.server.state.model_requests)
             if sequence == 1:
                 command = shell_command(["python", "e2e_helper.py", "read"])
@@ -628,6 +636,127 @@ else:
         thread.join()
 
 
+def run_cancellation(pentect: str) -> None:
+    valid = "rpa_PENTECT_CANCEL_VALID_0123456789abcdef"
+    invalid = "rpa_PENTECT_CANCEL_INVALID_fedcba9876543210"
+    state = State(valid, invalid, hold_model=True)
+    server = FixtureServer(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process: subprocess.Popen[str] | None = None
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pentect-cancel-e2e-", ignore_cleanup_errors=True
+        ) as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            project = root / "project"
+            home.mkdir()
+            project.mkdir()
+            (project / ".env").write_text(
+                f"FIRST_KEY={invalid}\nSECOND_KEY={valid}\n", encoding="utf-8"
+            )
+            codex_home = home / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            sentinel = (
+                f"[projects.{json.dumps(str(project.resolve()))}]\n"
+                'trust_level = "trusted"\n'
+                "# cancellation E2E sentinel\n"
+            )
+            config.write_text(sentinel, encoding="utf-8")
+            environment = os.environ.copy()
+            environment.update({
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "XDG_CACHE_HOME": str(home / ".cache"),
+                "XDG_DATA_HOME": str(home / ".local" / "share"),
+                "XDG_STATE_HOME": str(home / ".local" / "state"),
+                "OPENAI_API_KEY": "local-fixture",
+                "PENTECT_LOG_DIR": str(root / "logs"),
+            })
+            command = client_command(
+                pentect,
+                "codex",
+                project,
+                f"http://127.0.0.1:{server.server_port}/v1",
+            )
+            if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
+                command = [
+                    os.environ.get("COMSPEC", "cmd.exe"),
+                    "/d",
+                    "/s",
+                    "/c",
+                    *command,
+                ]
+            popen_options: dict[str, object] = {}
+            if os.name == "nt":
+                popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_options["start_new_session"] = True
+            process = subprocess.Popen(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                **popen_options,
+            )
+            if not state.model_request_seen.wait(timeout=20):
+                raise RuntimeError("cancellation E2E never reached the model fixture")
+            if os.name == "nt":
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(process.pid, signal.SIGINT)
+            try:
+                output, _ = process.communicate(timeout=8)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "Pentect did not finish client cleanup within 8 seconds after interrupt"
+                ) from error
+            sanitized = output.replace(valid, "<synthetic-key>").replace(
+                invalid, "<synthetic-key>"
+            )
+            if process.returncode == 0:
+                raise RuntimeError(
+                    "interrupted Pentect unexpectedly returned success:\n" + sanitized
+                )
+            config_after = config.read_text(encoding="utf-8")
+            if config_after != sentinel:
+                sanitized_config = config_after.replace(
+                    valid, "<synthetic-key>"
+                ).replace(invalid, "<synthetic-key>")
+                raise RuntimeError(
+                    "Codex configuration changed across cancellation: "
+                    + repr(sanitized_config[:2000])
+                )
+            runtime = home / ".cache" / "pentect" / "runtime"
+            residue = list(runtime.glob("process-host-candidate-*.json"))
+            residue.extend(runtime.glob("delegated-process-host.json"))
+            if residue:
+                raise RuntimeError(
+                    "Pentect left process-host registration after cancellation: "
+                    + ", ".join(path.name for path in residue)
+                )
+            upstream = "\n".join(state.model_requests)
+            if valid in upstream or invalid in upstream:
+                raise RuntimeError("cancellation request exposed plaintext to the model fixture")
+            print(
+                "installed codex cancellation E2E passed: bounded exit, "
+                "config restored, no process-host residue"
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        state.release_model_request.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pentect", default="pentect")
@@ -642,6 +771,8 @@ def main() -> int:
     # transport. A regression should fail before the slower Codex startup.
     for client in args.clients or ("claude", "codex", "opencode", "pi"):
         run_client(args.pentect, client)
+    if args.clients is None or "codex" in args.clients:
+        run_cancellation(args.pentect)
     return 0
 
 
