@@ -855,8 +855,11 @@ def run_image_redaction(pentect: str) -> None:
             if not all(base64.b64decode(encoded).startswith(b"\x89PNG\r\n\x1a\n") for encoded in encoded_images):
                 raise RuntimeError("the protected image payload was not a valid PNG")
             logs = (root / "logs" / "pentect.log").read_text(encoding="utf-8")
-            if IMAGE_SECRET in logs:
-                raise RuntimeError("image secret plaintext reached persistent diagnostics")
+            compact_logs = re.sub(r"\s+", "", logs)
+            if IMAGE_SECRET in logs or IMAGE_PNG_BASE64 in compact_logs:
+                raise RuntimeError(
+                    "image secret plaintext or original payload reached persistent diagnostics"
+                )
             print(
                 "installed codex image E2E passed: original replaced, black-box note "
                 "and opaque handle delivered, no model/log plaintext"
