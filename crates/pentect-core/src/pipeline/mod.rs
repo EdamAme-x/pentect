@@ -903,6 +903,24 @@ mod tests {
             )
         })
     }
+
+    #[test]
+    fn powershell_bound_secrets_are_masked_and_recoverable_through_default_pipeline() {
+        for (input, secret) in [
+            (
+                "Set-Item -Path:Env:SQUARE_ACCESS_TOKEN -Value:SyntheticValue",
+                "SyntheticValue",
+            ),
+            (
+                "ConvertTo-SecureString -String:IaiA@eqhtlc -AsPlainText:$true -Force",
+                "IaiA@eqhtlc",
+            ),
+        ] {
+            let result = m(input);
+            assert!(!result.masked.contains(secret), "{}", result.masked);
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+        }
+    }
     fn mj(s: &str) -> MaskResult {
         with_default_engine(|engine| {
             engine.mask(
