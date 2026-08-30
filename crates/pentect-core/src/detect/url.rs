@@ -1121,6 +1121,9 @@ enum QuerySecretKind {
     Password,
     Token,
     Secret,
+    CallbackArtifact,
+    CredentialArtifact,
+    OneTimeCode,
 }
 
 fn query_secret_kind(key: &str) -> Option<QuerySecretKind> {
@@ -1154,6 +1157,29 @@ fn query_secret_kind(key: &str) -> Option<QuerySecretKind> {
         || compact.ends_with("apikey")
     {
         return Some(QuerySecretKind::Secret);
+    }
+    if matches!(
+        compact.as_str(),
+        "code" | "authorizationcode" | "state" | "nonce" | "ticket" | "codeverifier" | "assertion"
+    ) {
+        return Some(QuerySecretKind::CallbackArtifact);
+    }
+    if matches!(
+        compact.as_str(),
+        "signature"
+            | "auth"
+            | "jwt"
+            | "credential"
+            | "sig"
+            | "hmac"
+            | "session"
+            | "sessionid"
+            | "sid"
+    ) {
+        return Some(QuerySecretKind::CredentialArtifact);
+    }
+    if matches!(compact.as_str(), "otp" | "pin" | "verificationcode") {
+        return Some(QuerySecretKind::OneTimeCode);
     }
     None
 }
@@ -1203,19 +1229,56 @@ fn query_secret_value_has_signal(
                 && len >= 6
                 && (len >= 12 || (has_alpha && has_digit) || has_token_punct)
         }
+        QuerySecretKind::CallbackArtifact => {
+            !is_name_reference && len >= 8 && (len >= 12 || has_digit || has_token_punct)
+        }
+        QuerySecretKind::CredentialArtifact => {
+            !is_name_reference
+                && len >= 6
+                && (len >= 12 || (has_alpha && has_digit) || has_token_punct)
+        }
+        QuerySecretKind::OneTimeCode => {
+            !is_name_reference
+                && ((len >= 4 && value.bytes().all(|byte| byte.is_ascii_digit()))
+                    || (len >= 6 && (len >= 12 || (has_alpha && has_digit) || has_token_punct)))
+        }
     }
 }
 
 fn query_value_is_name_reference(value: &str) -> bool {
     let value = value.trim();
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'-'))
-    {
+    if value.is_empty() {
         return false;
     }
     let compact = normalized_userinfo_component(value).replace('_', "");
+    if matches!(
+        compact.as_str(),
+        "active"
+            | "inactive"
+            | "pending"
+            | "required"
+            | "optional"
+            | "enabled"
+            | "disabled"
+            | "default"
+            | "none"
+            | "sha1"
+            | "sha256"
+            | "sha384"
+            | "sha512"
+            | "md5"
+            | "oauth"
+            | "oidc"
+            | "bearer"
+    ) {
+        return true;
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
     compact.contains("token")
         || compact.contains("secret")
         || compact.contains("password")
@@ -1315,6 +1378,7 @@ fn looks_uuid(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::detect::region;
+    use crate::{Config, Engine, Input, Profile};
 
     fn labels(raw: &str) -> Vec<(String, String)> {
         let reg = region(raw);
@@ -1398,6 +1462,97 @@ mod tests {
                 .iter()
                 .all(|(label, _)| label != "URL_CREDENTIAL")
         );
+    }
+
+    #[test]
+    fn callback_session_and_one_time_query_values_are_credentials() {
+        let keys = [
+            "code",
+            "authorization_code",
+            "state",
+            "nonce",
+            "ticket",
+            "code_verifier",
+            "signature",
+            "auth",
+            "jwt",
+            "assertion",
+            "credential",
+            "sig",
+            "hmac",
+            "otp",
+            "pin",
+            "verification_code",
+            "session",
+            "session_id",
+            "sid",
+        ];
+        for key in keys {
+            let raw = format!("https://example.test/callback?{key}=correcthorsebattery");
+            assert_eq!(
+                labels(&raw),
+                [(
+                    "URL_CREDENTIAL".to_string(),
+                    "correcthorsebattery".to_string()
+                )],
+                "{raw}"
+            );
+        }
+
+        let websocket = "wss://example.test/socket?auth=correcthorsebattery";
+        assert_eq!(
+            labels(websocket),
+            [(
+                "URL_CREDENTIAL".to_string(),
+                "correcthorsebattery".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn callback_query_credentials_mask_and_restore_through_the_canonical_engine() {
+        let input = [
+            "https://example.test/callback?code=correcthorsebattery",
+            "https://example.test/callback?state=correcthorsebattery",
+            "https://example.test/callback?nonce=correcthorsebattery",
+            "https://example.test/callback?code_verifier=correcthorsebattery",
+            "https://example.test/callback?session_id=correcthorsebattery",
+            "https://example.test/callback?otp=482931",
+            "wss://example.test/socket?auth=correcthorsebattery",
+        ]
+        .join("\n");
+        let result = Engine::with_profile(Profile::Strict)
+            .mask(Input::text(&input), &Config::insecure_testing());
+
+        assert!(
+            !result.masked.contains("correcthorsebattery"),
+            "{}",
+            result.masked
+        );
+        assert!(!result.masked.contains("482931"), "{}", result.masked);
+        assert_eq!(result.recovery.resolve(&result.masked), input);
+    }
+
+    #[test]
+    fn query_artifact_keys_preserve_obvious_navigation_metadata() {
+        for raw in [
+            "https://example.test/callback?state=ok",
+            "https://example.test/source?code=main",
+            "https://example.test/page?nonce=xyz",
+            "https://example.test/page?session=active",
+            "https://example.test/page?credential=default",
+            "https://example.test/page?hmac=sha256",
+            "https://example.test/page?otp=123",
+            "https://example.test/page?pin=12",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
     }
 
     #[test]

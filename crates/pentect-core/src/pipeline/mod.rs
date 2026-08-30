@@ -1428,6 +1428,32 @@ mod tests {
     }
 
     #[test]
+    fn har_set_cookie_header_masks_and_restores_the_complete_value() {
+        let input = r#"{"log":{"entries":[{"response":{"headers":[{"name":"Set-Cookie","value":"sessionid=correcthorsebattery; Path=/; HttpOnly; Secure"}]}}]}}"#;
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Har,
+                data: input.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+
+        assert!(
+            !result.masked.contains("correcthorsebattery"),
+            "{}",
+            result.masked
+        );
+        let masked: serde_json::Value = serde_json::from_str(&result.masked).unwrap();
+        assert!(
+            masked["log"]["entries"][0]["response"]["headers"][0]["value"]
+                .as_str()
+                .unwrap()
+                .starts_with("<<SET_COOKIE_")
+        );
+        assert_eq!(result.recovery.resolve(&result.masked), input);
+    }
+
+    #[test]
     fn public_identifiers_are_measured_separately_from_credential_context() {
         let input = concat!(
             "request_id=550e8400-e29b-41d4-a716-446655440000 ",
