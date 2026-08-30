@@ -3,12 +3,14 @@ use crate::session::Session;
 use crate::Result;
 use anyhow::{anyhow, bail, Context};
 use pentect_core::{Config, Recovery};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const ENV_ADDR: &str = "PENTECT_MEMORY_STORE_ADDR";
@@ -21,9 +23,6 @@ const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVITY_EVENTS: usize = 4_096;
 const MAX_ACTIVITY_EVENT_BYTES: usize = 16 * 1024;
 const MAX_ACTIVITY_POLL_EVENTS: usize = 256;
-const MAX_AGENT_SCRIPTS: usize = 128;
-const MAX_AGENT_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
-const AGENT_SCRIPT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct MemoryStore {
@@ -251,13 +250,6 @@ struct MemoryStoreState {
     masked_count: u64,
     activity: VecDeque<(u64, String)>,
     next_activity_id: u64,
-    agent_scripts: HashMap<String, AgentScript>,
-}
-
-struct AgentScript {
-    shell: String,
-    script: Zeroizing<String>,
-    expires_at: Instant,
 }
 
 struct ConnectionPermit(Arc<AtomicUsize>);
@@ -359,71 +351,6 @@ impl MemoryStoreClient {
         } else {
             bail!("memory store add response is malformed")
         }
-    }
-
-    pub(crate) fn put_agent_script(&self, shell: &str, script: &str) -> Result<String> {
-        if script.len() > MAX_AGENT_SCRIPT_BYTES {
-            bail!("agent script exceeds {MAX_AGENT_SCRIPT_BYTES} bytes");
-        }
-        let mut bytes = Vec::with_capacity(shell.len() + script.len() + 1);
-        bytes.extend_from_slice(shell.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(script.as_bytes());
-        let payload = data_encoding::BASE64.encode(&bytes);
-        bytes.zeroize();
-        // Script IDs are single-use capabilities. Retrying a put after the
-        // server committed it can create an unreachable duplicate.
-        let line = self.request_once("SCRIPT_PUT", &payload)?;
-        let fields = response_fields(&line)?;
-        if fields.len() != 2 || fields[0] != "OK" || !valid_runtime_token(fields[1]) {
-            bail!("memory store script response is malformed");
-        }
-        Ok(fields[1].to_string())
-    }
-
-    pub(crate) fn take_agent_script(&self, id: &str) -> Result<(String, Zeroizing<String>)> {
-        self.take_agent_script_with("SCRIPT_TAKE", id, false)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_rendered_agent_script(
-        &self,
-        id: &str,
-    ) -> Result<(String, Zeroizing<String>)> {
-        self.take_agent_script_with("SCRIPT_RENDER", id, true)
-    }
-
-    fn take_agent_script_with(
-        &self,
-        operation: &str,
-        id: &str,
-        retry: bool,
-    ) -> Result<(String, Zeroizing<String>)> {
-        // Taking consumes the capability, while test-only rendering is an
-        // idempotent read and may safely use the generic reconnect path.
-        let line = Zeroizing::new(if retry {
-            self.request(operation, id)?
-        } else {
-            self.request_once(operation, id)?
-        });
-        let fields = response_fields(&line)?;
-        if fields.len() != 2 || fields[0] != "OK" {
-            bail!("memory store script response is malformed");
-        }
-        let bytes = Zeroizing::new(
-            data_encoding::BASE64
-                .decode(fields[1].as_bytes())
-                .context("memory store script response is not valid base64")?,
-        );
-        let separator = bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| anyhow!("memory store script response is malformed"))?;
-        let shell = String::from_utf8(bytes[..separator].to_vec())
-            .context("memory store script shell is not UTF-8")?;
-        let script = String::from_utf8(bytes[separator + 1..].to_vec())
-            .context("memory store script is not UTF-8")?;
-        Ok((shell, Zeroizing::new(script)))
     }
 
     pub(crate) fn masked_count(&self) -> Result<u64> {
@@ -662,7 +589,6 @@ fn serve_memory_store_inner() -> Result<()> {
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
         next_activity_id: 1,
-        agent_scripts: HashMap::new(),
     }));
     println!(
         "{}",
@@ -720,7 +646,6 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
         next_activity_id: 1,
-        agent_scripts: HashMap::new(),
     }));
     let server_token = Arc::new(Zeroizing::new(token.to_string()));
     let server_read_token = Arc::new(Zeroizing::new(process_host_read_token.to_string()));
@@ -818,7 +743,6 @@ fn spawn_test_memory_store_with_activity_and_timeout(
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
         next_activity_id: 1,
-        agent_scripts: HashMap::new(),
     }));
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -927,15 +851,6 @@ fn handle_client_with_timeout(
             }
             [_, "ADD_COUNT", payload] if access == RequestAccess::Primary => {
                 add_masked_count_request(state, payload)
-            }
-            [_, "SCRIPT_PUT", payload] if access == RequestAccess::Primary => {
-                put_agent_script_request(state, payload)
-            }
-            [_, "SCRIPT_TAKE", id] if access == RequestAccess::Primary => {
-                take_agent_script_request(state, id)
-            }
-            [_, "SCRIPT_RENDER", id] if access == RequestAccess::Primary => {
-                render_agent_script_request(state, id)
             }
             [_, "LEASE", ""] if access == RequestAccess::Primary => {
                 let _ = reader.get_mut().set_read_timeout(None);
@@ -1049,126 +964,6 @@ fn add_masked_count_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str)
         .map_err(|_| anyhow!("memory store lock poisoned"))?;
     guard.masked_count = guard.masked_count.saturating_add(count);
     Ok("OK".to_string())
-}
-
-fn put_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str) -> Result<String> {
-    let mut bytes = data_encoding::BASE64
-        .decode(payload.as_bytes())
-        .context("agent script payload is not valid base64")?;
-    let separator = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| anyhow!("agent script payload is malformed"))?;
-    if bytes.len().saturating_sub(separator + 1) > MAX_AGENT_SCRIPT_BYTES {
-        bytes.zeroize();
-        bail!("agent script exceeds {MAX_AGENT_SCRIPT_BYTES} bytes");
-    }
-    let shell = String::from_utf8(bytes[..separator].to_vec())
-        .context("agent script shell is not UTF-8")?;
-    if !matches!(shell.as_str(), "bash" | "powershell" | "native") {
-        bytes.zeroize();
-        bail!("agent script shell is invalid");
-    }
-    let script =
-        String::from_utf8(bytes[separator + 1..].to_vec()).context("agent script is not UTF-8")?;
-    bytes.zeroize();
-
-    let mut guard = state
-        .lock()
-        .map_err(|_| anyhow!("memory store lock poisoned"))?;
-    let now = Instant::now();
-    guard
-        .agent_scripts
-        .retain(|_, pending| pending.expires_at > now);
-    if guard.agent_scripts.len() >= MAX_AGENT_SCRIPTS {
-        bail!("too many pending agent scripts");
-    }
-    let id = random_token_hex()?;
-    guard.agent_scripts.insert(
-        id.clone(),
-        AgentScript {
-            shell,
-            script: Zeroizing::new(script),
-            expires_at: now + AGENT_SCRIPT_TTL,
-        },
-    );
-    Ok(format!("OK\t{id}"))
-}
-
-fn take_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, id: &str) -> Result<String> {
-    let pending = take_pending_agent_script(state, id)?;
-    encode_agent_script_response(&pending.shell, pending.script.as_str())
-}
-
-fn render_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, id: &str) -> Result<String> {
-    let pending = take_pending_agent_script(state, id)?;
-    let guard = state
-        .lock()
-        .map_err(|_| anyhow!("memory store lock poisoned"))?;
-    let recovery = &guard.recovery;
-    let mode = crate::ExecMode::Shell(pending.script.to_string());
-    let resolved = Zeroizing::new(recovery.resolve(pending.script.as_str()));
-    if crate::contains_unresolved_masked_handle(resolved.as_str()) {
-        bail!("unknown masked handle");
-    }
-    let names = crate::referenced_env_names(&mode);
-    let mut bindings = BTreeMap::new();
-    for placeholder in recovery.placeholders() {
-        if !is_env_alias_placeholder(&placeholder) {
-            continue;
-        }
-        let record = recovery.resolve(&placeholder);
-        let Some((name, handle)) = decode_env_alias_record(&record) else {
-            continue;
-        };
-        let lower = name.to_ascii_lowercase();
-        if !names.contains(&lower) || is_reserved_child_env_name(name) {
-            continue;
-        }
-        let value = recovery.resolve(handle);
-        if value != handle {
-            bindings.insert(lower, (name.to_string(), value));
-        }
-    }
-    let rendered = Zeroizing::new(
-        crate::render_agent_script(
-            &pending.shell,
-            &bindings.into_values().collect::<Vec<_>>(),
-            resolved.as_str(),
-        )
-        .map_err(anyhow::Error::msg)?,
-    );
-    encode_agent_script_response(&pending.shell, rendered.as_str())
-}
-
-fn take_pending_agent_script(
-    state: &Arc<Mutex<MemoryStoreState>>,
-    id: &str,
-) -> Result<AgentScript> {
-    if !valid_runtime_token(id) {
-        bail!("agent script id is invalid");
-    }
-    let mut guard = state
-        .lock()
-        .map_err(|_| anyhow!("memory store lock poisoned"))?;
-    let pending = guard
-        .agent_scripts
-        .remove(id)
-        .ok_or_else(|| anyhow!("agent script is unavailable"))?;
-    if pending.expires_at <= Instant::now() {
-        bail!("agent script expired");
-    }
-    Ok(pending)
-}
-
-fn encode_agent_script_response(shell: &str, script: &str) -> Result<String> {
-    let mut bytes = Vec::with_capacity(shell.len() + script.len() + 1);
-    bytes.extend_from_slice(shell.as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(script.as_bytes());
-    let payload = data_encoding::BASE64.encode(&bytes);
-    bytes.zeroize();
-    Ok(format!("OK\t{payload}"))
 }
 
 fn add_activity_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str) -> Result<String> {
@@ -1424,19 +1219,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_scripts_are_memory_only_and_single_use() {
-        let token = "test-token-script".to_string();
-        let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
-        let id = client
-            .put_agent_script("bash", "printf '%s' \"$PENTECT_SECRET_deadbeef\"")
-            .unwrap();
-        let (shell, script) = client.take_agent_script(&id).unwrap();
-        assert_eq!(shell, "bash");
-        assert_eq!(script.as_str(), "printf '%s' \"$PENTECT_SECRET_deadbeef\"");
-        assert!(client.take_agent_script(&id).is_err());
-    }
-
-    #[test]
     fn client_reuses_one_connection_for_repeated_output_checks() {
         let token = "test-token-persistent".to_string();
         let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
@@ -1505,7 +1287,6 @@ mod tests {
             masked_count: 0,
             activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
             next_activity_id: 1,
-            agent_scripts: HashMap::new(),
         }));
         let payload = data_encoding::BASE64.encode(br#"{"action":"mask"}"#);
         for _ in 0..=MAX_ACTIVITY_EVENTS {

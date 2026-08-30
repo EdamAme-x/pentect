@@ -60,7 +60,7 @@ use pentect_core::{
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, Session};
 use sha2::{Digest, Sha256};
-use shell::{next_shell_word, powershell_string_literal, powershell_word, shell_quote_unix};
+use shell::next_shell_word;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,21 +77,17 @@ const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const ACTIVE_TOOL_OUTPUT_CACHE_LIMIT: usize = 128;
 const ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES: usize = 16 * 1024;
 
-pub fn agent_contract_instructions(environment_prefix: &str) -> String {
-    format!(
-        concat!(
-            "Session rules:\n",
-            "- Work normally with the host's tools and current shell. Do not invoke Pentect commands, explain the protection layer, or change approach because it is present unless the user asks.\n",
-            "- User-authorized secret work is allowed: retrieve, read, use, transform, and store secrets at the requested destination. Complete it normally.\n",
-            "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
-            "- A protected handle means the real value is ready to use through its environment binding: `$env:{environment_prefix}KEY_hash` in PowerShell or `${environment_prefix}KEY_hash` in a POSIX shell. Treat that binding as the real secret for commands, API requests, headers, SDKs, and destination files. You do not need to know or print its plaintext to use it.\n",
-            "- Once a handle or environment binding exists, use it immediately. Do not reread or reparse the source file, fetch the same secret again, or claim that the secret is unavailable or inaccessible. Do not echo, print, decode, or reconstruct the binding's value.\n",
-            "- If dotenv output shows `KEY=<<KEY_hash>>`, use `$env:{environment_prefix}KEY_hash` directly in the PowerShell command that needs the value (or `${environment_prefix}KEY_hash` in POSIX). Do not parse the dotenv file in a shell, copy the handle into `$env:KEY`, or call `SetEnvironmentVariable`.\n",
-            "- Shell tool calls may run in separate processes. Never depend on an environment assignment made by an earlier tool call; reference the provided binding directly in every command that needs it.\n",
-            "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
-        ),
-        environment_prefix = environment_prefix
+pub fn agent_contract_instructions(_environment_prefix: &str) -> String {
+    concat!(
+        "Session rules:\n",
+        "- Work normally with the host's tools and current shell. Do not invoke Pentect commands, explain the protection layer, or change approach because it is present unless the user asks.\n",
+        "- User-authorized secret work is allowed: retrieve, read, use, transform, and store secrets at the requested destination. Complete it normally.\n",
+        "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
+        "- Copy a protected handle unchanged into the local tool input that needs the value. Pentect restores known handles after the provider response returns locally, including command, file, and MCP arguments. You do not need to know or print the plaintext.\n",
+        "- Once a handle exists, use it immediately. Do not reread or reparse the source file, fetch the same secret again, or claim that the secret is unavailable or inaccessible. Do not echo, print, decode, or reconstruct its value.\n",
+        "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
     )
+    .to_string()
 }
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
@@ -115,7 +111,6 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("hook") => cmd_hook(&args),
         Some("bridge") => cmd_bridge(&args),
         Some("memory-store") => cmd_memory_store(&args),
-        Some("__agent-script") => cmd_agent_script(&args),
         Some("__agent-stream") => cmd_agent_stream(&args),
         Some("purge") => cmd_purge(&args),
         _ => {
@@ -434,28 +429,6 @@ pub fn resolve_known_text_from_active_memory_store(text: &str) -> Result<Option<
     ActiveMemoryStoreResolver::new()?.resolve_known_text(text)
 }
 
-/// Move a shell command containing known handles behind the local Pentect
-/// execution boundary. The model-facing command contains only an opaque
-/// encoded script or a one-time script identifier; plaintext is delivered to
-/// the shell over stdin or the existing same-shell bridge, never embedded in
-/// the returned command argv.
-pub fn wrap_shell_command_from_active_memory_store(
-    tool_name: &str,
-    command: &str,
-) -> Result<Option<String>, String> {
-    let resolver = ActiveMemoryStoreResolver::new()?;
-    let Some(mut probe) = resolver.resolve_known_text(command)? else {
-        return Ok(None);
-    };
-    let has_known_reference = probe != command;
-    probe.zeroize();
-    if !has_known_reference {
-        return Ok(None);
-    }
-    let session_name = default_session_name()?;
-    wrap_shell_command(HookProvider::Generic, &session_name, tool_name, command).map(Some)
-}
-
 /// A point-in-time resolver for one model-authored object or request.
 ///
 /// Constructing this value takes one memory-store snapshot. Callers should
@@ -487,6 +460,14 @@ impl ActiveMemoryStoreResolver {
             .recovery
             .as_ref()
             .map(|recovery| resolve_known_references(text, recovery, &self.env_bindings)))
+    }
+
+    fn from_recovery(recovery: pentect_core::Recovery) -> Self {
+        let env_bindings = environment_bindings_from_recovery(&recovery);
+        Self {
+            recovery: Some(recovery),
+            env_bindings,
+        }
     }
 }
 
@@ -685,6 +666,21 @@ impl ActiveToolOutputMasker {
             prompt_cache: HashMap::new(),
             prompt_cache_order: VecDeque::new(),
         })
+    }
+
+    /// Capture the mappings already owned by this masker without opening a
+    /// second memory-store connection. HTTP gateways use this immediately
+    /// after masking a request to restore completed local tool inputs.
+    pub fn known_text_resolver(&self) -> Result<ActiveMemoryStoreResolver, String> {
+        match &self.masker {
+            Some(masker) => masker
+                .recovery_snapshot()
+                .map(ActiveMemoryStoreResolver::from_recovery),
+            None => Ok(ActiveMemoryStoreResolver {
+                recovery: None,
+                env_bindings: BTreeMap::new(),
+            }),
+        }
     }
 
     pub fn mask_tool_output(&mut self, text: &str) -> Result<Option<String>, String> {
@@ -1119,66 +1115,6 @@ fn cmd_memory_store(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_agent_script(args: &[String]) -> i32 {
-    let opts = match AgentScriptOpts::parse(args) {
-        Ok(opts) => opts,
-        Err(error) => return die(&error),
-    };
-    let Some(client) = MemoryStoreClient::from_env() else {
-        return die("agent script requires a running Pentect session");
-    };
-    let mut rendered = match take_rendered_agent_script(&client, &opts) {
-        Ok(rendered) => rendered,
-        Err(error) => return die(&error),
-    };
-    print!("{}", rendered.as_str());
-    let result = std::io::stdout().flush();
-    rendered.zeroize();
-    match result {
-        Ok(()) => 0,
-        Err(error) => die(format!("could not write agent script: {error}")),
-    }
-}
-
-fn take_rendered_agent_script(
-    client: &MemoryStoreClient,
-    opts: &AgentScriptOpts,
-) -> Result<Zeroizing<String>, String> {
-    let (shell, masked_script) = match client.take_agent_script(&opts.id) {
-        Ok(pending) => pending,
-        Err(error) => return Err(error.to_string()),
-    };
-    let session = match Session::open_capability(&opts.session) {
-        Ok(session) => session,
-        Err(error) => return Err(error.to_string()),
-    };
-    let store = MemoryStore::for_session(&session);
-    let mode = ExecMode::Shell(masked_script.to_string());
-    let mut resolved = resolve_command_text(&store, masked_script.as_str())?;
-    if let Err(error) = register_local_file_inputs(&store, &resolved) {
-        resolved.zeroize();
-        return Err(error);
-    }
-    let mut env = match requested_env_bindings(&store, &mode) {
-        Ok(env) => env,
-        Err(error) => {
-            resolved.zeroize();
-            return Err(error);
-        }
-    };
-    let rendered = match render_agent_script(&shell, &env, &resolved) {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            resolved.zeroize();
-            zeroize_env_bindings(&mut env);
-            return Err(error);
-        }
-    };
-    resolved.zeroize();
-    zeroize_env_bindings(&mut env);
-    Ok(Zeroizing::new(rendered))
-}
-
 fn cmd_agent_stream(args: &[String]) -> i32 {
     let opts = match AgentStreamOpts::parse(args) {
         Ok(opts) => opts,
@@ -1208,90 +1144,6 @@ fn cmd_agent_stream(args: &[String]) -> i32 {
         return die(&error);
     }
     0
-}
-
-fn render_agent_script(
-    shell: &str,
-    env: &[(String, String)],
-    resolved: &str,
-) -> Result<String, String> {
-    let mut rendered = String::new();
-    match shell {
-        "bash" => {
-            for (name, value) in env {
-                if !looks_like_env_name(name) || is_pentect_control_env_name(name) {
-                    continue;
-                }
-                rendered.push_str("export ");
-                rendered.push_str(name);
-                rendered.push('=');
-                rendered.push_str(&shell_quote_unix(value));
-                rendered.push('\n');
-            }
-        }
-        "powershell" => {
-            let env = env
-                .iter()
-                .filter(|(name, _)| looks_like_env_name(name) && !is_pentect_control_env_name(name))
-                .collect::<Vec<_>>();
-            if env.is_empty() {
-                rendered.push_str(resolved);
-                return Ok(rendered);
-            }
-            let digest = Sha256::digest(
-                env.iter()
-                    .flat_map(|(name, _)| name.as_bytes().iter().copied())
-                    .chain(resolved.as_bytes().iter().copied())
-                    .collect::<Vec<_>>(),
-            );
-            let suffix = digest[..6]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            let saved = format!("__pentect_saved_env_{suffix}");
-            let entry = format!("__pentect_env_entry_{suffix}");
-            rendered.push('$');
-            rendered.push_str(&saved);
-            rendered.push_str(" = @{}\n");
-            for (name, value) in env {
-                rendered.push('$');
-                rendered.push_str(&saved);
-                rendered.push('[');
-                rendered.push_str(&powershell_string_literal(name));
-                rendered.push_str("] = [Environment]::GetEnvironmentVariable(");
-                rendered.push_str(&powershell_string_literal(name));
-                rendered.push_str(", 'Process')\n");
-                rendered.push_str("$env:");
-                rendered.push_str(name);
-                rendered.push_str(" = ");
-                rendered.push_str(&powershell_string_literal(value));
-                rendered.push('\n');
-            }
-            rendered.push_str("try {\n");
-            rendered.push_str(resolved);
-            rendered.push_str("\n} finally {\nforeach ($");
-            rendered.push_str(&entry);
-            rendered.push_str(" in $");
-            rendered.push_str(&saved);
-            rendered.push_str(".GetEnumerator()) { [Environment]::SetEnvironmentVariable($");
-            rendered.push_str(&entry);
-            rendered.push_str(".Key, $");
-            rendered.push_str(&entry);
-            rendered.push_str(".Value, 'Process') }\n$");
-            rendered.push_str(&saved);
-            rendered.push_str(" = $null\n}\n");
-            return Ok(rendered);
-        }
-        _ => return Err("agent script shell is invalid".to_string()),
-    }
-    rendered.push_str(resolved);
-    Ok(rendered)
-}
-
-fn zeroize_env_bindings(env: &mut [(String, String)]) {
-    for (_, value) in env {
-        value.zeroize();
-    }
 }
 
 fn prepare_exec_secret_inputs(store: &MemoryStore, opts: &ExecOpts) -> Result<(), String> {
@@ -2577,14 +2429,6 @@ impl ScriptShell {
             _ => Err("exec --script-shell requires native, bash, or powershell".to_string()),
         }
     }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Bash => "bash",
-            Self::PowerShell => "powershell",
-        }
-    }
 }
 
 enum ExecMode {
@@ -2598,11 +2442,6 @@ struct ResolveOpts {
     mode: ResolveMode,
 }
 
-struct AgentScriptOpts {
-    session: String,
-    id: String,
-}
-
 struct AgentStreamOpts {
     session: String,
     target: StreamTarget,
@@ -2612,32 +2451,6 @@ struct AgentStreamOpts {
 enum ResolveMode {
     Files(Vec<PathBuf>),
     Stdin,
-}
-
-impl AgentScriptOpts {
-    fn parse(args: &[String]) -> Result<Self, String> {
-        let mut session = default_session_name()?;
-        let mut id = None;
-        let mut i = 2;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--session" => {
-                    session = checked_session_name(&value(args, &mut i, "--session")?)
-                        .map_err(|error| error.to_string())?;
-                }
-                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
-                value if id.is_none() => {
-                    id = Some(value.to_string());
-                    i += 1;
-                }
-                value => return Err(format!("unexpected agent script argument: {value}")),
-            }
-        }
-        Ok(Self {
-            session,
-            id: id.ok_or_else(|| "agent script requires an id".to_string())?,
-        })
-    }
 }
 
 impl AgentStreamOpts {
@@ -3000,91 +2813,107 @@ fn handle_hook_lazy(
 }
 
 fn before_tool_updated_input(
-    provider: HookProvider,
-    session_name: &str,
+    _provider: HookProvider,
+    _session_name: &str,
     session: &Session,
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
+    let mut updated = tool_input.clone();
     if is_read_like_tool_name(tool_name) {
         if let Some(updated) = apply_masked_read_before_tool(session, tool_input)? {
             return Ok((updated, true));
         }
     }
-    if is_edit_like_tool_name(tool_name) {
-        if let Some(updated) = apply_masked_old_edit_before_tool(session, tool_input)? {
-            return Ok((updated, true));
-        }
-    }
     validate_masked_write_before_tool(session, tool_name, tool_input)?;
     if is_shell_tool_name(tool_name) {
-        if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
+        if let Some(command) = updated.get("command").and_then(Value::as_str) {
             if let Some(reason) = pentect_human_only_command_reason(command) {
                 return Err(reason);
             }
             let command = canonical_hook_shell_command(command)?;
-            let mut updated = tool_input.clone();
             if let Some(object) = updated.as_object_mut() {
-                object.insert(
-                    "command".to_string(),
-                    Value::String(wrap_shell_command(
-                        provider,
-                        session_name,
-                        tool_name,
-                        &command,
-                    )?),
-                );
-                return Ok((updated, true));
+                object.insert("command".to_string(), Value::String(command));
             }
         }
     }
-    Ok((tool_input.clone(), false))
+    resolve_known_value(&MemoryStore::for_session(session), &mut updated)?;
+    let changed = updated != *tool_input;
+    Ok((updated, changed))
 }
 
 fn before_tool_updated_input_lazy(
-    provider: HookProvider,
+    _provider: HookProvider,
     session_name: &str,
     cli: bool,
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
-    if is_read_like_tool_name(tool_name) {
-        let session = open_hook_session(cli, session_name)?;
-        if let Some(updated) = apply_masked_read_before_tool(&session, tool_input)? {
+    let mut updated = tool_input.clone();
+    let read_like = is_read_like_tool_name(tool_name);
+    let write_like = is_write_or_edit_like_tool_name(tool_name);
+    let has_handle = value_contains_pentect_masked_handle(tool_input);
+    let session = if read_like || write_like || has_handle {
+        Some(open_hook_session(cli, session_name)?)
+    } else {
+        None
+    };
+    if read_like {
+        let session = session.as_ref().expect("read tools open a session");
+        if let Some(updated) = apply_masked_read_before_tool(session, tool_input)? {
             return Ok((updated, true));
         }
     }
-    if is_write_or_edit_like_tool_name(tool_name) {
-        let session = open_hook_session(cli, session_name)?;
-        if is_edit_like_tool_name(tool_name) {
-            if let Some(updated) = apply_masked_old_edit_before_tool(&session, tool_input)? {
-                return Ok((updated, true));
-            }
-        }
-        validate_masked_write_before_tool(&session, tool_name, tool_input)?;
+    if write_like {
+        let session = session.as_ref().expect("write tools open a session");
+        validate_masked_write_before_tool(session, tool_name, tool_input)?;
     }
     if is_shell_tool_name(tool_name) {
-        if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
+        if let Some(command) = updated.get("command").and_then(Value::as_str) {
             if let Some(reason) = pentect_human_only_command_reason(command) {
                 return Err(reason);
             }
             let command = canonical_hook_shell_command(command)?;
-            let mut updated = tool_input.clone();
             if let Some(object) = updated.as_object_mut() {
-                object.insert(
-                    "command".to_string(),
-                    Value::String(wrap_shell_command(
-                        provider,
-                        session_name,
-                        tool_name,
-                        &command,
-                    )?),
-                );
-                return Ok((updated, true));
+                object.insert("command".to_string(), Value::String(command));
             }
         }
     }
-    Ok((tool_input.clone(), false))
+    if has_handle {
+        let session = session.as_ref().expect("handle inputs open a session");
+        resolve_known_value(&MemoryStore::for_session(session), &mut updated)?;
+    }
+    let changed = updated != *tool_input;
+    Ok((updated, changed))
+}
+
+fn value_contains_pentect_masked_handle(value: &Value) -> bool {
+    match value {
+        Value::String(text) => contains_pentect_masked_handle(text),
+        Value::Array(values) => values.iter().any(value_contains_pentect_masked_handle),
+        Value::Object(object) => object.values().any(value_contains_pentect_masked_handle),
+        _ => false,
+    }
+}
+
+fn resolve_known_value(store: &MemoryStore, value: &mut Value) -> Result<(), String> {
+    match value {
+        Value::String(text) => {
+            *text = store.resolve_all(text).map_err(|error| error.to_string())?;
+        }
+        Value::Array(values) => {
+            for value in values {
+                resolve_known_value(store, value)?;
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                resolve_known_value(store, value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
@@ -3338,10 +3167,16 @@ fn validate_masked_write_before_tool(
         let Some((path, content)) = write_path_and_content(tool_input) else {
             return Ok(());
         };
-        if !contains_pentect_masked_handle(content) {
+        let masked_path = contains_pentect_masked_handle(path);
+        let masked_content = contains_pentect_masked_handle(content);
+        if !masked_path && !masked_content {
             return Ok(());
         }
-        let (path, _) = resolved_write_parts(session, path, content)?;
+        let store = MemoryStore::for_session(session);
+        let path = resolved_local_write_path(&store, path, masked_path)?;
+        if masked_content {
+            let _ = resolve_masked_text(&store, content)?;
+        }
         ensure_local_write_path_within_cwd(&path)?;
         return Ok(());
     }
@@ -3390,66 +3225,44 @@ fn resolved_write_parts(
 ) -> Result<(PathBuf, String), String> {
     let store = MemoryStore::for_session(session);
     let resolved = resolve_masked_text(&store, content)?;
-    let path = checked_local_write_path(path)?;
+    let path = resolved_local_write_path(&store, path, contains_pentect_masked_handle(path))?;
     Ok((path, resolved))
+}
+
+fn resolved_local_write_path(
+    store: &MemoryStore,
+    path: &str,
+    contains_handle: bool,
+) -> Result<PathBuf, String> {
+    let resolved = if contains_handle {
+        resolve_masked_text(store, path)?
+    } else {
+        path.to_string()
+    };
+    checked_local_write_path(&resolved)
 }
 
 fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Result<(), String> {
     let Some((path, edits)) = edit_path_and_texts(tool_input) else {
         return Ok(());
     };
-    if !edits
-        .iter()
-        .any(|(_, text)| contains_pentect_masked_handle(text))
+    let masked_path = contains_pentect_masked_handle(path);
+    if !masked_path
+        && !edits
+            .iter()
+            .any(|(_, text)| contains_pentect_masked_handle(text))
     {
         return Ok(());
     }
-    let path = checked_local_write_path(path)?;
-    ensure_local_write_path_within_cwd(&path)?;
     let store = MemoryStore::for_session(session);
+    let path = resolved_local_write_path(&store, path, masked_path)?;
+    ensure_local_write_path_within_cwd(&path)?;
     for (kind, text) in edits {
         if matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text) {
             let _ = resolve_masked_text(&store, text)?;
         }
     }
     Ok(())
-}
-
-fn apply_masked_old_edit_before_tool(
-    session: &Session,
-    tool_input: &Value,
-) -> Result<Option<Value>, String> {
-    let Some((path_text, edits)) = edit_path_and_replacements(tool_input) else {
-        return Ok(None);
-    };
-    if !edits
-        .iter()
-        .any(|edit| contains_pentect_masked_handle(edit.old))
-    {
-        return Ok(None);
-    }
-    let path = checked_local_write_path(path_text)?;
-    ensure_local_write_path_within_cwd(&path)?;
-    let store = MemoryStore::for_session(session);
-    let mut content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    for edit in edits {
-        let old = resolve_masked_text_if_needed(&store, edit.old)?;
-        let new = resolve_masked_text_if_needed(&store, edit.new)?;
-        if old.is_empty() {
-            return Err("masked edit needs non-empty old text.".to_string());
-        }
-        if !content.contains(&old) {
-            return Err("masked edit target was not found; re-read the file.".to_string());
-        }
-        content = content.replacen(&old, &new, 1);
-    }
-    let anchor = safe_noop_edit_anchor(&content, &session.key)
-        .ok_or_else(|| "masked edit has no safe no-op anchor; use Write.".to_string())?;
-    let updated = noop_edit_input(tool_input, &anchor)?;
-    std::fs::write(&path, content)
-        .map_err(|e| format!("could not edit '{}': {e}", path.display()))?;
-    Ok(Some(updated))
 }
 
 fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Result<bool, String> {
@@ -3461,7 +3274,8 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     }) {
         return Ok(false);
     }
-    let path = checked_local_write_path(path)?;
+    let store = MemoryStore::for_session(session);
+    let path = resolved_local_write_path(&store, path, contains_pentect_masked_handle(path))?;
     ensure_local_write_path_within_cwd(&path)?;
     if !path.is_file() {
         return Ok(false);
@@ -3471,21 +3285,12 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     if !contains_pentect_masked_handle(&content) {
         return Ok(false);
     }
-    let store = MemoryStore::for_session(session);
     let resolved = resolve_masked_text(&store, &content)?;
     if resolved != content {
         std::fs::write(&path, resolved)
             .map_err(|e| format!("could not repair '{}': {e}", path.display()))?;
     }
     Ok(true)
-}
-
-fn resolve_masked_text_if_needed(store: &MemoryStore, content: &str) -> Result<String, String> {
-    if contains_pentect_masked_handle(content) {
-        resolve_masked_text(store, content)
-    } else {
-        Ok(content.to_string())
-    }
 }
 
 fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, String> {
@@ -3585,11 +3390,6 @@ enum EditTextKind {
     New,
 }
 
-struct EditReplacement<'a> {
-    old: &'a str,
-    new: &'a str,
-}
-
 fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>)> {
     for candidate in write_input_candidates(value) {
         let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
@@ -3599,20 +3399,6 @@ fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>
         push_edit_texts(candidate, &mut texts);
         if !texts.is_empty() {
             return Some((path, texts));
-        }
-    }
-    None
-}
-
-fn edit_path_and_replacements(value: &Value) -> Option<(&str, Vec<EditReplacement<'_>>)> {
-    for candidate in write_input_candidates(value) {
-        let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
-            continue;
-        };
-        let mut edits = Vec::new();
-        push_edit_replacements(candidate, &mut edits);
-        if !edits.is_empty() {
-            return Some((path, edits));
         }
     }
     None
@@ -3634,93 +3420,6 @@ fn push_edit_texts<'a>(value: &'a Value, out: &mut Vec<(EditTextKind, &'a str)>)
             push_edit_texts(edit, out);
         }
     }
-}
-
-fn push_edit_replacements<'a>(value: &'a Value, out: &mut Vec<EditReplacement<'a>>) {
-    if let (Some(old), Some(new)) = (
-        string_field(value, EDIT_OLD_FIELDS),
-        string_field(value, EDIT_NEW_FIELDS),
-    ) {
-        out.push(EditReplacement { old, new });
-    }
-    if let Some(edits) = value.get("edits").and_then(Value::as_array) {
-        for edit in edits {
-            push_edit_replacements(edit, out);
-        }
-    }
-}
-
-fn noop_edit_input(value: &Value, anchor: &str) -> Result<Value, String> {
-    let mut updated = value.clone();
-    let Some(candidate) = edit_candidate_object_mut(&mut updated) else {
-        return Err("masked edit input was not recognized.".to_string());
-    };
-    if candidate.get("edits").is_some() {
-        candidate.insert(
-            "edits".to_string(),
-            json!([{ "old_string": anchor, "new_string": anchor }]),
-        );
-        return Ok(updated);
-    }
-    let old_field = existing_field_name(candidate, EDIT_OLD_FIELDS).unwrap_or("old_string");
-    let new_field = existing_field_name(candidate, EDIT_NEW_FIELDS).unwrap_or("new_string");
-    candidate.insert(old_field.to_string(), Value::String(anchor.to_string()));
-    candidate.insert(new_field.to_string(), Value::String(anchor.to_string()));
-    Ok(updated)
-}
-
-fn edit_candidate_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
-    if direct_edit_candidate(value) {
-        return value.as_object_mut();
-    }
-    let field = WRITE_INPUT_FIELDS
-        .iter()
-        .copied()
-        .find(|field| value.get(*field).is_some_and(direct_edit_candidate))?;
-    value.get_mut(field)?.as_object_mut()
-}
-
-fn direct_edit_candidate(value: &Value) -> bool {
-    string_field(value, WRITE_PATH_FIELDS).is_some() && edit_path_and_replacements(value).is_some()
-}
-
-fn existing_field_name<'a>(
-    object: &serde_json::Map<String, Value>,
-    names: &'a [&'a str],
-) -> Option<&'a str> {
-    names
-        .iter()
-        .copied()
-        .find(|name| object.contains_key(*name))
-}
-
-fn safe_noop_edit_anchor(content: &str, key: &[u8; 32]) -> Option<String> {
-    content
-        .split_inclusive('\n')
-        .find(|candidate| safe_noop_edit_anchor_candidate(candidate, key))
-        .map(str::to_string)
-        // A file made entirely of secret-bearing lines has no publishable
-        // text anchor. Replacing one existing line feed with itself is still
-        // a valid edit no-op and reveals none of the file content.
-        .or_else(|| content.contains('\n').then(|| "\n".to_string()))
-}
-
-fn safe_noop_edit_anchor_candidate(candidate: &str, key: &[u8; 32]) -> bool {
-    let text = candidate.trim();
-    if text.is_empty() || candidate.len() > 512 || contains_pentect_masked_handle(candidate) {
-        return false;
-    }
-    let Ok(decode) = config::decode_config(Profile::Strict) else {
-        return false;
-    };
-    let result = Engine::with_profile_and_decode_config(Profile::Strict, decode).mask(
-        Input {
-            kind: Kind::Text,
-            data: candidate.to_string(),
-        },
-        &Config::new(*key),
-    );
-    result.summary.masked_count == 0
 }
 
 fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
@@ -3929,182 +3628,6 @@ fn unquote_wrapped_shell_arg(value: &str) -> String {
         }
     }
     value.to_string()
-}
-
-fn wrap_shell_command(
-    provider: HookProvider,
-    session_name: &str,
-    tool_name: &str,
-    masked_command: &str,
-) -> Result<String, String> {
-    let shell = script_shell_for_tool(provider, tool_name);
-    if matches!(provider, HookProvider::Claude | HookProvider::Generic)
-        && matches!(shell, ScriptShell::Bash | ScriptShell::PowerShell)
-    {
-        if let Some(client) = MemoryStoreClient::from_env() {
-            let id = client
-                .put_agent_script(shell.as_str(), masked_command)
-                .map_err(|error| error.to_string())?;
-            return same_shell_agent_wrapper(shell, session_name, &id);
-        }
-    }
-    let mut args = vec!["exec".to_string()];
-    add_non_default_session(&mut args, session_name);
-    args.push("--script-shell".to_string());
-    args.push(shell.as_str().to_string());
-    args.push("--script-b64".to_string());
-    args.push(data_encoding::BASE64URL_NOPAD.encode(masked_command.as_bytes()));
-    Ok(visible_pentect_command(&args))
-}
-
-fn same_shell_agent_wrapper(
-    shell: ScriptShell,
-    session_name: &str,
-    id: &str,
-) -> Result<String, String> {
-    let suffix = id
-        .get(..12)
-        .filter(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| "agent script id is invalid".to_string())?;
-    let mut script_args = vec!["__agent-script".to_string(), id.to_string()];
-    let end_marker = format!("__PENTECT_STREAM_END_{id}__");
-    let mut stream_args = vec![
-        "__agent-stream".to_string(),
-        "--end-marker".to_string(),
-        end_marker.clone(),
-    ];
-    add_non_default_session(&mut script_args, session_name);
-    add_non_default_session(&mut stream_args, session_name);
-    match shell {
-        ScriptShell::Bash => Ok(bash_same_shell_wrapper(
-            suffix,
-            &end_marker,
-            &target_shell_pentect_command(shell, &script_args),
-            &target_shell_pentect_command(shell, &stream_args),
-        )),
-        ScriptShell::PowerShell => Ok(powershell_same_shell_wrapper(
-            suffix,
-            &powershell_agent_script_fetch(suffix, id),
-        )),
-        ScriptShell::Native => Err("same-shell wrapper requires a known shell".to_string()),
-    }
-}
-
-fn target_shell_pentect_command(shell: ScriptShell, args: &[String]) -> String {
-    let quote = match shell {
-        ScriptShell::Bash => shell_quote_unix,
-        ScriptShell::PowerShell | ScriptShell::Native => powershell_word,
-    };
-    let mut command = match shell {
-        ScriptShell::Bash => String::from("\"${PENTECT_BIN}\""),
-        ScriptShell::PowerShell | ScriptShell::Native => String::from("$env:PENTECT_BIN"),
-    };
-    for arg in args {
-        command.push(' ');
-        command.push_str(&quote(arg));
-    }
-    command
-}
-
-fn bash_same_shell_wrapper(
-    suffix: &str,
-    end_marker: &str,
-    script_command: &str,
-    stream_command: &str,
-) -> String {
-    let status = format!("_pentect_status_{suffix}");
-    let stream_status = format!("_pentect_stream_status_{suffix}");
-    let pipe_status = format!("_pentect_pipe_status_{suffix}");
-    let script = format!("_pentect_script_{suffix}");
-    format!(
-        "(set +x; {script}=\"$({script_command} 2>&1)\"; {status}=$?; if [ \"${status}\" -ne 0 ]; then printf '%s\\n' \"${script}\" | {stream_command}; unset {script}; exit \"${status}\"; fi; {{ eval \"${script}\"; {status}=$?; printf '%s\\n' {marker}; exit \"${status}\"; }} 2>&1 | {stream_command}; {pipe_status}=(\"${{PIPESTATUS[@]}}\"); unset {script}; {status}=\"${{{pipe_status}[0]}}\"; {stream_status}=\"${{{pipe_status}[1]}}\"; if [ \"${status}\" -eq 0 ] && [ \"${stream_status}\" -ne 0 ]; then {status}=${stream_status}; fi; exit \"${status}\")",
-        marker = shell_quote_unix(end_marker),
-    )
-}
-
-fn powershell_same_shell_wrapper(suffix: &str, script_command: &str) -> String {
-    let script = format!("__pentect_script_{suffix}");
-    let status = format!("__pentect_status_{suffix}");
-    let success = format!("__pentect_success_{suffix}");
-    let native_status = format!("__pentect_native_status_{suffix}");
-    format!(
-        "${script} = (& {script_command} | Out-String); ${status} = 0; try {{ $global:LASTEXITCODE = 0; Invoke-Expression ${script}; ${success} = $?; ${native_status} = $LASTEXITCODE; if (${native_status} -is [int] -and ${native_status} -ne 0) {{ ${status} = ${native_status} }} elseif (-not ${success}) {{ ${status} = 1 }} }} catch {{ Write-Error -ErrorRecord $_; ${status} = 1 }}; ${script} = $null; if (${status} -ne 0) {{ exit ${status} }}"
-    )
-}
-
-fn powershell_agent_script_fetch(suffix: &str, id: &str) -> String {
-    format!(
-        "{{ ${client} = [System.Net.Sockets.TcpClient]::new(); ${reader} = $null; ${writer} = $null; try {{ ${address} = $env:PENTECT_MEMORY_STORE_ADDR -split ':', 2; if (${address}.Count -ne 2) {{ throw 'session unavailable' }}; ${client}.Connect(${address}[0], [int]${address}[1]); ${stream} = ${client}.GetStream(); ${writer} = [System.IO.StreamWriter]::new(${stream}, [System.Text.UTF8Encoding]::new($false), 1024, $true); ${reader} = [System.IO.StreamReader]::new(${stream}, [System.Text.Encoding]::UTF8, $false, 1024, $true); ${writer}.NewLine = \"`n\"; ${writer}.WriteLine(\"$env:PENTECT_MEMORY_STORE_TOKEN`tSCRIPT_RENDER`t{id}\"); ${writer}.Flush(); ${response} = ${reader}.ReadLine(); ${fields} = ${response} -split \"`t\", 2; if (${fields}.Count -ne 2 -or ${fields}[0] -ne 'OK') {{ throw 'script unavailable' }}; ${decoded} = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(${fields}[1])); ${separator} = ${decoded}.IndexOf([char]0); if (${separator} -lt 0) {{ throw 'script unavailable' }}; ${decoded}.Substring(${separator} + 1) }} finally {{ if (${reader}) {{ ${reader}.Dispose() }}; if (${writer}) {{ ${writer}.Dispose() }}; ${client}.Dispose(); ${response} = $null; ${fields} = $null; ${decoded} = $null }} }}",
-        client = format!("__pentect_client_{suffix}"),
-        reader = format!("__pentect_reader_{suffix}"),
-        writer = format!("__pentect_writer_{suffix}"),
-        address = format!("__pentect_address_{suffix}"),
-        stream = format!("__pentect_network_{suffix}"),
-        response = format!("__pentect_response_{suffix}"),
-        fields = format!("__pentect_fields_{suffix}"),
-        decoded = format!("__pentect_decoded_{suffix}"),
-        separator = format!("__pentect_separator_{suffix}"),
-    )
-}
-
-fn script_shell_for_tool(provider: HookProvider, tool_name: &str) -> ScriptShell {
-    let windows_bash_dialect = std::env::var("PENTECT_AGENT_BASH_DIALECT").ok();
-    script_shell_for_tool_with_windows_bash_dialect(
-        provider,
-        tool_name,
-        windows_bash_dialect.as_deref(),
-    )
-}
-
-fn script_shell_for_tool_with_windows_bash_dialect(
-    provider: HookProvider,
-    tool_name: &str,
-    windows_bash_dialect: Option<&str>,
-) -> ScriptShell {
-    match tool_name.to_ascii_lowercase().as_str() {
-        "bash"
-            if cfg!(windows)
-                && provider == HookProvider::Generic
-                && windows_bash_dialect != Some("bash") =>
-        {
-            ScriptShell::PowerShell
-        }
-        "bash" => ScriptShell::Bash,
-        "powershell" => ScriptShell::PowerShell,
-        _ => ScriptShell::Native,
-    }
-}
-
-fn visible_pentect_command(args: &[String]) -> String {
-    let quote = if cfg!(windows) {
-        powershell_word
-    } else {
-        shell_quote_unix
-    };
-    let mut out = String::from("pentect");
-    if !args.is_empty() {
-        out.push(' ');
-        out.push_str(
-            &args
-                .iter()
-                .map(|arg| quote(arg))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    out
-}
-
-fn add_non_default_session(words: &mut Vec<String>, session_name: &str) {
-    if should_emit_session_arg(session_name) {
-        words.push("--session".to_string());
-        words.push(session_name.to_string());
-    }
-}
-
-fn should_emit_session_arg(session_name: &str) -> bool {
-    session_name != DEFAULT_SESSION
-        && !default_session_name().is_ok_and(|default| default == session_name)
 }
 
 fn hook_phase(provider: HookProvider, input: &Value) -> HookPhase {

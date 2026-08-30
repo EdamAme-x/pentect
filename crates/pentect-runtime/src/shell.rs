@@ -34,32 +34,3 @@ pub(crate) fn next_shell_word(text: &str, start: usize) -> Option<(String, usize
     }
     Some((text[word_start..end].to_string(), word_start, end))
 }
-
-pub(crate) fn shell_quote_unix(value: &str) -> String {
-    if is_simple_shell_word(value) {
-        return value.to_string();
-    }
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-pub(crate) fn powershell_word(value: &str) -> String {
-    if is_simple_shell_word(value) {
-        value.to_string()
-    } else {
-        powershell_string_literal(value)
-    }
-}
-
-pub(crate) fn powershell_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn is_simple_shell_word(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-}

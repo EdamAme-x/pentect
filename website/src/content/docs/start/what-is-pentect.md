@@ -41,7 +41,7 @@ provider can see. Local tools still use the permissions of the current user.
 | --- | --- |
 | Local input | Finds supported sensitive values and creates handles |
 | Request to the provider | Sends handles instead of known real values |
-| Model response | Restores known handles in local assistant text; keeps tool arguments protected until local execution |
+| Model response | Restores known handles locally in assistant text and completed tool arguments |
 | Before a local tool runs | Restores handles that the current session knows |
 | Tool result | Checks and masks output before the next request |
 
@@ -54,6 +54,8 @@ need opaque output can set
 Restoration applies only to handles known to the active session and can expose the
 value to terminal scrollback or user-visible client conversation history.
 Pentect's persistent logs, diagnostics, and telemetry remain value-free.
+Completed local tool arguments can likewise contain plaintext in client history,
+process arguments, or debuggers. The protected boundary is provider traffic.
 
 ## Supported surfaces
 

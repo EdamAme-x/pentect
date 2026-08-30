@@ -2386,26 +2386,8 @@ where
                     });
                 for key in ["arguments", "input"] {
                     if let Some(Value::String(arguments)) = object.get_mut(key) {
-                        *arguments = if is_custom_call
-                            && key == "input"
-                            && crate::claude_http_proxy::is_free_form_shell_tool(
-                                tool_name.as_deref(),
-                            ) {
-                            // Custom tools carry completed free-form input rather than
-                            // JSON arguments. Only tools whose complete input is a shell
-                            // program may receive shell environment injection. In
-                            // particular, `functions.exec` carries JavaScript that can
-                            // invoke nested tools; prepending `export` to it both breaks
-                            // the program and can expose a protected value in a syntax
-                            // error.
-                            crate::claude_http_proxy::resolve_shell_text_safely(arguments, resolve)?
-                        } else if is_custom_call
-                            && key == "input"
-                            && is_javascript_orchestrator_tool(tool_name.as_deref())
-                        {
-                            resolve_javascript_orchestrator_tools(arguments, resolve)?
-                        } else if is_custom_call && key == "input" {
-                            arguments.clone()
+                        *arguments = if is_custom_call && key == "input" {
+                            resolve(arguments)?
                         } else {
                             crate::claude_http_proxy::resolve_tool_input_json(
                                 arguments,
@@ -2429,233 +2411,6 @@ where
         _ => {}
     }
     Ok(())
-}
-
-fn is_javascript_orchestrator_tool(name: Option<&str>) -> bool {
-    name.is_some_and(|name| {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "exec" | "functions.exec"
-        )
-    })
-}
-
-#[derive(Debug)]
-enum JavaScriptTokenKind {
-    Identifier(String),
-    String(String),
-    Punctuation(char),
-}
-
-#[derive(Debug)]
-struct JavaScriptToken {
-    kind: JavaScriptTokenKind,
-    start: usize,
-    end: usize,
-}
-
-/// Restore only literal arguments of recognized nested local tools.
-///
-/// Codex's `functions.exec` custom tool carries JavaScript which then invokes
-/// local tools. The nested calls are not separate provider events, so this HTTP
-/// boundary must handle them without treating the complete JavaScript program
-/// as a shell script. Unsupported syntax remains inert.
-fn resolve_javascript_orchestrator_tools<R>(source: &str, resolve: &mut R) -> Result<String, String>
-where
-    R: FnMut(&str) -> Result<String, String>,
-{
-    let tokens = tokenize_javascript_for_local_tools(source);
-    let mut replacements = Vec::<(usize, usize, String)>::new();
-    let mut index = 0;
-    while index + 4 < tokens.len() {
-        let Some(tool) = nested_local_tool_at(&tokens, index) else {
-            index += 1;
-            continue;
-        };
-        let object_index = index + 4;
-        if !token_is_punctuation(&tokens[object_index], '{') {
-            index += 1;
-            continue;
-        }
-        let wanted_key = match tool {
-            "exec_command" => "cmd",
-            "write_stdin" => "chars",
-            _ => unreachable!("nested_local_tool_at returns only known tools"),
-        };
-        let mut brace_depth = 0usize;
-        let mut cursor = object_index;
-        while cursor < tokens.len() {
-            match tokens[cursor].kind {
-                JavaScriptTokenKind::Punctuation('{') => brace_depth += 1,
-                JavaScriptTokenKind::Punctuation('}') => {
-                    if brace_depth == 0 {
-                        break;
-                    }
-                    brace_depth -= 1;
-                    if brace_depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            if brace_depth == 1 && cursor + 2 < tokens.len() {
-                let key_matches = match &tokens[cursor].kind {
-                    JavaScriptTokenKind::Identifier(key) | JavaScriptTokenKind::String(key) => {
-                        key == wanted_key
-                    }
-                    _ => false,
-                };
-                if key_matches && token_is_punctuation(&tokens[cursor + 1], ':') {
-                    if let JavaScriptTokenKind::String(value) = &tokens[cursor + 2].kind {
-                        let restored = if tool == "exec_command" {
-                            crate::claude_http_proxy::resolve_shell_text_safely(value, resolve)?
-                        } else {
-                            resolve(value)?
-                        };
-                        if restored != *value {
-                            let encoded = serde_json::to_string(&restored).map_err(|error| {
-                                format!("could not encode restored nested tool input: {error}")
-                            })?;
-                            replacements.push((
-                                tokens[cursor + 2].start,
-                                tokens[cursor + 2].end,
-                                encoded,
-                            ));
-                        }
-                        cursor += 2;
-                    }
-                }
-            }
-            cursor += 1;
-        }
-        index = cursor.saturating_add(1);
-    }
-    if replacements.is_empty() {
-        return Ok(source.to_string());
-    }
-    replacements.sort_unstable_by_key(|replacement| replacement.0);
-    replacements.dedup_by_key(|replacement| replacement.0);
-    let mut output = source.to_string();
-    for (start, end, replacement) in replacements.into_iter().rev() {
-        output.replace_range(start..end, &replacement);
-    }
-    Ok(output)
-}
-
-fn nested_local_tool_at(tokens: &[JavaScriptToken], index: usize) -> Option<&'static str> {
-    if !token_is_identifier(tokens.get(index)?, "tools")
-        || !token_is_punctuation(tokens.get(index + 1)?, '.')
-        || !token_is_punctuation(tokens.get(index + 3)?, '(')
-    {
-        return None;
-    }
-    match &tokens.get(index + 2)?.kind {
-        JavaScriptTokenKind::Identifier(name) if name == "exec_command" => Some("exec_command"),
-        JavaScriptTokenKind::Identifier(name) if name == "write_stdin" => Some("write_stdin"),
-        _ => None,
-    }
-}
-
-fn token_is_identifier(token: &JavaScriptToken, expected: &str) -> bool {
-    matches!(&token.kind, JavaScriptTokenKind::Identifier(value) if value == expected)
-}
-
-fn token_is_punctuation(token: &JavaScriptToken, expected: char) -> bool {
-    matches!(token.kind, JavaScriptTokenKind::Punctuation(value) if value == expected)
-}
-
-fn tokenize_javascript_for_local_tools(source: &str) -> Vec<JavaScriptToken> {
-    let bytes = source.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            index += 2;
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
-            continue;
-        }
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            index += 2;
-            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
-                index += 1;
-            }
-            index = (index + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[index] == b'"' {
-            let start = index;
-            index += 1;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'\\' => index = (index + 2).min(bytes.len()),
-                    b'"' => {
-                        index += 1;
-                        break;
-                    }
-                    _ => index += 1,
-                }
-            }
-            if index <= bytes.len() {
-                if let Ok(value) = serde_json::from_str::<String>(&source[start..index]) {
-                    tokens.push(JavaScriptToken {
-                        kind: JavaScriptTokenKind::String(value),
-                        start,
-                        end: index,
-                    });
-                }
-            }
-            continue;
-        }
-        if matches!(bytes[index], b'\'' | b'`') {
-            // Single-quoted and template literals can contain interpolation and
-            // JavaScript-specific escapes. Skip them entirely instead of risking
-            // code injection; Codex's nested tool objects use JSON string syntax.
-            let quote = bytes[index];
-            index += 1;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'\\' => index = (index + 2).min(bytes.len()),
-                    value if value == quote => {
-                        index += 1;
-                        break;
-                    }
-                    _ => index += 1,
-                }
-            }
-            continue;
-        }
-        if bytes[index].is_ascii_alphabetic() || matches!(bytes[index], b'_' | b'$') {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
-            {
-                index += 1;
-            }
-            tokens.push(JavaScriptToken {
-                kind: JavaScriptTokenKind::Identifier(source[start..index].to_string()),
-                start,
-                end: index,
-            });
-            continue;
-        }
-        let character = bytes[index] as char;
-        if ".(){}[]:,".contains(character) {
-            tokens.push(JavaScriptToken {
-                kind: JavaScriptTokenKind::Punctuation(character),
-                start: index,
-                end: index + 1,
-            });
-        }
-        index += 1;
-    }
-    tokens
 }
 
 async fn read_response_capped(response: reqwest::Response) -> Result<Option<Bytes>, String> {
@@ -4197,9 +3952,9 @@ mod tests {
             .unwrap();
         let arguments: Value = serde_json::from_str(arguments).unwrap();
         let command = arguments["command"].as_str().unwrap();
-        assert!(!command.contains(&secret), "{command}");
+        assert_eq!(command, format!("echo {secret}"));
         assert!(!command.contains(&handle), "{command}");
-        assert!(command.contains("script-b64"), "{command}");
+        assert!(!command.contains("pentect exec"), "{command}");
     }
 
     #[test]
@@ -5148,61 +4903,24 @@ mod tests {
     }
 
     #[test]
-    fn javascript_orchestrator_restores_only_nested_local_tool_arguments() {
-        for name in ["exec", "functions.exec"] {
-            let input = concat!(
-                "const decoy = \"tools.write_stdin({chars:\\\"<<SECRET_0123456789abcdef>>\\\"})\"; ",
-                "const first = await tools.exec_command({cmd:\"curl -H \\\"Authorization: Bearer ${PENTECT_SECRET_0123456789abcdef}\\\" http://127.0.0.1/check\"}); ",
-                "const second = await tools.write_stdin({session_id:7,chars:\"<<SECRET_0123456789abcdef>>\\n\"}); text(first); text(second)"
-            );
-            let mut value = serde_json::json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "custom_tool_call",
-                    "name": name,
-                    "input": input
-                }
-            });
-            let mut resolve = |text: &str| -> Result<String, String> {
-                Ok(text
-                    .replace(
-                        "${PENTECT_SECRET_0123456789abcdef}",
-                        "secret with 'quote' and newline\n",
-                    )
-                    .replace(
-                        "<<SECRET_0123456789abcdef>>",
-                        "secret with 'quote' and newline\n",
-                    ))
-            };
-            rewrite_function_calls(&mut value, &mut resolve).unwrap();
-            let rewritten = value["item"]["input"].as_str().unwrap();
-            assert!(rewritten.contains("export PENTECT_SECRET_0123456789abcdef="));
-            assert!(rewritten.contains("secret with 'quote' and newline\\n\\n"));
-            assert!(rewritten.contains(&format!(
-                "chars:{}",
-                serde_json::to_string("secret with 'quote' and newline\n\n").unwrap()
-            )));
-            assert!(rewritten.contains(
-                "const decoy = \"tools.write_stdin({chars:\\\"<<SECRET_0123456789abcdef>>\\\"})\""
-            ));
-            assert!(!rewritten.starts_with("export "));
-        }
-    }
-
-    #[test]
-    fn javascript_orchestrator_leaves_dynamic_and_unknown_calls_inert() {
-        let input = concat!(
-            "tools.exec_command({cmd: dynamicCommand});",
-            "tools.apply_patch({patch:\"<<SECRET_0123456789abcdef>>\"});",
-            "tools.write_stdin({chars:`<<SECRET_0123456789abcdef>>`})"
-        );
-        let mut resolve = |_text: &str| -> Result<String, String> {
-            panic!("unsupported JavaScript forms must remain inert")
-        };
-        assert_eq!(
-            resolve_javascript_orchestrator_tools(input, &mut resolve).unwrap(),
-            input
-        );
+    fn javascript_orchestrator_uses_the_same_exact_handle_restoration() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let secret = "safe-secret-token";
+        let input = "await tools.exec_command({cmd:'echo <<SECRET_0123456789abcdef>>'}); await tools.example_mcp({token:`<<SECRET_0123456789abcdef>>`});";
+        let mut value = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "custom_tool_call",
+                "name": "functions.exec",
+                "input": input
+            }
+        });
+        let mut resolve = |text: &str| Ok(text.replace(handle, secret));
+        rewrite_function_calls(&mut value, &mut resolve).unwrap();
+        let restored = value["item"]["input"].as_str().unwrap();
+        assert_eq!(restored.matches(secret).count(), 2, "{restored}");
+        assert!(restored.contains("tools.example_mcp"), "{restored}");
+        assert!(!restored.contains(handle), "{restored}");
     }
 
     #[test]

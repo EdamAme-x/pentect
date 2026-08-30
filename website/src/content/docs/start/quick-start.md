@@ -33,11 +33,10 @@ settings of Codex or Claude.
    credential. The model sees a handle such as
    `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the real value.
 
-   When the agent needs the value in a shell command, it can use the matching
-   `$env:PENTECT_LABEL_ID` PowerShell binding or `${PENTECT_LABEL_ID}` POSIX
-   binding for a `<<LABEL_ID>>` handle. Pentect adds the binding to the
-   protected tool process; it is not a permanent user environment variable.
-   See [Handles](/start/handles/) for the exact syntax.
+   When the agent needs the value, it copies the complete handle into a shell,
+   file, connector, or MCP tool argument. Pentect restores known handles in the
+   completed local tool call. See [Handles](/start/handles/) for the boundary
+   and lifetime rules.
 
 4. Watch local protection events when you need to verify a flow.
 
@@ -70,9 +69,9 @@ before the tool runs. Pentect then masks sensitive command output before it
 returns to the provider. `pentect log` records the event and label, not the real
 value.
 
-If `echo $env:PENTECT_DATABASE_URL_...` or `echo
-$PENTECT_DATABASE_URL_...` appears masked in tool output, that is expected. The
-command received the value, and Pentect protected the output on its way back.
+If a command prints the value and the result contains the handle again, that is
+expected. The command received the value locally, and Pentect protected the
+output before the next provider request.
 
 The client should still stream responses, run tools, and accept its normal
 flags. If a request format cannot be checked, Pentect returns an error instead

@@ -25,15 +25,14 @@ requests and responses without changing the client UI.
 3. **Let the model use the reference**
 
    The model can understand the label and put the handle in a tool call. It
-   does not need the real value. Protected launches also provide a local
-   environment binding such as
-   `$env:PENTECT_KAGGLE_API_TOKEN_85268c441f88c284` in PowerShell or
-   `${PENTECT_KAGGLE_API_TOKEN_85268c441f88c284}` in a POSIX shell.
+   does not need the real value. The complete handle can be copied directly
+   into shell, file, connector, or MCP arguments.
 
 4. **Restore only before a local tool runs**
 
    Pentect restores known handles just before the local client runs a tool
-   call. Text that only looks like a handle is not restored.
+   call. Text that only looks like a handle is not restored. Restoration is an
+   exact string replacement; Pentect does not reinterpret shell syntax.
 
 5. **Mask results on the way back**
 
@@ -45,7 +44,7 @@ requests and responses without changing the client UI.
 | Stage | Input | Output |
 | --- | --- | --- |
 | Client request | API data, stream data, or supported files | The same format, with sensitive values replaced |
-| Provider response | Text, events, and completed tool calls | The same format, with handles kept as references |
+| Provider response | Text, events, and completed tool calls | Handles remain references across the provider boundary |
 | Local execution | Completed tool arguments | Known handles restored just before the tool runs |
 | Tool result | stdout, stderr, and supported data | Sensitive values replaced before the next request |
 
@@ -55,6 +54,11 @@ next provider request. Supported screenshots use the image path instead.
 
 Pentect works with API fields instead of reading the terminal screen. Streaming
 and normal client controls continue to work.
+
+Restored arguments are local plaintext and may appear in client history,
+process arguments, debuggers, or terminal scrollback. Pentect's protection
+boundary is traffic sent to the model provider; tool results are masked again
+before they cross that boundary.
 
 ## Handle identity
 

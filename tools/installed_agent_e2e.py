@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,6 @@ from pathlib import Path
 
 
 HANDLE = re.compile(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>")
-ENV_HANDLE = re.compile(r"<<(?:FIRST_KEY|SECOND_KEY)_[0-9a-f]{16}>>")
 
 
 def response_object(response_id: str, output: list[dict[str, object]]) -> dict[str, object]:
@@ -146,12 +146,93 @@ def chat_tool_response(sequence: int, command: str) -> bytes:
     ])
 
 
+def anthropic_sse(events: list[dict[str, object]]) -> bytes:
+    return b"".join(
+        f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+        for event in events
+    )
+
+
+def anthropic_message(sequence: int) -> dict[str, object]:
+    return {
+        "id": f"msg_e2e_{sequence}",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "claude-sonnet-4-5",
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 1,
+        },
+    }
+
+
+def anthropic_tool_response(sequence: int, command: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Bash",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps({"command": command}, separators=(",", ":")),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
+def anthropic_text_response(sequence: int, text: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
 class State:
     def __init__(self, valid: str, invalid: str) -> None:
         self.valid = valid
         self.invalid = invalid
         self.model_requests: list[str] = []
         self.service_attempts: list[str] = []
+        self.anthropic_probe_responses = [0, 0]
+        self.anthropic_actions: list[dict[str, object]] = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -172,6 +253,59 @@ class Handler(BaseHTTPRequestHandler):
             status = 200 if authorization == f"Bearer {self.server.state.valid}" else 401
             self._json({"ok": status == 200}, status)
             return
+        request_path = self.path.split("?", 1)[0]
+        if request_path.endswith("/messages/count_tokens"):
+            self._json({"input_tokens": 1})
+            return
+        if request_path.endswith("/messages"):
+            request = body.decode("utf-8")
+            self.server.state.model_requests.append(request)
+            sequence = len(self.server.state.model_requests)
+            parsed = json.loads(request)
+            bash_enabled = any(
+                isinstance(tool, dict) and tool.get("name") == "Bash"
+                for tool in parsed.get("tools", [])
+            )
+            handles = anthropic_env_handles(parsed)
+            attempts = len(self.server.state.service_attempts)
+            if not bash_enabled:
+                action = "text:no-bash"
+                payload = anthropic_text_response(sequence, "DONE")
+            elif len(handles) < 2:
+                action = "tool:read"
+                payload = anthropic_tool_response(
+                    sequence, shell_command(["python", "e2e_helper.py", "read"])
+                )
+            elif (
+                attempts < 2
+                and self.server.state.anthropic_probe_responses[attempts] < 2
+            ):
+                self.server.state.anthropic_probe_responses[attempts] += 1
+                action = f"tool:probe:{attempts}"
+                payload = anthropic_tool_response(
+                    sequence, self._probe_command(handles[attempts], posix_shell=True)
+                )
+            else:
+                action = "text:done"
+                payload = anthropic_text_response(sequence, "DONE")
+            self.server.state.anthropic_actions.append({
+                "sequence": sequence,
+                "action": action,
+                "handles": len(handles),
+                "attempts": attempts,
+                "tools": [
+                    tool.get("name")
+                    for tool in parsed.get("tools", [])
+                    if isinstance(tool, dict)
+                ],
+            })
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path.endswith("/responses"):
             request = body.decode("utf-8")
             self.server.state.model_requests.append(request)
@@ -183,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
                 )
             else:
-                handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+                handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if sequence == 2 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[0]))
                 elif sequence == 3 and len(handles) >= 2:
@@ -208,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
                     bool(json.loads(item).get("tools"))
                     for item in self.server.state.model_requests
                 )
-                handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+                handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if sequence == 1:
                     payload = chat_tool_response(
                         sequence, shell_command(["python", "e2e_helper.py", "read"])
@@ -236,9 +370,13 @@ class Handler(BaseHTTPRequestHandler):
         command = self._probe_command(handle)
         return f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);"
 
-    def _probe_command(self, handle: str) -> str:
+    def _probe_command(self, handle: str, *, posix_shell: bool = False) -> str:
         url = f"http://127.0.0.1:{self.server.server_port}/check"
-        return shell_command(["python", "e2e_helper.py", "probe", url, handle])
+        arguments = ["python", "e2e_helper.py", "probe", url, handle]
+        # Claude's Bash tool always uses a POSIX shell, including Git Bash on
+        # native Windows. Quoting the handle also makes a restoration failure
+        # observable instead of letting `<<HANDLE>>` block as a here-document.
+        return shlex.join(arguments) if posix_shell else shell_command(arguments)
 
     def _json(self, value: object, status: int = 200) -> None:
         payload = json.dumps(value).encode()
@@ -253,9 +391,51 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class FixtureServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(self, state: State) -> None:
         super().__init__(("127.0.0.1", 0), Handler)
         self.state = state
+
+
+def request_tool_result_summary(requests: list[str]) -> list[str]:
+    summaries: list[str] = []
+    for request in requests:
+        try:
+            value = json.loads(request)
+        except json.JSONDecodeError:
+            continue
+        for message in value.get("messages", []):
+            content = message.get("content", []) if isinstance(message, dict) else []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                result = json.dumps(block.get("content"), ensure_ascii=True)
+                summary = result[-800:]
+                if summary not in summaries:
+                    summaries.append(summary)
+    return summaries[-4:]
+
+
+def anthropic_env_handles(request: dict[str, object]) -> list[str]:
+    messages = request.get("messages", [])
+    if not isinstance(messages, list):
+        return []
+    for message in reversed(messages):
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            rendered = json.dumps(block.get("content"), ensure_ascii=True)
+            if "FIRST_KEY=" not in rendered or "SECOND_KEY=" not in rendered:
+                continue
+            return list(dict.fromkeys(HANDLE.findall(rendered)))[:2]
+    return []
 
 
 def client_command(
@@ -292,6 +472,24 @@ def client_command(
             "bash",
             prompt,
         ]
+    if client == "claude":
+        return [
+            pentect,
+            "claude",
+            "--upstream",
+            upstream.removesuffix("/v1"),
+            "--bare",
+            "--print",
+            "--output-format",
+            "text",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--tools",
+            "Bash",
+            "--model",
+            "claude-sonnet-4-5",
+            prompt,
+        ]
     return [
         pentect,
         "opencode",
@@ -319,7 +517,9 @@ def run_client(pentect: str, client: str) -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix=f"pentect-{client}-e2e-") as raw_root:
+        with tempfile.TemporaryDirectory(
+            prefix=f"pentect-{client}-e2e-", ignore_cleanup_errors=True
+        ) as raw_root:
             root = Path(raw_root)
             home = root / "home"
             project = root / "project"
@@ -352,8 +552,17 @@ else:
                 "XDG_DATA_HOME": str(home / ".local" / "share"),
                 "XDG_STATE_HOME": str(home / ".local" / "state"),
                 "OPENAI_API_KEY": "local-fixture",
+                "ANTHROPIC_API_KEY": "local-fixture",
                 "PENTECT_LOG_DIR": str(root / "logs"),
             })
+            if os.name == "nt" and client == "claude":
+                git_bash = shutil.which("bash.exe") or shutil.which("bash")
+                if git_bash is None:
+                    raise RuntimeError(
+                        "claude E2E requires Git Bash on Windows, but bash.exe "
+                        "was not found on PATH"
+                    )
+                environment["CLAUDE_CODE_GIT_BASH_PATH"] = git_bash
             command = client_command(
                 pentect,
                 client,
@@ -362,7 +571,34 @@ else:
             )
             if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *command]
-            completed = subprocess.run(command, cwd=project, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=45,
+                )
+            except subprocess.TimeoutExpired as error:
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                output = output.replace(valid, "<synthetic-key>").replace(
+                    invalid, "<synthetic-key>"
+                )
+                handle_counts = [
+                    len(set(HANDLE.findall(request)))
+                    for request in state.model_requests
+                ]
+                raise RuntimeError(
+                    f"{client} E2E timed out; service attempts={len(state.service_attempts)}; "
+                    f"model requests={len(state.model_requests)} handles={handle_counts}; "
+                    "Anthropic actions="
+                    f"{state.anthropic_actions[:8] + state.anthropic_actions[-3:]}; "
+                    f"tool results={request_tool_result_summary(state.model_requests)}\n{output}"
+                ) from error
             if completed.returncode != 0:
                 output = completed.stdout.replace(valid, "<synthetic-key>").replace(invalid, "<synthetic-key>")
                 raise RuntimeError(f"{client} E2E exited with {completed.returncode}:\n{output}")
@@ -398,11 +634,13 @@ def main() -> int:
     parser.add_argument(
         "--client",
         action="append",
-        choices=("codex", "opencode", "pi"),
+        choices=("codex", "claude", "opencode", "pi"),
         dest="clients",
     )
     args = parser.parse_args()
-    for client in args.clients or ("codex", "opencode", "pi"):
+    # Run Claude first because it has the strictest native Windows tool
+    # transport. A regression should fail before the slower Codex startup.
+    for client in args.clients or ("claude", "codex", "opencode", "pi"):
         run_client(args.pentect, client)
     return 0
 
