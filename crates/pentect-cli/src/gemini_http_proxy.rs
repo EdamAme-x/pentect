@@ -36,7 +36,7 @@ fn diagnostic(reason: &str) {
         "gateway-stopped" => ("runtime", false),
         "connection-failed" => ("client-connection", true),
         "request-invalid-json" => ("protocol", false),
-        "request-protection-skipped" => ("protection", false),
+        "request-protection-skipped" | "response-protection-skipped" => ("protection", false),
         _ => ("unclassified", false),
     };
     pentect_agent::record_http_diagnostic_activity(
@@ -266,6 +266,7 @@ async fn proxy_request_inner(
     }
     let method = request.method().clone();
     let protected = endpoint.is_protected() && method == hyper::Method::POST;
+    let is_stream = endpoint == GeminiEndpoint::StreamGenerateContent;
     let body_forbidden = endpoint == GeminiEndpoint::Models;
     if endpoint.is_protected() && method != hyper::Method::POST {
         return Err("unknown format blocked: Gemini model endpoints must use POST".to_string());
@@ -361,15 +362,14 @@ async fn proxy_request_inner(
     {
         return Err("Gemini upstream returned an unsupported content encoding".to_string());
     }
-    let event_stream = response_headers
+    let media_type = response_headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
-        });
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    let event_stream = media_type
+        .is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"))
+        || (is_stream && media_type.is_none());
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -379,6 +379,10 @@ async fn proxy_request_inner(
             builder = builder.header(name, value);
         }
     }
+    builder = builder.header(
+        "x-pentect-coverage",
+        if protected { "full" } else { "none" },
+    );
     if event_stream && status.is_success() && endpoint == GeminiEndpoint::StreamGenerateContent {
         return builder
             .body(streaming_response_body(
@@ -399,10 +403,26 @@ async fn proxy_request_inner(
             "Upstream response body too large",
         ));
     };
-    let rewritten = rewrite_response_body(&body, &state.plugins, state.block_unknown_formats)?;
+    let rewrite = rewrite_response_body(&body, &state.plugins, state.block_unknown_formats);
+    let rewritten = apply_response_compatibility(body, state.block_unknown_formats, rewrite)?;
     builder
         .body(full_body(rewritten))
         .map_err(|error| format!("could not build Gemini response: {error}"))
+}
+
+fn apply_response_compatibility(
+    original: Bytes,
+    block_unknown_formats: bool,
+    rewrite: Result<Bytes, String>,
+) -> Result<Bytes, String> {
+    match rewrite {
+        Ok(rewritten) => Ok(rewritten),
+        Err(error) if !block_unknown_formats && error.starts_with("unknown format blocked:") => {
+            diagnostic("response-protection-skipped");
+            Ok(original)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -742,10 +762,7 @@ fn rewrite_response_body(
     value = run.payload;
     validate_response(&value, block_unknown_formats)?;
     run_tool_plugins(&mut value, &plugins)?;
-    let mut resolve = |text: &str| {
-        pentect_agent::resolve_known_text_from_active_memory_store(text)
-            .map(|value| value.unwrap_or_else(|| text.to_string()))
-    };
+    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
     crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve)?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
@@ -1091,6 +1108,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "upgrade"
             | "te"
             | "trailer"
+            | "content-encoding"
     )
 }
 
@@ -1284,6 +1302,46 @@ mod tests {
         (format!("http://{address}"), body_rx, thread)
     }
 
+    fn mock_raw_response(response: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.flush().unwrap();
+        });
+        (format!("http://{address}"), thread)
+    }
+
     #[test]
     fn recognizes_supported_gemini_model_routes() {
         assert_eq!(
@@ -1434,6 +1492,88 @@ mod tests {
             value["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["key"],
             "sk_test_synthetic"
         );
+    }
+
+    #[test]
+    fn response_keeps_handles_when_the_memory_store_becomes_unavailable() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        drop(store);
+
+        let handle = "<<STRIPE_SECRET_KEY_a81f42c7d93>>";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "shell", "args": {"key": handle}}}
+            ]}}]
+        }))
+        .unwrap();
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let rewritten = rewrite_response_body(&body, &plugins, true).unwrap();
+        let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(
+            rewritten["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["key"],
+            handle
+        );
+    }
+
+    #[test]
+    fn response_compatibility_only_passes_through_unknown_formats() {
+        let original = Bytes::from_static(b"opaque upstream response");
+        assert_eq!(
+            apply_response_compatibility(
+                original.clone(),
+                false,
+                Err("unknown format blocked: future Gemini envelope".to_string()),
+            )
+            .unwrap(),
+            original
+        );
+        assert!(apply_response_compatibility(
+            original.clone(),
+            true,
+            Err("unknown format blocked: future Gemini envelope".to_string()),
+        )
+        .is_err());
+        assert!(apply_response_compatibility(
+            original,
+            false,
+            Err("plugin blocked: policy denied the response".to_string()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stream_endpoint_recovers_missing_content_type_and_reports_coverage() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let body = "data: {\"candidates\":[]}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (upstream, thread) = mock_raw_response(response);
+        let proxy = GeminiHttpProxyGuard::start_with_header_env(upstream, &[]).unwrap();
+
+        let response = reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1beta/models/gemini-test:streamGenerateContent?alt=sse",
+                proxy.base_url()
+            ))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(r#"{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}"#)
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["x-pentect-coverage"], "full");
+        assert!(!response
+            .headers()
+            .contains_key(reqwest::header::CONTENT_ENCODING));
+        assert_eq!(response.text().unwrap(), body);
+        thread.join().unwrap();
     }
 
     #[test]
@@ -1812,6 +1952,7 @@ mod tests {
         assert!(!should_forward_request_header("Accept-Encoding"));
         assert!(!should_forward_request_header("Proxy-Authorization"));
         assert!(!should_forward_response_header("Proxy-Authenticate"));
+        assert!(!should_forward_response_header("Content-Encoding"));
         assert!(should_forward_request_header("Accept"));
     }
 
