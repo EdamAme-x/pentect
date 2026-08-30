@@ -839,6 +839,27 @@ fn active_prompt_explicit_marker_masks_low_entropy_value_and_removes_wrapper() {
 }
 
 #[test]
+fn active_tool_output_masks_low_entropy_session_log_fields() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-output-session-fields");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let output = "audit session_id=abc123 csrf_token=short refresh_token=refresh";
+    let masked = masker.mask_tool_output(output).unwrap().unwrap();
+
+    for leaked_fragment in [
+        "session_id=abc123",
+        "csrf_token=short",
+        "refresh_token=refresh",
+    ] {
+        assert!(
+            !masked.contains(leaked_fragment),
+            "{leaked_fragment:?} remained in {masked}"
+        );
+    }
+    assert_eq!(masked.matches("<<").count(), 3, "{masked}");
+}
+
+#[test]
 fn active_prompt_supports_mask_and_prompt_only_unmask_aliases() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-prompt-marker-aliases");

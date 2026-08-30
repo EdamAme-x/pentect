@@ -613,6 +613,11 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     };
     let key = trim_key_edge(&ctx.text[key_start..left_end]);
     let mut semantic_key = declared_identifier_key(key).unwrap_or_else(|| key.to_string());
+    if matches!(separator.kind, Separator::Assignment | Separator::Colon) {
+        if let Some(trailing) = trailing_log_field_key(key) {
+            semantic_key = trailing.to_string();
+        }
+    }
     let mut tuple_target = None;
     if separator.kind == Separator::Assignment {
         if let Some(targets) = tuple_assignment_targets(&ctx.text[ctx.line_start..left_end]) {
@@ -940,6 +945,7 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
             "auth_token",
             "bearer_token",
             "session_token",
+            "session_id",
         ],
     ) || matches!(name.as_str(), "token" | "session" | "cookie" | "jwt")
         || name.ends_with("_token")
@@ -1025,6 +1031,20 @@ fn trailing_sensitive_key_kind(key: &str) -> Option<KeyKind> {
         }
     }
     None
+}
+
+fn trailing_log_field_key(key: &str) -> Option<&str> {
+    let key = key.trim_end();
+    let start = key
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| {
+            (!(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+                .then_some(index + ch.len_utf8())
+        })
+        .unwrap_or(0);
+    let candidate = &key[start..];
+    (!candidate.is_empty() && sensitive_key_kind(candidate).is_some()).then_some(candidate)
 }
 
 fn implicit_key_name_kind(name: &str) -> Option<KeyKind> {
@@ -2538,12 +2558,28 @@ fn is_unquoted_alpha_prose_continuation(
         || rest.starts_with("//")
         || rest.starts_with("/*")
         || rest.starts_with('\\')
+        || starts_sensitive_assignment(rest)
     {
         return false;
     }
     rest.chars()
         .next()
         .is_some_and(|ch| ch.is_ascii_alphabetic())
+}
+
+fn starts_sensitive_assignment(text: &str) -> bool {
+    let text = text.trim_start();
+    let key_end = text
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (!(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))).then_some(index)
+        })
+        .unwrap_or(text.len());
+    let key = &text[..key_end];
+    if key.is_empty() || sensitive_key_kind(key).is_none() {
+        return false;
+    }
+    text[key_end..].trim_start().starts_with(['=', ':'])
 }
 
 fn is_powershell_command_name(value: &str) -> bool {
@@ -6907,6 +6943,7 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
                 | "id_token"
                 | "bearer_token"
                 | "session_token"
+                | "session_id"
                 | "token"
         ) || name.ends_with("_token")
             || name.ends_with("_apitoken");
@@ -6981,6 +7018,7 @@ fn compact_key_context_allows_low_entropy_literal(name: &str, kind: KeyKind) -> 
                 | "idtoken"
                 | "bearertoken"
                 | "sessiontoken"
+                | "sessionid"
                 | "token"
         ) || compact.ends_with("token");
     }
@@ -7027,6 +7065,10 @@ fn is_explicit_slot_low_entropy_literal(value: &str, key_name: &str, kind: KeyKi
     // unquoted (`admin_password: abcdef`). Once the key name explicitly names
     // material and the value survived source/prose suppressors, the slot is
     // stronger evidence than entropy alone.
+    if matches!(kind, KeyKind::Token) {
+        return is_lowercase_compact_alpha_literal(value)
+            && key_allows_low_entropy_literal(key_name, kind);
+    }
     if is_exact_password_low_entropy_slot(key_name, kind) {
         return is_lowercase_compact_alpha_literal(value);
     }
@@ -7743,6 +7785,31 @@ mod tests {
         assert!(has(r#"password = "6.hours""#, "6.hours"));
         assert!(has(r#"password1: "munpsmt""#, "munpsmt"));
         assert!(has(r#"new_password2: "kmyhawmjaydc""#, "kmyhawmjaydc"));
+    }
+
+    #[test]
+    fn masks_each_short_credential_in_a_prefixed_log_line() {
+        let raw = "audit: session_id=abc123 csrf_token=short refresh_token=refresh";
+        let got = hits(raw);
+        for value in ["abc123", "short", "refresh"] {
+            assert!(
+                got.iter().any(|(_, candidate)| candidate == value),
+                "{value:?} missing from {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_log_field_support_does_not_turn_code_or_status_fields_into_secrets() {
+        for raw in [
+            "let session_id = current_session;",
+            "const csrf_token = token_value;",
+            "audit: session is active",
+            "status=active session=ready",
+        ] {
+            let got = hits(raw);
+            assert!(got.is_empty(), "unexpected findings for {raw:?}: {got:?}");
+        }
     }
 
     #[test]
