@@ -280,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self.server.state.anthropic_probe_responses[attempts] += 1
                 payload = anthropic_tool_response(
-                    sequence, self._probe_command(handles[attempts])
+                    sequence, self._probe_command(handles[attempts], posix_shell=True)
                 )
             else:
                 payload = anthropic_text_response(sequence, "DONE")
@@ -355,9 +355,13 @@ class Handler(BaseHTTPRequestHandler):
         command = self._probe_command(handle)
         return f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);"
 
-    def _probe_command(self, handle: str) -> str:
+    def _probe_command(self, handle: str, *, posix_shell: bool = False) -> str:
         url = f"http://127.0.0.1:{self.server.server_port}/check"
-        return shell_command(["python", "e2e_helper.py", "probe", url, handle])
+        arguments = ["python", "e2e_helper.py", "probe", url, handle]
+        # Claude's Bash tool always uses a POSIX shell, including Git Bash on
+        # native Windows. Quoting the handle also makes a restoration failure
+        # observable instead of letting `<<HANDLE>>` block as a here-document.
+        return shlex.join(arguments) if posix_shell else shell_command(arguments)
 
     def _json(self, value: object, status: int = 200) -> None:
         payload = json.dumps(value).encode()
