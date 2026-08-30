@@ -112,6 +112,111 @@ impl Drop for SecureTempFile {
     }
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn atomic_owner_only_write(
+    path: &Path,
+    contents: &[u8],
+    purpose: &str,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{purpose} path has no parent"))?;
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| format!("OS CSPRNG unavailable for {purpose}: {error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{purpose} path has no valid file name"))?;
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        data_encoding::HEXLOWER.encode(&nonce)
+    ));
+
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("could not create protected {purpose}: {error}"))?;
+    if let Err(error) = restrict_to_current_user(&temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("could not write protected {purpose}: {error}"));
+    }
+    drop(file);
+
+    if let Err(error) = atomic_replace(&temporary, path, purpose) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    sync_parent_directory(path, purpose)
+}
+
+#[cfg(windows)]
+fn atomic_replace(temporary: &Path, path: &Path, purpose: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers that remain valid
+    // for the duration of the call.
+    let moved = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(format!(
+            "could not atomically publish {purpose}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), test))]
+fn atomic_replace(temporary: &Path, path: &Path, purpose: &str) -> Result<(), String> {
+    std::fs::rename(temporary, path)
+        .map_err(|error| format!("could not atomically publish {purpose}: {error}"))
+}
+
+#[cfg(all(unix, test))]
+fn sync_parent_directory(path: &Path, purpose: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{purpose} path has no parent"))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("could not sync {purpose} directory: {error}"))
+}
+
+#[cfg(all(not(unix), test))]
+fn sync_parent_directory(_: &Path, _: &str) -> Result<(), String> {
+    Ok(())
+}
+
 fn validate_name_part(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 80
@@ -233,6 +338,41 @@ pub(crate) fn restrict_to_current_user(_: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_owner_only_write_replaces_only_with_complete_contents() {
+        let directory =
+            SecureTempDirectory::create("pentect-atomic-write-", "atomic-write test").unwrap();
+        let path = directory.path().join("journal");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_owner_only_write(&path, b"complete new journal\n", "test journal").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete new journal\n");
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("journal")]);
+    }
+
+    #[test]
+    fn atomic_owner_only_write_removes_temporary_file_when_publish_fails() {
+        let directory =
+            SecureTempDirectory::create("pentect-atomic-fail-", "atomic-write failure test")
+                .unwrap();
+        let path = directory.path().join("journal");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = atomic_owner_only_write(&path, b"new journal\n", "test journal").unwrap_err();
+
+        assert!(error.contains("could not atomically publish"), "{error}");
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("journal")]);
+    }
 
     #[test]
     fn extracts_sid_without_decoding_the_account_name() {
