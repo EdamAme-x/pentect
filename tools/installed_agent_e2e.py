@@ -364,9 +364,33 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class FixtureServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(self, state: State) -> None:
         super().__init__(("127.0.0.1", 0), Handler)
         self.state = state
+
+
+def request_tool_result_summary(requests: list[str]) -> list[str]:
+    summaries: list[str] = []
+    for request in requests[-8:]:
+        try:
+            value = json.loads(request)
+        except json.JSONDecodeError:
+            continue
+        for message in value.get("messages", []):
+            content = message.get("content", []) if isinstance(message, dict) else []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                result = json.dumps(block.get("content"), ensure_ascii=True)
+                summary = result[-800:]
+                if summary not in summaries:
+                    summaries.append(summary)
+    return summaries[-4:]
 
 
 def client_command(
@@ -523,7 +547,8 @@ else:
                 ]
                 raise RuntimeError(
                     f"{client} E2E timed out; service attempts={len(state.service_attempts)}; "
-                    f"model requests={len(state.model_requests)} handles={handle_counts}\n{output}"
+                    f"model requests={len(state.model_requests)} handles={handle_counts}; "
+                    f"tool results={request_tool_result_summary(state.model_requests)}\n{output}"
                 ) from error
             if completed.returncode != 0:
                 output = completed.stdout.replace(valid, "<synthetic-key>").replace(invalid, "<synthetic-key>")
