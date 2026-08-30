@@ -71,6 +71,7 @@ pub(crate) struct OpenAiHttpProxyGuard {
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
     failure: Arc<Mutex<Option<String>>>,
+    protected_request_observed: Arc<AtomicBool>,
 }
 
 impl OpenAiHttpProxyGuard {
@@ -99,6 +100,8 @@ impl OpenAiHttpProxyGuard {
         let thread_auth = auth.clone();
         let failure = Arc::new(Mutex::new(None));
         let thread_failure = Arc::clone(&failure);
+        let protected_request_observed = Arc::new(AtomicBool::new(false));
+        let thread_protected_request_observed = Arc::clone(&protected_request_observed);
         let thread = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -117,8 +120,15 @@ impl OpenAiHttpProxyGuard {
                 }
             };
             runtime.block_on(async move {
-                if let Err(error) =
-                    run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
+                if let Err(error) = run_proxy(
+                    upstream,
+                    headers,
+                    thread_auth,
+                    thread_protected_request_observed,
+                    ready_tx,
+                    shutdown_rx,
+                )
+                .await
                 {
                     if let Ok(mut failure) = thread_failure.lock() {
                         *failure = Some(error);
@@ -135,6 +145,7 @@ impl OpenAiHttpProxyGuard {
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
             failure,
+            protected_request_observed,
         })
     }
 
@@ -150,6 +161,10 @@ impl OpenAiHttpProxyGuard {
         self.thread
             .as_ref()
             .is_some_and(|thread| !thread.is_finished())
+    }
+
+    pub(crate) fn protected_request_observed(&self) -> bool {
+        self.protected_request_observed.load(Ordering::Acquire)
     }
 }
 
@@ -176,6 +191,7 @@ struct ProxyState {
     requests: Arc<Semaphore>,
     block_unknown_formats: bool,
     headers: crate::upstream::HeaderOverrides,
+    protected_request_observed: Arc<AtomicBool>,
 }
 
 impl Drop for ProxyState {
@@ -188,10 +204,11 @@ async fn run_proxy(
     upstream: reqwest::Url,
     headers: crate::upstream::HeaderOverrides,
     auth: String,
+    protected_request_observed: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<String, String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let initialized = initialize_proxy(upstream, headers, auth).await;
+    let initialized = initialize_proxy(upstream, headers, auth, protected_request_observed).await;
     let (listener, state, local_base_url) = match initialized {
         Ok(initialized) => initialized,
         Err(error) => {
@@ -235,6 +252,7 @@ async fn initialize_proxy(
     upstream: reqwest::Url,
     headers: crate::upstream::HeaderOverrides,
     auth: String,
+    protected_request_observed: Arc<AtomicBool>,
 ) -> Result<(TcpListener, Arc<ProxyState>, String), String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -257,6 +275,7 @@ async fn initialize_proxy(
         requests: Arc::new(Semaphore::new(32)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
         headers,
+        protected_request_observed,
     });
     Ok((listener, state, local_base_url))
 }
@@ -548,6 +567,9 @@ async fn proxy_request_inner(
             .map_err(|_| "OpenAI request protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
             if let Some(response) = protected.local_response {
+                state
+                    .protected_request_observed
+                    .store(true, Ordering::Release);
                 if request_streaming {
                     return Ok(text_response(
                         StatusCode::UNPROCESSABLE_ENTITY,
@@ -564,6 +586,12 @@ async fn proxy_request_inner(
         });
         reqwest::Body::wrap_stream(stream)
     };
+
+    if (protected_request && inspect_protected_request) || files_upload || audio_upload {
+        state
+            .protected_request_observed
+            .store(true, Ordering::Release);
+    }
 
     let mut upstream_request = state.client.request(method.clone(), upstream_url);
     let connection_headers = connection_named_headers(&headers);
@@ -3862,6 +3890,7 @@ mod tests {
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = ProviderBoundaryTestEnv::install(&store);
         let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+        assert!(!proxy.protected_request_observed());
 
         let response = reqwest::blocking::Client::new()
             .get(format!("{}/responses", proxy.base_url()))
@@ -3871,6 +3900,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
+        assert!(!proxy.protected_request_observed());
     }
 
     #[test]
@@ -3895,6 +3925,7 @@ mod tests {
             Some("PENTECT_TEST_OPENAI_PROVIDER_KEY"),
         )
         .unwrap();
+        assert!(!proxy.protected_request_observed());
         let response = reqwest::blocking::Client::new()
             .post(format!("{}/v1/chat/completions", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -3930,6 +3961,7 @@ mod tests {
             .unwrap()
             .text()
             .unwrap();
+        assert!(proxy.protected_request_observed());
         let response: Value = serde_json::from_str(&response).unwrap();
         let (headers, request) = captured
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -4321,6 +4353,7 @@ mod tests {
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = ProviderBoundaryTestEnv::install(&store);
         let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+        assert!(!proxy.protected_request_observed());
         let secret = ["rpa_", "MODELROUTE", "BODYMUST", "NOTLEAVE", "1234567890"].concat();
 
         let client = reqwest::blocking::Client::new();
@@ -4986,6 +5019,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!proxy.protected_request_observed());
         let error = response.text().unwrap();
         assert!(
             error.contains("non-string response instructions"),

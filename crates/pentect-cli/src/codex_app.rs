@@ -13,6 +13,7 @@ use std::{fs::OpenOptions, io::Write, thread, time::Duration};
 const APP_START_GRACE: Duration = Duration::from_secs(15);
 const APP_EXIT_GRACE: Duration = Duration::from_secs(30);
 const APP_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
+const APP_PROTECTION_WARNING_AFTER: Duration = Duration::from_secs(30);
 const MAX_LIFECYCLE_LOG_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
@@ -86,10 +87,8 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     record_lifecycle(&lifecycle_log, "gateway-started", "loopback");
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
     eprintln!(
-        "[pentect] Codex provider '{}' is routed through the gateway for this App session",
-        routing.provider
+        "[pentect] Waiting for Codex App to send a protected Responses API request; use a non-sensitive test prompt first"
     );
-    eprintln!("[pentect] Responses API prompts, files, and completed tool calls are protected");
 
     let mut command = Command::new(&app);
     crate::upstream::hide_header_source_env(&mut command, &options.upstream_header_env);
@@ -143,7 +142,14 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             "could not install Codex App session cleanup handler: {error}"
         ));
     }
-    let status = monitor_codex_app(&mut child, &app, &proxy, &lifecycle_log)?;
+    let mut protection_reporter = CodexAppProtectionReporter::new(std::time::Instant::now());
+    let status = monitor_codex_app(
+        &mut child,
+        &app,
+        &proxy,
+        &lifecycle_log,
+        &mut protection_reporter,
+    )?;
     session_cleanup
         .lock()
         .map_err(|_| "Codex App session cleanup lock is unavailable".to_string())?
@@ -162,6 +168,7 @@ fn monitor_codex_app(
     app: &Path,
     proxy: &crate::openai_http_proxy::OpenAiHttpProxyGuard,
     lifecycle_log: &Option<CodexAppLifecycleLog>,
+    protection_reporter: &mut CodexAppProtectionReporter,
 ) -> Result<std::process::ExitStatus, String> {
     loop {
         if !proxy.is_running() {
@@ -175,6 +182,7 @@ fn monitor_codex_app(
                 "Codex App gateway stopped: {reason}; inspect the lifecycle entries with `pentect log`"
             ));
         }
+        report_codex_app_protection(proxy, lifecycle_log, protection_reporter);
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("could not monitor Codex App launcher: {error}"))?
@@ -187,7 +195,7 @@ fn monitor_codex_app(
             if !status.success() {
                 return Ok(status);
             }
-            return monitor_handed_off_app(app, proxy, lifecycle_log, status);
+            return monitor_handed_off_app(app, proxy, lifecycle_log, protection_reporter, status);
         }
         thread::sleep(APP_MONITOR_INTERVAL);
     }
@@ -197,6 +205,7 @@ fn monitor_handed_off_app(
     app: &Path,
     proxy: &crate::openai_http_proxy::OpenAiHttpProxyGuard,
     lifecycle_log: &Option<CodexAppLifecycleLog>,
+    protection_reporter: &mut CodexAppProtectionReporter,
     launcher_status: std::process::ExitStatus,
 ) -> Result<std::process::ExitStatus, String> {
     let mut process_probe = CodexAppProcessProbe::new(app);
@@ -209,6 +218,7 @@ fn monitor_handed_off_app(
             terminate_codex_app_processes(app);
             return Err(error);
         }
+        report_codex_app_protection(proxy, lifecycle_log, protection_reporter);
         if process_probe.app_is_running() {
             if !observed {
                 record_lifecycle(lifecycle_log, "app-process-observed", "running");
@@ -244,6 +254,73 @@ fn monitor_handed_off_app(
             warned_unobservable = true;
         }
         thread::sleep(APP_MONITOR_INTERVAL);
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CodexAppProtectionNotice {
+    Active,
+    NotObserved,
+}
+
+struct CodexAppProtectionReporter {
+    started_at: std::time::Instant,
+    active_reported: bool,
+    warning_reported: bool,
+}
+
+impl CodexAppProtectionReporter {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            active_reported: false,
+            warning_reported: false,
+        }
+    }
+
+    fn next_notice(
+        &mut self,
+        protected_request_observed: bool,
+        now: std::time::Instant,
+    ) -> Option<CodexAppProtectionNotice> {
+        if protected_request_observed && !self.active_reported {
+            self.active_reported = true;
+            return Some(CodexAppProtectionNotice::Active);
+        }
+        if !protected_request_observed
+            && !self.active_reported
+            && !self.warning_reported
+            && now.duration_since(self.started_at) >= APP_PROTECTION_WARNING_AFTER
+        {
+            self.warning_reported = true;
+            return Some(CodexAppProtectionNotice::NotObserved);
+        }
+        None
+    }
+}
+
+fn report_codex_app_protection(
+    proxy: &crate::openai_http_proxy::OpenAiHttpProxyGuard,
+    lifecycle_log: &Option<CodexAppLifecycleLog>,
+    reporter: &mut CodexAppProtectionReporter,
+) {
+    match reporter.next_notice(
+        proxy.protected_request_observed(),
+        std::time::Instant::now(),
+    ) {
+        Some(CodexAppProtectionNotice::Active) => {
+            record_lifecycle(lifecycle_log, "protected-request-observed", "active");
+            eprintln!(
+                "[pentect] Codex App is routed through the gateway; supported traffic is protected"
+            );
+        }
+        Some(CodexAppProtectionNotice::NotObserved) => {
+            record_lifecycle(lifecycle_log, "protected-request-not-observed", "warning");
+            eprintln!(
+                "[pentect] warning: Codex App has not sent a protected request after 30 seconds; confirm that this is the Pentect-launched App before sending sensitive data"
+            );
+        }
+        None => {}
     }
 }
 
@@ -1384,6 +1461,48 @@ fn success_status() -> std::process::ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_protected_request_warns_once_and_later_reports_recovery() {
+        let started_at = std::time::Instant::now();
+        let mut reporter = CodexAppProtectionReporter::new(started_at);
+
+        assert_eq!(
+            reporter.next_notice(false, started_at + Duration::from_secs(29)),
+            None
+        );
+        assert_eq!(
+            reporter.next_notice(false, started_at + APP_PROTECTION_WARNING_AFTER),
+            Some(CodexAppProtectionNotice::NotObserved)
+        );
+        assert_eq!(
+            reporter.next_notice(false, started_at + Duration::from_secs(31)),
+            None
+        );
+        assert_eq!(
+            reporter.next_notice(true, started_at + Duration::from_secs(32)),
+            Some(CodexAppProtectionNotice::Active)
+        );
+        assert_eq!(
+            reporter.next_notice(true, started_at + Duration::from_secs(33)),
+            None
+        );
+    }
+
+    #[test]
+    fn observed_protected_request_does_not_emit_a_late_warning() {
+        let started_at = std::time::Instant::now();
+        let mut reporter = CodexAppProtectionReporter::new(started_at);
+
+        assert_eq!(
+            reporter.next_notice(true, started_at + Duration::from_secs(1)),
+            Some(CodexAppProtectionNotice::Active)
+        );
+        assert_eq!(
+            reporter.next_notice(false, started_at + APP_PROTECTION_WARNING_AFTER),
+            None
+        );
+    }
 
     #[test]
     fn process_matching_requires_install_root_component_boundary() {
