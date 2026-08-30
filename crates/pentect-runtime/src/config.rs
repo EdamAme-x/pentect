@@ -71,8 +71,16 @@ fn validate_config_value(value: &toml::Value) -> Result<(), String> {
     agent_require_pentect_value(value)?;
     image_ocr_config_value(value)?;
     let decode = decode_config_value(value)?;
-    merge_decode_config_unchecked(Profile::Strict, decode, DecodeConfigPartial::default())
-        .validate()?;
+    for (name, profile) in [
+        ("strict", Profile::Strict),
+        ("balanced", Profile::Balanced),
+        ("dev", Profile::Dev),
+        ("paranoid", Profile::Paranoid),
+    ] {
+        merge_decode_config_unchecked(profile, decode, DecodeConfigPartial::default())
+            .validate()
+            .map_err(|error| format!("{error} (invalid for {name} profile)"))?;
+    }
     files_remember_value(value)?;
     activity_share_value(value)?;
     metrics_enabled_value(value)?;
@@ -1387,6 +1395,26 @@ unknown_min_bytes = 32
         assert_eq!(partial.max_inflate_bytes, Some(None));
         assert_eq!(partial.mask_unknown, Some(true));
         assert_eq!(partial.unknown_min_bytes, Some(32));
+    }
+
+    #[test]
+    fn config_validation_checks_decode_limits_for_every_profile() {
+        let value = "[decode]\nmin_bytes = 25\nunknown_min_bytes = 20"
+            .parse::<toml::Value>()
+            .unwrap();
+        let error = validate_config_value(&value).unwrap_err();
+        assert_eq!(
+            error,
+            "decode.unknown_min_bytes must be at least decode.min_bytes (invalid for paranoid profile)"
+        );
+    }
+
+    #[test]
+    fn config_validation_accepts_inactive_unknown_decode_limit() {
+        let value = "[decode]\nmin_bytes = 25\nunknown_min_bytes = 20\nmask_unknown = false"
+            .parse::<toml::Value>()
+            .unwrap();
+        validate_config_value(&value).unwrap();
     }
 
     #[test]
