@@ -660,7 +660,7 @@ def run_cancellation(pentect: str) -> None:
             codex_home.mkdir()
             config = codex_home / "config.toml"
             sentinel = (
-                f"[projects.{json.dumps(str(project))}]\n"
+                f"[projects.{json.dumps(str(project.resolve()))}]\n"
                 'trust_level = "trusted"\n'
                 "# cancellation E2E sentinel\n"
             )
