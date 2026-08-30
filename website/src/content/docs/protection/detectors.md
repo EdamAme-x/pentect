@@ -108,7 +108,7 @@ have separate component versions.
 | Detector | Finding category | What it masks by default | Evidence boundary |
 | --- | --- | --- | --- |
 | `ExplicitSecretDetector` | Secret | Non-empty values deliberately wrapped in `pentect(...)` or `mask(...)` | Unit and end-to-end handle tests; explicit user instruction, not inference |
-| `UrlDetector` | Secret, identifier, or endpoint | Credential-bearing URL and URI components, selected sensitive query values, `curl -u/-U` credentials, and selected cloud endpoint identifiers | Syntax and regression fixtures in the detector module |
+| `UrlDetector` | Secret, identifier, or endpoint | Credential-bearing URL and URI components; password/token/secret, OAuth/OIDC callback, signature/session, and one-time-code query fields; `curl -u/-U` credentials; and selected cloud endpoint identifiers | Syntax, HTTP/WebSocket query, navigation-metadata, and mask/restore regressions in the detector module |
 | `CliCredentialDetector` | Secret | Plaintext password arguments in supported PowerShell command shapes | Shell-token and command-shape regression fixtures |
 | `JwtDetector` | Secret | Structurally valid compact JWT and JWE values | JOSE structure, JSON header/payload, and size-bound tests; it does not establish token validity |
 | `KeyValueDetector` | Secret | Values in plaintext `key=value`, `key: value`, and similar secret-key contexts when key, separator, boundary, and value checks agree | Positive and benign-corpus regression fixtures; independently maintained heuristics |
