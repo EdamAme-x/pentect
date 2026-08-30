@@ -985,7 +985,7 @@ fn protect_openai_request_body(
             value,
             Some(serde_json::json!({"provider": "openai", "transport": "http"})),
         )?;
-    let plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
+    let mut plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
     value = run.payload;
     if let Some(outcome) = run.stopped {
         if outcome == pentect_agent::StopOutcome::Block {
@@ -1002,6 +1002,12 @@ fn protect_openai_request_body(
             })
             .map_err(|error| format!("could not encode plugin response: {error}"));
     }
+    plugin_partial |= {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+        crate::http_files::run_openai_inline_file_stages(&value, &plugins, "openai", "http_json")
+    }?;
     let unknown_content_kind = openai_request_unknown_content_kind(&value, dialect);
     let partial_schema = unknown_content_kind.is_some();
     if block_unknown_formats && (partial_schema || plugin_partial) {
