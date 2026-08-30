@@ -6,6 +6,7 @@ use pentect_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -1719,36 +1720,13 @@ fn resolve_command_executable(value: &str) -> Result<PathBuf, String> {
     }
     let paths = std::env::var_os("PATH").unwrap_or_default();
     #[cfg(windows)]
-    let extensions = std::env::var_os("PATHEXT")
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .filter(|extension| windows_command_extension_supported(extension))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                ".EXE".to_string(),
-                ".COM".to_string(),
-                ".CMD".to_string(),
-                ".BAT".to_string(),
-            ]
-        });
+    let candidates =
+        windows_executable_candidates(candidate, &std::env::var_os("PATHEXT").unwrap_or_default());
     #[cfg(not(windows))]
-    let extensions = vec![String::new()];
+    let candidates = vec![candidate.to_path_buf()];
     for directory in std::env::split_paths(&paths) {
-        for extension in &extensions {
-            let path = if extension.is_empty()
-                || value
-                    .to_ascii_lowercase()
-                    .ends_with(&extension.to_ascii_lowercase())
-            {
-                directory.join(value)
-            } else {
-                directory.join(format!("{value}{extension}"))
-            };
+        for candidate in &candidates {
+            let path = directory.join(candidate);
             if let Ok(path) = path.canonicalize() {
                 if supported_command_executable(&path) {
                     return Ok(path);
@@ -1757,6 +1735,41 @@ fn resolve_command_executable(value: &str) -> Result<PathBuf, String> {
         }
     }
     Err(format!("command executable is unavailable: {value}"))
+}
+
+#[doc(hidden)]
+pub fn windows_executable_candidates(program: &Path, pathext: &OsStr) -> Vec<PathBuf> {
+    if program.extension().is_some() {
+        return vec![program.to_path_buf()];
+    }
+    let mut extensions = pathext
+        .to_string_lossy()
+        .split(';')
+        .map(str::trim)
+        .filter(|extension| windows_command_extension_supported(extension))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
+        if !extensions
+            .iter()
+            .any(|extension| extension.eq_ignore_ascii_case(fallback))
+        {
+            extensions.push(fallback.to_string());
+        }
+    }
+    let mut names = extensions
+        .into_iter()
+        .map(|extension| {
+            let mut name = program.as_os_str().to_os_string();
+            name.push(extension);
+            PathBuf::from(name)
+        })
+        .collect::<Vec<_>>();
+    // An extensionless PE executable is valid for normal client launch. Plugin
+    // execution applies its stricter supported_command_executable policy after
+    // resolving each candidate.
+    names.push(program.to_path_buf());
+    names
 }
 
 #[cfg(unix)]
@@ -1775,8 +1788,8 @@ fn supported_command_executable(path: &Path) -> bool {
             .is_some_and(windows_command_extension_supported)
 }
 
-#[cfg(any(windows, test))]
-fn windows_command_extension_supported(extension: &str) -> bool {
+#[doc(hidden)]
+pub fn windows_command_extension_supported(extension: &str) -> bool {
     matches!(
         extension
             .strip_prefix('.')
@@ -3795,6 +3808,30 @@ mod tests {
         for extension in ["ps1", ".js", "sh", ""] {
             assert!(!windows_command_extension_supported(extension));
         }
+    }
+
+    #[test]
+    fn windows_command_candidates_trim_pathext_and_restore_safe_fallbacks() {
+        let candidates =
+            windows_executable_candidates(Path::new("tool"), OsStr::new(".EXE; .CMD ; .PS1"));
+        assert_eq!(
+            candidates,
+            [
+                PathBuf::from("tool.EXE"),
+                PathBuf::from("tool.CMD"),
+                PathBuf::from("tool.COM"),
+                PathBuf::from("tool.BAT"),
+                PathBuf::from("tool"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_command_candidates_preserve_explicit_extensions() {
+        assert_eq!(
+            windows_executable_candidates(Path::new("tool.cmd"), OsStr::new(".EXE")),
+            [PathBuf::from("tool.cmd")]
+        );
     }
 
     fn command_fixture(response: &str) -> Vec<String> {
