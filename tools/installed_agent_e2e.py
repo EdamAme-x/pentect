@@ -374,7 +374,7 @@ class FixtureServer(ThreadingHTTPServer):
 
 def request_tool_result_summary(requests: list[str]) -> list[str]:
     summaries: list[str] = []
-    for request in requests[-8:]:
+    for request in requests:
         try:
             value = json.loads(request)
         except json.JSONDecodeError:
@@ -472,7 +472,9 @@ def run_client(pentect: str, client: str) -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix=f"pentect-{client}-e2e-") as raw_root:
+        with tempfile.TemporaryDirectory(
+            prefix=f"pentect-{client}-e2e-", ignore_cleanup_errors=True
+        ) as raw_root:
             root = Path(raw_root)
             home = root / "home"
             project = root / "project"
@@ -589,7 +591,9 @@ def main() -> int:
         dest="clients",
     )
     args = parser.parse_args()
-    for client in args.clients or ("codex", "claude", "opencode", "pi"):
+    # Run Claude first because it has the strictest native Windows tool
+    # transport. A regression should fail before the slower Codex startup.
+    for client in args.clients or ("claude", "codex", "opencode", "pi"):
         run_client(args.pentect, client)
     return 0
 
