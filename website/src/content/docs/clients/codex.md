@@ -67,6 +67,15 @@ Pentect starts a local gateway that supports the Responses API. It protects
 prompts, tool results, files, and completed tool-call arguments. Streaming
 responses still work.
 
+Responses computer-use screenshots returned as
+`computer_call_output.output` are checked through the same local image and OCR
+path as other supported inline images. Pentect keeps the computer-call IDs and
+safety fields intact, replaces sensitive pixels in the screenshot, and adds a
+separate user text item containing only the corresponding handles. A malformed,
+unknown, or unscannable computer screenshot follows the configured
+`image.unscanned` policy; allowing unknown JSON formats does not by itself skip
+the image check.
+
 For each protected request, Pentect adds short session instructions that tell
 Codex how to use handles and their local environment bindings. These
 instructions contain no real secret values. They prevent the agent from
@@ -107,6 +116,11 @@ App a session-only Codex configuration; it never points your shared
 uses your normal provider, even while the protected App is open.
 
 `--check` exercises discovery and routing without sending a model prompt.
+
+CI exercises the Codex App process boundary and the documented Responses
+computer-use request shape with mock services and fake secrets. It does not sign
+in to a real OpenAI account or drive the released App UI, so that end-to-end UI
+step remains a release verification item.
 
 `pentect codex app` stays attached for the full App session. If the launcher
 hands off to another App process, Pentect keeps the gateway alive until that

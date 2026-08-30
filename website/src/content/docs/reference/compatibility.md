@@ -14,7 +14,7 @@ drift is visible before the next release.
 | Claude Code `2.1.238` | Real launch on Linux and all installer platforms | `pentect claude` |
 | OpenCode `1.18.20` | Real launch on Linux and all installer platforms | `pentect opencode` |
 | Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
-| ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests | `pentect codex app` |
+| ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests, including computer-use screenshots | `pentect codex app` |
 | Claude Desktop | Protocol tests; Windows current-user trust-store launch path awaiting real-account release verification | `pentect claude app` with explicit certificate confirmation |
 
 ## Not implemented
@@ -45,7 +45,7 @@ links, broken data, custom gateway paths, and Codex zstd-compressed requests.
 | --- | --- | --- |
 | `pentect codex` | OpenAI Responses | Includes streaming events and completed tool calls |
 | `pentect claude` | Anthropic Messages | Includes streaming content blocks and tool use |
-| `pentect codex app` | Responses routes used by supported Codex mode | Other ChatGPT modes are outside this claim |
+| `pentect codex app` | Responses routes used by supported Codex mode, including documented `computer_call_output` screenshots | Other ChatGPT modes are outside this claim |
 | `pentect claude app` | Supported Claude Chat and attachment routes on a compatible app build | Claude Code should use `pentect claude`; Cowork and Voice are outside this claim |
 
 “Supported” means Pentect recognizes and checks the route and content shapes
@@ -86,7 +86,7 @@ that local handles are not printed.
 
 | Desktop surface | Current scope |
 | --- | --- |
-| Codex App | Supported Codex mode using the Responses protocol |
+| Codex App | Supported Codex mode using the Responses protocol; signed-in UI execution remains a manual release check |
 | Claude Desktop | Protocol support exists, but current build compatibility is restricted as described below |
 | Other app modes | Not claimed unless listed here |
 

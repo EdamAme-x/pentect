@@ -12,6 +12,7 @@ because text handles cannot replace pixels.
 | UTF-8 text | Detect and replace | Text with handles |
 | Supported PDF | Read and check supported content | Protected document content |
 | Supported inline image | Local OCR and visual masking | Masked pixels and an adjacent handle note |
+| Responses computer-use screenshot | Local OCR and visual masking | Masked pixels and a separate user text item containing the handles |
 | Supported Files API image upload | Local OCR and visual masking | Masked pixels; `partial` coverage when handles cannot be attached |
 | Unknown binary | Block | Nothing |
 | File ID or remote file that Pentect cannot check | Use the unscanned setting | Nothing when set to `block` |
@@ -98,6 +99,13 @@ This also applies when a supported browser or MCP tool returns a screenshot as
 part of a tool result. Pentect applies the configured image policy before that
 result enters the next provider request. If the tool also returns page text, HTML, clipboard
 text, or structured JSON, Pentect checks those values as text.
+
+For the OpenAI Responses computer-use shape, Pentect inspects the nested
+`computer_screenshot` image and leaves its call ID and protocol metadata
+unchanged. If masking produces handles, Pentect adds them as a separate valid
+user message instead of changing the `computer_call_output` object. Unknown
+computer output shapes remain subject to the unscanned-image policy even when
+unknown JSON formats are allowed for compatibility.
 
 For example, when an agent creates an API key in a browser, the key may appear
 in a page snapshot, structured tool result, or screenshot. Supported text

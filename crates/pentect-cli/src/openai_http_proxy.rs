@@ -1372,7 +1372,7 @@ async fn resolve_openai_remote_files(
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    resolve_openai_remote_file_values(&mut value, budget).await?;
+    resolve_openai_remote_file_values(&mut value, budget, false).await?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| "could not encode resolved remote attachment".to_string())
@@ -1381,16 +1381,18 @@ async fn resolve_openai_remote_files(
 fn resolve_openai_remote_file_values<'a>(
     value: &'a mut Value,
     budget: &'a mut crate::remote_content::RemoteRequestBudget,
+    computer_output: bool,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    resolve_openai_remote_file_values(value, budget).await?;
+                    resolve_openai_remote_file_values(value, budget, false).await?;
                 }
             }
             Value::Object(object) => {
                 let input_type = object.get("type").and_then(Value::as_str);
+                let is_computer_call_output = input_type == Some("computer_call_output");
                 if input_type == Some("image_url") {
                     let url = object
                         .get("image_url")
@@ -1442,7 +1444,9 @@ fn resolve_openai_remote_file_values<'a>(
                             .or_insert(Value::String(remote.filename));
                         return Ok(());
                     }
-                } else if input_type == Some("input_image") {
+                } else if input_type == Some("input_image")
+                    || (computer_output && input_type == Some("computer_screenshot"))
+                {
                     if let Some(url) = object
                         .get("image_url")
                         .and_then(Value::as_str)
@@ -1464,8 +1468,10 @@ fn resolve_openai_remote_file_values<'a>(
                         return Ok(());
                     }
                 }
-                for value in object.values_mut() {
-                    resolve_openai_remote_file_values(value, budget).await?;
+                for (key, value) in object.iter_mut() {
+                    let nested_computer_output = is_computer_call_output && key == "output";
+                    resolve_openai_remote_file_values(value, budget, nested_computer_output)
+                        .await?;
                 }
             }
             _ => {}
@@ -1478,11 +1484,14 @@ fn openai_request_unknown_content_kind(
     value: &Value,
     dialect: OpenAiRequestDialect,
 ) -> Option<&str> {
-    fn visit(value: &Value) -> Option<&str> {
+    fn visit(value: &Value, computer_output: bool) -> Option<&str> {
         match value {
-            Value::Array(items) => items.iter().find_map(visit),
+            Value::Array(items) => items.iter().find_map(|item| visit(item, false)),
             Value::Object(object) => {
                 if let Some(kind) = object.get("type").and_then(Value::as_str) {
+                    if kind == "computer_screenshot" && !computer_output {
+                        return Some(kind);
+                    }
                     if !matches!(
                         kind,
                         "message"
@@ -1507,6 +1516,7 @@ fn openai_request_unknown_content_kind(
                             | "image_generation_call"
                             | "computer_call"
                             | "computer_call_output"
+                            | "computer_screenshot"
                             | "reasoning"
                             | "compaction"
                             | "compaction_summary"
@@ -1516,10 +1526,13 @@ fn openai_request_unknown_content_kind(
                         return Some(kind);
                     }
                 }
-                ["content", "input", "output"]
-                    .into_iter()
-                    .filter_map(|key| object.get(key))
-                    .find_map(visit)
+                let is_computer_call_output =
+                    object.get("type").and_then(Value::as_str) == Some("computer_call_output");
+                ["content", "input", "output"].into_iter().find_map(|key| {
+                    object
+                        .get(key)
+                        .and_then(|value| visit(value, is_computer_call_output && key == "output"))
+                })
             }
             _ => None,
         }
@@ -1532,7 +1545,7 @@ fn openai_request_unknown_content_kind(
             .or_else(|| {
                 value
                     .get("input")
-                    .map(visit)
+                    .map(|input| visit(input, false))
                     .unwrap_or(Some("missing input"))
             }),
         OpenAiRequestDialect::ChatCompletions => value
@@ -1540,7 +1553,9 @@ fn openai_request_unknown_content_kind(
             .map(visit_chat_messages)
             .unwrap_or(Some("missing messages")),
         OpenAiRequestDialect::Completions => completions_unknown_shape(value),
-        OpenAiRequestDialect::StandaloneSearch => standalone_search_unknown_shape(value, visit),
+        OpenAiRequestDialect::StandaloneSearch => {
+            standalone_search_unknown_shape(value, |input| visit(input, false))
+        }
         OpenAiRequestDialect::Embeddings => embeddings_unknown_shape(value),
         OpenAiRequestDialect::ImageGeneration => required_string_shape(value, "prompt"),
         OpenAiRequestDialect::AudioSpeech => required_string_shape(value, "input").or_else(|| {
@@ -2086,18 +2101,30 @@ fn mask_openai_input(
         Value::Array(items) => {
             let original = std::mem::take(items);
             for mut item in original {
-                let note = if item.get("type").and_then(Value::as_str) == Some("input_image") {
-                    match item.as_object_mut() {
-                        Some(object) => inspect_openai_image(object)?,
-                        None => None,
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                let (note, computer_output) = match item_type {
+                    "input_image" => (
+                        match item.as_object_mut() {
+                            Some(object) => inspect_openai_image(object)?,
+                            None => None,
+                        },
+                        false,
+                    ),
+                    "computer_call_output" => (
+                        match item.as_object_mut() {
+                            Some(object) => inspect_computer_call_output(object, files)?,
+                            None => None,
+                        },
+                        true,
+                    ),
+                    _ => {
+                        mask_openai_input(&mut item, tool_result, masker, files)?;
+                        (None, false)
                     }
-                } else {
-                    mask_openai_input(&mut item, tool_result, masker, files)?;
-                    None
                 };
                 items.push(item);
                 if let Some(text) = note {
-                    items.push(serde_json::json!({"type": "input_text", "text": text}));
+                    items.push(openai_image_mask_note(text, computer_output));
                 }
             }
             Ok(())
@@ -2132,6 +2159,13 @@ fn mask_openai_input(
                 "input_image" => {
                     let _ = inspect_openai_image(object)?;
                 }
+                // This shape is not part of the documented top-level Responses
+                // input contract. Unknown-format compatibility may reach it,
+                // but it must still pass the image policy rather than exposing
+                // an unchecked image_url.
+                "computer_screenshot" => {
+                    let _ = inspect_openai_image(object)?;
+                }
                 "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
                 "message" => {
                     let external_content =
@@ -2154,6 +2188,18 @@ fn mask_openai_input(
     }
 }
 
+fn openai_image_mask_note(text: String, computer_output: bool) -> Value {
+    if computer_output {
+        serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}]
+        })
+    } else {
+        serde_json::json!({"type": "input_text", "text": text})
+    }
+}
+
 fn inspect_openai_image(
     object: &mut serde_json::Map<String, Value>,
 ) -> Result<Option<String>, String> {
@@ -2171,6 +2217,29 @@ fn inspect_openai_image(
         return Ok(Some(protected.note));
     }
     Ok(None)
+}
+
+fn inspect_computer_call_output(
+    object: &mut serde_json::Map<String, Value>,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<Option<String>, String> {
+    let Some(output) = object.get_mut("output").and_then(Value::as_object_mut) else {
+        return unscanned_image_policy().map(|_| None);
+    };
+    if output.get("type").and_then(Value::as_str) != Some("computer_screenshot") {
+        return unscanned_image_policy().map(|_| None);
+    }
+    if output.get("image_url").is_some() {
+        return inspect_openai_image(output);
+    }
+    if output
+        .get("file_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| files.get(id) == Some(&crate::http_files::Coverage::Full))
+    {
+        return Ok(None);
+    }
+    unscanned_image_policy().map(|_| None)
 }
 
 fn inspect_openai_file(
@@ -5362,6 +5431,269 @@ mod tests {
             openai_request_unknown_content_kind(&future, OpenAiRequestDialect::Responses),
             Some("future_block")
         );
+    }
+
+    #[test]
+    fn documented_computer_screenshot_shape_is_known_but_future_shapes_are_not() {
+        let current = serde_json::json!({
+            "input": [{
+                "type": "computer_call_output",
+                "call_id": "call_1",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "data:image/png;base64,opaque"
+                }
+            }]
+        });
+        assert_eq!(
+            openai_request_unknown_content_kind(&current, OpenAiRequestDialect::Responses),
+            None
+        );
+
+        let future = serde_json::json!({
+            "input": [{
+                "type": "computer_call_output",
+                "call_id": "call_1",
+                "output": {"type": "future_computer_frame", "data": "opaque"}
+            }]
+        });
+        assert_eq!(
+            openai_request_unknown_content_kind(&future, OpenAiRequestDialect::Responses),
+            Some("future_computer_frame")
+        );
+
+        let direct = serde_json::json!({
+            "input": [{
+                "type": "computer_screenshot",
+                "image_url": "data:image/png;base64,opaque"
+            }]
+        });
+        assert_eq!(
+            openai_request_unknown_content_kind(&direct, OpenAiRequestDialect::Responses),
+            Some("computer_screenshot")
+        );
+    }
+
+    #[test]
+    fn computer_screenshot_uses_image_policy_even_when_unknown_formats_are_allowed() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "input": [{
+                    "type": "computer_call_output",
+                    "call_id": "call_1",
+                    "output": {
+                        "type": "computer_screenshot",
+                        "image_url": "data:image/png;base64,not-base64"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+
+        for block_unknown_formats in [true, false] {
+            let error = match protect_openai_request_body(
+                &body,
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                OpenAiRequestDialect::Responses,
+                block_unknown_formats,
+            ) {
+                Ok(_) => panic!("an unscannable computer screenshot must not pass through"),
+                Err(error) => error,
+            };
+            assert!(error.starts_with("image blocked:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn direct_computer_screenshot_is_unknown_and_cannot_bypass_image_policy() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let body = Bytes::from_static(
+            br#"{"input":[{"type":"computer_screenshot","image_url":"data:image/png;base64,not-base64"}]}"#,
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+
+        let strict = match protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::Responses,
+            true,
+        ) {
+            Ok(_) => panic!("a direct computer screenshot should be unknown"),
+            Err(error) => error,
+        };
+        assert!(strict.starts_with("unknown format blocked:"), "{strict}");
+        assert!(strict.contains("computer_screenshot"), "{strict}");
+
+        let compatible = match protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::Responses,
+            false,
+        ) {
+            Ok(_) => panic!("compatibility must not bypass the image policy"),
+            Err(error) => error,
+        };
+        assert!(compatible.starts_with("image blocked:"), "{compatible}");
+    }
+
+    #[test]
+    fn unknown_computer_output_remains_blocked_when_unknown_formats_are_allowed() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let body = Bytes::from_static(
+            br#"{"input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"future_computer_frame","data":"opaque"}}]}"#,
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::new();
+
+        for block_unknown_formats in [true, false] {
+            let error = match protect_openai_request_body(
+                &body,
+                &masker,
+                &plugins,
+                &files,
+                OpenAiRequestDialect::Responses,
+                block_unknown_formats,
+            ) {
+                Ok(_) => panic!("an unknown computer output should be rejected"),
+                Err(error) => error,
+            };
+            if block_unknown_formats {
+                assert!(error.starts_with("unknown format blocked:"), "{error}");
+                assert!(error.contains("future_computer_frame"), "{error}");
+            } else {
+                assert!(error.starts_with("image blocked:"), "{error}");
+            }
+        }
+    }
+
+    #[cfg(all(feature = "ocr", target_os = "linux"))]
+    #[test]
+    fn computer_screenshot_is_redacted_and_preserves_protocol_fields() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        // A QR image containing only a fake test credential. This exercises the
+        // real barcode/OCR, image rewrite, handle, and Responses note path.
+        let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/dAAAAAnRSTlP//8i138cAAAAJcEhZcwAACxIAAAsSAdLdfvwAAAF8SURBVGiB7ZrLrsIwEEP9/z/tq3beSSp1gXQX9VBKgbOypo4zAL4piPKSElFSIkpK/LMSsLrfXa95ZZ+KWpVgnG+1rsNUGwBEMZTArY+pVUrltSiclKC313XxrBdFMZSx5+i3XS+Kuspc/pbFNHvyL3yesuLyeFgf8Xkqqvk95hfjDb5OwSOEmb3nL/N9UdiVYFiW61XHsC6Kops4upOnVU3/oihm+6Ap5neo9dNoMohi3mfY8kJ6nSgM/0LEVGusSBO5ZojCsj6iDL9GE5laRXHZ6bB2jqFXix6iMFMaaozTxIk1URQXJehd1SaG+RSFNbnTu6vdnO5hM7RCFLO72GNX3zP1vApR7BOvSqW1oRx+D1FZcbvlWtlCrCimEiivyqifEzBR3JSgnWuRTCM7zFchiqlSzHRO+Z6iuPySwRgVeg/NIT5EYXQOfRlM3Y79RVFXxf8Acjt5f3jwL36esqpf0TK1bvMJiHpReANRVJSUiJISUVIi6pdK/AHPECxsuaPlLgAAAABJRU5ErkJggg==";
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "input": [{
+                    "id": "item_1",
+                    "type": "computer_call_output",
+                    "call_id": "call_1",
+                    "acknowledged_safety_checks": [{"id": "check_1"}],
+                    "output": {
+                        "type": "computer_screenshot",
+                        "image_url": image_url
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let protected = protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::Responses,
+            true,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Full);
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        let output = &protected["input"][0];
+        assert_eq!(output["id"], "item_1");
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(output["acknowledged_safety_checks"][0]["id"], "check_1");
+        assert_eq!(output["output"]["type"], "computer_screenshot");
+        let protected_image = output["output"]["image_url"].as_str().unwrap();
+        assert!(protected_image.starts_with("data:image/png;base64,"));
+        assert_ne!(protected_image, image_url);
+
+        let note = &protected["input"][1];
+        assert_eq!(note["type"], "message");
+        assert_eq!(note["role"], "user");
+        assert_eq!(note["content"][0]["type"], "input_text");
+        let note_text = note["content"][0]["text"].as_str().unwrap();
+        assert!(note_text.contains("Masked regions:"), "{note_text}");
+        assert!(note_text.contains("<<KEYED_SECRET_"), "{note_text}");
+        assert!(!serde_json::to_string(&protected)
+            .unwrap()
+            .contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    }
+
+    #[test]
+    fn attested_computer_screenshot_preserves_protocol_fields_and_note_schema() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "input": [{
+                    "id": "item_1",
+                    "type": "computer_call_output",
+                    "call_id": "call_1",
+                    "acknowledged_safety_checks": [{"id": "check_1"}],
+                    "output": {
+                        "type": "computer_screenshot",
+                        "file_id": "file_checked"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::from([(
+            "file_checked".to_string(),
+            crate::http_files::Coverage::Full,
+        )]);
+        let protected = protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            OpenAiRequestDialect::Responses,
+            true,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Full);
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        let output = &protected["input"][0];
+        assert_eq!(output["id"], "item_1");
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(output["acknowledged_safety_checks"][0]["id"], "check_1");
+        assert_eq!(output["output"]["type"], "computer_screenshot");
+        assert_eq!(output["output"]["file_id"], "file_checked");
+
+        let note = openai_image_mask_note(
+            "Masked regions:\n[1] <<TEST_0123456789abcdef>>".into(),
+            true,
+        );
+        assert_eq!(note["type"], "message");
+        assert_eq!(note["role"], "user");
+        assert_eq!(note["content"][0]["type"], "input_text");
+        assert!(note["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<<TEST_0123456789abcdef>>"));
     }
 
     #[test]
