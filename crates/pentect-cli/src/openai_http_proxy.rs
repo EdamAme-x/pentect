@@ -682,6 +682,7 @@ async fn proxy_request_inner(
                 },
                 Arc::clone(&state.plugins),
                 restore_output,
+                state.block_unknown_formats,
             ))
             .map_err(|error| format!("could not build OpenAI streaming response: {error}"));
     }
@@ -728,7 +729,12 @@ async fn proxy_request_inner(
         && status.is_success()
         && is_json_response
     {
-        let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
+        let response_body = run_response_plugins(
+            response_body,
+            &state.plugins,
+            "openai",
+            state.block_unknown_formats,
+        )?;
         let rewritten = if chat_response {
             rewrite_chat_completions_json_response(&response_body, restore_output)
         } else if completions_response {
@@ -760,12 +766,13 @@ fn run_response_plugins(
     body: Bytes,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     provider: &str,
+    block_unknown_formats: bool,
 ) -> Result<Bytes, String> {
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    let mut payload = run_response_plugins_value(value, plugins, provider)?;
+    let mut payload = run_response_plugins_value(value, plugins, provider, block_unknown_formats)?;
     let plugins = plugins
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
@@ -779,14 +786,38 @@ fn run_response_plugins_value(
     value: Value,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     provider: &str,
+    block_unknown_formats: bool,
 ) -> Result<Value, String> {
     let plugins = plugins
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
-    let run = plugins.run(
+    run_openai_response_plugin_with(
+        value,
+        provider,
+        block_unknown_formats,
+        |stage, payload, context| plugins.run(stage, payload, context),
+    )
+}
+
+fn run_openai_response_plugin_with(
+    value: Value,
+    provider: &str,
+    block_unknown_formats: bool,
+    mut run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        Value,
+        Option<Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<Value, String> {
+    let run = run(
         pentect_agent::MiddlewareStage::Response,
         value,
         Some(serde_json::json!({"provider": provider, "transport": "http"})),
+    )?;
+    crate::plugins::enforce_response_plugin_coverage(
+        run.coverage,
+        block_unknown_formats,
+        "OpenAI",
     )?;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
@@ -2477,6 +2508,7 @@ struct StreamState {
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
+    block_unknown_formats: bool,
     output_text: HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     output_resolve: HandleResolver,
 }
@@ -2490,7 +2522,7 @@ enum StreamTransform {
 }
 
 fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), String> {
-    let block = run_sse_response_plugins(&block, &state.plugins)?;
+    let block = run_sse_response_plugins(&block, &state.plugins, state.block_unknown_formats)?;
     let rewritten = match state.transform {
         StreamTransform::Responses => rewrite_openai_sse_block(
             &block,
@@ -2533,6 +2565,7 @@ fn streaming_response_body(
     transform: StreamTransform,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
+    block_unknown_formats: bool,
 ) -> ProxyBody {
     let state = StreamState {
         upstream: Box::pin(response.bytes_stream()),
@@ -2544,6 +2577,7 @@ fn streaming_response_body(
         finished: false,
         plugins,
         restore_output,
+        block_unknown_formats,
         output_text: HashMap::new(),
         output_resolve: Box::new(crate::claude_http_proxy::request_scoped_resolver()),
     };
@@ -3018,6 +3052,7 @@ fn sse_data(text: &str) -> Option<Cow<'_, str>> {
 fn run_sse_response_plugins(
     block: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
 ) -> Result<Vec<u8>, String> {
     let Ok(text) = std::str::from_utf8(block) else {
         return Ok(block.to_vec());
@@ -3031,7 +3066,7 @@ fn run_sse_response_plugins(
     let Ok(value) = serde_json::from_str::<Value>(data.as_ref()) else {
         return Ok(block.to_vec());
     };
-    let payload = run_response_plugins_value(value, plugins, "openai")?;
+    let payload = run_response_plugins_value(value, plugins, "openai", block_unknown_formats)?;
     encode_sse_value(text, &payload).map(|bytes| bytes.to_vec())
 }
 
@@ -3547,6 +3582,66 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_response_partial_coverage_obeys_strict_and_ignore_policy() {
+        let strict_error = run_openai_response_plugin_with(
+            serde_json::json!({"id": "response"}),
+            "openai",
+            true,
+            |stage, payload, context| {
+                assert_eq!(stage, pentect_agent::MiddlewareStage::Response);
+                assert_eq!(
+                    context.unwrap(),
+                    serde_json::json!({
+                        "provider": "openai",
+                        "transport": "http"
+                    })
+                );
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Partial,
+                    stopped: None,
+                    message: None,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(strict_error.contains("OpenAI Response plugin reported partial coverage"));
+
+        let allowed = run_openai_response_plugin_with(
+            serde_json::json!({"id": "response"}),
+            "openai",
+            false,
+            |_stage, mut payload, _context| {
+                payload["plugin"] = Value::Bool(true);
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Partial,
+                    stopped: None,
+                    message: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(allowed["plugin"], true);
+
+        let stop_error = run_openai_response_plugin_with(
+            serde_json::json!({"id": "response"}),
+            "openai",
+            true,
+            |_stage, payload, _context| {
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Full,
+                    stopped: Some(pentect_agent::StopOutcome::Block),
+                    message: Some("test policy".to_string()),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(stop_error, "plugin blocked: test policy");
+    }
 
     #[cfg(windows)]
     #[test]
@@ -4853,6 +4948,7 @@ mod tests {
             finished: false,
             plugins: Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
             restore_output: false,
+            block_unknown_formats: true,
             output_text: HashMap::new(),
             output_resolve: Box::new(|text| Ok(text.to_string())),
         };

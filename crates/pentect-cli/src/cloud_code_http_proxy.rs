@@ -943,12 +943,11 @@ fn rewrite_response_value(
             value.clone(),
             Some(serde_json::json!({"provider": "google-cloud-code", "transport": "http"})),
         )?;
-    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
-        return Err(
-            "unknown format blocked: a plugin reported partial Google Cloud Code response coverage"
-                .to_string(),
-        );
-    }
+    crate::plugins::enforce_response_plugin_coverage(
+        run.coverage,
+        block_unknown_formats,
+        "Google Cloud Code",
+    )?;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",

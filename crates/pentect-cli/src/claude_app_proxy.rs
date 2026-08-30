@@ -3051,12 +3051,11 @@ where
             value,
             Some(serde_json::json!({"provider": "claude", "transport": "desktop-http"})),
         )?;
-    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
-        return Err(
-            "unknown format blocked: a Claude App plugin reported partial response coverage"
-                .to_string(),
-        );
-    }
+    crate::plugins::enforce_response_plugin_coverage(
+        run.coverage,
+        block_unknown_formats,
+        "Claude App",
+    )?;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",

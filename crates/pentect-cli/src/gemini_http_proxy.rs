@@ -716,12 +716,11 @@ fn rewrite_response_body(
         value,
         Some(serde_json::json!({"provider": "gemini", "transport": "http"})),
     )?;
-    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
-        return Err(
-            "unknown format blocked: a plugin reported partial Gemini response coverage"
-                .to_string(),
-        );
-    }
+    crate::plugins::enforce_response_plugin_coverage(
+        run.coverage,
+        block_unknown_formats,
+        "Gemini",
+    )?;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",
