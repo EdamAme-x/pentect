@@ -266,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                 isinstance(tool, dict) and tool.get("name") == "Bash"
                 for tool in parsed.get("tools", [])
             )
-            handles = list(dict.fromkeys(HANDLE.findall(request)))
+            handles = anthropic_env_handles(parsed)
             attempts = len(self.server.state.service_attempts)
             if not bash_enabled:
                 action = "text:no-bash"
@@ -418,6 +418,24 @@ def request_tool_result_summary(requests: list[str]) -> list[str]:
                 if summary not in summaries:
                     summaries.append(summary)
     return summaries[-4:]
+
+
+def anthropic_env_handles(request: dict[str, object]) -> list[str]:
+    messages = request.get("messages", [])
+    if not isinstance(messages, list):
+        return []
+    for message in reversed(messages):
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            rendered = json.dumps(block.get("content"), ensure_ascii=True)
+            if "FIRST_KEY=" not in rendered or "SECOND_KEY=" not in rendered:
+                continue
+            return list(dict.fromkeys(HANDLE.findall(rendered)))[:2]
+    return []
 
 
 def client_command(
