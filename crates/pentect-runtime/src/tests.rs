@@ -1916,6 +1916,40 @@ fn write_tool_refuses_masked_repair_outside_current_dir() {
 }
 
 #[test]
+fn write_tool_validates_the_resolved_handle_path() {
+    let root = temp_root("capability-write-handle-path");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let handle = "<<FILE_PATH_0123456789abcdef>>";
+    let recovery = pentect_core::Recovery::seal(
+        std::collections::HashMap::from([(
+            handle.to_string(),
+            "../pentect-should-not-write.txt".to_string(),
+        )]),
+        &session.key,
+    );
+    MemoryStore::for_session(&session)
+        .add_recovery(recovery)
+        .unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": handle,
+            "content": "ordinary content\n"
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("outside the current directory"), "{reason}");
+    assert!(!reason.contains("pentect-should-not-write"), "{reason}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn write_tool_repairs_camel_case_external_schema_after_tool() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-camel");

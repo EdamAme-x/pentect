@@ -3167,10 +3167,16 @@ fn validate_masked_write_before_tool(
         let Some((path, content)) = write_path_and_content(tool_input) else {
             return Ok(());
         };
-        if !contains_pentect_masked_handle(content) {
+        let masked_path = contains_pentect_masked_handle(path);
+        let masked_content = contains_pentect_masked_handle(content);
+        if !masked_path && !masked_content {
             return Ok(());
         }
-        let (path, _) = resolved_write_parts(session, path, content)?;
+        let store = MemoryStore::for_session(session);
+        let path = resolved_local_write_path(&store, path, masked_path)?;
+        if masked_content {
+            let _ = resolve_masked_text(&store, content)?;
+        }
         ensure_local_write_path_within_cwd(&path)?;
         return Ok(());
     }
@@ -3219,23 +3225,38 @@ fn resolved_write_parts(
 ) -> Result<(PathBuf, String), String> {
     let store = MemoryStore::for_session(session);
     let resolved = resolve_masked_text(&store, content)?;
-    let path = checked_local_write_path(path)?;
+    let path = resolved_local_write_path(&store, path, contains_pentect_masked_handle(path))?;
     Ok((path, resolved))
+}
+
+fn resolved_local_write_path(
+    store: &MemoryStore,
+    path: &str,
+    contains_handle: bool,
+) -> Result<PathBuf, String> {
+    let resolved = if contains_handle {
+        resolve_masked_text(store, path)?
+    } else {
+        path.to_string()
+    };
+    checked_local_write_path(&resolved)
 }
 
 fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Result<(), String> {
     let Some((path, edits)) = edit_path_and_texts(tool_input) else {
         return Ok(());
     };
-    if !edits
-        .iter()
-        .any(|(_, text)| contains_pentect_masked_handle(text))
+    let masked_path = contains_pentect_masked_handle(path);
+    if !masked_path
+        && !edits
+            .iter()
+            .any(|(_, text)| contains_pentect_masked_handle(text))
     {
         return Ok(());
     }
-    let path = checked_local_write_path(path)?;
-    ensure_local_write_path_within_cwd(&path)?;
     let store = MemoryStore::for_session(session);
+    let path = resolved_local_write_path(&store, path, masked_path)?;
+    ensure_local_write_path_within_cwd(&path)?;
     for (kind, text) in edits {
         if matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text) {
             let _ = resolve_masked_text(&store, text)?;
@@ -3253,7 +3274,8 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     }) {
         return Ok(false);
     }
-    let path = checked_local_write_path(path)?;
+    let store = MemoryStore::for_session(session);
+    let path = resolved_local_write_path(&store, path, contains_pentect_masked_handle(path))?;
     ensure_local_write_path_within_cwd(&path)?;
     if !path.is_file() {
         return Ok(false);
@@ -3263,7 +3285,6 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     if !contains_pentect_masked_handle(&content) {
         return Ok(false);
     }
-    let store = MemoryStore::for_session(session);
     let resolved = resolve_masked_text(&store, &content)?;
     if resolved != content {
         std::fs::write(&path, resolved)
