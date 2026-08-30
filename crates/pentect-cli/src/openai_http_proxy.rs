@@ -1372,7 +1372,7 @@ async fn resolve_openai_remote_files(
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    resolve_openai_remote_file_values(&mut value, budget).await?;
+    resolve_openai_remote_file_values(&mut value, budget, false).await?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| "could not encode resolved remote attachment".to_string())
@@ -1381,16 +1381,18 @@ async fn resolve_openai_remote_files(
 fn resolve_openai_remote_file_values<'a>(
     value: &'a mut Value,
     budget: &'a mut crate::remote_content::RemoteRequestBudget,
+    computer_output: bool,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    resolve_openai_remote_file_values(value, budget).await?;
+                    resolve_openai_remote_file_values(value, budget, false).await?;
                 }
             }
             Value::Object(object) => {
                 let input_type = object.get("type").and_then(Value::as_str);
+                let is_computer_call_output = input_type == Some("computer_call_output");
                 if input_type == Some("image_url") {
                     let url = object
                         .get("image_url")
@@ -1442,7 +1444,9 @@ fn resolve_openai_remote_file_values<'a>(
                             .or_insert(Value::String(remote.filename));
                         return Ok(());
                     }
-                } else if matches!(input_type, Some("input_image" | "computer_screenshot")) {
+                } else if input_type == Some("input_image")
+                    || (computer_output && input_type == Some("computer_screenshot"))
+                {
                     if let Some(url) = object
                         .get("image_url")
                         .and_then(Value::as_str)
@@ -1464,8 +1468,10 @@ fn resolve_openai_remote_file_values<'a>(
                         return Ok(());
                     }
                 }
-                for value in object.values_mut() {
-                    resolve_openai_remote_file_values(value, budget).await?;
+                for (key, value) in object.iter_mut() {
+                    let nested_computer_output = is_computer_call_output && key == "output";
+                    resolve_openai_remote_file_values(value, budget, nested_computer_output)
+                        .await?;
                 }
             }
             _ => {}
@@ -1478,11 +1484,14 @@ fn openai_request_unknown_content_kind(
     value: &Value,
     dialect: OpenAiRequestDialect,
 ) -> Option<&str> {
-    fn visit(value: &Value) -> Option<&str> {
+    fn visit(value: &Value, computer_output: bool) -> Option<&str> {
         match value {
-            Value::Array(items) => items.iter().find_map(visit),
+            Value::Array(items) => items.iter().find_map(|item| visit(item, false)),
             Value::Object(object) => {
                 if let Some(kind) = object.get("type").and_then(Value::as_str) {
+                    if kind == "computer_screenshot" && !computer_output {
+                        return Some(kind);
+                    }
                     if !matches!(
                         kind,
                         "message"
@@ -1517,10 +1526,13 @@ fn openai_request_unknown_content_kind(
                         return Some(kind);
                     }
                 }
-                ["content", "input", "output"]
-                    .into_iter()
-                    .filter_map(|key| object.get(key))
-                    .find_map(visit)
+                let is_computer_call_output =
+                    object.get("type").and_then(Value::as_str) == Some("computer_call_output");
+                ["content", "input", "output"].into_iter().find_map(|key| {
+                    object
+                        .get(key)
+                        .and_then(|value| visit(value, is_computer_call_output && key == "output"))
+                })
             }
             _ => None,
         }
@@ -1533,7 +1545,7 @@ fn openai_request_unknown_content_kind(
             .or_else(|| {
                 value
                     .get("input")
-                    .map(visit)
+                    .map(|input| visit(input, false))
                     .unwrap_or(Some("missing input"))
             }),
         OpenAiRequestDialect::ChatCompletions => value
@@ -1541,7 +1553,9 @@ fn openai_request_unknown_content_kind(
             .map(visit_chat_messages)
             .unwrap_or(Some("missing messages")),
         OpenAiRequestDialect::Completions => completions_unknown_shape(value),
-        OpenAiRequestDialect::StandaloneSearch => standalone_search_unknown_shape(value, visit),
+        OpenAiRequestDialect::StandaloneSearch => {
+            standalone_search_unknown_shape(value, |input| visit(input, false))
+        }
         OpenAiRequestDialect::Embeddings => embeddings_unknown_shape(value),
         OpenAiRequestDialect::ImageGeneration => required_string_shape(value, "prompt"),
         OpenAiRequestDialect::AudioSpeech => required_string_shape(value, "input").or_else(|| {
@@ -2143,6 +2157,13 @@ fn mask_openai_input(
                     }
                 }
                 "input_image" => {
+                    let _ = inspect_openai_image(object)?;
+                }
+                // This shape is not part of the documented top-level Responses
+                // input contract. Unknown-format compatibility may reach it,
+                // but it must still pass the image policy rather than exposing
+                // an unchecked image_url.
+                "computer_screenshot" => {
                     let _ = inspect_openai_image(object)?;
                 }
                 "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
@@ -5440,6 +5461,17 @@ mod tests {
             openai_request_unknown_content_kind(&future, OpenAiRequestDialect::Responses),
             Some("future_computer_frame")
         );
+
+        let direct = serde_json::json!({
+            "input": [{
+                "type": "computer_screenshot",
+                "image_url": "data:image/png;base64,opaque"
+            }]
+        });
+        assert_eq!(
+            openai_request_unknown_content_kind(&direct, OpenAiRequestDialect::Responses),
+            Some("computer_screenshot")
+        );
     }
 
     #[test]
@@ -5477,6 +5509,45 @@ mod tests {
             };
             assert!(error.starts_with("image blocked:"), "{error}");
         }
+    }
+
+    #[test]
+    fn direct_computer_screenshot_is_unknown_and_cannot_bypass_image_policy() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let body = Bytes::from_static(
+            br#"{"input":[{"type":"computer_screenshot","image_url":"data:image/png;base64,not-base64"}]}"#,
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+
+        let strict = match protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::Responses,
+            true,
+        ) {
+            Ok(_) => panic!("a direct computer screenshot should be unknown"),
+            Err(error) => error,
+        };
+        assert!(strict.starts_with("unknown format blocked:"), "{strict}");
+        assert!(strict.contains("computer_screenshot"), "{strict}");
+
+        let compatible = match protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            OpenAiRequestDialect::Responses,
+            false,
+        ) {
+            Ok(_) => panic!("compatibility must not bypass the image policy"),
+            Err(error) => error,
+        };
+        assert!(compatible.starts_with("image blocked:"), "{compatible}");
     }
 
     #[test]
