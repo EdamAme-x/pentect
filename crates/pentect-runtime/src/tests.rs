@@ -4596,15 +4596,23 @@ fn only_windows_generic_bash_uses_powershell_semantics() {
         ScriptShell::Bash
     };
     assert_eq!(
-        script_shell_for_tool(HookProvider::Generic, "bash"),
+        script_shell_for_tool_with_windows_bash_dialect(HookProvider::Generic, "bash", None),
         expected
     );
     assert_eq!(
-        script_shell_for_tool(HookProvider::Claude, "Bash"),
+        script_shell_for_tool_with_windows_bash_dialect(
+            HookProvider::Generic,
+            "bash",
+            Some("bash"),
+        ),
         ScriptShell::Bash
     );
     assert_eq!(
-        script_shell_for_tool(HookProvider::Generic, "PowerShell"),
+        script_shell_for_tool_with_windows_bash_dialect(HookProvider::Claude, "Bash", None),
+        ScriptShell::Bash
+    );
+    assert_eq!(
+        script_shell_for_tool_with_windows_bash_dialect(HookProvider::Generic, "PowerShell", None,),
         ScriptShell::PowerShell
     );
 }

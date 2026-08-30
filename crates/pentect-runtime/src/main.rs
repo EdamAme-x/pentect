@@ -4048,8 +4048,27 @@ fn powershell_agent_script_fetch(suffix: &str, id: &str) -> String {
 }
 
 fn script_shell_for_tool(provider: HookProvider, tool_name: &str) -> ScriptShell {
+    let windows_bash_dialect = std::env::var("PENTECT_AGENT_BASH_DIALECT").ok();
+    script_shell_for_tool_with_windows_bash_dialect(
+        provider,
+        tool_name,
+        windows_bash_dialect.as_deref(),
+    )
+}
+
+fn script_shell_for_tool_with_windows_bash_dialect(
+    provider: HookProvider,
+    tool_name: &str,
+    windows_bash_dialect: Option<&str>,
+) -> ScriptShell {
     match tool_name.to_ascii_lowercase().as_str() {
-        "bash" if cfg!(windows) && provider == HookProvider::Generic => ScriptShell::PowerShell,
+        "bash"
+            if cfg!(windows)
+                && provider == HookProvider::Generic
+                && windows_bash_dialect != Some("bash") =>
+        {
+            ScriptShell::PowerShell
+        }
         "bash" => ScriptShell::Bash,
         "powershell" => ScriptShell::PowerShell,
         _ => ScriptShell::Native,
