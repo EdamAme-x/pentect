@@ -275,6 +275,23 @@ def client_command(
             "--skip-git-repo-check",
             prompt,
         ]
+    if client == "pi":
+        return [
+            pentect,
+            "pi",
+            "--upstream",
+            upstream,
+            "--model",
+            "gpt-5.6-luna",
+            "--api",
+            "chat",
+            "--print",
+            "--no-session",
+            "--no-context-files",
+            "--tools",
+            "bash",
+            prompt,
+        ]
     return [
         pentect,
         "opencode",
@@ -379,10 +396,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pentect", default="pentect")
     parser.add_argument(
-        "--client", action="append", choices=("codex", "opencode"), dest="clients"
+        "--client",
+        action="append",
+        choices=("codex", "opencode", "pi"),
+        dest="clients",
     )
     args = parser.parse_args()
-    for client in args.clients or ("codex", "opencode"):
+    for client in args.clients or ("codex", "opencode", "pi"):
         run_client(args.pentect, client)
     return 0
 

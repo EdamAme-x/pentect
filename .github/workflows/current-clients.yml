@@ -141,7 +141,7 @@ jobs:
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
         run: python tools/client_smoke.py --group portable
-      - name: Verify installed Codex and OpenCode handle flows
+      - name: Verify installed Codex, OpenCode, and Pi handle flows
         run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
       - name: Start both protected desktop app contracts (Windows)
         if: runner.os == 'Windows'
