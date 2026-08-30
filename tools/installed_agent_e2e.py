@@ -233,6 +233,7 @@ class State:
         self.model_requests: list[str] = []
         self.service_attempts: list[str] = []
         self.anthropic_probe_responses = [0, 0]
+        self.anthropic_actions: list[dict[str, object]] = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -269,8 +270,10 @@ class Handler(BaseHTTPRequestHandler):
             handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
             attempts = len(self.server.state.service_attempts)
             if not bash_enabled:
+                action = "text:no-bash"
                 payload = anthropic_text_response(sequence, "DONE")
             elif len(handles) < 2:
+                action = "tool:read"
                 payload = anthropic_tool_response(
                     sequence, shell_command(["python", "e2e_helper.py", "read"])
                 )
@@ -279,11 +282,24 @@ class Handler(BaseHTTPRequestHandler):
                 and self.server.state.anthropic_probe_responses[attempts] < 2
             ):
                 self.server.state.anthropic_probe_responses[attempts] += 1
+                action = f"tool:probe:{attempts}"
                 payload = anthropic_tool_response(
                     sequence, self._probe_command(handles[attempts], posix_shell=True)
                 )
             else:
+                action = "text:done"
                 payload = anthropic_text_response(sequence, "DONE")
+            self.server.state.anthropic_actions.append({
+                "sequence": sequence,
+                "action": action,
+                "handles": len(handles),
+                "attempts": attempts,
+                "tools": [
+                    tool.get("name")
+                    for tool in parsed.get("tools", [])
+                    if isinstance(tool, dict)
+                ],
+            })
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.send_header("cache-control", "no-cache")
@@ -562,6 +578,8 @@ else:
                 raise RuntimeError(
                     f"{client} E2E timed out; service attempts={len(state.service_attempts)}; "
                     f"model requests={len(state.model_requests)} handles={handle_counts}; "
+                    "Anthropic actions="
+                    f"{state.anthropic_actions[:8] + state.anthropic_actions[-3:]}; "
                     f"tool results={request_tool_result_summary(state.model_requests)}\n{output}"
                 ) from error
             if completed.returncode != 0:
