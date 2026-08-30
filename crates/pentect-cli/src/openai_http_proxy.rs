@@ -5510,6 +5510,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "ocr", target_os = "linux"))]
     #[test]
     fn computer_screenshot_is_redacted_and_preserves_protocol_fields() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
@@ -5565,6 +5566,63 @@ mod tests {
         assert!(!serde_json::to_string(&protected)
             .unwrap()
             .contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    }
+
+    #[test]
+    fn attested_computer_screenshot_preserves_protocol_fields_and_note_schema() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "input": [{
+                    "id": "item_1",
+                    "type": "computer_call_output",
+                    "call_id": "call_1",
+                    "acknowledged_safety_checks": [{"id": "check_1"}],
+                    "output": {
+                        "type": "computer_screenshot",
+                        "file_id": "file_checked"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::from([(
+            "file_checked".to_string(),
+            crate::http_files::Coverage::Full,
+        )]);
+        let protected = protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            OpenAiRequestDialect::Responses,
+            true,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Full);
+        let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+        let output = &protected["input"][0];
+        assert_eq!(output["id"], "item_1");
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(output["acknowledged_safety_checks"][0]["id"], "check_1");
+        assert_eq!(output["output"]["type"], "computer_screenshot");
+        assert_eq!(output["output"]["file_id"], "file_checked");
+
+        let note = openai_image_mask_note(
+            "Masked regions:\n[1] <<TEST_0123456789abcdef>>".into(),
+            true,
+        );
+        assert_eq!(note["type"], "message");
+        assert_eq!(note["role"], "user");
+        assert_eq!(note["content"][0]["type"], "input_text");
+        assert!(note["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<<TEST_0123456789abcdef>>"));
     }
 
     #[test]
