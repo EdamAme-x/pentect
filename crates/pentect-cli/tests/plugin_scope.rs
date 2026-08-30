@@ -163,6 +163,55 @@ fn project_plugin_directory_is_visible_from_nested_working_directory() {
 }
 
 #[test]
+fn official_plugin_directory_is_visible_from_nested_working_directory() {
+    let root = temp_dir("official-plugin-nested");
+    let home = root.join("home");
+    let project = root.join("project");
+    let nested = project.join("src/nested");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    write_manifest(
+        &project.join("plugins/nested-official"),
+        "nested-official",
+        "NESTED_OFFICIAL",
+        r"OFFICIAL-[0-9]{6}",
+    );
+
+    let output = command(&home, &nested)
+        .args(["plugins", "list"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("nested-official: official ok configs=1 binary=no"),
+        "{stdout}"
+    );
+
+    let mut child = command(&home, &nested)
+        .args(["mask", "--plugins", "nested-official"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"OFFICIAL-123456")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("<<NESTED_OFFICIAL_"), "{stdout}");
+    assert!(!nested.join("plugins").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn nearest_nested_pentect_directory_defines_a_separate_project_root() {
     let root = temp_dir("plugin-explicit-nested-root");
     let home = root.join("home");

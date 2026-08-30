@@ -3237,6 +3237,10 @@ impl PlatformCommandsFile {
     }
 }
 
+fn plugin_project_root() -> Result<PathBuf, String> {
+    crate::project_root()
+}
+
 fn validate_permissions(
     name: &str,
     permissions: Option<PermissionsFile>,
@@ -3261,8 +3265,7 @@ fn validate_permissions(
     {
         return Ok(None);
     }
-    let project_root = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
+    let project_root = plugin_project_root()
         .map_err(|_| format!("plugin '{name}' project directory is unavailable"))?;
     let plugin_root = manifest
         .parent()
@@ -3605,8 +3608,7 @@ pub struct PluginRuntimeDirs {
 
 pub fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
     let id = plugin_id(id_or_name);
-    let project = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
+    let project = plugin_project_root()
         .map_err(|error| format!("could not resolve plugin project directory: {error}"))?;
     let mut digest = sha2::Sha256::new();
     use sha2::Digest as _;

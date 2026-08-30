@@ -565,7 +565,7 @@ fn plugin_paths_for_named_scoped(
 ) -> Result<PluginPaths> {
     validate_plugin_name(name)?;
     let project_dir = plugins_root()?.join(name);
-    let official_dir = official_plugins_root().join(name);
+    let official_dir = official_plugins_root()?.join(name);
 
     if scope == PluginScope::Project {
         if project_dir.is_dir() {
@@ -754,8 +754,10 @@ pub(crate) fn plugins_root() -> Result<PathBuf> {
         .join(PLUGINS_DIR))
 }
 
-fn official_plugins_root() -> PathBuf {
-    PathBuf::from(OFFICIAL_PLUGINS_DIR)
+pub(crate) fn official_plugins_root() -> Result<PathBuf> {
+    Ok(pentect_agent::project_root()
+        .map_err(anyhow::Error::msg)?
+        .join(OFFICIAL_PLUGINS_DIR))
 }
 
 pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
@@ -980,7 +982,7 @@ fn plugin_source_with_refresh(
         for (root, repository) in [
             (plugins_root()?.join(spec), None),
             (
-                official_plugins_root().join(spec),
+                official_plugins_root()?.join(spec),
                 Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
             ),
         ] {
