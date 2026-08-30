@@ -28,6 +28,8 @@ mod update;
 mod upstream;
 
 use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
+#[cfg(any(windows, test))]
+use pentect_agent::{windows_command_extension_supported, windows_executable_candidates};
 use pentect_core::{
     infer_kind_with_content, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack,
     Profile,
@@ -819,53 +821,6 @@ fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -
         }
     }
     None
-}
-
-#[cfg(any(windows, test))]
-fn windows_executable_candidates(program: &Path, pathext: &OsStr) -> Vec<PathBuf> {
-    if program.extension().is_some() {
-        return vec![program.to_path_buf()];
-    }
-    let mut extensions = pathext
-        .to_string_lossy()
-        .split(';')
-        .map(str::trim)
-        .filter(|extension| windows_command_extension_supported(extension))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
-        if !extensions
-            .iter()
-            .any(|extension| extension.eq_ignore_ascii_case(fallback))
-        {
-            extensions.push(fallback.to_string());
-        }
-    }
-    let mut names = extensions
-        .into_iter()
-        .map(|extension| {
-            let mut name = program.as_os_str().to_os_string();
-            name.push(extension);
-            PathBuf::from(name)
-        })
-        .collect::<Vec<_>>();
-    // An extensionless PE executable is valid. Keep the raw name only after
-    // known launchable PATHEXT candidates so npm's POSIX shim cannot shadow
-    // its adjacent cmd shim.
-    names.push(program.to_path_buf());
-    names
-}
-
-#[cfg(any(windows, test))]
-pub(crate) fn windows_command_extension_supported(extension: &str) -> bool {
-    matches!(
-        extension
-            .strip_prefix('.')
-            .unwrap_or(extension)
-            .to_ascii_lowercase()
-            .as_str(),
-        "exe" | "com" | "cmd" | "bat"
-    )
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
