@@ -98,6 +98,17 @@ impl OutputMasker {
         self.masked_count
     }
 
+    pub(crate) fn recovery_snapshot(&self) -> Result<Recovery, String> {
+        let mut combined = Recovery::empty_for_key(&self.store.session.key);
+        for recovery in self.store.snapshot().map_err(|error| error.to_string())? {
+            combined.extend_same_key(recovery);
+        }
+        if let OutputMaskerMode::Deferred { .. } = &self.mode {
+            combined.extend_same_key(self.pending.clone());
+        }
+        Ok(combined)
+    }
+
     pub(crate) fn flush(&mut self) -> Result<(), String> {
         if !self.pending.is_empty() {
             let next = Recovery::empty_for_key(&self.store.session.key);

@@ -580,6 +580,7 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
+    let mut resolve = masker_scoped_resolver(&state.masker);
     if is_event_stream || (!messages_path && !files_upload) {
         let transform = status.is_success() && messages_path && is_event_stream;
         return builder
@@ -588,6 +589,7 @@ async fn proxy_request_inner(
                 transform,
                 Arc::clone(&state.plugins),
                 restore_output,
+                resolve,
             ))
             .map_err(|error| format!("could not build Claude streaming response: {error}"));
     }
@@ -632,7 +634,7 @@ async fn proxy_request_inner(
     }
     let response_body = if status.is_success() && messages_path {
         let response_body = run_response_plugins(response_body, &state.plugins)?;
-        match rewrite_anthropic_json_response(&response_body, restore_output) {
+        match rewrite_anthropic_json_response(&response_body, restore_output, &mut resolve) {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(_error) => {
                 diagnostic("response-restore-skipped", "protection", "messages", false);
@@ -1199,6 +1201,7 @@ fn streaming_response_body(
     transform: bool,
     plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
+    resolve: HandleResolver,
 ) -> ProxyBody {
     if !transform {
         let stream = response.bytes_stream().map(|item| {
@@ -1210,11 +1213,7 @@ fn streaming_response_body(
 
     let state = TransformedStreamState {
         upstream: Box::pin(response.bytes_stream()),
-        transformer: SseStreamTransformer::new(
-            Box::new(request_scoped_resolver()),
-            Some(plugins),
-            restore_output,
-        ),
+        transformer: SseStreamTransformer::new(resolve, Some(plugins), restore_output),
         ready: VecDeque::new(),
         finished: false,
     };
@@ -2112,11 +2111,17 @@ pub(crate) fn mask_value_strings(
     }
 }
 
-fn rewrite_anthropic_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
+fn rewrite_anthropic_json_response<R>(
+    body: &[u8],
+    restore_output: bool,
+    resolve: &mut R,
+) -> Result<Vec<u8>, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
-    let mut resolve = request_scoped_resolver();
-    restore_anthropic_json_value(&mut value, restore_output, &mut resolve)?;
+    restore_anthropic_json_value(&mut value, restore_output, resolve)?;
     serde_json::to_vec(&value)
         .map_err(|error| format!("could not encode restored Claude response: {error}"))
 }
@@ -2483,6 +2488,39 @@ pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, St
             Ok(text.to_string())
         }
     }
+}
+
+fn masker_scoped_resolver(
+    masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
+) -> HandleResolver {
+    let resolver = masker
+        .lock()
+        .map_err(|_| "Claude request masker lock was poisoned".to_string())
+        .and_then(|masker| masker.known_text_resolver());
+    Box::new(move |text| match &resolver {
+        Ok(resolver) => match resolver.resolve_known_text(text) {
+            Ok(Some(resolved)) => Ok(resolved),
+            Ok(None) => Ok(text.to_string()),
+            Err(_error) => {
+                diagnostic(
+                    "tool-input-restore-skipped",
+                    "resolution",
+                    "tool-input",
+                    false,
+                );
+                Ok(text.to_string())
+            }
+        },
+        Err(_error) => {
+            diagnostic(
+                "tool-input-restore-skipped",
+                "resolution",
+                "tool-input",
+                false,
+            );
+            Ok(text.to_string())
+        }
+    })
 }
 
 fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {

@@ -754,6 +754,8 @@ fn active_tool_output_masker_reuses_in_memory_state() {
         .unwrap();
     assert!(!second.contains(raw), "{second}");
     assert!(second.contains(&handle), "{second}");
+    let resolver = masker.known_text_resolver().unwrap();
+    assert_eq!(resolver.resolve_known_text(&handle).unwrap().unwrap(), raw);
     assert_eq!(client.masked_count().unwrap(), 2);
 }
 

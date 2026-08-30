@@ -461,6 +461,14 @@ impl ActiveMemoryStoreResolver {
             .as_ref()
             .map(|recovery| resolve_known_references(text, recovery, &self.env_bindings)))
     }
+
+    fn from_recovery(recovery: pentect_core::Recovery) -> Self {
+        let env_bindings = environment_bindings_from_recovery(&recovery);
+        Self {
+            recovery: Some(recovery),
+            env_bindings,
+        }
+    }
 }
 
 fn environment_bindings_from_recovery(
@@ -658,6 +666,21 @@ impl ActiveToolOutputMasker {
             prompt_cache: HashMap::new(),
             prompt_cache_order: VecDeque::new(),
         })
+    }
+
+    /// Capture the mappings already owned by this masker without opening a
+    /// second memory-store connection. HTTP gateways use this immediately
+    /// after masking a request to restore completed local tool inputs.
+    pub fn known_text_resolver(&self) -> Result<ActiveMemoryStoreResolver, String> {
+        match &self.masker {
+            Some(masker) => masker
+                .recovery_snapshot()
+                .map(ActiveMemoryStoreResolver::from_recovery),
+            None => Ok(ActiveMemoryStoreResolver {
+                recovery: None,
+                env_bindings: BTreeMap::new(),
+            }),
+        }
     }
 
     pub fn mask_tool_output(&mut self, text: &str) -> Result<Option<String>, String> {
