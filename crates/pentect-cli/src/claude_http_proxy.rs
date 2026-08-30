@@ -589,6 +589,7 @@ async fn proxy_request_inner(
                 transform,
                 Arc::clone(&state.plugins),
                 restore_output,
+                state.block_unknown_formats,
                 resolve,
             ))
             .map_err(|error| format!("could not build Claude streaming response: {error}"));
@@ -676,6 +677,28 @@ fn run_response_plugins(
 fn run_anthropic_response_plugin_with(
     value: Value,
     block_unknown_formats: bool,
+    run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        Value,
+        Option<Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<Value, String> {
+    run_anthropic_response_plugin_with_context(
+        value,
+        block_unknown_formats,
+        PluginContext {
+            provider: "anthropic",
+            transport: "http",
+            label: "Claude",
+        },
+        run,
+    )
+}
+
+fn run_anthropic_response_plugin_with_context(
+    value: Value,
+    block_unknown_formats: bool,
+    plugin_context: PluginContext,
     mut run: impl FnMut(
         pentect_agent::MiddlewareStage,
         Value,
@@ -685,12 +708,15 @@ fn run_anthropic_response_plugin_with(
     let run = run(
         pentect_agent::MiddlewareStage::Response,
         value,
-        Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
+        Some(serde_json::json!({
+            "provider": plugin_context.provider,
+            "transport": plugin_context.transport,
+        })),
     )?;
     crate::plugins::enforce_response_plugin_coverage(
         run.coverage,
         block_unknown_formats,
-        "Claude",
+        plugin_context.label,
     )?;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
@@ -1224,6 +1250,7 @@ fn streaming_response_body(
     transform: bool,
     plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
+    block_unknown_formats: bool,
     resolve: HandleResolver,
 ) -> ProxyBody {
     if !transform {
@@ -1236,7 +1263,8 @@ fn streaming_response_body(
 
     let state = TransformedStreamState {
         upstream: Box::pin(response.bytes_stream()),
-        transformer: SseStreamTransformer::new(resolve, Some(plugins), restore_output),
+        transformer: SseStreamTransformer::new(resolve, Some(plugins), restore_output)
+            .with_strict_response_coverage(block_unknown_formats),
         ready: VecDeque::new(),
         finished: false,
     };
@@ -1293,24 +1321,25 @@ pub(crate) struct SseStreamTransformer<R> {
     max_pending_bytes: usize,
     plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
     restore_output: bool,
+    block_unknown_formats: bool,
     output_text: HashMap<(u64, &'static str), OutputTextRestorer>,
-    tool_plugin_context: SseToolPluginContext,
+    plugin_context: PluginContext,
 }
 
 #[derive(Clone, Copy)]
-struct SseToolPluginContext {
+struct PluginContext {
     provider: &'static str,
     transport: &'static str,
     label: &'static str,
 }
 
-const ANTHROPIC_HTTP_SSE_CONTEXT: SseToolPluginContext = SseToolPluginContext {
+const ANTHROPIC_HTTP_SSE_CONTEXT: PluginContext = PluginContext {
     provider: "anthropic",
     transport: "http_sse",
     label: "Claude",
 };
 
-const CLAUDE_APP_SSE_CONTEXT: SseToolPluginContext = SseToolPluginContext {
+const CLAUDE_APP_SSE_CONTEXT: PluginContext = PluginContext {
     provider: "claude",
     transport: "desktop-http",
     label: "Claude App",
@@ -1359,7 +1388,7 @@ where
         resolve: R,
         plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
         restore_output: bool,
-        tool_plugin_context: SseToolPluginContext,
+        plugin_context: PluginContext,
     ) -> Self {
         Self {
             resolve,
@@ -1369,9 +1398,15 @@ where
             max_pending_bytes: MAX_PENDING_SSE_BYTES,
             plugins,
             restore_output,
+            block_unknown_formats: false,
             output_text: HashMap::new(),
-            tool_plugin_context,
+            plugin_context,
         }
+    }
+
+    pub(crate) fn with_strict_response_coverage(mut self, strict: bool) -> Self {
+        self.block_unknown_formats = strict;
+        self
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, String> {
@@ -1436,6 +1471,12 @@ where
     }
 
     fn process_block(&mut self, block: Vec<u8>, output: &mut Vec<Bytes>) -> Result<(), String> {
+        let block = run_anthropic_sse_response_plugins(
+            &block,
+            self.plugins.as_deref(),
+            self.block_unknown_formats,
+            self.plugin_context,
+        )?;
         if self.tool_buffer.is_some() {
             match sse_control_event(&block) {
                 SseControlEvent::Ping => {
@@ -1484,7 +1525,7 @@ where
                             None,
                             &mut self.resolve,
                             self.plugins.as_deref(),
-                            self.tool_plugin_context,
+                            self.plugin_context,
                         )
                     })?;
                 output.push(Bytes::from(rewritten));
@@ -1513,6 +1554,81 @@ where
         }
         Ok(())
     }
+}
+
+fn run_anthropic_sse_response_plugins(
+    block: &[u8],
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+    block_unknown_formats: bool,
+    plugin_context: PluginContext,
+) -> Result<Vec<u8>, String> {
+    let Some(plugins) = plugins else {
+        return Ok(block.to_vec());
+    };
+    let plugins = plugins
+        .lock()
+        .map_err(|_| format!("{} plugin lock was poisoned", plugin_context.label))?;
+    if !plugins.has_hook(pentect_agent::MiddlewareStage::Response) {
+        return Ok(block.to_vec());
+    }
+    run_anthropic_sse_response_plugin_with(
+        block,
+        block_unknown_formats,
+        plugin_context,
+        |stage, payload, context| plugins.run(stage, payload, context),
+    )
+}
+
+fn run_anthropic_sse_response_plugin_with(
+    block: &[u8],
+    block_unknown_formats: bool,
+    plugin_context: PluginContext,
+    run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        Value,
+        Option<Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<Vec<u8>, String> {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return Ok(block.to_vec());
+    };
+    let Some(value) = sse_json_data(text) else {
+        return Ok(block.to_vec());
+    };
+    let payload = run_anthropic_response_plugin_with_context(
+        value,
+        block_unknown_formats,
+        plugin_context,
+        run,
+    )?;
+    encode_anthropic_sse_value(text, &payload)
+}
+
+fn encode_anthropic_sse_value(template: &str, value: &Value) -> Result<Vec<u8>, String> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| format!("could not encode Anthropic SSE event: {error}"))?;
+    let mut replaced = false;
+    let mut output = String::with_capacity(template.len() + encoded.len());
+    for line in template.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with("data:") {
+            if !replaced {
+                output.push_str("data: ");
+                output.push_str(&encoded);
+                if line.ends_with("\r\n") {
+                    output.push_str("\r\n");
+                } else if line.ends_with('\n') {
+                    output.push('\n');
+                }
+                replaced = true;
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    replaced
+        .then(|| output.into_bytes())
+        .ok_or_else(|| "Anthropic SSE event had no data field to encode".to_string())
 }
 
 fn rewrite_anthropic_output_sse_block<R>(
@@ -2229,7 +2345,7 @@ fn rewrite_anthropic_sse_with_tool_context<R>(
     forced_tool_name: Option<&str>,
     resolve: &mut R,
     plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
-    plugin_context: SseToolPluginContext,
+    plugin_context: PluginContext,
 ) -> Result<String, String>
 where
     R: FnMut(&str) -> Result<String, String>,
@@ -2816,6 +2932,140 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(stop_error, "plugin blocked: test policy");
+    }
+
+    #[test]
+    fn anthropic_sse_response_plugin_mutates_complete_events_and_preserves_framing() {
+        let input = concat!(
+            ": keep-alive\r\n",
+            "event: content_block_delta\r\n",
+            "data: {\"type\":\"content_block_delta\",\r\n",
+            "data: \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n"
+        );
+        for (plugin_context, expected_context) in [
+            (
+                ANTHROPIC_HTTP_SSE_CONTEXT,
+                serde_json::json!({"provider": "anthropic", "transport": "http_sse"}),
+            ),
+            (
+                CLAUDE_APP_SSE_CONTEXT,
+                serde_json::json!({"provider": "claude", "transport": "desktop-http"}),
+            ),
+        ] {
+            let mut calls = 0;
+            let output = run_anthropic_sse_response_plugin_with(
+                input.as_bytes(),
+                true,
+                plugin_context,
+                |stage, mut payload, context| {
+                    calls += 1;
+                    assert_eq!(stage, pentect_agent::MiddlewareStage::Response);
+                    assert_eq!(context, Some(expected_context.clone()));
+                    assert_eq!(payload["type"], "content_block_delta");
+                    assert_eq!(payload["index"], 0);
+                    payload["plugin_checked"] = Value::Bool(true);
+                    Ok(pentect_agent::MiddlewareRun {
+                        payload,
+                        coverage: pentect_agent::MiddlewareCoverage::Full,
+                        stopped: None,
+                        message: None,
+                    })
+                },
+            )
+            .unwrap();
+            let output = std::str::from_utf8(&output).unwrap();
+
+            assert_eq!(calls, 1);
+            assert!(output.starts_with(": keep-alive\r\nevent: content_block_delta\r\n"));
+            assert!(output.ends_with("\r\n\r\n"));
+            assert_eq!(output.matches("data:").count(), 1);
+            assert!(output.contains("\"plugin_checked\":true"), "{output}");
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_without_response_hooks_preserves_event_bytes() {
+        let input = b"event: ping\r\ndata: {\"type\": \"ping\"}\r\n\r\n";
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::default());
+        assert_eq!(
+            run_anthropic_sse_response_plugins(
+                input,
+                Some(&plugins),
+                true,
+                ANTHROPIC_HTTP_SSE_CONTEXT,
+            )
+            .unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_response_partial_and_stop_fail_closed_before_emission() {
+        let input = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let partial = |payload| {
+            Ok(pentect_agent::MiddlewareRun {
+                payload,
+                coverage: pentect_agent::MiddlewareCoverage::Partial,
+                stopped: None,
+                message: None,
+            })
+        };
+        let strict_error = run_anthropic_sse_response_plugin_with(
+            input,
+            true,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+            |_stage, payload, _context| partial(payload),
+        )
+        .unwrap_err();
+        assert!(strict_error.contains("Claude Response plugin reported partial coverage"));
+
+        let allowed = run_anthropic_sse_response_plugin_with(
+            input,
+            false,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+            |_stage, mut payload, _context| {
+                payload["partial_allowed"] = Value::Bool(true);
+                partial(payload)
+            },
+        )
+        .unwrap();
+        assert!(std::str::from_utf8(&allowed)
+            .unwrap()
+            .contains("\"partial_allowed\":true"));
+
+        let stop_error = run_anthropic_sse_response_plugin_with(
+            input,
+            false,
+            CLAUDE_APP_SSE_CONTEXT,
+            |_stage, payload, _context| {
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Full,
+                    stopped: Some(pentect_agent::StopOutcome::Block),
+                    message: Some("stream policy".to_string()),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(stop_error, "plugin blocked: stream policy");
+    }
+
+    #[test]
+    fn anthropic_sse_response_plugin_skips_non_json_events() {
+        for input in [
+            b"event: ping\ndata: not-json\n\n".as_slice(),
+            b": keep-alive\n\n".as_slice(),
+            &[0xff, 0xfe],
+        ] {
+            let output = run_anthropic_sse_response_plugin_with(
+                input,
+                true,
+                ANTHROPIC_HTTP_SSE_CONTEXT,
+                |_stage, _payload, _context| panic!("non-JSON SSE must not invoke middleware"),
+            )
+            .unwrap();
+            assert_eq!(output, input);
+        }
     }
 
     #[tokio::test]

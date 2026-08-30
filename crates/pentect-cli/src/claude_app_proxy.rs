@@ -2069,6 +2069,7 @@ async fn forward_inspected_inner(
             Box::pin(stream),
             Arc::clone(&state.plugins),
             state.restore_output,
+            state.block_unknown_formats,
         )
     } else {
         BodyExt::boxed_unsync(StreamBody::new(stream))
@@ -3082,17 +3083,25 @@ fn chat_sse_body<S>(
     stream: S,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
+    block_unknown_formats: bool,
 ) -> ProxyBody
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
 {
-    chat_sse_body_with_limit(stream, plugins, restore_output, MAX_CHAT_BODY_BYTES)
+    chat_sse_body_with_limit(
+        stream,
+        plugins,
+        restore_output,
+        block_unknown_formats,
+        MAX_CHAT_BODY_BYTES,
+    )
 }
 
 fn chat_sse_body_with_limit<S>(
     stream: S,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
+    block_unknown_formats: bool,
     max_pending_bytes: usize,
 ) -> ProxyBody
 where
@@ -3104,7 +3113,8 @@ where
         plugins,
         restore_output,
         max_pending_bytes,
-    );
+    )
+    .with_strict_response_coverage(block_unknown_formats);
     chat_sse_body_with_transformer(stream, transformer)
 }
 
@@ -3765,6 +3775,7 @@ mod tests {
         let body = chat_sse_body_with_limit(
             stream,
             Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            false,
             false,
             4,
         );
