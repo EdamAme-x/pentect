@@ -232,6 +232,7 @@ class State:
         self.invalid = invalid
         self.model_requests: list[str] = []
         self.service_attempts: list[str] = []
+        self.anthropic_probe_responses = [0, 0]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -260,19 +261,26 @@ class Handler(BaseHTTPRequestHandler):
             request = body.decode("utf-8")
             self.server.state.model_requests.append(request)
             sequence = len(self.server.state.model_requests)
+            parsed = json.loads(request)
+            bash_enabled = any(
+                isinstance(tool, dict) and tool.get("name") == "Bash"
+                for tool in parsed.get("tools", [])
+            )
             handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
             attempts = len(self.server.state.service_attempts)
-            if len(handles) < 2:
+            if not bash_enabled:
+                payload = anthropic_text_response(sequence, "DONE")
+            elif len(handles) < 2:
                 payload = anthropic_tool_response(
                     sequence, shell_command(["python", "e2e_helper.py", "read"])
                 )
-            elif attempts == 0 and sequence <= 3:
+            elif (
+                attempts < 2
+                and self.server.state.anthropic_probe_responses[attempts] < 2
+            ):
+                self.server.state.anthropic_probe_responses[attempts] += 1
                 payload = anthropic_tool_response(
-                    sequence, self._probe_command(handles[0])
-                )
-            elif attempts == 1 and sequence <= 4:
-                payload = anthropic_tool_response(
-                    sequence, self._probe_command(handles[1])
+                    sequence, self._probe_command(handles[attempts])
                 )
             else:
                 payload = anthropic_text_response(sequence, "DONE")
