@@ -9,12 +9,9 @@ fn pi_provider_reports_the_selected_api_without_exposing_credentials() {
         .args([
             "provider",
             "pi",
-            "--upstream",
-            "http://127.0.0.1:9",
-            "--model",
-            "synthetic-model",
-            "--api",
-            "responses",
+            "--upstream=http://127.0.0.1:9",
+            "--model=synthetic-model",
+            "--api=responses",
         ])
         .env_remove("PENTECT_AGENT_LAUNCHED")
         .env_remove("PENTECT_MEMORY_STORE_ADDR")

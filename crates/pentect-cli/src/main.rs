@@ -1209,62 +1209,111 @@ fn cmd_view(args: &[String]) {
 /// Long-lived provider backend for first-party integrations such as the Pi
 /// extension. Readiness is the only stdout record;
 /// the process and its loopback gateway live until the parent closes stdin.
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderOpts {
+    upstream: String,
+    model: String,
+    api: &'static str,
+    header_env: Vec<String>,
+}
+
+impl ProviderOpts {
+    fn parse(args: &[String], upstream: String) -> Result<Self, String> {
+        let mut opts = Self {
+            upstream,
+            model: "gpt-5".to_string(),
+            api: "openai-completions",
+            header_env: Vec::new(),
+        };
+        let mut index = 0;
+        while index < args.len() {
+            if let Some((value, consumed)) =
+                provider_option_value(args, index, "--upstream", "--upstream requires a value")?
+            {
+                if value.trim().is_empty() {
+                    return Err("--upstream requires a value".to_string());
+                }
+                opts.upstream = value;
+                index += consumed;
+                continue;
+            }
+            if let Some((value, consumed)) =
+                provider_option_value(args, index, "--model", "--model requires a value")?
+            {
+                if value.trim().is_empty() {
+                    return Err("--model requires a value".to_string());
+                }
+                opts.model = value;
+                index += consumed;
+                continue;
+            }
+            if let Some((value, consumed)) =
+                provider_option_value(args, index, "--api", "--api requires a value")?
+            {
+                opts.api = parse_provider_api(&value)?;
+                index += consumed;
+                continue;
+            }
+            if let Some((value, consumed)) = provider_option_value(
+                args,
+                index,
+                "--upstream-header-env",
+                "--upstream-header-env requires HEADER=ENV_NAME",
+            )? {
+                opts.header_env.push(value);
+                index += consumed;
+                continue;
+            }
+            return Err(format!("unknown provider option '{}'", args[index]));
+        }
+        if opts.model.len() > 200 || opts.model.chars().any(char::is_control) {
+            return Err("model ID is invalid".to_string());
+        }
+        Ok(opts)
+    }
+}
+
+fn provider_option_value(
+    args: &[String],
+    index: usize,
+    option: &str,
+    missing: &str,
+) -> Result<Option<(String, usize)>, String> {
+    let argument = args[index].as_str();
+    if argument == option {
+        return args
+            .get(index + 1)
+            .cloned()
+            .map(|value| Some((value, 2)))
+            .ok_or_else(|| missing.to_string());
+    }
+    assigned_option_value(argument, option).map(|value| value.map(|value| (value, 1)))
+}
+
+fn parse_provider_api(value: &str) -> Result<&'static str, String> {
+    match value {
+        "chat" | "chat-completions" | "openai-completions" => Ok("openai-completions"),
+        "responses" | "openai-responses" => Ok("openai-responses"),
+        value => Err(format!(
+            "unsupported API format '{value}'; use --api chat or --api responses"
+        )),
+    }
+}
+
 fn cmd_provider(args: &[String]) -> i32 {
     let integration = match args.get(2).map(String::as_str) {
         Some("pi") => "pi",
         _ => die("provider requires the supported integration name `pi`"),
     };
-    let mut upstream =
+    let default_upstream =
         nonempty_env("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let mut model = "gpt-5".to_string();
-    let mut api = "openai-completions";
-    let mut header_env = Vec::new();
-    let mut index = 3;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--upstream" => {
-                upstream = args
-                    .get(index + 1)
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| die("--upstream requires a value"));
-                index += 2;
-            }
-            "--model" => {
-                model = args
-                    .get(index + 1)
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| die("--model requires a value"));
-                index += 2;
-            }
-            "--api" if integration == "pi" => {
-                api = match args.get(index + 1).map(String::as_str) {
-                    Some("chat" | "chat-completions" | "openai-completions") => {
-                        "openai-completions"
-                    }
-                    Some("responses" | "openai-responses") => "openai-responses",
-                    Some(value) => die(format!(
-                        "unsupported API format '{value}'; use --api chat or --api responses"
-                    )),
-                    None => die("--api requires a value"),
-                };
-                index += 2;
-            }
-            "--upstream-header-env" => {
-                header_env.push(
-                    args.get(index + 1)
-                        .cloned()
-                        .unwrap_or_else(|| die("--upstream-header-env requires HEADER=ENV_NAME")),
-                );
-                index += 2;
-            }
-            flag => die(format!("unknown provider option '{flag}'")),
-        }
-    }
-    if model.len() > 200 || model.chars().any(char::is_control) {
-        die("model ID is invalid");
-    }
+    let opts = ProviderOpts::parse(&args[3..], default_upstream).unwrap_or_else(|error| die(error));
+    let ProviderOpts {
+        upstream,
+        model,
+        api,
+        header_env,
+    } = opts;
 
     // The integration process inherits the environment without reading the
     // credential. Rust converts the standard OpenAI key into an upstream-only
@@ -3826,6 +3875,52 @@ mod tests {
         )
         .unwrap_err()
         .contains("--upstream requires a value"));
+    }
+
+    #[test]
+    fn provider_options_accept_equivalent_assignment_forms() {
+        let spaced = ProviderOpts::parse(
+            &[
+                "--upstream".to_string(),
+                "https://gateway.example/v1".to_string(),
+                "--model".to_string(),
+                "gpt-test".to_string(),
+                "--api".to_string(),
+                "responses".to_string(),
+                "--upstream-header-env".to_string(),
+                "x-api-key=GATEWAY_KEY".to_string(),
+            ],
+            "https://default.example/v1".to_string(),
+        )
+        .unwrap();
+        let assigned = ProviderOpts::parse(
+            &[
+                "--upstream=https://gateway.example/v1".to_string(),
+                "--model=gpt-test".to_string(),
+                "--api=responses".to_string(),
+                "--upstream-header-env=x-api-key=GATEWAY_KEY".to_string(),
+            ],
+            "https://default.example/v1".to_string(),
+        )
+        .unwrap();
+        assert_eq!(assigned, spaced);
+
+        for option in [
+            "--upstream=",
+            "--model=",
+            "--api=",
+            "--upstream-header-env=",
+            "--upstream-extra=https://example.com",
+        ] {
+            assert!(
+                ProviderOpts::parse(
+                    &[option.to_string()],
+                    "https://default.example/v1".to_string()
+                )
+                .is_err(),
+                "{option}"
+            );
+        }
     }
 
     #[test]

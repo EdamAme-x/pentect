@@ -142,7 +142,23 @@ impl PluginCmd {
         let mut values = Vec::new();
         let mut i = 3usize;
         while i < args.len() {
-            match args[i].as_str() {
+            let argument = args[i].as_str();
+            if let Some(key) = crate::assigned_option_value(argument, "--unset")? {
+                unset = Some(key);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = crate::assigned_option_value(argument, "--profile")? {
+                if value.starts_with("--") {
+                    return Err("--profile requires a profile name".to_string());
+                }
+                if profile.replace(value).is_some() {
+                    return Err("--profile may only be set once".to_string());
+                }
+                i += 1;
+                continue;
+            }
+            match argument {
                 "--json" => json = true,
                 "--yes" => approved = true,
                 "--project" => {
@@ -4251,6 +4267,64 @@ mod tests {
             PluginCmd::parse(&args).unwrap_err(),
             "--yes is only valid for plugins add, dev, setup, or update"
         );
+    }
+
+    #[test]
+    fn parses_assignment_form_plugin_values() {
+        let setup = vec![
+            "pentect".into(),
+            "plugins".into(),
+            "setup".into(),
+            "example-plugin".into(),
+            "--profile=cuda".into(),
+        ];
+        assert!(matches!(
+            PluginCmd::parse(&setup).unwrap().action,
+            Action::Setup {
+                profile: Some(profile),
+                ..
+            } if profile == "cuda"
+        ));
+
+        let config = vec![
+            "pentect".into(),
+            "plugins".into(),
+            "config".into(),
+            "example-plugin".into(),
+            "--unset=model.token".into(),
+        ];
+        assert!(matches!(
+            PluginCmd::parse(&config).unwrap().action,
+            Action::Config {
+                change: ConfigChange::Unset(key),
+                ..
+            } if key == "model.token"
+        ));
+
+        let duplicate = vec![
+            "pentect".into(),
+            "plugins".into(),
+            "setup".into(),
+            "example-plugin".into(),
+            "--profile".into(),
+            "cpu".into(),
+            "--profile=cuda".into(),
+        ];
+        assert_eq!(
+            PluginCmd::parse(&duplicate).unwrap_err(),
+            "--profile may only be set once"
+        );
+
+        for invalid in ["--profile=", "--profile=--cuda", "--profile-extra=cuda"] {
+            let args = vec![
+                "pentect".into(),
+                "plugins".into(),
+                "setup".into(),
+                "example-plugin".into(),
+                invalid.into(),
+            ];
+            assert!(PluginCmd::parse(&args).is_err(), "{invalid}");
+        }
     }
 
     #[test]
