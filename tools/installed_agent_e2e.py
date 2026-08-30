@@ -317,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
                 )
             else:
-                handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+                handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if sequence == 2 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[0]))
                 elif sequence == 3 and len(handles) >= 2:
@@ -342,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
                     bool(json.loads(item).get("tools"))
                     for item in self.server.state.model_requests
                 )
-                handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+                handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if sequence == 1:
                     payload = chat_tool_response(
                         sequence, shell_command(["python", "e2e_helper.py", "read"])
