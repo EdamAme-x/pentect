@@ -3191,11 +3191,14 @@ mod tests {
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
         assert!(
-            !openai_response.contains(secret.as_str()),
+            openai_response.contains(secret.as_str()),
             "{openai_response}"
         );
         assert!(!openai_response.contains("<<PENTECT_E2E_TOKEN_"));
-        assert!(openai_response.contains("script-b64"), "{openai_response}");
+        assert!(
+            !openai_response.contains("pentect exec"),
+            "{openai_response}"
+        );
         drop(openai_proxy);
         openai_thread.join().unwrap();
 
@@ -3227,12 +3230,12 @@ mod tests {
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
-        assert!(!chat_response.contains(secret.as_str()), "{chat_response}");
+        assert!(chat_response.contains(secret.as_str()), "{chat_response}");
         assert!(
             first_valid_handle(&chat_response).is_none(),
             "{chat_response}"
         );
-        assert!(chat_response.contains("script-b64"), "{chat_response}");
+        assert!(!chat_response.contains("pentect exec"), "{chat_response}");
         drop(chat_proxy);
         chat_thread.join().unwrap();
 
@@ -3308,9 +3311,9 @@ mod tests {
             .expect("provider should receive the sanitized file and metadata");
         assert_eq!(media_type, "text/plain");
         assert_eq!(filename, "notes.txt");
-        assert!(!file_response.contains(secret.as_str()), "{file_response}");
+        assert!(file_response.contains(secret.as_str()), "{file_response}");
         assert!(!file_response.contains(&handle), "{file_response}");
-        assert!(file_response.contains("script-b64"), "{file_response}");
+        assert!(!file_response.contains("pentect exec"), "{file_response}");
         drop(file_proxy);
         file_thread.join().unwrap();
     }
