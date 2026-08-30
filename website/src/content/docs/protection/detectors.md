@@ -12,6 +12,33 @@ This inventory describes the default built-in engine. A plugin can add rules,
 but plugin findings are plugin-provided evidence and are not part of the
 built-in coverage claims.
 
+## Credential-class boundaries
+
+Detection depends on both the value and its trusted context. A short string can
+be a real password and an ordinary word at the same time, so Pentect does not
+claim that every credential is recognizable from the value alone.
+
+| Class | Default behavior | Evidence boundary |
+| --- | --- | --- |
+| Low-entropy password | Built in when a parser supplies a password field or plaintext has a supported password assignment/prose shape | A bare common word or very short string is intentionally not treated as a secret without context. A structured value identical to its key, such as `"password": "Password"`, is also left visible because that shape is common localization UI text. Use `pentect(...)` or `mask(...)` when the intended meaning is known only to the user. |
+| Cookie | Built in for parser-identified cookie values and `Cookie`/`Set-Cookie` headers; supported keyed plaintext forms are also detected | A bare cookie value has no unique syntax and is not a separate value-only claim. |
+| Session ID or session token | Built in for sensitive structured keys, supported key/value text, and structurally valid token formats such as JWT | A bare UUID remains visible unless trusted cookie, session, or identifier-bearing context says otherwise. UUID shape alone is not proof of a credential. |
+| Refresh, access, or CSRF token | Built in for sensitive structured keys, supported key/value text, credential-bearing URL fields, and token-specific formats | A bare word or public identifier is not automatically classified as a token. |
+| JWT or JWE | Built in through `JwtDetector` when compact JOSE structure validates | Structural validation does not prove that the token is live or accepted by a service. |
+| Editor-extension credential | No product-name-wide claim. Built-in detectors protect supported generic token formats and sensitive fields regardless of which editor produced them | An extension-specific storage envelope needs a verified parser or plugin before Pentect can claim full coverage for that extension. |
+
+The same standard engine handles `pentect mask`, supported AI prompt and tool
+result paths, and text extracted from logs. HTTP adapters add only the protocol
+fields they explicitly recognize, including credential-bearing headers,
+cookies, and protected JSON fields. OCR sends recognized text through the same
+engine, but this proves only masking after successful text recognition; OCR
+accuracy and unscanned-image policy are separate boundaries.
+
+Plugins may add extra formats or rules. They do not turn a heuristic or an
+intentionally unsupported bare value into built-in coverage. Explicit
+`pentect(...)` and `mask(...)` markers are user instructions, not automatic
+detections, and are the safe control for an ambiguous value.
+
 ## Upstream-derived detectors
 
 | Detector | Source and pinned version | Enabled coverage | Evidence and limit |

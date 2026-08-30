@@ -3385,6 +3385,26 @@ mod tests {
     }
 
     #[test]
+    fn recognized_ocr_text_masks_low_entropy_credential_fields() {
+        let key = [7; 32];
+        let text =
+            "password: hunter2\nsession_token: abc123\ncsrf_token: short\nrefresh_token: refresh";
+        let hits = image_text_secret_hits(text, &key).unwrap();
+        let entries = secret_entries(text, &hits, &key);
+        let values = entries
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in ["hunter2", "abc123", "short", "refresh"] {
+            assert!(
+                values.contains(&expected),
+                "{expected:?} missing from {values:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ocr_explicit_markers_preserve_exact_values_and_survive_malformed_prefixes() {
         let key = [7; 32];
         let text = "pentect(unclosed\nmask( pa(ss), 日本語 )\npentect(alpha!\nbeta)";

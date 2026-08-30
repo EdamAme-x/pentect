@@ -1300,6 +1300,146 @@ mod tests {
     }
 
     #[test]
+    fn low_entropy_credential_classes_are_covered_across_text_env_and_logs() {
+        let cases = [
+            (Kind::Text, "my password is letmein", vec!["letmein"]),
+            (
+                Kind::Env,
+                "PASSWORD=password\nSESSION_TOKEN=abc123\n",
+                vec!["PASSWORD=password", "SESSION_TOKEN=abc123"],
+            ),
+            (
+                Kind::ToolResult,
+                "audit: session_id=abc123 csrf_token=short refresh_token=refresh",
+                vec![
+                    "session_id=abc123",
+                    "csrf_token=short",
+                    "refresh_token=refresh",
+                ],
+            ),
+            (
+                Kind::Json,
+                r#"{"password":"hunter2","session_id":"abc123","csrf_token":"short","refresh_token":"refresh"}"#,
+                vec![
+                    r#""password":"hunter2""#,
+                    r#""session_id":"abc123""#,
+                    r#""csrf_token":"short""#,
+                    r#""refresh_token":"refresh""#,
+                ],
+            ),
+            (
+                Kind::Json,
+                r#"{"extension":{"sessionToken":"abc123"}}"#,
+                vec![r#""sessionToken":"abc123""#],
+            ),
+            (
+                Kind::Text,
+                concat!(
+                    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+                    "eyJ1c2VyIjoiYWxpY2UifQ.",
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+                ),
+                vec!["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"],
+            ),
+        ];
+
+        let engine = Engine::with_profile(Profile::Strict);
+        for (kind, input, leaked_fragments) in cases {
+            let result = engine.mask(
+                Input {
+                    kind,
+                    data: input.to_string(),
+                },
+                &Config::insecure_testing(),
+            );
+            for leaked_fragment in leaked_fragments {
+                assert!(
+                    !result.masked.contains(leaked_fragment),
+                    "{leaked_fragment:?} remained in {:?}: {}",
+                    input,
+                    result.masked
+                );
+            }
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn ambiguous_low_entropy_prose_requires_an_explicit_mask_marker() {
+        let ambiguous = "my password is password";
+        assert_eq!(m(ambiguous).masked, ambiguous);
+
+        let forced = m("my password is mask(password)");
+        assert!(!forced.masked.contains("password)"), "{}", forced.masked);
+        assert!(
+            forced.masked.contains("my password is <<KEYED_SECRET_"),
+            "{}",
+            forced.masked
+        );
+
+        let structured_label = mj(r#"{"password":"password"}"#);
+        assert_eq!(structured_label.masked, r#"{"password":"password"}"#);
+        let structured_forced = mj(r#"{"password":"mask(password)"}"#);
+        assert!(
+            structured_forced
+                .masked
+                .contains(r#""password":"<<KEYED_SECRET_"#),
+            "{}",
+            structured_forced.masked
+        );
+    }
+
+    #[test]
+    fn http_credential_headers_mask_short_values_without_masking_public_headers() {
+        let engine = Engine::with_profile(Profile::Strict);
+        let cases = [
+            (RegionKind::Cookie, None, "abc"),
+            (RegionKind::Header, Some("Cookie"), "sid=abc"),
+            (RegionKind::Header, Some("Authorization"), "Bearer x"),
+        ];
+
+        for (kind, key, value) in cases {
+            let result = engine.mask_context(
+                value.to_string(),
+                Context {
+                    path: None,
+                    key: key.map(str::to_string),
+                    hints: Vec::new(),
+                    kind,
+                    format: Kind::Har,
+                },
+                &Config::insecure_testing(),
+            );
+            assert!(!result.masked.contains(value), "{key:?}: {}", result.masked);
+        }
+
+        let public = engine.mask_context(
+            "application/json".to_string(),
+            Context {
+                path: None,
+                key: Some("Content-Type".to_string()),
+                hints: Vec::new(),
+                kind: RegionKind::Header,
+                format: Kind::Har,
+            },
+            &Config::insecure_testing(),
+        );
+        assert_eq!(public.masked, "application/json");
+    }
+
+    #[test]
+    fn public_identifiers_are_measured_separately_from_credential_context() {
+        let input = concat!(
+            "request_id=550e8400-e29b-41d4-a716-446655440000 ",
+            "order_id=123456 trace_id=4bf92f3577b34da6a3ce929d0e0e4736 ",
+            "commit=0123456789abcdef0123456789abcdef01234567"
+        );
+        let result = m(input);
+        assert_eq!(result.masked, input);
+        assert_eq!(result.summary.masked_count, 0);
+    }
+
+    #[test]
     fn json_sibling_secret_context_is_order_independent() {
         for input in [
             r#"{"value":"correcthorsebattery","name":"db_password"}"#,
