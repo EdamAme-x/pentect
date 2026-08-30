@@ -212,7 +212,7 @@ fn sync_parent_directory(path: &Path, purpose: &str) -> Result<(), String> {
         .map_err(|error| format!("could not sync {purpose} directory: {error}"))
 }
 
-#[cfg(all(not(unix), test))]
+#[cfg(windows)]
 fn sync_parent_directory(_: &Path, _: &str) -> Result<(), String> {
     Ok(())
 }
