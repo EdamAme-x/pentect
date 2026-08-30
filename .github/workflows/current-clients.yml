@@ -142,7 +142,11 @@ jobs:
       - name: Start all current portable clients
         run: python tools/client_smoke.py --group portable
       - name: Verify installed Codex, Claude, OpenCode, and Pi handle flows
+        if: github.event_name != 'pull_request' || runner.os != 'Windows'
         run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
+      - name: Verify installed client handle flows without OCR (Windows PR)
+        if: github.event_name == 'pull_request' && runner.os == 'Windows'
+        run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}" --skip-image
       - name: Start both protected desktop app contracts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

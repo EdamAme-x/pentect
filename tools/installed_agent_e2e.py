@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -20,6 +21,19 @@ from pathlib import Path
 
 
 HANDLE = re.compile(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>")
+IMAGE_SECRET = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+IMAGE_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/d"
+    "AAAAAnRSTlP//8i138cAAAAJcEhZcwAACxIAAAsSAdLdfvwAAAF8SURBVGiB7ZrLrsIw"
+    "EEP9/z/tq3beSSp1gXQX9VBKgbOypo4zAL4piPKSElFSIkpK/LMSsLrfXa95ZZ+KWpVg"
+    "nG+1rsNUGwBEMZTArY+pVUrltSiclKC313XxrBdFMZSx5+i3XS+Kuspc/pbFNHvyL3ye"
+    "suLyeFgf8Xkqqvk95hfjDb5OwSOEmb3nL/N9UdiVYFiW61XHsC6Kops4upOnVU3/oihm"
+    "+6Ap5neo9dNoMohi3mfY8kJ6nSgM/0LEVGusSBO5ZojCsj6iDL9GE5laRXHZ6bB2jqFX"
+    "ix6iMFMaaozTxIk1URQXJehd1SaG+RSFNbnTu6vdnO5hM7RCFLO72GNX3zP1vApR7BOv"
+    "SqW1oRx+D1FZcbvlWtlCrCimEiivyqifEzBR3JSgnWuRTCM7zFchiqlSzHRO+Z6iuPyS"
+    "wRgVeg/NIT5EYXQOfRlM3Y79RVFXxf8Acjt5f3jwL36esqpf0TK1bvMJiHpReANRVJSU"
+    "iJISUVIi6pdK/AHPECxsuaPlLgAAAABJRU5ErkJggg=="
+)
 
 
 def response_object(response_id: str, output: list[dict[str, object]]) -> dict[str, object]:
@@ -318,7 +332,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.state.release_model_request.wait(timeout=30)
                 return
             sequence = len(self.server.state.model_requests)
-            if sequence == 1:
+            if '"type":"input_image"' in request:
+                payload = text_response(sequence, "DONE")
+            elif sequence == 1:
                 command = shell_command(["python", "e2e_helper.py", "read"])
                 payload = tool_response(
                     sequence,
@@ -757,6 +773,103 @@ def run_cancellation(pentect: str) -> None:
         thread.join()
 
 
+def run_image_redaction(pentect: str) -> None:
+    state = State("unused-valid", "unused-invalid")
+    server = FixtureServer(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pentect-image-e2e-", ignore_cleanup_errors=True
+        ) as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            project = root / "project"
+            home.mkdir()
+            project.mkdir()
+            image = project / "secret.png"
+            image.write_bytes(base64.b64decode(IMAGE_PNG_BASE64))
+            environment = os.environ.copy()
+            environment.update({
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "XDG_CACHE_HOME": str(home / ".cache"),
+                "XDG_DATA_HOME": str(home / ".local" / "share"),
+                "XDG_STATE_HOME": str(home / ".local" / "state"),
+                "OPENAI_API_KEY": "local-fixture",
+                "PENTECT_LOG_DIR": str(root / "logs"),
+            })
+            command = [
+                pentect,
+                "codex",
+                "--upstream",
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "--model",
+                "gpt-5.6-luna",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "Describe the protected image and finish.",
+                "--image",
+                str(image),
+            ]
+            if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
+                command = [
+                    os.environ.get("COMSPEC", "cmd.exe"),
+                    "/d",
+                    "/s",
+                    "/c",
+                    *command,
+                ]
+            completed = subprocess.run(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"image E2E exited with {completed.returncode}:\n{completed.stdout}"
+                )
+            upstream = "\n".join(state.model_requests)
+            compact_upstream = upstream.replace(" ", "").replace("\n", "")
+            if IMAGE_SECRET in upstream:
+                raise RuntimeError("image secret plaintext reached the model fixture")
+            if IMAGE_PNG_BASE64 in compact_upstream:
+                raise RuntimeError("the original unredacted PNG reached the model fixture")
+            if "Pentect masked sensitive information in this image with black boxes." not in upstream:
+                raise RuntimeError("the model fixture did not receive the image-redaction explanation")
+            if "Masked regions:" not in upstream or not HANDLE.search(upstream):
+                raise RuntimeError("the model fixture did not receive an opaque image handle")
+            encoded_images = re.findall(
+                r"data:image/png;base64,([A-Za-z0-9+/=]+)", upstream
+            )
+            if not encoded_images:
+                raise RuntimeError("the model fixture did not receive a protected PNG")
+            if any(encoded == IMAGE_PNG_BASE64 for encoded in encoded_images):
+                raise RuntimeError("the protected PNG was identical to the original")
+            if not all(base64.b64decode(encoded).startswith(b"\x89PNG\r\n\x1a\n") for encoded in encoded_images):
+                raise RuntimeError("the protected image payload was not a valid PNG")
+            logs = (root / "logs" / "pentect.log").read_text(encoding="utf-8")
+            compact_logs = re.sub(r"\s+", "", logs)
+            if IMAGE_SECRET in logs or IMAGE_PNG_BASE64 in compact_logs:
+                raise RuntimeError(
+                    "image secret plaintext or original payload reached persistent diagnostics"
+                )
+            print(
+                "installed codex image E2E passed: original replaced, black-box note "
+                "and opaque handle delivered, no model/log plaintext"
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pentect", default="pentect")
@@ -766,6 +879,7 @@ def main() -> int:
         choices=("codex", "claude", "opencode", "pi"),
         dest="clients",
     )
+    parser.add_argument("--skip-image", action="store_true")
     args = parser.parse_args()
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.
@@ -773,6 +887,8 @@ def main() -> int:
         run_client(args.pentect, client)
     if args.clients is None or "codex" in args.clients:
         run_cancellation(args.pentect)
+        if not args.skip_image:
+            run_image_redaction(args.pentect)
     return 0
 
 
