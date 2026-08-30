@@ -404,7 +404,10 @@ fn configure_child_process(command: &mut Command) {
 struct CodexSessionHome {
     path: PathBuf,
     source_home: PathBuf,
+    owner_lock: Option<std::fs::File>,
 }
+
+const SESSION_OWNER_LOCK: &str = ".pentect-owner.lock";
 
 #[derive(Debug)]
 struct CodexConfigLock {
@@ -494,7 +497,7 @@ impl CodexSessionHome {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        let path = sessions.join(format!("{}-{suffix}", std::process::id()));
+        let path = sessions.join(format!("{}-{suffix}-2", std::process::id()));
         std::fs::create_dir(&path).map_err(|error| {
             format!(
                 "could not create Codex App session home '{}': {error}",
@@ -556,9 +559,17 @@ impl CodexSessionHome {
             cleanup_session_home(&path);
             return Err(error);
         }
+        let owner_lock = match create_session_owner_lock(&path) {
+            Ok(owner_lock) => owner_lock,
+            Err(error) => {
+                cleanup_session_home(&path);
+                return Err(error);
+            }
+        };
         Ok(Self {
             path,
             source_home: source_home.to_path_buf(),
+            owner_lock: Some(owner_lock),
         })
     }
 
@@ -573,8 +584,31 @@ impl CodexSessionHome {
 
 impl Drop for CodexSessionHome {
     fn drop(&mut self) {
+        if let Some(owner_lock) = self.owner_lock.take() {
+            if let Err(error) = owner_lock.unlock() {
+                eprintln!("[pentect] could not release Codex App session owner lock: {error}");
+            }
+            drop(owner_lock);
+        }
         cleanup_session_home(&self.path);
     }
+}
+
+fn create_session_owner_lock(path: &Path) -> Result<std::fs::File, String> {
+    let lock_path = path.join(SESSION_OWNER_LOCK);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| format!("could not create Codex App session owner lock: {error}"))?;
+    file.try_lock()
+        .map_err(|error| format!("could not acquire Codex App session owner lock: {error}"))?;
+    Ok(file)
 }
 
 fn session_home_excludes(name: &std::ffi::OsStr) -> bool {
@@ -653,23 +687,69 @@ fn cleanup_stale_session_homes(sessions: &Path) {
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for entry in entries.flatten() {
-        let Some(pid) = generated_session_pid(&entry.file_name()) else {
+        let Some(owner) = generated_session_owner(&entry.file_name()) else {
             continue;
         };
-        if system.process(sysinfo::Pid::from_u32(pid)).is_none() {
+        let running = if owner.uses_lock {
+            match session_owner_lock_is_held(&entry.path()) {
+                Ok(running) => running,
+                Err(error) => {
+                    eprintln!("[pentect] warning: could not inspect Codex App session owner lock: {error}");
+                    true
+                }
+            }
+        } else {
+            system.process(sysinfo::Pid::from_u32(owner.pid)).is_some()
+        };
+        if !running {
             cleanup_session_home(&entry.path());
         }
     }
 }
 
-#[cfg(test)]
-fn generated_session_name(name: &std::ffi::OsStr) -> bool {
-    generated_session_pid(name).is_some()
+fn session_owner_lock_is_held(path: &Path) -> Result<bool, String> {
+    let lock_path = path.join(SESSION_OWNER_LOCK);
+    let metadata = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| error.to_string())?;
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.to_string()),
+    }
 }
 
-fn generated_session_pid(name: &std::ffi::OsStr) -> Option<u32> {
+struct GeneratedSessionOwner {
+    pid: u32,
+    uses_lock: bool,
+}
+
+#[cfg(test)]
+fn generated_session_name(name: &std::ffi::OsStr) -> bool {
+    generated_session_owner(name).is_some()
+}
+
+fn generated_session_owner(name: &std::ffi::OsStr) -> Option<GeneratedSessionOwner> {
     let name = name.to_string_lossy();
-    let (pid, suffix) = name.split_once('-')?;
+    let parts = name.split('-').collect::<Vec<_>>();
+    let (pid, suffix, uses_lock) = match parts.as_slice() {
+        [pid, suffix] => (*pid, *suffix, false),
+        [pid, suffix, "2"] => (*pid, *suffix, true),
+        _ => return None,
+    };
     if pid.is_empty()
         || suffix.is_empty()
         || !pid.bytes().all(|byte| byte.is_ascii_digit())
@@ -677,7 +757,8 @@ fn generated_session_pid(name: &std::ffi::OsStr) -> Option<u32> {
     {
         return None;
     }
-    pid.parse().ok()
+    let pid = pid.parse::<u32>().ok().filter(|pid| *pid != 0)?;
+    Some(GeneratedSessionOwner { pid, uses_lock })
 }
 
 fn cleanup_session_home(path: &Path) {
@@ -1602,9 +1683,15 @@ base_url = "https://other.example/v1"
     #[test]
     fn stale_cleanup_only_accepts_generated_session_names() {
         assert!(generated_session_name(std::ffi::OsStr::new("123-456")));
+        assert!(generated_session_name(std::ffi::OsStr::new("123-456-2")));
         assert!(!generated_session_name(std::ffi::OsStr::new("123")));
         assert!(!generated_session_name(std::ffi::OsStr::new("../outside")));
         assert!(!generated_session_name(std::ffi::OsStr::new("123-current")));
+        assert!(!generated_session_name(std::ffi::OsStr::new("123-456-3")));
+        assert!(!generated_session_name(std::ffi::OsStr::new(
+            "123-456-789-extra"
+        )));
+        assert!(!generated_session_name(std::ffi::OsStr::new("0-1-2")));
     }
 
     #[test]
@@ -1612,18 +1699,33 @@ base_url = "https://other.example/v1"
         let root = test_home("codex-stale-session-cleanup");
         let sessions = root.join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        let live = sessions.join(format!("{}-1", std::process::id()));
-        let stale = sessions.join(format!("{}-2", u32::MAX));
+        let live = sessions.join(format!("{}-1-2", std::process::id()));
+        let stale_locked = sessions.join(format!("{}-2-2", std::process::id()));
+        let missing_lock = sessions.join(format!("{}-3-2", std::process::id()));
+        let legacy_live = sessions.join(format!("{}-4", std::process::id()));
+        let legacy_stale = sessions.join(format!("{}-5", u32::MAX));
         let unrelated = sessions.join("keep-me");
         std::fs::create_dir(&live).unwrap();
-        std::fs::create_dir(&stale).unwrap();
+        std::fs::create_dir(&stale_locked).unwrap();
+        std::fs::create_dir(&missing_lock).unwrap();
+        std::fs::create_dir(&legacy_live).unwrap();
+        std::fs::create_dir(&legacy_stale).unwrap();
         std::fs::create_dir(&unrelated).unwrap();
+        let live_lock = create_session_owner_lock(&live).unwrap();
+        let stale_lock = create_session_owner_lock(&stale_locked).unwrap();
+        stale_lock.unlock().unwrap();
+        drop(stale_lock);
 
         cleanup_stale_session_homes(&sessions);
 
         assert!(live.exists());
-        assert!(!stale.exists());
+        assert!(!stale_locked.exists());
+        assert!(!missing_lock.exists());
+        assert!(legacy_live.exists());
+        assert!(!legacy_stale.exists());
         assert!(unrelated.exists());
+        live_lock.unlock().unwrap();
+        drop(live_lock);
         std::fs::remove_dir_all(root).unwrap();
     }
 
