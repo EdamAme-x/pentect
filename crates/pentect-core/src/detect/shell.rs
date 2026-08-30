@@ -4,6 +4,45 @@ pub(crate) struct Token {
     pub(crate) byte_to_raw: Vec<usize>,
 }
 
+enum PowerShellParameterForm {
+    Separate,
+    Bound(usize),
+}
+
+/// Returns the token and decoded-byte offset of a PowerShell named parameter's
+/// value. PowerShell officially supports both `-Name Value` and `-Name:Value`.
+/// We also accept `-Name=Value` defensively, but only after an exact,
+/// case-insensitive parameter-name match.
+pub(crate) fn powershell_parameter_value(tokens: &[Token], name: &str) -> Option<(usize, usize)> {
+    tokens.iter().enumerate().find_map(|(index, token)| {
+        match powershell_parameter_form(&token.value, name)? {
+            PowerShellParameterForm::Separate => tokens.get(index + 1).map(|_| (index + 1, 0)),
+            PowerShellParameterForm::Bound(start) if start < token.value.len() => {
+                Some((index, start))
+            }
+            PowerShellParameterForm::Bound(_) => tokens.get(index + 1).map(|_| (index + 1, 0)),
+        }
+    })
+}
+
+pub(crate) fn has_powershell_parameter(tokens: &[Token], name: &str) -> bool {
+    tokens
+        .iter()
+        .any(|token| powershell_parameter_form(&token.value, name).is_some())
+}
+
+fn powershell_parameter_form(value: &str, name: &str) -> Option<PowerShellParameterForm> {
+    if value.eq_ignore_ascii_case(name) {
+        return Some(PowerShellParameterForm::Separate);
+    }
+    let prefix = value.get(..name.len())?;
+    if !prefix.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    matches!(value.as_bytes().get(name.len()), Some(b':' | b'='))
+        .then_some(PowerShellParameterForm::Bound(name.len() + 1))
+}
+
 pub(crate) fn tokens(line: &str, base: usize) -> Vec<Token> {
     let mut out = Vec::new();
     let chars = line.char_indices().collect::<Vec<_>>();
@@ -93,5 +132,16 @@ mod tests {
         assert_eq!(value.byte_to_raw.len(), value.value.len());
         assert_eq!(value.byte_to_raw[0], 30);
         assert_eq!(basename("C:\\Tools\\CURL.EXE"), "CURL");
+    }
+
+    #[test]
+    fn powershell_parameters_require_an_exact_name_and_preserve_value_offsets() {
+        let tokens = tokens("Thing -VaLuE:'sécret' -Values:not-secret", 10);
+        let (index, start) = powershell_parameter_value(&tokens, "-Value").unwrap();
+        let value = &tokens[index];
+        assert_eq!(&value.value[start..], "sécret");
+        assert_eq!(value.byte_to_raw[start], 24);
+        assert!(!has_powershell_parameter(&tokens, "-ValuesX"));
+        assert!(powershell_parameter_value(&tokens, "-Val").is_none());
     }
 }

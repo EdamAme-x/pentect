@@ -89,26 +89,21 @@ fn inspect_convert_to_secure_string(
     }) else {
         return;
     };
-    if !tokens[command_index + 1..]
-        .iter()
-        .any(|token| token.value.eq_ignore_ascii_case("-AsPlainText"))
-    {
+    let arguments = &tokens[command_index + 1..];
+    if !shell::has_powershell_parameter(arguments, "-AsPlainText") {
         return;
     }
-    let arguments = &tokens[command_index + 1..];
-    let value = arguments
-        .windows(2)
-        .find(|pair| pair[0].value.eq_ignore_ascii_case("-String"))
-        .map(|pair| &pair[1])
-        .or_else(|| {
-            arguments
-                .iter()
-                .find(|token| !token.value.is_empty() && !token.value.starts_with('-'))
-        });
-    let Some(value) = value else {
+    let value = shell::powershell_parameter_value(arguments, "-String").or_else(|| {
+        arguments
+            .iter()
+            .position(|token| !token.value.is_empty() && !token.value.starts_with('-'))
+            .map(|index| (index, 0))
+    });
+    let Some((value_index, value_start)) = value else {
         return;
     };
-    push_cli_password(view, out, value, 0);
+    let value = &arguments[value_index];
+    push_cli_password(view, out, value, value_start);
 }
 
 fn is_powershell_command_name(value: &str) -> bool {
@@ -270,6 +265,40 @@ mod tests {
                 )
             ]
         );
+    }
+
+    #[test]
+    fn convert_to_secure_string_masks_bound_string_parameters() {
+        for (raw, expected) in [
+            (
+                "ConvertTo-SecureString -String:IaiA@eqhtlc -AsPlainText -Force",
+                "IaiA@eqhtlc",
+            ),
+            (
+                "ConvertTo-SecureString -STRING:'sécret value' -AsPlainText:$true -Force",
+                "sécret value",
+            ),
+            (
+                "ConvertTo-SecureString -String: '-starts-with-dash' -AsPlainText -Force",
+                "-starts-with-dash",
+            ),
+            (
+                "ConvertTo-SecureString -String=IaiA@eqhtlc -AsPlainText=$true -Force",
+                "IaiA@eqhtlc",
+            ),
+        ] {
+            assert_eq!(
+                labels(raw),
+                [("CMD_PASSWORD".to_string(), expected.to_string())],
+                "{raw}"
+            );
+        }
+        for raw in [
+            "ConvertTo-SecureString -Stringify:IaiA@eqhtlc -AsPlainText -Force",
+            "ConvertTo-SecureString -String:IaiA@eqhtlc -AsPlainTexts:$true -Force",
+        ] {
+            assert!(labels(raw).is_empty(), "{raw}: {:?}", labels(raw));
+        }
     }
 
     #[test]

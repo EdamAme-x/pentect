@@ -147,33 +147,39 @@ fn scan_powershell_set_item(
     if !super::shell::basename(&command.value).eq_ignore_ascii_case("set-item") {
         return;
     }
-    let Some((env_index, key)) = tokens.iter().enumerate().find_map(|(index, token)| {
-        let (scope, key) = token.value.split_once(':')?;
-        scope.eq_ignore_ascii_case("env").then_some((index, key))
-    }) else {
+    let path = super::shell::powershell_parameter_value(tokens, "-Path")
+        .or_else(|| tokens.iter().enumerate().find_map(environment_path));
+    let Some((path_index, path_start)) = path else {
         return;
     };
-    if !valid_environment_name(key) || !is_sensitive_key_name(key) {
+    let path_token = &tokens[path_index];
+    let Some((scope, key)) = path_token.value[path_start..].split_once(':') else {
+        return;
+    };
+    if !scope.eq_ignore_ascii_case("env")
+        || !valid_environment_name(key)
+        || !is_sensitive_key_name(key)
+    {
         return;
     }
-    let value_index = tokens
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_, token)| token.value.eq_ignore_ascii_case("-Value"))
-        .map(|(index, _)| index + 1)
-        .or_else(|| {
-            tokens
-                .get(env_index + 1)
-                .is_some_and(|token| !token.value.starts_with('-'))
-                .then_some(env_index + 1)
-        });
-    let Some(value) = value_index.and_then(|index| tokens.get(index)) else {
+    let value = super::shell::powershell_parameter_value(tokens, "-Value").or_else(|| {
+        tokens
+            .get(path_index + 1)
+            .filter(|token| !token.value.starts_with('-'))
+            .map(|_| (path_index + 1, 0))
+    });
+    let Some((value_index, value_start)) = value else {
         return;
     };
-    if let Some(range) = token_raw_range(value, 0) {
+    let value = &tokens[value_index];
+    if let Some(range) = token_raw_range(value, value_start) {
         push_environment_span(view, spans, range);
     }
+}
+
+fn environment_path((index, token): (usize, &super::shell::Token)) -> Option<(usize, usize)> {
+    let (scope, _) = token.value.split_once(':')?;
+    scope.eq_ignore_ascii_case("env").then_some((index, 0))
 }
 
 fn first_shell_command<'a>(
@@ -1048,6 +1054,37 @@ mod tests {
             "Set-Item -Path Env:SQUARE_ACCESS_TOKEN; Write-Output -Value NotTheEnvValue"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn powershell_set_item_masks_bound_parameter_values() {
+        for (raw, expected) in [
+            (
+                "Set-Item -Path:Env:SQUARE_ACCESS_TOKEN -Value:SyntheticValue",
+                "SyntheticValue",
+            ),
+            (
+                "Set-Item -VALUE:'mail gun value' -PATH:Env:MAILGUN_API_KEY",
+                "mail gun value",
+            ),
+            (
+                "Set-Item -Path: Env:SQUARE_ACCESS_TOKEN -Value: sécret-value",
+                "sécret-value",
+            ),
+            (
+                "Set-Item -Path=Env:SQUARE_ACCESS_TOKEN -Value=SyntheticValue",
+                "SyntheticValue",
+            ),
+        ] {
+            assert_eq!(shell_env_values(raw), [expected], "{raw}");
+        }
+        for raw in [
+            "Set-Item -Paths:Env:SQUARE_ACCESS_TOKEN -Value:SyntheticValue",
+            "Set-Item -Path:Env:SQUARE_ACCESS_TOKEN -Values:SyntheticValue",
+            "Set-Item -Path:X:SQUARE_ACCESS_TOKEN -Value:SyntheticValue",
+        ] {
+            assert!(shell_env_values(raw).is_empty(), "{raw}");
+        }
     }
 
     #[test]
