@@ -266,12 +266,13 @@ async fn proxy_request_inner(
     }
     let method = request.method().clone();
     let protected = endpoint.is_protected() && method == hyper::Method::POST;
+    let body_forbidden = endpoint == GeminiEndpoint::Models;
     if endpoint.is_protected() && method != hyper::Method::POST {
         return Err("unknown format blocked: Gemini model endpoints must use POST".to_string());
     }
     let upstream_url = crate::upstream::join_url(&state.upstream, path_and_query, "Gemini")?;
     let request_headers = request.headers().clone();
-    let body = if protected {
+    let body = if protected || body_forbidden {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -285,31 +286,41 @@ async fn proxy_request_inner(
             }
             Err(error) => return Err(format!("could not read Gemini request: {error}")),
         };
-        let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
-        let body =
-            crate::cloud_code_http_proxy::resolve_google_remote_files(body, &mut remote_budget)
-                .await?;
-        let protected = protect_request_body(
-            &body,
-            endpoint,
-            &state.masker,
-            &state.plugins,
-            state.block_unknown_formats,
-        )?;
-        if let Some(response) = protected.local_response {
-            if endpoint == GeminiEndpoint::StreamGenerateContent {
-                return Ok(text_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Plugin local responses are unavailable for streaming Gemini requests",
-                ));
+        if body_forbidden {
+            if !body.is_empty() {
+                return Err(
+                    "request body blocked: Gemini models endpoints do not accept request bodies"
+                        .to_string(),
+                );
             }
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(full_body(response))
-                .expect("local plugin response"));
+            reqwest::Body::from(body)
+        } else {
+            let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
+            let body =
+                crate::cloud_code_http_proxy::resolve_google_remote_files(body, &mut remote_budget)
+                    .await?;
+            let protected = protect_request_body(
+                &body,
+                endpoint,
+                &state.masker,
+                &state.plugins,
+                state.block_unknown_formats,
+            )?;
+            if let Some(response) = protected.local_response {
+                if endpoint == GeminiEndpoint::StreamGenerateContent {
+                    return Ok(text_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Plugin local responses are unavailable for streaming Gemini requests",
+                    ));
+                }
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(hyper::header::CONTENT_TYPE, "application/json")
+                    .body(full_body(response))
+                    .expect("local plugin response"));
+            }
+            reqwest::Body::from(protected.body)
         }
-        reqwest::Body::from(protected.body)
     } else {
         let stream = request.into_body().into_data_stream().map(|chunk| {
             chunk.map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))
@@ -1347,6 +1358,49 @@ mod tests {
             ),
             "unknown"
         );
+    }
+
+    #[test]
+    fn models_request_body_is_rejected_before_gemini_upstream() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let proxy =
+            GeminiHttpProxyGuard::start_with_header_env("http://127.0.0.1:9".to_string(), &[])
+                .unwrap();
+        let client = reqwest::blocking::Client::new();
+
+        for path in [
+            "/v1beta/models",
+            "/v1/models?pageSize=10",
+            "/v1beta/models/gemini-test?view=full",
+            "/v1/models/gemini-test",
+        ] {
+            let response = client
+                .post(format!("{}{path}", proxy.base_url()))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(r#"{"note":"plaintext-must-not-leave"}"#)
+                .send()
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            assert!(
+                response
+                    .text()
+                    .unwrap()
+                    .contains("Gemini models endpoints do not accept request bodies"),
+                "{path}"
+            );
+        }
+
+        let empty = client
+            .get(format!("{}/v1beta/models", proxy.base_url()))
+            .send()
+            .unwrap();
+        assert_eq!(empty.status(), reqwest::StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
