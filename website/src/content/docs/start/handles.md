@@ -1,6 +1,6 @@
 ---
 title: Handles
-description: Understand handle names, environment bindings, lifetime, and recovery.
+description: Understand handle names, local restoration, lifetime, and recovery.
 ---
 
 A handle is a local reference to a sensitive value:
@@ -66,34 +66,21 @@ balanced parentheses.
 
 ## How a tool uses a handle
 
-Protected launches provide an environment binding for each handle. Remove the
-angle brackets and add `PENTECT_` to the handle's label and ID. For example,
-`<<DATABASE_URL_ID>>` maps to `PENTECT_DATABASE_URL_ID`:
+The model copies the complete handle into a tool argument. Before the local
+client executes the completed tool call, Pentect replaces every known handle in
+its string arguments with the original value. This applies recursively to shell
+commands, file writes and edits, connector arguments, and MCP arguments.
 
-::: code-group
+Pentect does not parse or rewrite shell syntax. It performs exact replacement
+of known handles and leaves every other byte unchanged. The client and shell
+therefore keep their normal semantics. If a value contains shell metacharacters,
+the agent must place the handle in syntax appropriate for that command, just as
+it would for any other argument.
 
-```powershell [PowerShell]
-# Handle: <<DATABASE_URL_ID>>
-irm https://api.example.test/status `
-  -Headers @{ Authorization = "Bearer $env:PENTECT_DATABASE_URL_ID" }
-```
-
-```sh [Bash / Zsh]
-# Handle: <<DATABASE_URL_ID>>
-curl https://api.example.test/status \
-  -H "Authorization: Bearer ${PENTECT_DATABASE_URL_ID}"
-```
-
-:::
-
-Pentect also resolves a handle copied directly into completed tool-call
-arguments. The environment form is useful for shell commands because it avoids
-placing the real value in the command text.
-
-Do not assign the binding to a normal variable in one tool call and expect a
-later tool call to keep it. Agent shells may be separate processes. Reference
-the complete binding literally in each command that needs it; do not construct
-its name dynamically or print it first.
+This boundary protects provider traffic, not the local client process. A
+restored value may be visible in local tool-call history, process arguments,
+debuggers, or terminal scrollback. Tool output is checked and masked again
+before the next provider request.
 
 ## Lifetime and stability
 
@@ -140,8 +127,10 @@ With `files.remember = true`, Pentect can remember where a handle came from and
 recover it only if the file still matches the recorded location and content.
 This is local metadata, not a copy of every secret.
 
-Use `pentect exec` when a command needs a handle. Use `pentect resolve` only
-when you intentionally need plaintext written to standard output or a file:
+Supported protected clients restore handles in completed tool calls
+automatically. `pentect exec` remains available for manual terminal workflows.
+Use `pentect resolve` only when you intentionally need plaintext written to
+standard output or a file:
 
 ```sh
 pentect exec 'command --token <<API_TOKEN_...>>'

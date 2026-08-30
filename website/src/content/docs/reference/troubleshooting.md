@@ -47,25 +47,17 @@ Check these points:
 See [Handles](/start/handles/) for the difference between stable identity and
 live recovery data.
 
-## A `PENTECT_...` environment binding is empty
+## A handle was not restored in a tool call
 
-These bindings exist in protected tool processes. They are not permanent user
-environment variables and normally do not exist in a separate terminal.
+Copy the complete `<<LABEL_ID>>` handle into the tool argument. Do not convert
+it to a `PENTECT_...` environment variable name. Pentect restores exact known
+handles recursively in completed local shell, file, connector, and MCP inputs.
 
-Use the complete name from the current handle. For example:
-
-```text
-<<KAGGLE_API_TOKEN_b818890b85f7482a>>
-PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a
-```
-
-For a handle written as `<<LABEL_ID>>`, reference `$env:PENTECT_LABEL_ID` in
-PowerShell or `${PENTECT_LABEL_ID}` in Bash and Zsh. The angle brackets belong
-only to the handle, not to the environment variable name.
-
-If the command output shows another handle instead of the value, masking worked.
-Do not use `echo` as a test. Test the intended API call with a fake credential
-and check its ordinary status result.
+If the value contains shell metacharacters, the surrounding command still has
+to use syntax valid for that shell. Pentect replaces the handle but does not
+parse, quote, or escape the command. Test the intended operation with a fake
+credential and inspect its ordinary status result instead of printing the
+credential.
 
 ## A handle ID changed
 
