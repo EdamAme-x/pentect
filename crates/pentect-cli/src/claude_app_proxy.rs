@@ -464,10 +464,54 @@ fn write_windows_ca_journal(thumbprint: &str) -> Result<(), String> {
         format!("could not create Claude Desktop CA cleanup directory: {error}")
     })?;
     crate::secure_temp::restrict_to_current_user(parent)?;
-    let journal = format!("{thumbprint}\n{}\n", std::process::id());
+    let owner_creation_time = windows_process_creation_time(std::process::id())?;
+    let journal = format!(
+        "{thumbprint}\n{}\n{owner_creation_time}\n",
+        std::process::id()
+    );
     std::fs::write(&path, journal)
         .map_err(|error| format!("could not write Claude Desktop CA cleanup journal: {error}"))?;
     crate::secure_temp::restrict_to_current_user(&path)
+}
+
+#[cfg(windows)]
+fn windows_process_creation_time(pid: u32) -> Result<u64, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err(format!(
+            "could not inspect Claude Desktop CA owner process: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let inspected =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let inspected_error = (inspected == 0).then(std::io::Error::last_os_error);
+    let closed = unsafe { CloseHandle(handle) };
+    if let Some(error) = inspected_error {
+        return Err(format!(
+            "could not inspect Claude Desktop CA owner process: {error}"
+        ));
+    }
+    if closed == 0 {
+        return Err(format!(
+            "could not close Claude Desktop CA owner process handle: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let creation_time = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    if creation_time == 0 {
+        return Err("Claude Desktop CA owner process creation time is unavailable".to_string());
+    }
+    Ok(creation_time)
 }
 
 #[cfg(windows)]
@@ -506,7 +550,13 @@ fn validate_ca_thumbprint(thumbprint: &str) -> Result<(), String> {
 #[cfg(windows)]
 struct WindowsCaJournal {
     thumbprint: String,
-    owner: Option<u32>,
+    owner: Option<WindowsCaOwner>,
+}
+
+#[cfg(windows)]
+struct WindowsCaOwner {
+    pid: u32,
+    creation_time: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -516,7 +566,7 @@ fn parse_windows_ca_journal(content: &str) -> Result<WindowsCaJournal, String> {
         .next()
         .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())?;
     validate_ca_thumbprint(thumbprint)?;
-    let owner = lines
+    let owner_pid = lines
         .next()
         .map(|value| {
             value
@@ -526,28 +576,62 @@ fn parse_windows_ca_journal(content: &str) -> Result<WindowsCaJournal, String> {
                 .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())
         })
         .transpose()?;
+    let owner_creation_time = lines
+        .next()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|creation_time| *creation_time != 0)
+                .ok_or_else(|| "Claude Desktop CA cleanup journal is invalid".to_string())
+        })
+        .transpose()?;
+    if owner_creation_time.is_some() && owner_pid.is_none() {
+        return Err("Claude Desktop CA cleanup journal is invalid".to_string());
+    }
     if lines.next().is_some() {
         return Err("Claude Desktop CA cleanup journal is invalid".to_string());
     }
     Ok(WindowsCaJournal {
         thumbprint: thumbprint.to_string(),
-        owner,
+        owner: owner_pid.map(|pid| WindowsCaOwner {
+            pid,
+            creation_time: owner_creation_time,
+        }),
     })
 }
 
 #[cfg(windows)]
-fn windows_ca_owner_is_running(owner: Option<u32>) -> bool {
+fn windows_ca_owner_is_running(owner: Option<&WindowsCaOwner>) -> bool {
     let Some(owner) = owner else {
         return false;
     };
-    let pid = sysinfo::Pid::from_u32(owner);
+    let pid = sysinfo::Pid::from_u32(owner.pid);
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
         true,
         sysinfo::ProcessRefreshKind::nothing(),
     );
-    system.process(pid).is_some()
+    if system.process(pid).is_none() {
+        return false;
+    }
+    match owner.creation_time {
+        Some(expected) => windows_process_creation_time(owner.pid)
+            .map(|observed| expected == observed)
+            .unwrap_or(true),
+        // PID-only journals came from older Pentect releases. Preserve them
+        // while the PID exists rather than disrupting an active old session.
+        None => true,
+    }
+}
+
+#[cfg(windows)]
+fn windows_ca_owner_matches_creation_time(owner: &WindowsCaOwner, observed: u64) -> bool {
+    match owner.creation_time {
+        Some(expected) => observed == 0 || expected == observed,
+        None => true,
+    }
 }
 
 // Releases before the journal moved into its own directory wrote it directly
@@ -701,7 +785,7 @@ fn windows_user_ca_present(thumbprint: &str) -> Result<bool, String> {
 pub(crate) fn windows_ca_cleanup_pending() -> Result<bool, String> {
     Ok(read_windows_ca_journals()?
         .iter()
-        .any(|(_, journal)| !windows_ca_owner_is_running(journal.owner)))
+        .any(|(_, journal)| !windows_ca_owner_is_running(journal.owner.as_ref())))
 }
 
 #[cfg(windows)]
@@ -709,7 +793,7 @@ pub(crate) fn cleanup_stale_windows_user_ca() -> Result<(), String> {
     let journals = read_windows_ca_journals()?;
     let mut removed = 0usize;
     for (path, journal) in journals {
-        if windows_ca_owner_is_running(journal.owner) {
+        if windows_ca_owner_is_running(journal.owner.as_ref()) {
             continue;
         }
         remove_windows_user_ca(&journal.thumbprint)?;
@@ -4622,10 +4706,16 @@ mod tests {
     fn windows_ca_journal_accepts_only_sha1_thumbprints() {
         let thumbprint = "00112233445566778899AABBCCDDEEFF00112233";
         assert!(validate_ca_thumbprint(thumbprint).is_ok());
-        let current = parse_windows_ca_journal(&format!("{thumbprint}\n1234\n")).unwrap();
-        assert_eq!(current.owner, Some(1234));
+        let current = parse_windows_ca_journal(&format!("{thumbprint}\n1234\n5678\n")).unwrap();
+        let current_owner = current.owner.as_ref().unwrap();
+        assert_eq!(current_owner.pid, 1234);
+        assert_eq!(current_owner.creation_time, Some(5678));
+        let pid_only = parse_windows_ca_journal(&format!("{thumbprint}\n1234\n")).unwrap();
+        let pid_only_owner = pid_only.owner.as_ref().unwrap();
+        assert_eq!(pid_only_owner.pid, 1234);
+        assert_eq!(pid_only_owner.creation_time, None);
         let legacy = parse_windows_ca_journal(thumbprint).unwrap();
-        assert_eq!(legacy.owner, None);
+        assert!(legacy.owner.is_none());
         assert!(parse_windows_ca_journal(&format!("{thumbprint}\n1234\nextra")).is_err());
         for invalid in [
             "",
@@ -4635,6 +4725,24 @@ mod tests {
         ] {
             assert!(validate_ca_thumbprint(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ca_owner_identity_rejects_same_second_pid_reuse() {
+        let owner = WindowsCaOwner {
+            pid: 1234,
+            creation_time: Some(10_000_001),
+        };
+        assert!(windows_ca_owner_matches_creation_time(&owner, 10_000_001));
+        assert!(!windows_ca_owner_matches_creation_time(&owner, 10_000_002));
+
+        let legacy = WindowsCaOwner {
+            pid: 1234,
+            creation_time: None,
+        };
+        assert!(windows_ca_owner_matches_creation_time(&legacy, 10_000_002));
+        assert!(windows_ca_owner_matches_creation_time(&owner, 0));
     }
 
     #[cfg(windows)]
