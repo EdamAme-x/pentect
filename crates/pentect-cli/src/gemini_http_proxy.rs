@@ -1109,6 +1109,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "te"
             | "trailer"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -1550,7 +1551,7 @@ mod tests {
         let _env = TestEnv::install(&store);
         let body = "data: {\"candidates\":[]}\n\n";
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nX-Pentect-Coverage: none\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -1569,6 +1570,14 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
         assert!(!response
             .headers()
             .contains_key(reqwest::header::CONTENT_ENCODING));
@@ -1953,6 +1962,7 @@ mod tests {
         assert!(!should_forward_request_header("Proxy-Authorization"));
         assert!(!should_forward_response_header("Proxy-Authenticate"));
         assert!(!should_forward_response_header("Content-Encoding"));
+        assert!(!should_forward_response_header("X-Pentect-Coverage"));
         assert!(should_forward_request_header("Accept"));
     }
 
