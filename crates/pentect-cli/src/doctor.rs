@@ -262,7 +262,7 @@ fn migrate_removed_config_keys(source: &str) -> Result<Option<String>, String> {
     if document.contains_key("require_pentect") {
         let value = document
             .get("require_pentect")
-            .and_then(toml_edit::Item::as_bool)
+            .and_then(item_bool)
             .ok_or_else(|| "require_pentect must be a boolean".to_string())?;
         let agent = ensure_table(&mut document, "agent")?;
         if !agent.contains_key("required") {
@@ -350,6 +350,10 @@ fn table_has(document: &toml_edit::DocumentMut, table: &str, key: &str) -> bool 
 
 fn table_bool(document: &toml_edit::DocumentMut, table: &str, key: &str) -> Option<bool> {
     let value = document.get(table)?.as_table_like()?.get(key)?;
+    item_bool(value)
+}
+
+fn item_bool(value: &toml_edit::Item) -> Option<bool> {
     value.as_bool().or_else(|| {
         value
             .as_str()
@@ -448,21 +452,43 @@ fn check_command(name: &'static str) -> Check {
 }
 
 fn find_command(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    find_command_in(name, paths)
+}
+
+fn find_command_in(name: &str, paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let candidates = command_names(name)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     let path = Path::new(name);
-    if path.is_file() {
-        return Some(path.to_path_buf());
+    let explicit_path = path.is_absolute() || path.components().count() > 1;
+    if explicit_path {
+        return candidates.into_iter().find(|path| is_launchable_file(path));
     }
-    let paths = std::env::var_os("PATH")?;
-    let candidates = command_names(name);
-    for dir in std::env::split_paths(&paths) {
+    for dir in paths {
         for candidate in &candidates {
             let full = dir.join(candidate);
-            if full.is_file() {
+            if is_launchable_file(&full) {
                 return Some(full);
             }
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn is_launchable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_launchable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn print_checks(checks: &[Check]) {
@@ -816,6 +842,7 @@ mod tests {
     fn ambiguous_removed_settings_are_reported() {
         assert!(migrate_removed_config_keys("[handles]\nhash_scope = \"team\"\n").is_err());
         assert!(migrate_removed_config_keys("[handles]\nhash_scope = 1\n").is_err());
+        assert!(migrate_removed_config_keys("require_pentect = \"sometimes\"\n").is_err());
         assert!(migrate_removed_config_keys("not = = toml").is_err());
     }
 
@@ -903,12 +930,108 @@ mod tests {
     #[test]
     fn removed_config_string_booleans_use_runtime_semantics() {
         let source = concat!(
+            "require_pentect = \"true\"\n",
             "file_pointer_manager = { save = \"off\" }\n",
             "log = { share = \"yes\" }\n",
         );
         let migrated = migrate_removed_config_keys(source).unwrap().unwrap();
+        assert!(migrated.contains("required = true"), "{migrated}");
         assert!(migrated.contains("remember = false"), "{migrated}");
         assert!(migrated.contains("share = true"), "{migrated}");
+    }
+
+    #[test]
+    fn command_lookup_ignores_bare_files_in_the_current_directory() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-doctor-command-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("codex"), "not a command").unwrap();
+        {
+            let _cwd = CurrentDirGuard::enter(&root);
+            assert_eq!(
+                find_command_in("codex", std::iter::empty::<PathBuf>()),
+                None
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_lookup_preserves_explicit_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-doctor-command-explicit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(windows)]
+        let command = root.join("codex.exe");
+        #[cfg(not(windows))]
+        let command = root.join("codex");
+        std::fs::write(&command, "command").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(
+            find_command_in(command.to_str().unwrap(), std::iter::empty::<PathBuf>()),
+            Some(command.clone())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_lookup_finds_launchable_path_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-doctor-command-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(windows)]
+        let command = root.join("codex.exe");
+        #[cfg(not(windows))]
+        let command = root.join("codex");
+        std::fs::write(&command, "command").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(find_command_in("codex", [root.clone()]), Some(command));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_lookup_rejects_non_executable_path_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-doctor-command-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let command = root.join("codex");
+        std::fs::write(&command, "not executable").unwrap();
+        assert_eq!(find_command_in("codex", [root.clone()]), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
