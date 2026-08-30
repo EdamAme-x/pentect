@@ -567,14 +567,16 @@ async fn proxy_request_inner(
             .map_err(|_| "OpenAI request protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
             if let Some(response) = protected.local_response {
-                state
-                    .protected_request_observed
-                    .store(true, Ordering::Release);
                 if request_streaming {
                     return Ok(text_response(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "Plugin local responses are unavailable for streaming OpenAI requests",
                     ));
+                }
+                if request_was_fully_protected(request_coverage) {
+                    state
+                        .protected_request_observed
+                        .store(true, Ordering::Release);
                 }
                 return Ok(json_response(StatusCode::OK, response));
             }
@@ -587,7 +589,7 @@ async fn proxy_request_inner(
         reqwest::Body::wrap_stream(stream)
     };
 
-    if (protected_request && inspect_protected_request) || files_upload || audio_upload {
+    if request_was_fully_protected(request_coverage) {
         state
             .protected_request_observed
             .store(true, Ordering::Release);
@@ -748,6 +750,10 @@ async fn proxy_request_inner(
     builder
         .body(full_body(response_body))
         .map_err(|error| format!("could not build OpenAI response: {error}"))
+}
+
+fn request_was_fully_protected(coverage: Option<crate::http_files::Coverage>) -> bool {
+    coverage == Some(crate::http_files::Coverage::Full)
 }
 
 fn run_response_plugins(
@@ -3904,6 +3910,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_protected_route_does_not_count_as_observed_protection() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{}/responses", proxy.base_url()))
+            .body(Vec::new())
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+        assert!(!proxy.protected_request_observed());
+    }
+
+    #[test]
     fn provider_boundary_masks_chat_requests_and_restores_local_assistant_output() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -4513,6 +4536,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(protected.coverage, crate::http_files::Coverage::Partial);
+        assert!(!request_was_fully_protected(Some(protected.coverage)));
         let protected = String::from_utf8(protected.body.to_vec()).unwrap();
         assert!(!protected.contains(&secret));
         assert!(protected.contains("<<"));
@@ -5264,6 +5288,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
+        assert!(!request_was_fully_protected(Some(allowed.coverage)));
         assert_eq!(allowed.body, body);
     }
 

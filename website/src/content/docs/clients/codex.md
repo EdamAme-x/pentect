@@ -116,6 +116,8 @@ events from previous sessions as well as live protection events.
 After launch, use a non-sensitive test prompt first. Pentect reports active
 protection only after the App sends a supported request through the gateway. A
 listening gateway by itself is not proof that the App is routed through it.
+See [Compatibility](/reference/compatibility/) for the routes and client modes
+covered by this status.
 
 ## Verify protection
 
