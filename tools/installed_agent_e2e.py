@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -483,6 +484,14 @@ else:
                 "ANTHROPIC_API_KEY": "local-fixture",
                 "PENTECT_LOG_DIR": str(root / "logs"),
             })
+            if os.name == "nt" and client == "claude":
+                git_bash = shutil.which("bash.exe") or shutil.which("bash")
+                if git_bash is None:
+                    raise RuntimeError(
+                        "claude E2E requires Git Bash on Windows, but bash.exe "
+                        "was not found on PATH"
+                    )
+                environment["CLAUDE_CODE_GIT_BASH_PATH"] = git_bash
             command = client_command(
                 pentect,
                 client,
