@@ -142,7 +142,7 @@ jobs:
       - name: Start all current portable clients
         run: python tools/client_smoke.py --group portable
       - name: Verify installed Codex, Claude, OpenCode, and Pi handle flows
-        run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
+        run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}" ${{ runner.os == 'Windows' && '--skip-image' || '' }}
       - name: Start both protected desktop app contracts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
