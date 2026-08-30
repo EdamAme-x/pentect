@@ -19,7 +19,6 @@ from pathlib import Path
 
 
 HANDLE = re.compile(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>")
-ENV_HANDLE = re.compile(r"<<(?:FIRST_KEY|SECOND_KEY)_[0-9a-f]{16}>>")
 
 
 def response_object(response_id: str, output: list[dict[str, object]]) -> dict[str, object]:
@@ -267,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                 isinstance(tool, dict) and tool.get("name") == "Bash"
                 for tool in parsed.get("tools", [])
             )
-            handles = list(dict.fromkeys(ENV_HANDLE.findall(request)))
+            handles = list(dict.fromkeys(HANDLE.findall(request)))
             attempts = len(self.server.state.service_attempts)
             if not bash_enabled:
                 action = "text:no-bash"
