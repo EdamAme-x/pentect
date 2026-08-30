@@ -3952,9 +3952,9 @@ mod tests {
             .unwrap();
         let arguments: Value = serde_json::from_str(arguments).unwrap();
         let command = arguments["command"].as_str().unwrap();
-        assert!(!command.contains(&secret), "{command}");
+        assert_eq!(command, format!("echo {secret}"));
         assert!(!command.contains(&handle), "{command}");
-        assert!(command.contains("script-b64"), "{command}");
+        assert!(!command.contains("pentect exec"), "{command}");
     }
 
     #[test]
