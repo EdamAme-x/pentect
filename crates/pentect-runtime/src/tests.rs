@@ -3823,6 +3823,30 @@ fn file_pointer_manager_uses_project_root_across_nested_working_directories() {
 }
 
 #[test]
+fn plugin_runtime_storage_uses_project_root_across_nested_working_directories() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("plugin-runtime-project-root");
+    let _cwd = enter_temp_cwd(&root);
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let nested = root.join("src/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let plugin = format!("nested-runtime-{}", std::process::id());
+
+    let from_root = plugin_runtime_dirs(&plugin).unwrap();
+    std::env::set_current_dir(&nested).unwrap();
+    let from_nested = plugin_runtime_dirs(&plugin).unwrap();
+
+    assert_eq!(from_nested.data_dir, from_root.data_dir);
+    assert_eq!(from_nested.cache_dir, from_root.cache_dir);
+    assert_eq!(from_nested.config_file, from_root.config_file);
+    assert!(!nested.join(".pentect").exists());
+
+    let _ = std::fs::remove_dir_all(&from_root.data_dir);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn file_pointer_manager_refuses_changed_source_file() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-changed");

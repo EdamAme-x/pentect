@@ -3794,7 +3794,7 @@ fn plugin_rows() -> Result<Vec<PluginRow>, String> {
         "project",
     )?);
     rows.extend(plugin_rows_in(
-        Path::new("plugins").to_path_buf(),
+        plugins::official_plugins_root().map_err(|error| error.to_string())?,
         "official",
     )?);
     Ok(rows)
