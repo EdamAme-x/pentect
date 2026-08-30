@@ -568,9 +568,24 @@ pub(crate) fn run_anthropic_inline_file_stages(
     provider: &str,
     transport: &str,
 ) -> Result<bool, String> {
+    run_anthropic_inline_file_stages_with(value, provider, transport, |stage, payload, context| {
+        plugins.run(stage, payload, context)
+    })
+}
+
+fn run_anthropic_inline_file_stages_with(
+    value: &serde_json::Value,
+    provider: &str,
+    transport: &str,
+    run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        serde_json::Value,
+        Option<serde_json::Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<bool, String> {
     let mut files = Vec::new();
     collect_anthropic_inline_files(value, &mut files);
-    run_inline_file_stages(files, plugins, provider, transport)
+    run_inline_file_stages_with(files, provider, transport, run)
 }
 
 pub(crate) fn run_google_inline_file_stages(
@@ -590,9 +605,24 @@ fn run_inline_file_stages(
     provider: &str,
     transport: &str,
 ) -> Result<bool, String> {
+    run_inline_file_stages_with(files, provider, transport, |stage, payload, context| {
+        plugins.run(stage, payload, context)
+    })
+}
+
+fn run_inline_file_stages_with(
+    files: Vec<InlineFileMetadata>,
+    provider: &str,
+    transport: &str,
+    mut run: impl FnMut(
+        pentect_agent::MiddlewareStage,
+        serde_json::Value,
+        Option<serde_json::Value>,
+    ) -> Result<pentect_agent::MiddlewareRun, String>,
+) -> Result<bool, String> {
     let mut partial = false;
     for file in files {
-        let run = plugins.run(
+        let run = run(
             pentect_agent::MiddlewareStage::File,
             serde_json::json!({
                 "filename": file.filename,
@@ -630,7 +660,7 @@ fn collect_anthropic_inline_files(value: &serde_json::Value, output: &mut Vec<In
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            if matches!(kind, "document" | "image") {
+            if matches!(kind, "document" | "image" | "file") {
                 if let Some(source) = object.get("source").and_then(serde_json::Value::as_object) {
                     if source.get("type").and_then(serde_json::Value::as_str) == Some("base64") {
                         push_inline_file(
@@ -1742,6 +1772,12 @@ mod tests {
                 {"type": "document", "file_name": "notes.txt",
                     "media_type": "text/plain", "file_data": "YWJj"
                 },
+                {"type": "file", "file_name": "claude-app.txt",
+                    "file_data": "data:text/plain;base64,aGVsbG8="
+                },
+                {"type": "profile", "file_name": "not-a-file.txt",
+                    "file_data": "data:text/plain;base64,aGlkZGVu"
+                },
                 {"type": "image", "image_url": "https://example.com/not-inline.png"},
                 {"type": "tool_use", "input": {"type": "document", "source": {
                     "type": "base64", "data": "aGlkZGVu"
@@ -1768,8 +1804,74 @@ mod tests {
                     media_type: "text/plain".to_string(),
                     size: 3,
                 },
+                InlineFileMetadata {
+                    filename: Some("claude-app.txt".to_string()),
+                    media_type: "text/plain".to_string(),
+                    size: 5,
+                },
             ]
         );
+    }
+
+    #[test]
+    fn claude_app_inline_file_reaches_file_middleware_with_partial_coverage() {
+        let value = serde_json::json!({
+            "messages": [{"content": [{
+                "type": "file",
+                "file_name": "notes.txt",
+                "file_data": "data:text/plain;base64,aGVsbG8="
+            }]}]
+        });
+        let mut calls = 0;
+        let partial = run_anthropic_inline_file_stages_with(
+            &value,
+            "claude",
+            "desktop_http_json",
+            |stage, payload, context| {
+                calls += 1;
+                assert_eq!(stage, pentect_agent::MiddlewareStage::File);
+                assert_eq!(payload["filename"], "notes.txt");
+                assert_eq!(payload["media_type"], "text/plain");
+                assert_eq!(payload["size"], 5);
+                let context = context.unwrap();
+                assert_eq!(context["provider"], "claude");
+                assert_eq!(context["transport"], "desktop_http_json");
+                assert_eq!(context["inline"], true);
+                assert_eq!(context["encoding"], "base64");
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Partial,
+                    stopped: None,
+                    message: None,
+                })
+            },
+        )
+        .unwrap();
+        assert!(partial);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn claude_app_inline_file_honors_file_middleware_stop() {
+        let value = serde_json::json!({
+            "type": "file",
+            "file_data": "data:application/pdf;base64,aGVsbG8="
+        });
+        let error = run_anthropic_inline_file_stages_with(
+            &value,
+            "claude",
+            "desktop_http_json",
+            |_stage, payload, _context| {
+                Ok(pentect_agent::MiddlewareRun {
+                    payload,
+                    coverage: pentect_agent::MiddlewareCoverage::Full,
+                    stopped: Some(pentect_agent::StopOutcome::Block),
+                    message: Some("test policy".to_string()),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "file upload blocked: test policy");
     }
 
     #[test]
