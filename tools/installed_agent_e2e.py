@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import io
 import json
 import os
 import re
@@ -417,62 +419,204 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_failed_setup_rolls_back(
             pentect, root, home, project, environment
         )
-        verify_plugin_startup_failure_modes(pentect, root, project, environment)
+        verify_installed_command_failure_boundaries(pentect, root, project, environment)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
-            "add/setup/update/reinstall/remove, failed-setup rollback, no log plaintext"
+            "add/setup/update/reinstall/remove, failed-setup rollback, Command runtime "
+            "fail-closed boundaries and process cleanup, no log plaintext"
         )
 
 
-def verify_plugin_startup_failure_modes(
+def verify_installed_command_failure_boundaries(
     pentect: str,
     root: Path,
     project: Path,
     environment: dict[str, str],
 ) -> None:
-    for required in (False, True):
-        plugin = root / ("required-broken-plugin" if required else "optional-broken-plugin")
-        plugin.mkdir()
-        (plugin / "plugin.toml").write_text(
-            f'''schema = "pentect.plugin.v1"
-name = "{'required' if required else 'optional'}-broken-plugin"
-command = ["missing-pentect-plugin-command"]
+    plugin = root / "command-failure-plugin"
+    plugin.mkdir()
+    manifest = plugin / "plugin.toml"
+    script = plugin / "server.py"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "command-failure-e2e"
+command = ["python", "{plugin}/server.py"]
 hooks = ["inspect"]
-required = {str(required).lower()}
+required = true
 
 [execution]
-timeout_ms = 0
-''',
-            encoding="utf-8",
+timeout_ms = 1000
+startup_timeout_ms = 1000
+max_output_bytes = 1024
+'''
+    script_source = r'''import json
+import os
+import subprocess
+import sys
+import time
+
+for line in sys.stdin:
+    request = json.loads(line)
+    mode = request.get("config", {}).get("mode", "valid")
+    if mode == "invalid-json":
+        print("not-json", flush=True)
+    elif mode == "oversized":
+        print("x" * 2048, flush=True)
+    elif mode == "timeout":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        with open("timeout-pids.json", "w", encoding="utf-8") as marker:
+            json.dump([os.getpid(), child.pid], marker)
+        time.sleep(30)
+    elif mode == "exit":
+        sys.exit(17)
+    else:
+        print(json.dumps({
+            "schema": "pentect.plugin.v1",
+            "id": request["id"],
+            "type": "result",
+            "action": "next",
+            "spans": [],
+        }, separators=(",", ":")), flush=True)
+'''
+    manifest.write_text(manifest_source, encoding="utf-8")
+    script.write_text(script_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+
+    def set_mode(mode: str) -> None:
+        run_pentect(
+            pentect,
+            ["plugins", "config", "command-failure-e2e", f"mode={mode}", "--project"],
+            cwd=project,
+            environment=environment,
         )
+
+    def expect_mask_failure(reason: str) -> None:
         completed = subprocess.run(
-            pentect_command(
-                pentect,
-                ["mask", "--plugins", str(plugin)],
-            ),
+            pentect_command(pentect, ["mask"]),
             cwd=project,
             env=environment,
-            input="ordinary plugin failure fixture",
+            input="ordinary command plugin fixture",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=30,
         )
-        if required:
-            if completed.returncode == 0 or "execution limits" not in completed.stdout:
-                raise RuntimeError(
-                    "required broken plugin did not fail closed:\n" + completed.stdout
-                )
-        else:
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    "optional broken plugin aborted Pentect:\n" + completed.stdout
-                )
-            if "optional plugin 'optional-broken-plugin' skipped during startup" not in completed.stdout:
-                raise RuntimeError(
-                    "optional broken plugin did not emit its startup reason:\n"
-                    + completed.stdout
-                )
+        if completed.returncode == 0 or reason not in completed.stdout:
+            raise RuntimeError(
+                f"required command plugin did not fail closed with {reason!r}:\n"
+                + completed.stdout
+            )
+
+    set_mode("valid")
+    run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin="ordinary command plugin fixture",
+    )
+    for mode, reason in (
+        ("invalid-json", "returned invalid JSON"),
+        ("oversized", "response exceeds its limit"),
+        ("exit", "closed stdout"),
+        ("timeout", "command startup timed out"),
+    ):
+        set_mode(mode)
+        expect_mask_failure(reason)
+
+    timeout_pids = json.loads((plugin / "timeout-pids.json").read_text(encoding="utf-8"))
+    for pid in timeout_pids:
+        if process_exists(pid):
+            raise RuntimeError(f"timed-out command plugin process {pid} was not terminated")
+
+    set_mode("valid")
+    manifest.write_text(
+        manifest_source.replace(
+            'name = "command-failure-e2e"\n',
+            'name = "command-failure-e2e"\ndescription = "changed"\n',
+        ),
+        encoding="utf-8",
+    )
+    expect_mask_failure("changed after approval")
+    manifest.write_text(manifest_source, encoding="utf-8")
+
+    script.write_text(script_source + "\n# changed after setup\n", encoding="utf-8")
+    expect_mask_failure("changed after setup")
+    script.write_text(script_source, encoding="utf-8")
+    script.unlink()
+    expect_mask_failure("is unavailable")
+
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "command-failure-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+    optional = root / "optional-command-failure-plugin"
+    optional.mkdir()
+    optional_manifest = manifest_source.replace(
+        'name = "command-failure-e2e"',
+        'name = "optional-command-failure-e2e"',
+    ).replace("required = true", "required = false")
+    (optional / "plugin.toml").write_text(optional_manifest, encoding="utf-8")
+    optional_script = optional / "server.py"
+    optional_script.write_text(script_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(optional), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    optional_script.unlink()
+    completed = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin="ordinary optional command plugin fixture",
+    )
+    if (
+        "optional plugin 'optional-command-failure-e2e' skipped during startup"
+        not in completed.stdout
+        or "is unavailable" not in completed.stdout
+    ):
+        raise RuntimeError(
+            "optional installed command failure did not expose its reason:\n"
+            + completed.stdout
+        )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "optional-command-failure-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
+def process_exists(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    completed = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+    )
+    return any(
+        len(row) > 1 and row[1] == str(pid)
+        for row in csv.reader(io.StringIO(completed.stdout))
+    )
 
 
 def tool_response(sequence: int, source: str) -> bytes:
