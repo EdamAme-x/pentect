@@ -1300,6 +1300,22 @@ mod tests {
     }
 
     #[test]
+    fn json_key_component_values_are_masked_and_recoverable() {
+        let input = r#"{"signing_key":"signing-material","masterKey":"master-material","encryption-key":"encryption-material","deploy_key":"deploy-material","public_key":"visible","correlation_key":"request-id","monkey_value":"banana"}"#;
+        let result = mj(input);
+        let value: serde_json::Value =
+            serde_json::from_str(&result.masked).expect("masked output is valid JSON");
+        let object = value.as_object().unwrap();
+        for key in ["signing_key", "masterKey", "encryption-key", "deploy_key"] {
+            assert!(object[key].as_str().unwrap().starts_with("<<"), "{key}");
+        }
+        assert_eq!(object["public_key"].as_str().unwrap(), "visible");
+        assert_eq!(object["correlation_key"].as_str().unwrap(), "request-id");
+        assert_eq!(object["monkey_value"].as_str().unwrap(), "banana");
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn low_entropy_credential_classes_are_covered_across_text_env_and_logs() {
         let cases = [
             (Kind::Text, "my password is letmein", vec!["letmein"]),

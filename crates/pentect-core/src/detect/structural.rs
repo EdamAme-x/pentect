@@ -289,7 +289,7 @@ pub(crate) fn is_sensitive_key_name(key: &str) -> bool {
     if is_explicitly_non_sensitive_key(&name) || is_non_credential_sensitive_word_name(&name) {
         return false;
     }
-    name == "key"
+    name.split('_').any(|part| part == "key")
         || name == "auth"
         || name == "authorization"
         || name.contains("auth_")
@@ -1032,10 +1032,17 @@ mod tests {
             "export MAILGUN_API_KEY='mail gun value'; npx server\n",
             "PUBLIC_MODE=development app\n",
             "FOO=bar SQUARE_ACCESS_TOKEN=SquareValue node app.js\n",
+            "SIGNING_KEY=signing-material service\n",
+            "PUBLIC_KEY=visible-material service\n",
         );
         assert_eq!(
             shell_env_values(raw),
-            ["SyntheticValue", "mail gun value", "SquareValue"]
+            [
+                "SyntheticValue",
+                "mail gun value",
+                "SquareValue",
+                "signing-material",
+            ]
         );
     }
 
@@ -1365,6 +1372,39 @@ mod tests {
             sensitive_key_fires(Some("password"), "correct horse battery staple"),
             Some("PASSWORD".to_string())
         );
+    }
+
+    #[test]
+    fn key_components_are_sensitive_unless_explicitly_non_secret() {
+        for key in [
+            "signing_key",
+            "masterKey",
+            "encryption-key",
+            "deploy_key",
+            "key_material",
+        ] {
+            assert!(is_sensitive_key_name(key), "{key}");
+            assert!(
+                sensitive_key_fires(Some(key), "opaque-material-1341").is_some(),
+                "{key}"
+            );
+        }
+        for key in [
+            "public_key",
+            "correlation_key",
+            "foreign_key",
+            "routing_key",
+            "topology_key",
+            "api_key_name",
+            "monkey_value",
+        ] {
+            assert!(!is_sensitive_key_name(key), "{key}");
+            assert_eq!(
+                sensitive_key_fires(Some(key), "visible-material"),
+                None,
+                "{key}"
+            );
+        }
     }
 
     #[test]
