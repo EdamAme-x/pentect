@@ -1093,6 +1093,9 @@ def main() -> int:
     parser.add_argument("--skip-image", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
     args = parser.parse_args()
+    candidate = Path(args.pentect)
+    if candidate.is_file():
+        args.pentect = str(candidate.resolve())
     if args.plugin_lifecycle_only:
         run_plugin_lifecycle(args.pentect)
         return 0
