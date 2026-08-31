@@ -2446,6 +2446,10 @@ fn memory_store_startup_failure(
 
 impl MemoryStoreGuard {
     fn start(pentect: &Path) -> Result<Self, String> {
+        // Resolve every required location before spawning the long-lived child.
+        // `Child` does not kill the process when dropped, so a later `?` would
+        // otherwise leave a memory store behind after reporting startup failure.
+        let process_host_root = process_host_root()?;
         if let (Some(addr), Some(token), Some(launch_proof)) = (
             std::env::var_os(PENTECT_MEMORY_STORE_ADDR_ENV),
             std::env::var_os(PENTECT_MEMORY_STORE_TOKEN_ENV),
@@ -2454,7 +2458,6 @@ impl MemoryStoreGuard {
             let addr = addr.to_string_lossy().to_string();
             let token = token.to_string_lossy().to_string();
             let launch_proof = launch_proof.to_string_lossy();
-            let process_host_root = process_host_root()?;
             if !addr.is_empty()
                 && valid_runtime_token(&token)
                 && launch_proof == token
@@ -2542,7 +2545,6 @@ impl MemoryStoreGuard {
                 return Err(error.to_string());
             }
         };
-        let process_host_root = process_host_root()?;
         let process_host_candidate = match pentect_agent::register_process_host_candidate(
             &process_host_root,
             &addr,
@@ -4125,6 +4127,32 @@ mod tests {
         let (reason, action) = classify_memory_store_startup_stderr(b"unexpected child crash");
         assert_eq!(reason, "child-exited");
         assert!(action.contains("pentect log"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn memory_store_resolves_process_host_storage_before_spawning_child() {
+        let _lock = TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _environment = EnvVarGuard::set_optional([
+            ("HOME", None),
+            ("XDG_RUNTIME_DIR", None),
+            ("XDG_CACHE_HOME", None),
+        ]);
+        let missing_executable = Path::new("/pentect-test-binary-must-not-be-spawned");
+
+        let error = match MemoryStoreGuard::start(missing_executable) {
+            Ok(_) => panic!("memory store unexpectedly started"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("could not locate the user cache directory"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("could not start Pentect memory store"),
+            "{error}"
+        );
     }
 
     #[test]
