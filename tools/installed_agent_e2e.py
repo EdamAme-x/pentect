@@ -389,6 +389,75 @@ command = ["python", "-c", "import sys; sys.exit(17)"]
         raise RuntimeError("failed plugin setup remained enabled")
 
 
+def verify_home_rooted_project_storage_boundary(pentect: str) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="pentect-plugin-e2e-home-project-", ignore_cleanup_errors=True
+    ) as raw_home:
+        home = Path(raw_home)
+        (home / ".git").mkdir()
+        plugin = home / "optional-home-plugin"
+        plugin.mkdir()
+        manifest = plugin / "plugin.toml"
+        script = plugin / "server.py"
+        manifest_source = '''schema = "pentect.plugin.v1"
+name = "optional-home-storage-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = false
+'''
+        manifest.write_text(manifest_source, encoding="utf-8")
+        script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        config_dir = home / ".pentect"
+        config_dir.mkdir()
+        (config_dir / "config.toml").write_text(
+            f"plugins = [{json.dumps(str(plugin))}]\n", encoding="utf-8"
+        )
+        environment = isolated_environment(home, home / "logs")
+        ordinary = "ordinary HOME-rooted project fixture"
+        optional = run_pentect(
+            pentect,
+            ["mask"],
+            cwd=home,
+            environment=environment,
+            stdin=ordinary,
+        )
+        if (
+            ordinary not in optional.stdout
+            or "optional plugin 'optional-home-storage-e2e' skipped during startup"
+            not in optional.stdout
+            or "Pentect plugin data directory must be outside the project"
+            not in optional.stdout
+        ):
+            raise RuntimeError(
+                "optional HOME-rooted project plugin did not fail open with its reason:\n"
+                + optional.stdout
+            )
+
+        manifest.write_text(
+            manifest_source.replace("required = false", "required = true"),
+            encoding="utf-8",
+        )
+        required = subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=home,
+            env=environment,
+            input=ordinary,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if (
+            required.returncode == 0
+            or "Pentect plugin data directory must be outside the project"
+            not in required.stdout
+        ):
+            raise RuntimeError(
+                "required HOME-rooted project plugin did not fail closed with its reason:\n"
+                + required.stdout
+            )
+
+
 def verify_interrupted_setup_rolls_back(
     pentect: str,
     root: Path,
@@ -545,10 +614,12 @@ def run_plugin_lifecycle(pentect: str) -> None:
             pentect, root, home, project, environment
         )
         verify_installed_command_failure_boundaries(pentect, root, project, environment)
+        verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
             "add/setup/update/reinstall/remove, failed/interrupted-setup rollback, Command runtime "
-            "fail-closed boundaries and process cleanup, no log plaintext"
+            "fail-closed boundaries and process cleanup, HOME-rooted optional/required storage "
+            "boundaries, no log plaintext"
         )
 
 
