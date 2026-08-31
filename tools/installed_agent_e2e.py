@@ -123,7 +123,7 @@ def install_detector_plugin(
     root: Path,
     project: Path,
     environment: dict[str, str],
-) -> None:
+) -> Path:
     plugin = root / "plugin"
     plugin.mkdir()
     (plugin / "plugin.toml").write_text(
@@ -138,6 +138,28 @@ confidence = "high"
 """,
         encoding="utf-8",
     )
+    inspected = run_pentect(
+        pentect,
+        ["plugins", "inspect", str(plugin), "--json"],
+        cwd=project,
+        environment=environment,
+    )
+    inspection = json.loads(inspected.stdout)
+    if (
+        inspection.get("name") != "agent-e2e-plugin"
+        or inspection.get("form") != "manifest"
+        or len(inspection.get("configs", [])) != 1
+    ):
+        raise RuntimeError("plugin inspect did not describe the fixture: " + inspected.stdout)
+    tested = run_pentect(
+        pentect,
+        ["plugins", "test", str(plugin), "--json"],
+        cwd=project,
+        environment=environment,
+    )
+    checks = json.loads(tested.stdout).get("checks", [])
+    if not checks or any(check.get("status") != "ok" for check in checks):
+        raise RuntimeError("plugin test did not validate the fixture: " + tested.stdout)
     added = run_pentect(
         pentect,
         ["plugins", "add", str(plugin), "--project", "--yes"],
@@ -156,6 +178,39 @@ confidence = "high"
     )
     if "agent-e2e-plugin: project ok configs=1 binary=no" not in listed.stdout:
         raise RuntimeError("installed project plugin was not active")
+    setup = run_pentect(
+        pentect,
+        ["plugins", "setup", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    if "verified: manifest-only plugin" not in setup.stdout:
+        raise RuntimeError("plugin setup did not verify the installed fixture")
+    updated = run_pentect(
+        pentect,
+        ["plugins", "update", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    if "update: refreshed manifest for agent-e2e-plugin" not in updated.stdout:
+        raise RuntimeError("plugin update did not refresh the installed fixture")
+    reinstalled = run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    if "enabled:" not in reinstalled.stdout:
+        raise RuntimeError("plugin reinstall did not remain idempotent")
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if listed.stdout.count("agent-e2e-plugin: project ok configs=1 binary=no") != 1:
+        raise RuntimeError("plugin reinstall duplicated project state")
+    return plugin
 
 
 def remove_detector_plugin(
@@ -202,20 +257,149 @@ def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
         "XDG_STATE_HOME": str(home / ".local" / "state"),
         "PENTECT_LOG_DIR": str(log_dir),
     })
+    if os.name == "nt":
+        local_app_data = home / "AppData" / "Local"
+        roaming_app_data = home / "AppData" / "Roaming"
+        local_app_data.mkdir(parents=True)
+        roaming_app_data.mkdir(parents=True)
+        environment.update({
+            "LOCALAPPDATA": str(local_app_data),
+            "APPDATA": str(roaming_app_data),
+        })
     return environment
+
+
+def snapshot_regular_files(*roots: Path) -> dict[str, bytes]:
+    snapshot: dict[str, bytes] = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file():
+                snapshot[f"{root.name}/{path.relative_to(root)}"] = path.read_bytes()
+    return snapshot
+
+
+def verify_user_scope_lifecycle(
+    pentect: str,
+    plugin: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    project_before = snapshot_regular_files(project)
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "agent-e2e-plugin: user ok configs=1 binary=no" not in listed.stdout:
+        raise RuntimeError("installed user plugin was not active")
+    masked = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=PLUGIN_PLAINTEXT,
+    )
+    if PLUGIN_PLAINTEXT in masked.stdout or not PLUGIN_HANDLE.search(masked.stdout):
+        raise RuntimeError("installed user plugin did not protect its fixture")
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "agent-e2e-plugin"],
+        cwd=project,
+        environment=environment,
+    )
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "agent-e2e-plugin:" in listed.stdout:
+        raise RuntimeError("removed user plugin remained active")
+    if snapshot_regular_files(project) != project_before:
+        raise RuntimeError("user plugin lifecycle changed project-scoped files")
+
+
+def verify_failed_setup_rolls_back(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "failed-setup-plugin"
+    plugin.mkdir()
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "failed-setup-e2e"
+command = ["python", "-c", "import sys; sys.exit(0)"]
+hooks = ["inspect"]
+
+[setup]
+command = ["python", "-c", "import sys; sys.exit(17)"]
+''',
+        encoding="utf-8",
+    )
+    before = snapshot_regular_files(home, project)
+    completed = subprocess.run(
+        pentect_command(
+            pentect,
+            ["plugins", "add", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+    if (
+        completed.returncode == 0
+        or "plugin environment setup failed with exit 17" not in completed.stdout
+    ):
+        raise RuntimeError(
+            "failed plugin setup did not report its exit status:\n" + completed.stdout
+        )
+    after = snapshot_regular_files(home, project)
+    if after != before:
+        changed = sorted(set(before) ^ set(after))
+        changed.extend(
+            path for path in sorted(set(before) & set(after)) if before[path] != after[path]
+        )
+        raise RuntimeError(
+            "failed plugin setup left partial persistent state: " + ", ".join(changed)
+        )
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "failed-setup-e2e:" in listed.stdout:
+        raise RuntimeError("failed plugin setup remained enabled")
 
 
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
-        prefix="pentect-plugin-e2e-", ignore_cleanup_errors=True
-    ) as raw_root:
+        prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
+    ) as raw_root, tempfile.TemporaryDirectory(
+        prefix="pentect-plugin-e2e-home-", ignore_cleanup_errors=True
+    ) as raw_home:
         root = Path(raw_root)
-        home = root / "home"
+        home = Path(raw_home)
         project = root / "project"
-        home.mkdir()
         project.mkdir()
+        (project / ".git").mkdir()
         environment = isolated_environment(home, root / "logs")
-        install_detector_plugin(pentect, root, project, environment)
+        plugin = install_detector_plugin(pentect, root, project, environment)
         masked = run_pentect(
             pentect,
             ["mask"],
@@ -229,8 +413,15 @@ def run_plugin_lifecycle(pentect: str) -> None:
         if PLUGIN_PLAINTEXT in logs:
             raise RuntimeError("plugin fixture plaintext reached persistent diagnostics")
         remove_detector_plugin(pentect, project, environment)
+        verify_user_scope_lifecycle(pentect, plugin, project, environment)
+        verify_failed_setup_rolls_back(
+            pentect, root, home, project, environment
+        )
         verify_plugin_startup_failure_modes(pentect, root, project, environment)
-        print("installed plugin lifecycle E2E passed: add, mask, remove, no log plaintext")
+        print(
+            "installed plugin lifecycle E2E passed: inspect, test, project/user "
+            "add/setup/update/reinstall/remove, failed-setup rollback, no log plaintext"
+        )
 
 
 def verify_plugin_startup_failure_modes(
@@ -854,8 +1045,9 @@ else:
                 raise RuntimeError("a synthetic plaintext key reached persistent diagnostics")
             remove_detector_plugin(pentect, project, environment)
             print(
-                f"installed {client} E2E passed: project plugin add/mask/remove, "
-                "two key handles, no model/log plaintext"
+                f"installed {client} E2E passed: project plugin "
+                "inspect/test/add/setup/update/reinstall/mask/remove, two key handles, "
+                "no model/log plaintext"
             )
     finally:
         server.shutdown()
