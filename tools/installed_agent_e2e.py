@@ -734,7 +734,8 @@ if len(list(workers.glob("*.worker"))) < 2:
     raise SystemExit(23)
 if role == "follower":
     release = workers / "release"
-    while not release.exists() and time.monotonic() < deadline:
+    release_deadline = time.monotonic() + 15
+    while not release.exists() and time.monotonic() < release_deadline:
         time.sleep(0.02)
     if not release.exists():
         raise SystemExit(24)
@@ -811,7 +812,7 @@ for line in sys.stdin:
     if len(leaders) != 1 or len(followers) != 1:
         raise RuntimeError("concurrent command workers did not elect one leader and one follower")
     processes_by_pid = {process.pid: process for process in processes}
-    leader_worker, leader_data = leaders[0]
+    _, leader_data = leaders[0]
     follower_worker, follower_data = followers[0]
     leader = processes_by_pid.get(leader_data["parent"])
     follower = processes_by_pid.get(follower_data["parent"])
