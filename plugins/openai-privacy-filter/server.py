@@ -12,6 +12,7 @@ from typing import Any
 
 MAX_REQUEST_BYTES = 1024 * 1024
 PROTOCOL_SCHEMA = "pentect.plugin.v1"
+DEFAULT_CPU_MOE_BATCH_SIZE = 2
 
 
 def _use_managed_python() -> None:
@@ -103,6 +104,41 @@ def _label(value: object) -> tuple[str, str]:
     return (label or "PII", "secret" if raw.lower() == "secret" else "pii")
 
 
+def _cpu_moe_batch_size() -> int:
+    """Resolve the CPU MoE chunk size; zero explicitly disables chunking."""
+    raw = os.environ.get("PENTECT_OPF_CPU_MOE_BATCH_SIZE")
+    if raw is None:
+        return DEFAULT_CPU_MOE_BATCH_SIZE
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "PENTECT_OPF_CPU_MOE_BATCH_SIZE must be a non-negative integer"
+        ) from error
+    if value < 0:
+        raise ValueError(
+            "PENTECT_OPF_CPU_MOE_BATCH_SIZE must be a non-negative integer"
+        )
+    return value
+
+
+def configure_runtime(redactor: Any, device: str) -> Any:
+    """Load OPF and bound its CPU MoE working set without changing predictions."""
+    runtime = redactor.get_runtime()
+    if device != "cpu":
+        return runtime
+
+    batch_size = _cpu_moe_batch_size()
+    if batch_size == 0:
+        return runtime
+    blocks = getattr(getattr(runtime, "model", None), "block", ())
+    for block in blocks:
+        mlp = getattr(block, "mlp", None)
+        if mlp is not None and hasattr(mlp, "torch_ops_batch"):
+            mlp.torch_ops_batch = batch_size
+    return runtime
+
+
 def inspect_text(redactor: Any, text: str) -> list[dict[str, object]]:
     result = redactor.redact(text)
     if isinstance(result, str):
@@ -180,13 +216,14 @@ def main() -> None:
 
     from opf import OPF
 
+    device = _selected_device(args.device)
     redactor = OPF(
         model=_managed_checkpoint(args.checkpoint),
-        device=_selected_device(args.device),
+        device=device,
         output_mode="typed",
         output_text_only=False,
     )
-    redactor.get_runtime()
+    configure_runtime(redactor, device)
     serve(redactor)
 
 
