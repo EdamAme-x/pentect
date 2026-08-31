@@ -332,12 +332,16 @@ impl PluginMiddleware {
                 let id = id
                     .to_str()
                     .ok_or_else(|| "global plugin identity is not UTF-8".to_string())?;
-                plugins.push(PluginBinary::load_global(&path, id)?);
+                if let Some(plugin) = PluginBinary::load_from_environment(&path, Some(id))? {
+                    plugins.push(plugin);
+                }
             }
         }
         if let Some(value) = std::env::var_os(BINARIES_ENV) {
             for path in std::env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()) {
-                plugins.push(PluginBinary::load(&path)?);
+                if let Some(plugin) = PluginBinary::load_from_environment(&path, None)? {
+                    plugins.push(plugin);
+                }
             }
         }
         Ok(Self { plugins })
@@ -645,8 +649,17 @@ impl PluginBinary {
         Self::load_scoped(path, None)
     }
 
-    fn load_global(path: &Path, id: &str) -> Result<Self, String> {
-        Self::load_scoped(path, Some(id))
+    fn load_from_environment(path: &Path, global_id: Option<&str>) -> Result<Option<Self>, String> {
+        match Self::load_scoped(path, global_id) {
+            Ok(plugin) => Ok(Some(plugin)),
+            Err(error) => {
+                let Some(name) = optional_plugin_name(path) else {
+                    return Err(error);
+                };
+                eprintln!("[pentect] optional plugin '{name}' skipped during startup: {error}");
+                Ok(None)
+            }
+        }
     }
 
     fn load_scoped(path: &Path, global_id: Option<&str>) -> Result<Self, String> {
@@ -948,6 +961,19 @@ impl PluginBinary {
         }
         Ok(response)
     }
+}
+
+fn optional_plugin_name(path: &Path) -> Option<String> {
+    let source = read_bounded_utf8(path, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest").ok()?;
+    let file = toml::from_str::<PluginFile>(&source).ok()?;
+    if file.required {
+        return None;
+    }
+    Some(
+        file.name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| plugin_default_name(path)),
+    )
 }
 
 fn parse_declared_hooks(
@@ -3795,6 +3821,47 @@ fn plugin_id(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn invalid_startup_manifest(required: bool) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-optional-plugin-startup-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("plugin.toml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "schema = \"pentect.plugin.v1\"\nname = \"startup-fixture\"\ncommand = [\"missing-pentect-plugin-command\"]\nhooks = [\"inspect\"]\nrequired = {required}\n\n[execution]\ntimeout_ms = 0\n"
+            ),
+        )
+        .unwrap();
+        manifest
+    }
+
+    #[test]
+    fn environment_loading_skips_optional_plugin_initialization_failure() {
+        let manifest = invalid_startup_manifest(false);
+        let loaded = PluginBinary::load_from_environment(&manifest, None).unwrap();
+        assert!(loaded.is_none());
+
+        // Explicit validation remains strict even for an optional plugin.
+        let error = PluginBinary::load(&manifest).unwrap_err();
+        assert!(error.contains("execution limits"), "{error}");
+        let _ = std::fs::remove_dir_all(manifest.parent().unwrap());
+    }
+
+    #[test]
+    fn environment_loading_keeps_required_plugin_initialization_fail_closed() {
+        let manifest = invalid_startup_manifest(true);
+        let error = PluginBinary::load_from_environment(&manifest, None).unwrap_err();
+        assert!(error.contains("execution limits"), "{error}");
+        let _ = std::fs::remove_dir_all(manifest.parent().unwrap());
+    }
+
     fn oversized_output_command() -> Option<Vec<String>> {
         let bytes = HOST_MAX_COMMAND_STREAM_BYTES + 64 * 1024;
         python_protocol_fixture(&format!(
@@ -4393,7 +4460,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let global = PluginMiddleware {
-            plugins: vec![PluginBinary::load_global(&manifest, &global_id).unwrap()],
+            plugins: vec![PluginBinary::load_scoped(&manifest, Some(&global_id)).unwrap()],
         };
         let result = global.detect_spans(&Input::text("SECRET"), None).unwrap();
         assert_eq!(result.spans.len(), 1);
