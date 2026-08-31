@@ -1454,6 +1454,22 @@ mod tests {
     }
 
     #[test]
+    fn xml_sensitive_element_text_masks_and_restores_through_the_standard_engine() {
+        let input = "<config><password>correcthorsebattery</password><api_token>tenant7trial</api_token></config>";
+        let result = Engine::with_profile(Profile::Strict)
+            .mask(Input::text(input), &Config::insecure_testing());
+
+        assert!(
+            !result.masked.contains("correcthorsebattery"),
+            "{}",
+            result.masked
+        );
+        assert!(!result.masked.contains("tenant7trial"), "{}", result.masked);
+        assert_eq!(result.masked.matches("<<KEYED_SECRET_").count(), 2);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn public_identifiers_are_measured_separately_from_credential_context() {
         let input = concat!(
             "request_id=550e8400-e29b-41d4-a716-446655440000 ",
