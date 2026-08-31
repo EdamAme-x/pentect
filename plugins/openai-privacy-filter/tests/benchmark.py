@@ -102,16 +102,38 @@ def main() -> None:
     args = parser.parse_args()
     if args.iterations < 1 or any(size < 1 for size in args.sizes):
         parser.error("iterations and sizes must be positive")
+    if args.batch_size is not None and args.batch_size < 0:
+        parser.error("--batch-size must be non-negative")
+    if args.device != "cpu" and args.batch_size is not None:
+        parser.error("--batch-size requires --device cpu")
+    if args.compare_unchunked and args.device != "cpu":
+        parser.error("--compare-unchunked requires --device cpu")
 
     plugin = Path(__file__).parents[1] / "server.py"
     environment = os.environ.copy()
-    if args.batch_size is not None:
-        environment["PENTECT_OPF_CPU_MOE_BATCH_SIZE"] = str(args.batch_size)
+    effective_batch_size: int | None = None
+    if args.device == "cpu":
+        raw_batch_size = (
+            str(args.batch_size)
+            if args.batch_size is not None
+            else environment.get("PENTECT_OPF_CPU_MOE_BATCH_SIZE", "2")
+        )
+        try:
+            effective_batch_size = int(raw_batch_size)
+        except ValueError:
+            parser.error(
+                "PENTECT_OPF_CPU_MOE_BATCH_SIZE must be a non-negative integer"
+            )
+        if effective_batch_size < 0:
+            parser.error(
+                "PENTECT_OPF_CPU_MOE_BATCH_SIZE must be a non-negative integer"
+            )
+        environment["PENTECT_OPF_CPU_MOE_BATCH_SIZE"] = str(effective_batch_size)
     process = start_plugin(plugin, args.device, environment)
     report: dict[str, object] = {
         "schema": "pentect.opf-benchmark.v1",
         "device": args.device,
-        "batch_size": args.batch_size,
+        "batch_size": effective_batch_size,
         "iterations": args.iterations,
         "measurements": [],
     }
