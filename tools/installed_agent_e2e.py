@@ -21,6 +21,8 @@ from pathlib import Path
 
 
 HANDLE = re.compile(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>")
+PLUGIN_HANDLE = re.compile(r"<<PLUGIN_E2E_[0-9a-f]{16}>>")
+PLUGIN_PLAINTEXT = "PENTECT-PLUGIN-E2E-VALUE"
 IMAGE_SECRET = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
 IMAGE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/d"
@@ -74,6 +76,212 @@ def shell_command(arguments: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(arguments)
     return shlex.join(arguments)
+
+
+def pentect_command(pentect: str, arguments: list[str]) -> list[str]:
+    command = [pentect, *arguments]
+    if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
+        return [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/s",
+            "/c",
+            subprocess.list2cmdline(command),
+        ]
+    return command
+
+
+def run_pentect(
+    pentect: str,
+    arguments: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    stdin: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        pentect_command(pentect, arguments),
+        cwd=cwd,
+        env=environment,
+        input=stdin,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        output = completed.stdout.replace(PLUGIN_PLAINTEXT, "<plugin-fixture>")
+        raise RuntimeError(
+            f"Pentect {' '.join(arguments[:3])} exited with "
+            f"{completed.returncode}:\n{output}"
+        )
+    return completed
+
+
+def install_detector_plugin(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "plugin"
+    plugin.mkdir()
+    (plugin / "plugin.toml").write_text(
+        """schema = "pentect.plugin.v1"
+name = "agent-e2e-plugin"
+
+[[detector]]
+label = "PLUGIN_E2E"
+pattern = '''PENTECT-PLUGIN-E2E-VALUE'''
+category = "identifier"
+confidence = "high"
+""",
+        encoding="utf-8",
+    )
+    added = run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    if "verified: manifest-only plugin" not in added.stdout or "enabled:" not in added.stdout:
+        raise RuntimeError(
+            "plugin add did not verify and enable the fixture:\n" + added.stdout
+        )
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "agent-e2e-plugin: project ok configs=1 binary=no" not in listed.stdout:
+        raise RuntimeError("installed project plugin was not active")
+
+
+def remove_detector_plugin(
+    pentect: str,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "agent-e2e-plugin", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "agent-e2e-plugin:" in listed.stdout:
+        raise RuntimeError("removed project plugin remained active")
+    masked = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=PLUGIN_PLAINTEXT,
+    )
+    if PLUGIN_PLAINTEXT not in masked.stdout or PLUGIN_HANDLE.search(masked.stdout):
+        raise RuntimeError(
+            "removed project plugin still changed masking output: "
+            + repr(masked.stdout.strip())
+        )
+
+
+def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update({
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "PENTECT_LOG_DIR": str(log_dir),
+    })
+    return environment
+
+
+def run_plugin_lifecycle(pentect: str) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="pentect-plugin-e2e-", ignore_cleanup_errors=True
+    ) as raw_root:
+        root = Path(raw_root)
+        home = root / "home"
+        project = root / "project"
+        home.mkdir()
+        project.mkdir()
+        environment = isolated_environment(home, root / "logs")
+        install_detector_plugin(pentect, root, project, environment)
+        masked = run_pentect(
+            pentect,
+            ["mask"],
+            cwd=project,
+            environment=environment,
+            stdin=PLUGIN_PLAINTEXT,
+        )
+        if PLUGIN_PLAINTEXT in masked.stdout or not PLUGIN_HANDLE.search(masked.stdout):
+            raise RuntimeError("installed project plugin did not protect its fixture")
+        logs = (root / "logs" / "pentect.log").read_text(encoding="utf-8")
+        if PLUGIN_PLAINTEXT in logs:
+            raise RuntimeError("plugin fixture plaintext reached persistent diagnostics")
+        remove_detector_plugin(pentect, project, environment)
+        verify_plugin_startup_failure_modes(pentect, root, project, environment)
+        print("installed plugin lifecycle E2E passed: add, mask, remove, no log plaintext")
+
+
+def verify_plugin_startup_failure_modes(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    for required in (False, True):
+        plugin = root / ("required-broken-plugin" if required else "optional-broken-plugin")
+        plugin.mkdir()
+        (plugin / "plugin.toml").write_text(
+            f'''schema = "pentect.plugin.v1"
+name = "{'required' if required else 'optional'}-broken-plugin"
+command = ["missing-pentect-plugin-command"]
+hooks = ["inspect"]
+required = {str(required).lower()}
+
+[execution]
+timeout_ms = 0
+''',
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            pentect_command(
+                pentect,
+                ["mask", "--plugins", str(plugin)],
+            ),
+            cwd=project,
+            env=environment,
+            input="ordinary plugin failure fixture",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if required:
+            if completed.returncode == 0 or "execution limits" not in completed.stdout:
+                raise RuntimeError(
+                    "required broken plugin did not fail closed:\n" + completed.stdout
+                )
+        else:
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "optional broken plugin aborted Pentect:\n" + completed.stdout
+                )
+            if "optional plugin 'optional-broken-plugin' skipped during startup" not in completed.stdout:
+                raise RuntimeError(
+                    "optional broken plugin did not emit its startup reason:\n"
+                    + completed.stdout
+                )
 
 
 def tool_response(sequence: int, source: str) -> bytes:
@@ -550,6 +758,9 @@ def run_client(pentect: str, client: str) -> None:
             home.mkdir()
             project.mkdir()
             (project / ".env").write_text(f"FIRST_KEY={invalid}\nSECOND_KEY={valid}\n", encoding="utf-8")
+            (project / "plugin-input.txt").write_text(
+                PLUGIN_PLAINTEXT + "\n", encoding="utf-8"
+            )
             (project / "e2e_helper.py").write_text(
                 """from pathlib import Path
 import sys
@@ -557,6 +768,7 @@ import urllib.request
 
 if sys.argv[1] == "read":
     print(Path(".env").read_text(encoding="utf-8"))
+    print(Path("plugin-input.txt").read_text(encoding="utf-8"))
 elif sys.argv[1] == "probe":
     request = urllib.request.Request(
         sys.argv[2], data=b"", headers={"Authorization": f"Bearer {sys.argv[3]}"}
@@ -567,17 +779,10 @@ else:
 """,
                 encoding="utf-8",
             )
-            environment = os.environ.copy()
+            environment = isolated_environment(home, root / "logs")
             environment.update({
-                "HOME": str(home),
-                "USERPROFILE": str(home),
-                "XDG_CONFIG_HOME": str(home / ".config"),
-                "XDG_CACHE_HOME": str(home / ".cache"),
-                "XDG_DATA_HOME": str(home / ".local" / "share"),
-                "XDG_STATE_HOME": str(home / ".local" / "state"),
                 "OPENAI_API_KEY": "local-fixture",
                 "ANTHROPIC_API_KEY": "local-fixture",
-                "PENTECT_LOG_DIR": str(root / "logs"),
             })
             if os.name == "nt" and client == "claude":
                 git_bash = shutil.which("bash.exe") or shutil.which("bash")
@@ -587,6 +792,7 @@ else:
                         "was not found on PATH"
                     )
                 environment["CLAUDE_CODE_GIT_BASH_PATH"] = git_bash
+            install_detector_plugin(pentect, root, project, environment)
             command = client_command(
                 pentect,
                 client,
@@ -636,15 +842,20 @@ else:
             upstream = "\n".join(state.model_requests)
             if valid in upstream or invalid in upstream:
                 raise RuntimeError("a synthetic plaintext key reached the model simulator")
+            if PLUGIN_PLAINTEXT in upstream:
+                raise RuntimeError("plugin fixture plaintext reached the model simulator")
             if len(set(HANDLE.findall(upstream))) < 2:
                 raise RuntimeError("the model simulator did not receive two distinct handles")
+            if not PLUGIN_HANDLE.search(upstream):
+                raise RuntimeError("the model simulator did not receive the plugin handle")
             log_path = root / "logs" / "pentect.log"
             logs = log_path.read_text(encoding="utf-8")
-            if valid in logs or invalid in logs:
+            if valid in logs or invalid in logs or PLUGIN_PLAINTEXT in logs:
                 raise RuntimeError("a synthetic plaintext key reached persistent diagnostics")
+            remove_detector_plugin(pentect, project, environment)
             print(
-                f"installed {client} E2E passed: two handles, invalid then valid, "
-                "no model/log plaintext"
+                f"installed {client} E2E passed: project plugin add/mask/remove, "
+                "two key handles, no model/log plaintext"
             )
     finally:
         server.shutdown()
@@ -822,15 +1033,23 @@ def run_image_redaction(pentect: str) -> None:
                     "/c",
                     *command,
                 ]
-            completed = subprocess.run(
-                command,
-                cwd=project,
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=30,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=90,
+                )
+            except subprocess.TimeoutExpired as error:
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                raise RuntimeError(
+                    f"image E2E did not finish within 90 seconds:\n{output}"
+                ) from error
             if completed.returncode != 0:
                 raise RuntimeError(
                     f"image E2E exited with {completed.returncode}:\n{completed.stdout}"
@@ -880,7 +1099,14 @@ def main() -> int:
         dest="clients",
     )
     parser.add_argument("--skip-image", action="store_true")
+    parser.add_argument("--plugin-lifecycle-only", action="store_true")
     args = parser.parse_args()
+    candidate = Path(args.pentect)
+    if candidate.is_file():
+        args.pentect = str(candidate.resolve())
+    if args.plugin_lifecycle_only:
+        run_plugin_lifecycle(args.pentect)
+        return 0
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.
     for client in args.clients or ("claude", "codex", "opencode", "pi"):

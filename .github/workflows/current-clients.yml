@@ -33,6 +33,13 @@ jobs:
               - '.github/workflows/current-clients.yml'
               - '.github/workflows/release.yml'
               - 'crates/pentect-cli/src/client_descriptor.rs'
+              - 'crates/pentect-cli/src/plugins.rs'
+              - 'crates/pentect-cli/src/plugins_cmd.rs'
+              - 'crates/pentect-runtime/src/masking.rs'
+              - 'crates/pentect-runtime/src/plugin_middleware.rs'
+              - 'plugins/**'
+              - 'protocol/**'
+              - 'sdk/**'
               - 'crates/pentect-runtime/src/main.rs'
               - 'crates/pentect-runtime/src/tests.rs'
               - 'tools/client_smoke.py'
@@ -113,11 +120,11 @@ jobs:
           test "$installed" = "$latest"
           printf 'PENTECT_SMOKE_BINARY=%s\n' "$install_dir/pentect" >> "$GITHUB_ENV"
           printf 'PENTECT_AGENT_E2E_BINARY=%s\n' "$install_dir/pentect" >> "$GITHUB_ENV"
-      - name: Fetch candidate build dependencies (Windows PR)
-        if: github.event_name == 'pull_request' && runner.os == 'Windows'
+      - name: Fetch candidate build dependencies (PR)
+        if: github.event_name == 'pull_request'
         run: git submodule update --init --recursive
       - uses: ./.github/actions/rust-toolchain
-        if: github.event_name == 'pull_request' && runner.os == 'Windows'
+        if: github.event_name == 'pull_request'
       - name: Configure fast candidate linking (Windows PR)
         if: github.event_name == 'pull_request' && runner.os == 'Windows'
         shell: pwsh
@@ -126,7 +133,7 @@ jobs:
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
           "CARGO_PROFILE_DEV_DEBUG=0" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: github.event_name == 'pull_request' && runner.os == 'Windows'
+        if: github.event_name == 'pull_request'
         with:
           save-if: false
       - name: Build candidate Pentect for agent E2E (Windows PR)
@@ -137,6 +144,15 @@ jobs:
           $binary = Join-Path $PWD 'target\debug\pentect.exe'
           if (-not (Test-Path -LiteralPath $binary)) { throw 'candidate build did not produce pentect.exe' }
           "PENTECT_AGENT_E2E_BINARY=$binary" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build candidate Pentect for agent E2E (POSIX PR)
+        if: github.event_name == 'pull_request' && runner.os != 'Windows'
+        shell: sh
+        run: |
+          set -eu
+          cargo build -p pentect-cli --locked
+          binary="$GITHUB_WORKSPACE/target/debug/pentect"
+          test -x "$binary"
+          printf 'PENTECT_AGENT_E2E_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Install current portable clients
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
