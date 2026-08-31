@@ -149,7 +149,7 @@ jobs:
         shell: sh
         run: |
           set -eu
-          cargo build -p pentect-cli --no-default-features --locked
+          cargo build -p pentect-cli --locked
           binary="$GITHUB_WORKSPACE/target/debug/pentect"
           test -x "$binary"
           printf 'PENTECT_AGENT_E2E_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
