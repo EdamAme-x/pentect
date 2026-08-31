@@ -98,8 +98,148 @@ impl Detector for KeyValueDetector {
             line_start = line_end + 1;
         }
 
+        scan_xml_element_text(text, view, &mut out);
+
         out
     }
+}
+
+#[derive(Clone, Copy)]
+struct XmlOpenElement<'a> {
+    name: &'a str,
+    content_start: usize,
+    has_child: bool,
+}
+
+/// Treats leaf XML element text as a structured value whose key is the element
+/// name. The scanner is deliberately small and single-pass: it does not try to
+/// interpret XML entities or rewrite markup, and malformed nesting yields no
+/// element-text spans.
+fn scan_xml_element_text(text: &str, view: &NormalizedView<'_>, out: &mut Vec<Span>) {
+    let mut stack = Vec::<XmlOpenElement<'_>>::new();
+    let mut search = 0usize;
+
+    while let Some(relative) = text[search..].find('<') {
+        let tag_start = search + relative;
+        let Some(tag_end) = xml_tag_end(text, tag_start) else {
+            break;
+        };
+        let tag = &text[tag_start + 1..tag_end];
+        let trimmed = tag.trim();
+
+        if trimmed.starts_with(['!', '?']) {
+            if let Some(parent) = stack.last_mut() {
+                parent.has_child = true;
+            }
+            search = tag_end + 1;
+            continue;
+        }
+
+        let closing = trimmed.starts_with('/');
+        let body = if closing {
+            trimmed[1..].trim_start()
+        } else {
+            trimmed
+        };
+        let Some(name) = xml_element_name(body) else {
+            stack.clear();
+            search = tag_end + 1;
+            continue;
+        };
+
+        if closing {
+            let Some(open) = stack.pop() else {
+                search = tag_end + 1;
+                continue;
+            };
+            if open.name != name {
+                stack.clear();
+                search = tag_end + 1;
+                continue;
+            }
+            if !open.has_child {
+                push_xml_element_text(text, open, tag_start, view, out);
+            }
+        } else if !trimmed.ends_with('/') {
+            if let Some(parent) = stack.last_mut() {
+                parent.has_child = true;
+            }
+            stack.push(XmlOpenElement {
+                name,
+                content_start: tag_end + 1,
+                has_child: false,
+            });
+        }
+
+        search = tag_end + 1;
+    }
+}
+
+fn xml_tag_end(text: &str, tag_start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut quote = None;
+    let mut pos = tag_start + 1;
+    while pos < bytes.len() {
+        match (quote, bytes[pos]) {
+            (Some(active), current) if current == active => quote = None,
+            (None, b'\'' | b'"') => quote = Some(bytes[pos]),
+            (None, b'>') => return Some(pos),
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn xml_element_name(body: &str) -> Option<&str> {
+    let end = body
+        .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '/' | '>'))
+        .unwrap_or(body.len());
+    let name = &body[..end];
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    ((first == '_' || first.is_alphabetic())
+        && chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')))
+    .then_some(name)
+}
+
+fn push_xml_element_text(
+    text: &str,
+    open: XmlOpenElement<'_>,
+    content_end: usize,
+    view: &NormalizedView<'_>,
+    out: &mut Vec<Span>,
+) {
+    let semantic_name = open.name.rsplit(':').next().unwrap_or(open.name);
+    let Some(kind) = sensitive_key_kind(semantic_name) else {
+        return;
+    };
+    let raw = &text[open.content_start..content_end];
+    let leading = raw.len() - raw.trim_start().len();
+    let value_start = open.content_start + leading;
+    let value_end = open.content_start + raw.trim_end().len();
+    if value_start >= value_end {
+        return;
+    }
+    let value = &text[value_start..value_end];
+    let key_name = normalize_key(semantic_name);
+    if !looks_like_secret_value(
+        value,
+        kind,
+        true,
+        Separator::Assignment,
+        &key_name,
+        semantic_name,
+    ) {
+        return;
+    }
+    out.push(Span {
+        range: view.to_raw(ByteRange::new(value_start, value_end)),
+        category: Category::Secret,
+        label: labels::KEYED_SECRET.to_string(),
+        confidence: Confidence::Medium,
+        source: DetectorId::KeyValue,
+    });
 }
 
 fn scan_line(
@@ -7493,6 +7633,56 @@ mod tests {
 
         let wrapped_pat = "<<ghp_Ab3dE5fGh7Jk9Lm2Np4Qr6St8Uv1Wx3Yz5Bc>>";
         assert!(has(&format!("password={wrapped_pat}"), wrapped_pat));
+    }
+
+    #[test]
+    fn masks_sensitive_xml_leaf_element_text() {
+        for (input, value) in [
+            (
+                "<password>correcthorsebattery</password>",
+                "correcthorsebattery",
+            ),
+            (
+                "<api_token>correcthorsebattery</api_token>",
+                "correcthorsebattery",
+            ),
+            (
+                "<secret>correcthorsebattery</secret>",
+                "correcthorsebattery",
+            ),
+            (
+                "<cfg:api_token>tenant7trial</cfg:api_token>",
+                "tenant7trial",
+            ),
+            (
+                "<password>\n  correcthorsebattery\n</password>",
+                "correcthorsebattery",
+            ),
+            ("<パスワード>tenant7trial</パスワード>", "tenant7trial"),
+        ] {
+            assert!(has(input, value), "missing XML element value in {input:?}");
+        }
+    }
+
+    #[test]
+    fn xml_element_scanner_preserves_markup_and_benign_values() {
+        for input in [
+            "<password />",
+            "<password></password>",
+            "<password>${PASSWORD}</password>",
+            "<password><value>correcthorsebattery</value></password>",
+            "<password>correct<!-- keep -->horsebattery</password>",
+            "<password>correcthorsebattery</secret>",
+            "<description>correcthorsebattery</description>",
+        ] {
+            assert!(hits(input).is_empty(), "unexpected XML hit in {input:?}");
+        }
+    }
+
+    #[test]
+    fn xml_tag_end_ignores_greater_than_inside_attributes() {
+        let input = r#"<password note=">">correcthorsebattery</password>"#;
+        assert!(has(input, "correcthorsebattery"));
     }
 
     #[test]
