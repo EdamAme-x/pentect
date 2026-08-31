@@ -149,6 +149,8 @@ jobs:
               - 'crates/pentect-runtime/src/image_ocr.rs'
               - 'crates/pentect-runtime/src/image.rs'
             plugins:
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/current-clients.yml'
               - 'crates/pentect-cli/src/plugins.rs'
               - 'crates/pentect-cli/src/plugins_cmd.rs'
               - 'crates/pentect-runtime/src/masking.rs'
@@ -156,6 +158,7 @@ jobs:
               - 'plugins/**'
               - 'protocol/**'
               - 'sdk/**'
+              - 'tools/installed_agent_e2e.py'
             codex_app:
               - 'crates/pentect-cli/src/codex_app.rs'
               - 'crates/pentect-cli/src/openai_http_proxy.rs'
@@ -254,7 +257,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [ubuntu-22.04, windows-latest, macos-latest]
     steps:
       - name: Require change detection
         if: needs.changes.result != 'success'
@@ -283,6 +286,11 @@ jobs:
       - name: Test plugin lifecycle CLI
         if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-cli plugins_cmd::tests --bin pentect --locked
+      - name: Test installed plugin lifecycle
+        if: needs.changes.outputs.plugins == 'true'
+        run: |
+          cargo build -p pentect-cli --no-default-features --locked
+          python tools/installed_agent_e2e.py --pentect "target/debug/pentect${{ runner.os == 'Windows' && '.exe' || '' }}" --plugin-lifecycle-only
       - name: Check plugin SDK
         if: needs.changes.outputs.plugins == 'true'
         run: cargo check --manifest-path sdk/rust/pentect-plugin/Cargo.toml --target wasm32-unknown-unknown
