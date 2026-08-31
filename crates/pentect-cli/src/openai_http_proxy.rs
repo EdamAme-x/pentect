@@ -139,7 +139,7 @@ impl OpenAiHttpProxyGuard {
         });
         let base_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "OpenAI HTTP gateway did not start within 30 seconds".to_string())??;
+            .map_err(|_| "OpenAI HTTP gateway initialization timed out".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -1808,10 +1808,13 @@ fn mask_openai_request(
         // Instructions are supplied by the client or provider, not authored by
         // the current user. Prompt-only unmask markers must never take effect
         // here.
-        mask_text(instructions, true, masker)?;
+        let masked = masker
+            .mask_tool_output_without_plugins(instructions)?
+            .ok_or_else(|| "content inspection is unavailable".to_string())?;
+        *instructions = masked;
     }
     if let Some(input) = value.get_mut("input") {
-        mask_openai_input(input, false, masker, files)?;
+        mask_openai_responses_input(input, masker, files)?;
     }
     if let Some(messages) = value.get_mut("messages") {
         mask_chat_messages(messages, masker, files)?;
@@ -1831,14 +1834,56 @@ fn mask_openai_request(
     // Standalone search commands are derived from the current user request.
     // Scan every string because queries and location/filter values do not use
     // Responses content blocks.
-    for (field, external_content) in [
-        ("commands", false),
-        ("settings", false),
-        ("reasoning", true),
-    ] {
+    for (field, external_content) in [("commands", false), ("settings", false)] {
         if let Some(search_value) = value.get_mut(field) {
             let mut nodes = 0_usize;
             mask_search_value(search_value, external_content, 0, &mut nodes, masker)?;
+        }
+    }
+    Ok(())
+}
+
+fn mask_openai_responses_input(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    let Value::Array(items) = value else {
+        return mask_openai_input(value, false, masker, files);
+    };
+    let current_user_index = items.iter().rposition(|item| {
+        item.as_object().is_some_and(|object| {
+            object.get("type").and_then(Value::as_str) == Some("message")
+                && object.get("role").and_then(Value::as_str) == Some("user")
+        })
+    });
+    let original = std::mem::take(items);
+    for (index, mut item) in original.into_iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let external_content = Some(index) != current_user_index;
+        let (note, computer_output) = match item_type {
+            "input_image" => (
+                match item.as_object_mut() {
+                    Some(object) => inspect_openai_image(object)?,
+                    None => None,
+                },
+                false,
+            ),
+            "computer_call_output" => (
+                match item.as_object_mut() {
+                    Some(object) => inspect_computer_call_output(object, files)?,
+                    None => None,
+                },
+                true,
+            ),
+            _ => {
+                mask_openai_input(&mut item, external_content, masker, files)?;
+                (None, false)
+            }
+        };
+        items.push(item);
+        if let Some(text) = note {
+            items.push(openai_image_mask_note(text, computer_output));
         }
     }
     Ok(())
@@ -2097,7 +2142,10 @@ fn mask_openai_input(
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     match value {
-        Value::String(text) => mask_text(text, tool_result, masker),
+        Value::String(text) => {
+            log_large_openai_plugin_input("responses-string", text, tool_result);
+            mask_text(text, tool_result, masker)
+        }
         Value::Array(items) => {
             let original = std::mem::take(items);
             for mut item in original {
@@ -2153,6 +2201,7 @@ fn mask_openai_input(
                 }
                 "input_text" | "output_text" => {
                     if let Some(Value::String(text)) = object.get_mut("text") {
+                        log_large_openai_plugin_input(item_type.as_str(), text, tool_result);
                         mask_text(text, tool_result, masker)?;
                     }
                 }
@@ -2169,7 +2218,7 @@ fn mask_openai_input(
                 "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
                 "message" => {
                     let external_content =
-                        object.get("role").and_then(Value::as_str) != Some("user");
+                        tool_result || object.get("role").and_then(Value::as_str) != Some("user");
                     if let Some(content) = object.get_mut("content") {
                         mask_openai_input(content, external_content, masker, files)?;
                     }
@@ -2185,6 +2234,15 @@ fn mask_openai_input(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn log_large_openai_plugin_input(source: &str, text: &str, external_content: bool) {
+    if !external_content && text.len() >= 1024 {
+        eprintln!(
+            "[pentect] inspecting large OpenAI user input with plugins; source={source} input_bytes={}",
+            text.len()
+        );
     }
 }
 
@@ -3902,6 +3960,48 @@ mod tests {
     }
 
     #[test]
+    fn only_final_responses_user_message_is_current_input() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "HISTORYONLY", "ZYXWVUTS", "1234567890"].concat();
+        let keyed_secret = format!("RUNPOD_API_KEY={secret}");
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let mut input = serde_json::json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("unmask({keyed_secret})")
+                }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("unmask({keyed_secret})")
+                }]
+            },
+            {
+                "type": "agent_message",
+                "text": format!("unmask({keyed_secret})")
+            }
+        ]);
+
+        mask_openai_responses_input(&mut input, &mut masker, &HashMap::new()).unwrap();
+
+        let history = input[0]["content"][0]["text"].as_str().unwrap();
+        assert!(!history.contains(&secret));
+        assert!(history.contains("<<"));
+        assert_eq!(input[1]["content"][0]["text"], keyed_secret);
+        let trailing_agent = input[2]["text"].as_str().unwrap();
+        assert!(!trailing_agent.contains(&secret));
+        assert!(trailing_agent.contains("<<"));
+    }
+
+    #[test]
     fn chat_history_masks_legacy_function_and_custom_tool_payloads() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -5267,7 +5367,7 @@ mod tests {
                     }],
                     "response_length": "short"
                 },
-                "reasoning": {"summary": format!("unmask({secret})")},
+                "reasoning": {"summary": "auto", "context": "all_turns"},
                 "settings": {"search_context_size": "low"},
                 "max_output_tokens": 2500
             }))
@@ -5290,9 +5390,8 @@ mod tests {
             .unwrap();
         assert!(!query.contains(&secret), "{query}");
         assert!(query.contains("<<KEYED_SECRET_"), "{query}");
-        let reasoning = protected["reasoning"]["summary"].as_str().unwrap();
-        assert!(!reasoning.contains(&secret), "{reasoning}");
-        assert!(reasoning.contains("<<KEYED_SECRET_"), "{reasoning}");
+        assert_eq!(protected["reasoning"]["summary"], "auto");
+        assert_eq!(protected["reasoning"]["context"], "all_turns");
         assert!(protected.get("instructions").is_none());
     }
 

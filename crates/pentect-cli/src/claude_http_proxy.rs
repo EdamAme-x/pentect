@@ -216,7 +216,7 @@ impl ClaudeHttpProxyGuard {
         });
         let base_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Claude HTTP proxy did not start within 30 seconds".to_string())??;
+            .map_err(|_| "Claude HTTP proxy initialization timed out".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -2485,7 +2485,10 @@ pub(crate) fn mask_string(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
 ) -> Result<(), String> {
     let masked = if tool_result {
-        masker.mask_tool_output(text)?
+        // Provider/client history and tool output still pass the deterministic
+        // engine and Alcatraz, but do not run heavyweight context plugins.
+        // Current user-authored text takes the full plugin path below.
+        masker.mask_tool_output_without_plugins(text)?
     } else {
         masker.mask_prompt_text(text)?
     };

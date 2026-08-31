@@ -34,7 +34,8 @@ const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_SPANS: usize = 512;
 const MAX_TIMEOUT_MS: u64 = 60_000;
-const MAX_STARTUP_TIMEOUT_MS: u64 = 600_000;
+pub const MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_STARTUP_TIMEOUT_MS: u64 = MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT.as_millis() as u64;
 const MAX_PLUGIN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_SPANS: usize = 4096;
@@ -143,6 +144,7 @@ pub fn test_local_wasm_plugin(bytes: &[u8], name: &str) -> Result<usize, String>
             program: PluginProgram::Wasm(Box::new(wasm)),
             hooks,
             required: true,
+            prewarm: false,
             command_config: None,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -241,8 +243,12 @@ struct PluginChainBudget {
 
 impl PluginChainBudget {
     fn new() -> Self {
+        Self::with_duration(MAX_PLUGIN_CHAIN_DURATION)
+    }
+
+    fn with_duration(duration: Duration) -> Self {
         Self {
-            deadline: Instant::now() + MAX_PLUGIN_CHAIN_DURATION,
+            deadline: Instant::now() + duration,
             input_bytes: 0,
             output_bytes: 0,
             spans: 0,
@@ -344,7 +350,9 @@ impl PluginMiddleware {
                 }
             }
         }
-        Ok(Self { plugins })
+        let mut middleware = Self { plugins };
+        middleware.prewarm_enabled_plugins()?;
+        Ok(middleware)
     }
 
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
@@ -363,6 +371,47 @@ impl PluginMiddleware {
         self.plugins
             .iter()
             .any(|plugin| plugin.hooks.contains(&hook))
+    }
+
+    fn prewarm_enabled_plugins(&mut self) -> Result<(), String> {
+        let mut ready = Vec::with_capacity(self.plugins.len());
+        for plugin in self.plugins.drain(..) {
+            if !plugin.prewarm {
+                ready.push(plugin);
+                continue;
+            }
+            let started = Instant::now();
+            eprintln!("[pentect] preparing plugin '{}'", plugin.name);
+            match plugin.prewarm() {
+                Ok(()) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    record_plugin_access(&plugin.name, "command-prewarm-ready");
+                    eprintln!(
+                        "[pentect] plugin '{}' is ready after {elapsed_ms} ms",
+                        plugin.name
+                    );
+                    ready.push(plugin);
+                }
+                Err(error) if !plugin.required => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    record_plugin_access(&plugin.name, "command-prewarm-failed");
+                    eprintln!(
+                        "[pentect] optional plugin '{}' disabled during startup after {elapsed_ms} ms: {error}",
+                        plugin.name
+                    );
+                }
+                Err(error) => {
+                    record_plugin_access(&plugin.name, "command-prewarm-failed");
+                    return Err(format!(
+                        "plugin '{}' failed to prepare after {} ms: {error}",
+                        plugin.name,
+                        started.elapsed().as_millis()
+                    ));
+                }
+            }
+        }
+        self.plugins = ready;
+        Ok(())
     }
 
     /// Invoke every exported hook once with a value-free fixture. This checks
@@ -636,6 +685,7 @@ struct PluginBinary {
     program: PluginProgram,
     hooks: BTreeSet<MiddlewareStage>,
     required: bool,
+    prewarm: bool,
     command_config: Option<Value>,
     timeout: Duration,
     startup_timeout: Duration,
@@ -774,6 +824,7 @@ impl PluginBinary {
         }
         let timeout_ms = execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let startup_timeout_ms = execution.startup_timeout_ms.unwrap_or(timeout_ms);
+        let prewarm = command_needs_prewarm(command_form, &file.hooks, startup_timeout_ms);
         let max_input_bytes = execution.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES);
         let max_output_bytes = execution
             .max_output_bytes
@@ -872,6 +923,7 @@ impl PluginBinary {
             program,
             hooks,
             required: file.required,
+            prewarm,
             command_config,
             timeout: Duration::from_millis(timeout_ms),
             startup_timeout: Duration::from_millis(startup_timeout_ms),
@@ -910,6 +962,7 @@ impl PluginBinary {
                 .remaining()
                 .map_err(|error| format!("plugin '{}': {error}", self.name))?,
         );
+        let invocation_started = Instant::now();
         let output = match &self.program {
             PluginProgram::Wasm(wasm) => wasm.invoke_bounded(
                 hook,
@@ -919,15 +972,26 @@ impl PluginBinary {
                 &self.name,
                 budget.deadline,
                 Arc::clone(&budget.network_requests),
-            )?,
+            ),
             PluginProgram::Command(command) => command.invoke_with_startup_timeout(
                 &encoded,
                 timeout,
                 self.startup_timeout,
                 &self.name,
                 budget,
-            )?,
-        };
+            ),
+        }
+        .map_err(|error| format!("{error}; input_bytes={}", encoded.len()))?;
+        let invocation_elapsed = invocation_started.elapsed();
+        if invocation_elapsed >= Duration::from_secs(5) {
+            eprintln!(
+                "[pentect] plugin '{}' invocation completed after {} ms; input_bytes={}",
+                self.name,
+                invocation_elapsed.as_millis(),
+                encoded.len()
+            );
+            record_plugin_access(&self.name, "command-slow");
+        }
         budget
             .charge_output(output.len())
             .map_err(|error| format!("plugin '{}': {error}", self.name))?;
@@ -961,6 +1025,32 @@ impl PluginBinary {
         }
         Ok(response)
     }
+
+    fn prewarm(&self) -> Result<(), String> {
+        let payload = json!({"kind": "text", "text": ""});
+        let mut budget = PluginChainBudget::with_duration(self.startup_timeout);
+        let response =
+            self.invoke_bounded(MiddlewareStage::Inspect, &payload, None, &mut budget)?;
+        if response.action == Action::Stop {
+            return Err(format!("plugin '{}' stopped its startup probe", self.name));
+        }
+        if response.payload.is_some() {
+            return Err(format!(
+                "plugin '{}' cannot replace input from the inspect hook; add findings instead",
+                self.name
+            ));
+        }
+        for span in response.spans {
+            plugin_span("", span, &self.name)?;
+        }
+        Ok(())
+    }
+}
+
+fn command_needs_prewarm(command_form: bool, hooks: &[String], startup_timeout_ms: u64) -> bool {
+    command_form
+        && hooks.iter().any(|hook| hook == "inspect")
+        && startup_timeout_ms > MAX_PLUGIN_CHAIN_DURATION.as_millis() as u64
 }
 
 fn optional_plugin_name(path: &Path) -> Option<String> {
@@ -4232,6 +4322,7 @@ mod tests {
             ),
             hooks: BTreeSet::from([MiddlewareStage::Inspect]),
             required: true,
+            prewarm: false,
             command_config: Some(json!({})),
             timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -4322,6 +4413,7 @@ mod tests {
                 ),
                 hooks: BTreeSet::from([MiddlewareStage::ToolCall]),
                 required: false,
+                prewarm: false,
                 command_config: Some(json!({})),
                 timeout: Duration::from_secs(5),
                 startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -4350,6 +4442,7 @@ mod tests {
             ),
             hooks: BTreeSet::from([MiddlewareStage::Inspect]),
             required,
+            prewarm: false,
             command_config: Some(json!({})),
             timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -4357,6 +4450,101 @@ mod tests {
             max_output_bytes: 4096,
             max_spans: DEFAULT_MAX_SPANS,
         }
+    }
+
+    #[test]
+    fn selected_command_prewarms_with_startup_timeout_then_serves_live_request() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys,time\nfor index,line in enumerate(sys.stdin):\n r=json.loads(line)\n if index == 0: time.sleep(0.15)\n print(json.dumps({'schema':'pentect.plugin.v1','id':r['id'],'type':'result','action':'next','spans':[]}), flush=True)",
+        ) else {
+            return;
+        };
+        let plugin = PluginBinary {
+            name: "prewarm-fixture".to_string(),
+            program: PluginProgram::Command(
+                CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap(),
+            ),
+            hooks: BTreeSet::from([MiddlewareStage::Inspect]),
+            required: true,
+            prewarm: true,
+            command_config: Some(json!({})),
+            timeout: Duration::from_millis(50),
+            startup_timeout: Duration::from_secs(5),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: 4096,
+            max_spans: DEFAULT_MAX_SPANS,
+        };
+        let mut middleware = PluginMiddleware {
+            plugins: vec![plugin],
+        };
+
+        middleware.prewarm_enabled_plugins().unwrap();
+        let result = middleware.detect_spans(&Input::text("safe"), None).unwrap();
+
+        assert_eq!(result.coverage, MiddlewareCoverage::Full);
+        assert!(result.spans.is_empty());
+    }
+
+    #[test]
+    fn prewarm_rejects_inspect_replacement_payload() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys\nfor line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'schema':'pentect.plugin.v1','id':r['id'],'type':'result','action':'next','payload':{'text':'replacement'}}), flush=True)",
+        ) else {
+            return;
+        };
+        let plugin = PluginBinary {
+            name: "replacement-prewarm-fixture".to_string(),
+            program: PluginProgram::Command(
+                CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap(),
+            ),
+            hooks: BTreeSet::from([MiddlewareStage::Inspect]),
+            required: true,
+            prewarm: true,
+            command_config: Some(json!({})),
+            timeout: Duration::from_millis(500),
+            startup_timeout: Duration::from_secs(5),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: 4096,
+            max_spans: DEFAULT_MAX_SPANS,
+        };
+
+        let error = plugin.prewarm().unwrap_err();
+        assert!(
+            error.contains("cannot replace input from the inspect hook"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn long_command_inspect_startup_is_selected_for_prewarm_automatically() {
+        let inspect = vec!["inspect".to_string()];
+        assert!(command_needs_prewarm(true, &inspect, 60_001));
+        assert!(!command_needs_prewarm(true, &inspect, 60_000));
+        assert!(!command_needs_prewarm(
+            true,
+            &["request".to_string()],
+            300_000
+        ));
+        assert!(!command_needs_prewarm(false, &inspect, 300_000));
+    }
+
+    #[test]
+    fn optional_prewarm_failure_disables_plugin_and_required_failure_blocks_startup() {
+        let mut optional_plugin = invalid_command_plugin(false);
+        optional_plugin.prewarm = true;
+        let mut optional = PluginMiddleware {
+            plugins: vec![optional_plugin],
+        };
+        optional.prewarm_enabled_plugins().unwrap();
+        assert!(optional.is_empty());
+
+        let mut required_plugin = invalid_command_plugin(true);
+        required_plugin.prewarm = true;
+        let mut required = PluginMiddleware {
+            plugins: vec![required_plugin],
+        };
+        let error = required.prewarm_enabled_plugins().unwrap_err();
+        assert!(error.contains("invalid JSON"), "{error}");
     }
 
     #[test]

@@ -109,12 +109,22 @@ max_spans = 512
 The largest allowed values are 60 seconds per invocation, 10 minutes for
 `startup_timeout_ms`, 4 MiB input, 4 MiB output, and 4,096 findings. The startup
 limit applies only to the first response from a native Command process; later
-responses use `timeout_ms`. If omitted, it equals `timeout_ms`. It is still
-capped by the time remaining in the 60-second plugin-chain deadline; cold
-startup never extends that deadline. Waiting for another request to release a
-shared Command process uses the same remaining deadline. The Wasm file
-itself must be 32 MiB or smaller. Pentect infers the form, so new manifests do
-not set a runtime or mode.
+responses use `timeout_ms`. If omitted, it equals `timeout_ms`.
+
+When a Command plugin has an `inspect` hook and its `startup_timeout_ms` exceeds
+the live 60-second chain deadline, Pentect prepares it automatically. Pentect
+sends one empty-text inspection before protected traffic begins, waits up to
+`startup_timeout_ms`, and reuses that ready process. This lets a local model
+initialize without extending the deadline for real requests. A failed optional
+plugin is disabled with an actionable startup warning; a failed required plugin
+stops startup. Existing approvals remain valid because no extra manifest flag
+is required.
+
+Other cold starts are capped by the time remaining in the 60-second
+plugin-chain deadline. Waiting for another request to release a shared Command
+process uses the same remaining deadline. The Wasm file itself must be 32 MiB
+or smaller. Pentect infers the form, so new manifests do not set a runtime or
+mode.
 
 Use small limits. They protect the user from a slow or broken plugin.
 
