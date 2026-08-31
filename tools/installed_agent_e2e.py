@@ -1033,15 +1033,23 @@ def run_image_redaction(pentect: str) -> None:
                     "/c",
                     *command,
                 ]
-            completed = subprocess.run(
-                command,
-                cwd=project,
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=30,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=90,
+                )
+            except subprocess.TimeoutExpired as error:
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                raise RuntimeError(
+                    f"image E2E did not finish within 90 seconds:\n{output}"
+                ) from error
             if completed.returncode != 0:
                 raise RuntimeError(
                     f"image E2E exited with {completed.returncode}:\n{completed.stdout}"
