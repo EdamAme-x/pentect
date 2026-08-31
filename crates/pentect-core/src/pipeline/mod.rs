@@ -1470,6 +1470,27 @@ mod tests {
     }
 
     #[test]
+    fn cli_credential_boundaries_mask_and_restore_through_the_standard_engine() {
+        for input in [
+            "docker login registry.example -u user -p correcthorsebattery",
+            "docker login registry.example --password correcthorsebattery",
+            "kubectl --token correcthorsebattery get pods",
+            "vault login correcthorsebattery",
+            "aws configure set aws_secret_access_key correcthorsebattery",
+        ] {
+            let result = Engine::with_profile(Profile::Strict)
+                .mask(Input::text(input), &Config::insecure_testing());
+            assert!(
+                !result.masked.contains("correcthorsebattery"),
+                "{}",
+                result.masked
+            );
+            assert_eq!(result.summary.masked_count, 1, "{}", result.masked);
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+        }
+    }
+
+    #[test]
     fn public_identifiers_are_measured_separately_from_credential_context() {
         let input = concat!(
             "request_id=550e8400-e29b-41d4-a716-446655440000 ",
