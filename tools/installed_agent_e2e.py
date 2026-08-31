@@ -389,6 +389,128 @@ command = ["python", "-c", "import sys; sys.exit(17)"]
         raise RuntimeError("failed plugin setup remained enabled")
 
 
+def verify_interrupted_setup_rolls_back(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "interrupted-setup-plugin"
+    plugin.mkdir()
+    setup = plugin / "setup.py"
+    setup.write_text(
+        '''import os
+import time
+
+with open("setup-pid.txt", "w", encoding="utf-8") as marker:
+    marker.write(str(os.getpid()))
+while True:
+    time.sleep(1)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "server.py").write_text(
+        '''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "interrupted-setup-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+
+[setup]
+command = ["python", "{plugin}/setup.py"]
+''',
+        encoding="utf-8",
+    )
+    before = snapshot_regular_files(home, project)
+    popen_options: dict[str, object] = {}
+    if os.name == "nt":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(
+        pentect_command(
+            pentect,
+            ["plugins", "add", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        **popen_options,
+    )
+    marker = plugin / "setup-pid.txt"
+    deadline = time.monotonic() + 10
+    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not marker.exists():
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        raise RuntimeError("plugin setup did not reach its interrupt fixture:\n" + output)
+    setup_pid = int(marker.read_text(encoding="utf-8"))
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        os.kill(process.pid, signal.SIGINT)
+    try:
+        output, _ = process.communicate(timeout=8)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.wait()
+        raise RuntimeError("interrupted plugin setup did not exit within 8 seconds") from error
+    if process.returncode == 0 or "plugin environment setup was interrupted" not in output:
+        raise RuntimeError("interrupted plugin setup did not report interruption:\n" + output)
+    if not wait_for_process_exit(setup_pid, timeout=2.0):
+        raise RuntimeError(f"interrupted plugin setup process {setup_pid} was not terminated")
+    if snapshot_regular_files(home, project) != before:
+        raise RuntimeError("interrupted plugin setup left partial persistent state")
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "interrupted-setup-e2e:" in listed.stdout:
+        raise RuntimeError("interrupted plugin setup remained enabled")
+
+    setup.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin="ordinary recovered setup fixture",
+    )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "interrupted-setup-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
@@ -419,10 +541,13 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_failed_setup_rolls_back(
             pentect, root, home, project, environment
         )
+        verify_interrupted_setup_rolls_back(
+            pentect, root, home, project, environment
+        )
         verify_installed_command_failure_boundaries(pentect, root, project, environment)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
-            "add/setup/update/reinstall/remove, failed-setup rollback, Command runtime "
+            "add/setup/update/reinstall/remove, failed/interrupted-setup rollback, Command runtime "
             "fail-closed boundaries and process cleanup, no log plaintext"
         )
 

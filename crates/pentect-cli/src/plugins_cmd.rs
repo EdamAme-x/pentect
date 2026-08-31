@@ -6,7 +6,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_COMMAND_LOCK_FILE: &str = "command.lock";
@@ -15,6 +19,11 @@ const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_PLUGIN_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_PLUGIN_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_WASM_BYTES: u64 = 32 * 1024 * 1024;
+const SETUP_CHILD_POLL: Duration = Duration::from_millis(25);
+const SETUP_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+
+static SETUP_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static SETUP_INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub(crate) fn cmd_plugins(args: &[String]) {
     let opts = match PluginCmd::parse(args) {
@@ -2450,15 +2459,25 @@ fn run_command_environment_setup(
         argv.push(profile.to_string());
     }
     let executable = resolve_command_executable(&argv[0])?;
+    install_setup_interrupt_handler()?;
+    SETUP_INTERRUPTED.store(false, Ordering::SeqCst);
     println!("environment setup: starting");
-    let status = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(&argv[1..])
         .current_dir(&root)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::inherit());
+    configure_setup_process_tree(&mut command);
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("could not start plugin environment setup: {error}"))?;
+    let status = wait_for_setup_child(&mut child)?;
+    let interrupted = SETUP_INTERRUPTED.swap(false, Ordering::SeqCst);
+    if interrupted {
+        return Err("plugin environment setup was interrupted".to_string());
+    }
     if !status.success() {
         return Err(format!(
             "plugin environment setup failed with {}",
@@ -2471,6 +2490,77 @@ fn run_command_environment_setup(
     println!("environment setup: complete");
     Ok(())
 }
+
+fn install_setup_interrupt_handler() -> Result<(), String> {
+    SETUP_INTERRUPT_HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| {
+                SETUP_INTERRUPTED.store(true, Ordering::SeqCst);
+            })
+            .map_err(|error| format!("could not install plugin setup interrupt handler: {error}"))
+        })
+        .clone()
+}
+
+fn wait_for_setup_child(child: &mut Child) -> Result<std::process::ExitStatus, String> {
+    let mut interrupted_at = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_setup_process_tree(child.id(), true);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "could not wait for plugin environment setup: {error}"
+                ));
+            }
+        }
+        if SETUP_INTERRUPTED.load(Ordering::SeqCst) {
+            let started = interrupted_at.get_or_insert_with(Instant::now);
+            terminate_setup_process_tree(child.id(), started.elapsed() >= SETUP_INTERRUPT_GRACE);
+        }
+        thread::sleep(SETUP_CHILD_POLL);
+    }
+}
+
+#[cfg(unix)]
+fn configure_setup_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_setup_process_tree(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_setup_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_setup_process_tree(pid: u32, force: bool) {
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_setup_process_tree(pid: u32, _force: bool) {
+    let _ = Command::new(crate::windows_system_executable("taskkill.exe"))
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_setup_process_tree(_pid: u32, _force: bool) {}
 
 struct CommandRuntimeSnapshot {
     data_dir: PathBuf,
