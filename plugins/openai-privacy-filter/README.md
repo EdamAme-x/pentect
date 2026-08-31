@@ -25,13 +25,14 @@ Pentect turns those ranges into normal handles such as
 
 ## Live end-to-end test
 
-The live test runs setup without fixture mode, loads the real model, masks
-synthetic PII through Pentect, then repeats the mask in a new Pentect process.
-It also launches the installed Codex CLI through Pentect and a local Responses
-API recorder. The recorder verifies that synthetic PII reached the upstream as
-a handle, never as plaintext, and returns a complete local response that Codex
-must consume without a plugin timeout. No OpenAI request is made by that step.
-It may download several gigabytes when the managed environment is not ready.
+The live test runs setup without fixture mode, loads the real model, verifies
+the plugin protocol directly against that model, masks synthetic PII through
+Pentect, then repeats the mask in a new Pentect process. It also launches the
+installed Codex CLI through Pentect and a local Responses API recorder. The
+recorder verifies that synthetic PII reached the upstream as a handle, never as
+plaintext, and returns a complete local response that Codex must consume
+without a plugin timeout. No OpenAI request is made by that step. It may
+download several gigabytes when the managed environment is not ready.
 
 ```sh
 python3 plugins/openai-privacy-filter/tests/live_e2e.py \

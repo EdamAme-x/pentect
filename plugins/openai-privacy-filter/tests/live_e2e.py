@@ -18,9 +18,12 @@ from typing import Any
 
 
 SAMPLE = "Please contact Alice Example at alice@example.com or +1 415-555-0100."
-EXPECTED_LABELS = ("PRIVATE_EMAIL", "PRIVATE_PHONE")
+EXPECTED_HANDLE_GROUPS = (
+    ("PRIVATE_EMAIL", "EMAIL_ADDRESS"),
+    ("PRIVATE_PHONE", "PHONE_NUMBER"),
+)
 CODEX_SAMPLE = "The synthetic test contact is alice@example.com. Reply exactly OK."
-EMAIL_HANDLE = re.compile(rb"<<PRIVATE_EMAIL_[0-9a-f]{16,64}>>")
+EMAIL_HANDLE = re.compile(rb"<<(?:PRIVATE_EMAIL|EMAIL_ADDRESS)_[0-9a-f]{16,64}>>")
 
 
 def live_environment() -> dict[str, str]:
@@ -65,8 +68,16 @@ def assert_live_setup(environment: dict[str, str]) -> None:
     state = json.loads((root / "setup.json").read_text(encoding="utf-8"))
     if state.get("fixture") is True:
         raise RuntimeError("live E2E refused fixture setup state")
-    checkpoint = Path(state["checkpoint"])
-    if not checkpoint.is_dir() or not any(checkpoint.glob("*.safetensors")):
+    configured = state.get("checkpoint")
+    candidates = [root / "checkpoint", Path.home() / ".opf" / "privacy_filter"]
+    if isinstance(configured, str) and configured:
+        candidates.insert(0, Path(configured).expanduser())
+    if not any(
+        checkpoint.is_dir()
+        and (checkpoint / "config.json").is_file()
+        and any(checkpoint.glob("*.safetensors"))
+        for checkpoint in candidates
+    ):
         raise RuntimeError("live E2E setup has no real model checkpoint")
 
 
@@ -90,15 +101,66 @@ def mask_once(
         raise RuntimeError(
             f"Pentect mask failed ({result.returncode}): {result.stderr.strip()}"
         )
-    for label in EXPECTED_LABELS:
-        if f"<<{label}_" not in result.stdout:
-            raise RuntimeError(f"real OPF did not produce a {label} handle")
+    for labels in EXPECTED_HANDLE_GROUPS:
+        if not any(f"<<{label}_" in result.stdout for label in labels):
+            raise RuntimeError(
+                f"Pentect did not produce one of {labels!r}; "
+                f"stdout={result.stdout.strip()!r}; stderr={result.stderr.strip()!r}"
+            )
     if "alice@example.com" in result.stdout or "+1 415-555-0100" in result.stdout:
         raise RuntimeError("real OPF allowed synthetic PII through unchanged")
     if "preparing plugin 'openai-privacy-filter'" not in result.stderr:
         raise RuntimeError("Pentect did not prewarm the real OPF process")
     if "plugin 'openai-privacy-filter' is ready after" not in result.stderr:
         raise RuntimeError("Pentect did not report real OPF readiness")
+    return elapsed
+
+
+def inspect_plugin_once(
+    plugin: Path,
+    project: Path,
+    environment: dict[str, str],
+    timeout: float,
+    profile: str,
+) -> float:
+    request = {
+        "schema": "pentect.plugin.v1",
+        "id": 1,
+        "hook": "inspect",
+        "payload": {"text": SAMPLE},
+    }
+    started = time.monotonic()
+    result = run(
+        [
+            shutil.which("python3") or "python3",
+            str(plugin / "server.py"),
+            "--device",
+            "cpu" if profile == "auto" else profile,
+        ],
+        cwd=project,
+        environment=environment,
+        timeout=timeout,
+        input_text=json.dumps(request, separators=(",", ":")) + "\n",
+    )
+    elapsed = time.monotonic() - started
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"real OPF protocol probe failed ({result.returncode}): {result.stderr.strip()}"
+        )
+    try:
+        response = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"real OPF returned invalid protocol JSON: {error}") from error
+    labels = {
+        span.get("label")
+        for span in response.get("spans", [])
+        if isinstance(span, dict)
+    }
+    missing = {"PRIVATE_EMAIL", "PRIVATE_PHONE"} - labels
+    if missing:
+        raise RuntimeError(
+            f"real OPF protocol probe missed {sorted(missing)!r}; response={response!r}"
+        )
     return elapsed
 
 
@@ -123,7 +185,7 @@ class ProtectedUpstream:
                 if b"alice@example.com" in body:
                     owner.error = "Codex upstream received synthetic email in plaintext"
                 elif EMAIL_HANDLE.search(body) is None:
-                    owner.error = "Codex upstream did not receive a PRIVATE_EMAIL handle"
+                    owner.error = "Codex upstream did not receive a protected email handle"
                 owner.request_seen.set()
                 encoded = _completed_response_stream()
                 self.send_response(200)
@@ -354,6 +416,9 @@ def main() -> None:
                 f"real OPF setup failed ({setup.returncode}): {setup.stderr.strip()}"
             )
         assert_live_setup(environment)
+        plugin_seconds = inspect_plugin_once(
+            plugin, project, environment, args.timeout_seconds, args.profile
+        )
         cold_seconds = mask_once(
             pentect, plugin, project, environment, args.timeout_seconds
         )
@@ -379,6 +444,7 @@ def main() -> None:
             {
                 "schema": "pentect.opf-live-e2e.v1",
                 "profile": args.profile,
+                "plugin_seconds": round(plugin_seconds, 3),
                 "cold_seconds": round(cold_seconds, 3),
                 "restart_seconds": round(restart_seconds, 3),
                 "codex_seconds": (

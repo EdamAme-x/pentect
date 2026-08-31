@@ -1859,12 +1859,35 @@ fn mask_openai_responses_input(
     });
     let original = std::mem::take(items);
     for (index, mut item) in original.into_iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         let external_content = item
             .as_object()
             .is_some_and(|object| object.get("type").and_then(Value::as_str) == Some("message"))
             && Some(index) != current_user_index;
-        mask_openai_input(&mut item, external_content, masker, files)?;
+        let (note, computer_output) = match item_type {
+            "input_image" => (
+                match item.as_object_mut() {
+                    Some(object) => inspect_openai_image(object)?,
+                    None => None,
+                },
+                false,
+            ),
+            "computer_call_output" => (
+                match item.as_object_mut() {
+                    Some(object) => inspect_computer_call_output(object, files)?,
+                    None => None,
+                },
+                true,
+            ),
+            _ => {
+                mask_openai_input(&mut item, external_content, masker, files)?;
+                (None, false)
+            }
+        };
         items.push(item);
+        if let Some(text) = note {
+            items.push(openai_image_mask_note(text, computer_output));
+        }
     }
     Ok(())
 }
