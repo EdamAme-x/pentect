@@ -530,7 +530,7 @@ for line in sys.stdin:
 
     timeout_pids = json.loads((plugin / "timeout-pids.json").read_text(encoding="utf-8"))
     for pid in timeout_pids:
-        if process_exists(pid):
+        if not wait_for_process_exit(pid, timeout=2.0):
             raise RuntimeError(f"timed-out command plugin process {pid} was not terminated")
 
     set_mode("valid")
@@ -617,6 +617,15 @@ def process_exists(pid: int) -> bool:
         len(row) > 1 and row[1] == str(pid)
         for row in csv.reader(io.StringIO(completed.stdout))
     )
+
+
+def wait_for_process_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while process_exists(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def tool_response(sequence: int, source: str) -> bytes:
