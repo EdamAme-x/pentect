@@ -122,12 +122,27 @@ impl OutputMasker {
     }
 
     pub(crate) fn mask_tool_output(&mut self, text: &str) -> Result<String, String> {
+        self.mask_tool_output_with_plugins(text, true)
+    }
+
+    pub(crate) fn mask_tool_output_without_plugins(
+        &mut self,
+        text: &str,
+    ) -> Result<String, String> {
+        self.mask_tool_output_with_plugins(text, false)
+    }
+
+    fn mask_tool_output_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<String, String> {
         let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
             Kind::Env
         } else {
             Kind::Text
         };
-        self.mask_text(text, kind)
+        self.mask_text_with_plugins(text, kind, run_plugins)
     }
 
     /// Inspect tool-output text with the same masking stages without recording
@@ -150,6 +165,21 @@ impl OutputMasker {
     }
 
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
+        self.mask_prompt_text_with_plugins(text, true)
+    }
+
+    pub(crate) fn mask_prompt_text_without_plugins(
+        &mut self,
+        text: &str,
+    ) -> Result<String, String> {
+        self.mask_prompt_text_with_plugins(text, false)
+    }
+
+    fn mask_prompt_text_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<String, String> {
         // Protect an explicit user-authored exception before remasking values
         // already known to the session. Otherwise a value first seen in tool,
         // system, or assistant content can never be explicitly unmasked by the
@@ -157,11 +187,15 @@ impl OutputMasker {
         let (protected, unmasked_values) =
             protect_prompt_unmask_markers(text, &self.store.session.identity_key);
         let remasked = self.remask_all(&protected)?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Prepare,
-            remasked,
-            &Kind::Text,
-        )?;
+        let remasked = if run_plugins {
+            self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Prepare,
+                remasked,
+                &Kind::Text,
+            )?
+        } else {
+            remasked
+        };
         // Prompt scalars are text. Only opt into dotenv parsing when the
         // payload actually contains assignment syntax; treating every
         // `Label: prose` sentence as Env turns ordinary messages into secrets.
@@ -181,11 +215,17 @@ impl OutputMasker {
         if let Some(env_result) = &env_result {
             self.track_mask_result("prompt", env_result);
         }
+        let no_plugins = PluginMiddleware::default();
+        let plugins = if run_plugins {
+            &self.plugin_middleware
+        } else {
+            &no_plugins
+        };
         let mut result = mask_read_input_with_engine_plugins_and_identity(
             self.store.session.key,
             self.store.session.identity_key,
             self.prompt_engine,
-            &self.plugin_middleware,
+            plugins,
             Input {
                 kind: Kind::Text,
                 data: env_result
@@ -201,11 +241,15 @@ impl OutputMasker {
                 .saturating_add(env_result.summary.masked_count);
         }
         let initially_masked = std::mem::take(&mut result.masked);
-        let masked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Finalize,
-            initially_masked,
-            &Kind::Text,
-        )?;
+        let masked = if run_plugins {
+            self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Finalize,
+                initially_masked,
+                &Kind::Text,
+            )?
+        } else {
+            initially_masked
+        };
         let final_result = self.prompt_engine.mask(
             Input {
                 kind: Kind::Text,
@@ -236,14 +280,31 @@ impl OutputMasker {
     }
 
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
+        self.mask_text_with_plugins(text, kind, true)
+    }
+
+    fn mask_text_with_plugins(
+        &mut self,
+        text: &str,
+        kind: Kind,
+        run_plugins: bool,
+    ) -> Result<String, String> {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Prepare,
-            remasked,
-            &kind,
-        )?;
-        let remasked = self.mask_plugin_input(remasked, kind.clone(), None)?;
+        let remasked = if run_plugins {
+            self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Prepare,
+                remasked,
+                &kind,
+            )?
+        } else {
+            remasked
+        };
+        let remasked = if run_plugins {
+            self.mask_plugin_input(remasked, kind.clone(), None)?
+        } else {
+            remasked
+        };
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
             disclose_length: false,
@@ -279,11 +340,15 @@ impl OutputMasker {
                 recovery.extend_same_key(text_result.recovery);
             }
         }
-        let masked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Finalize,
-            masked,
-            &kind,
-        )?;
+        let masked = if run_plugins {
+            self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Finalize,
+                masked,
+                &kind,
+            )?
+        } else {
+            masked
+        };
         // Plugins may transform text, but they cannot bypass the deterministic
         // engine: re-run it after the final plugin stage.
         let final_result = self.engine.mask(

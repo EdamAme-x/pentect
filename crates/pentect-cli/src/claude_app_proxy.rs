@@ -1346,7 +1346,7 @@ impl ClaudeAppProxyGuard {
         });
         let proxy_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Claude App proxy did not start within 30 seconds".to_string())??;
+            .map_err(|_| "Claude App proxy initialization timed out".to_string())??;
         Ok(Self {
             proxy_url,
             #[cfg(not(windows))]

@@ -101,7 +101,7 @@ impl GeminiHttpProxyGuard {
         });
         let base_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Gemini gateway did not start within 30 seconds".to_string())??;
+            .map_err(|_| "Gemini gateway initialization timed out".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),

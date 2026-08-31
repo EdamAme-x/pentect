@@ -26,7 +26,7 @@ pub use plugin_middleware::{
     plugin_runtime_dirs_for_manifest, test_local_wasm_plugin, valid_plugin_publisher_workflow,
     windows_command_extension_supported, windows_executable_candidates, DetectSpansRun,
     MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware, PluginRuntimeDirs,
-    StopOutcome, DEFAULT_PUBLISHER_WORKFLOW,
+    StopOutcome, DEFAULT_PUBLISHER_WORKFLOW, MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT,
 };
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
@@ -685,11 +685,26 @@ impl ActiveToolOutputMasker {
     }
 
     pub fn mask_tool_output(&mut self, text: &str) -> Result<Option<String>, String> {
+        self.mask_tool_output_with_plugins(text, true)
+    }
+
+    pub fn mask_tool_output_without_plugins(
+        &mut self,
+        text: &str,
+    ) -> Result<Option<String>, String> {
+        self.mask_tool_output_with_plugins(text, false)
+    }
+
+    fn mask_tool_output_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<Option<String>, String> {
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
-        let cache_key =
-            (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES).then(|| tool_output_cache_key(text));
+        let cache_key = (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES)
+            .then(|| tool_output_cache_key(text, run_plugins));
         if let Some(key) = cache_key {
             if let Some(cached) = self.cache.get(&key) {
                 if cached.masked_count > 0 {
@@ -702,7 +717,11 @@ impl ActiveToolOutputMasker {
                 return Ok(Some(cached.masked.clone()));
             }
         }
-        let masked = masker.mask_tool_output(text)?;
+        let masked = if run_plugins {
+            masker.mask_tool_output(text)?
+        } else {
+            masker.mask_tool_output_without_plugins(text)?
+        };
         masker.flush_activity();
         let total = masker.masked_count();
         let delta = total.saturating_sub(self.reported_masked_count);
@@ -732,11 +751,26 @@ impl ActiveToolOutputMasker {
     }
 
     pub fn mask_prompt_text(&mut self, text: &str) -> Result<Option<String>, String> {
+        self.mask_prompt_text_with_plugins(text, true)
+    }
+
+    pub fn mask_prompt_text_without_plugins(
+        &mut self,
+        text: &str,
+    ) -> Result<Option<String>, String> {
+        self.mask_prompt_text_with_plugins(text, false)
+    }
+
+    fn mask_prompt_text_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<Option<String>, String> {
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
-        let cache_key =
-            (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES).then(|| tool_output_cache_key(text));
+        let cache_key = (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES)
+            .then(|| prompt_cache_key(text, run_plugins));
         if let Some(key) = cache_key {
             if let Some(cached) = self.prompt_cache.get(&key) {
                 if cached.masked_count > 0 {
@@ -749,7 +783,11 @@ impl ActiveToolOutputMasker {
                 return Ok(Some(cached.masked.clone()));
             }
         }
-        let masked = masker.mask_prompt_text(text)?;
+        let masked = if run_plugins {
+            masker.mask_prompt_text(text)?
+        } else {
+            masker.mask_prompt_text_without_plugins(text)?
+        };
         masker.flush_activity();
         let total = masker.masked_count();
         let delta = total.saturating_sub(self.reported_masked_count);
@@ -813,11 +851,20 @@ fn remember_cached_output(
     order.push_back(key);
 }
 
-fn tool_output_cache_key(text: &str) -> [u8; 32] {
-    let digest = Sha256::digest(text.as_bytes());
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&digest);
-    key
+fn tool_output_cache_key(text: &str, run_plugins: bool) -> [u8; 32] {
+    masking_cache_key(b"pentect-tool-output-cache-v1", text, run_plugins)
+}
+
+fn prompt_cache_key(text: &str, run_plugins: bool) -> [u8; 32] {
+    masking_cache_key(b"pentect-prompt-cache-v1", text, run_plugins)
+}
+
+fn masking_cache_key(domain: &[u8], text: &str, run_plugins: bool) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update([u8::from(run_plugins)]);
+    digest.update(text.as_bytes());
+    digest.finalize().into()
 }
 
 pub fn mask_tool_output_into_active_memory_store(text: &str) -> Result<Option<String>, String> {
