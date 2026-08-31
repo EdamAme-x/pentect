@@ -1,4 +1,4 @@
-use super::{shell, Detector};
+use super::{shell, structural, Detector};
 use crate::model::*;
 use crate::normalize::NormalizedView;
 
@@ -7,12 +7,7 @@ pub struct CliCredentialDetector;
 impl Detector for CliCredentialDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
-        if !text.as_bytes().contains(&b'-')
-            || !(shell::contains_ascii_ci(text, "password")
-                || shell::contains_ascii_ci(text, "passwd")
-                || shell::contains_ascii_ci(text, "pwd")
-                || shell::contains_ascii_ci(text, "convertto-securestring"))
-        {
+        if !may_contain_cli_credential_boundary(text) {
             return Vec::new();
         }
 
@@ -35,19 +30,175 @@ impl Detector for CliCredentialDetector {
 }
 
 fn inspect_line(view: &NormalizedView, out: &mut Vec<Span>, line_start: usize, line: &str) {
-    if !shell::contains_ascii_ci(line, "-password")
-        && !shell::contains_ascii_ci(line, "-passwd")
-        && !shell::contains_ascii_ci(line, "-pwd")
-        && !shell::contains_ascii_ci(line, "convertto-securestring")
-    {
+    if !may_contain_cli_credential_boundary(line) {
         return;
     }
     let tokens = shell::tokens(line, line_start);
-    if tokens.is_empty() {
+    for command in shell::command_slices(&tokens, view.text()) {
+        inspect_powershell_password_parameter(view, out, command);
+        inspect_convert_to_secure_string(view, out, command);
+        inspect_named_secret_options(view, out, command);
+        inspect_login_short_password(view, out, command);
+        inspect_configure_set(view, out, command);
+        inspect_positional_secret_commands(view, out, command);
+    }
+}
+
+fn may_contain_cli_credential_boundary(text: &str) -> bool {
+    text.contains("--")
+        || shell::contains_ascii_ci(text, "-password")
+        || shell::contains_ascii_ci(text, "-passwd")
+        || shell::contains_ascii_ci(text, "-pwd")
+        || shell::contains_ascii_ci(text, " -p")
+        || shell::contains_ascii_ci(text, "convertto-securestring")
+        || shell::contains_ascii_ci(text, "configure")
+        || shell::contains_ascii_ci(text, "vault")
+}
+
+fn inspect_named_secret_options(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    tokens: &[shell::Token],
+) {
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let Some(inline_start) = long_secret_option(&token.value) else {
+            index += 1;
+            continue;
+        };
+        if let Some(value_start) = inline_start {
+            push_cli_keyed_secret(view, out, token, value_start);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = tokens
+            .get(index + 1)
+            .filter(|value| !looks_like_option(&value.value))
+        {
+            push_cli_keyed_secret(view, out, value, 0);
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn long_secret_option(value: &str) -> Option<Option<usize>> {
+    let option = value.strip_prefix("--")?;
+    let separator = option.find(['=', ':']);
+    let name = separator.map_or(option, |at| &option[..at]);
+    if name.is_empty() {
+        return None;
+    }
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    if !structural::is_sensitive_key_name(&normalized) || option_names_non_value_source(&normalized)
+    {
+        return None;
+    }
+    let inline_start = separator.map(|at| 2 + at + 1);
+    Some(inline_start)
+}
+
+fn option_names_non_value_source(name: &str) -> bool {
+    [
+        "_file",
+        "_path",
+        "_stdin",
+        "_fd",
+        "_command",
+        "_env",
+        "_variable",
+        "_name",
+        "_type",
+        "_format",
+        "_algorithm",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+}
+
+fn looks_like_option(value: &str) -> bool {
+    value.starts_with('-') && value.len() > 1
+}
+
+fn inspect_login_short_password(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    tokens: &[shell::Token],
+) {
+    let login = tokens
+        .iter()
+        .any(|token| token.value.eq_ignore_ascii_case("login"));
+    let has_username = tokens.iter().any(|token| {
+        token.value == "-u"
+            || token.value.starts_with("-u=")
+            || token.value.starts_with("-u:")
+            || token.value.eq_ignore_ascii_case("--username")
+            || token.value.to_ascii_lowercase().starts_with("--username=")
+            || token.value.to_ascii_lowercase().starts_with("--username:")
+    });
+    if !login || !has_username {
         return;
     }
-    inspect_powershell_password_parameter(view, out, &tokens);
-    inspect_convert_to_secure_string(view, out, &tokens);
+    for (index, token) in tokens.iter().enumerate() {
+        if token.value == "-p" {
+            if let Some(value) = tokens
+                .get(index + 1)
+                .filter(|value| !looks_like_option(&value.value))
+            {
+                push_cli_password(view, out, value, 0);
+            }
+        }
+    }
+}
+
+fn inspect_configure_set(view: &NormalizedView, out: &mut Vec<Span>, tokens: &[shell::Token]) {
+    for window in tokens.windows(4) {
+        if !window[0].value.eq_ignore_ascii_case("configure")
+            || !window[1].value.eq_ignore_ascii_case("set")
+        {
+            continue;
+        }
+        let key = window[2].value.replace(['-', '.'], "_");
+        if structural::is_sensitive_key_name(&key) && !looks_like_option(&window[3].value) {
+            push_cli_keyed_secret(view, out, &window[3], 0);
+        }
+    }
+}
+
+struct PositionalSecretCommand {
+    command: &'static str,
+    subcommand: &'static str,
+}
+
+const POSITIONAL_SECRET_COMMANDS: &[PositionalSecretCommand] = &[PositionalSecretCommand {
+    command: "vault",
+    subcommand: "login",
+}];
+
+fn inspect_positional_secret_commands(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    tokens: &[shell::Token],
+) {
+    for (index, token) in tokens.iter().enumerate() {
+        for spec in POSITIONAL_SECRET_COMMANDS {
+            if !shell::basename(&token.value).eq_ignore_ascii_case(spec.command)
+                || !tokens
+                    .get(index + 1)
+                    .is_some_and(|token| token.value.eq_ignore_ascii_case(spec.subcommand))
+            {
+                continue;
+            }
+            if let Some(value) = tokens
+                .get(index + 2)
+                .filter(|value| !looks_like_option(&value.value))
+            {
+                push_cli_keyed_secret(view, out, value, 0);
+            }
+        }
+    }
 }
 
 fn inspect_powershell_password_parameter(
@@ -146,11 +297,30 @@ fn push_cli_password(
     token: &shell::Token,
     value_start: usize,
 ) {
+    push_cli_secret(view, out, token, value_start, labels::CMD_PASSWORD);
+}
+
+fn push_cli_keyed_secret(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    token: &shell::Token,
+    value_start: usize,
+) {
+    push_cli_secret(view, out, token, value_start, labels::KEYED_SECRET);
+}
+
+fn push_cli_secret(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    token: &shell::Token,
+    value_start: usize,
+    label: &str,
+) {
     if value_start >= token.value.len() || value_start >= token.byte_to_raw.len() {
         return;
     }
     let value = token.value[value_start..].trim();
-    if !cli_password_is_material(value) {
+    if !cli_secret_is_material(value) {
         return;
     }
     let trim_left =
@@ -167,15 +337,15 @@ fn push_cli_password(
             token.byte_to_raw[end - 1] + 1,
         )),
         category: Category::Secret,
-        label: labels::CMD_PASSWORD.to_string(),
+        label: label.to_string(),
         confidence: Confidence::High,
         source: DetectorId::Rule,
     });
 }
 
-fn cli_password_is_material(value: &str) -> bool {
+fn cli_secret_is_material(value: &str) -> bool {
     let value = value.trim();
-    if !(6..=256).contains(&value.len()) {
+    if value.is_empty() || value.len() > 256 || value == "-" {
         return false;
     }
     if value
@@ -187,21 +357,29 @@ fn cli_password_is_material(value: &str) -> bool {
     let normalized = normalize_password_word(value);
     if matches!(
         normalized.as_str(),
-        "password" | "passwd" | "pwd" | "secret" | "token" | "example" | "sample" | "value"
+        "password"
+            | "passwd"
+            | "pwd"
+            | "secret"
+            | "token"
+            | "example"
+            | "sample"
+            | "value"
+            | "string"
+            | "bearer"
+            | "basic"
+            | "digest"
+            | "ntlm"
+            | "negotiate"
+            | "oauth"
+            | "oauth2"
     ) {
         return false;
     }
     if value.starts_with('$') || value.starts_with('%') {
         return false;
     }
-    let has_upper = value.bytes().any(|b| b.is_ascii_uppercase());
-    let has_lower = value.bytes().any(|b| b.is_ascii_lowercase());
-    let has_digit = value.bytes().any(|b| b.is_ascii_digit());
-    let has_symbol = value
-        .bytes()
-        .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'_' | b'-' | b'.' | b'@'))
-        || value.contains('@');
-    value.len() >= 7 || (has_symbol && (has_upper || has_lower)) || (has_digit && has_lower)
+    true
 }
 
 fn normalize_password_word(value: &str) -> String {
@@ -302,11 +480,76 @@ mod tests {
     }
 
     #[test]
+    fn masks_generic_long_secret_options() {
+        for raw in [
+            "docker login registry.example --password correcthorsebattery",
+            "kubectl --token correcthorsebattery get pods",
+            "tool --client-secret=correcthorsebattery run",
+            "tool --api-key:correcthorsebattery run",
+        ] {
+            assert_eq!(
+                labels(raw),
+                [(
+                    "KEYED_SECRET".to_string(),
+                    "correcthorsebattery".to_string()
+                )],
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            labels(r#"svn --username 'foo' --password 'bar \'bar' https://foo.example.org/svn/"#),
+            [("KEYED_SECRET".to_string(), r#"bar \'bar"#.to_string())]
+        );
+        assert_eq!(
+            labels("tool --password x"),
+            [("KEYED_SECRET".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn masks_contextual_short_and_positional_cli_secrets() {
+        for (raw, label) in [
+            (
+                "docker login registry.example -u user -p correcthorsebattery",
+                "CMD_PASSWORD",
+            ),
+            ("vault login correcthorsebattery", "KEYED_SECRET"),
+            (
+                "aws configure set aws_secret_access_key correcthorsebattery",
+                "KEYED_SECRET",
+            ),
+        ] {
+            assert_eq!(
+                labels(raw),
+                [(label.to_string(), "correcthorsebattery".to_string())],
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_boundaries_do_not_mask_metadata_or_cross_commands() {
+        for raw in [
+            "docker run -p 8080:80 image",
+            "docker login -u user; echo -p correcthorsebattery",
+            "tool login -u user -profile production",
+            "tool --password-file ./password.txt",
+            "tool --token-path ./token.txt",
+            "tool --secret-name production",
+            "kubectl --token $KUBERNETES_TOKEN get pods",
+            "docker login -u user --password -",
+            "vault status",
+            "aws configure set output_format json",
+        ] {
+            assert!(labels(raw).is_empty(), "{raw}: {:?}", labels(raw));
+        }
+    }
+
+    #[test]
     fn command_password_templates_are_ignored() {
         for raw in [
             "$obj = Get-NtToken -Password password",
             "$obj = Get-NtToken -Password $password",
-            "svn --username 'foo' --password 'bar \\'bar' https://foo.example.org/svn/",
         ] {
             assert!(labels(raw).is_empty(), "{raw}: {:?}", labels(raw));
         }

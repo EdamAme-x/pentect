@@ -66,6 +66,19 @@ pub(crate) fn tokens(line: &str, base: usize) -> Vec<Token> {
             if quote.is_none() && is_control(ch) {
                 break;
             }
+            if ch == '\\'
+                && quote.is_some()
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|(_, next)| Some(*next) == quote)
+            {
+                let (quoted_offset, quoted) = chars[i + 1];
+                value.push(quoted);
+                byte_to_raw
+                    .extend((0..quoted.len_utf8()).map(|offset| base + quoted_offset + offset));
+                i += 2;
+                continue;
+            }
             if matches!(ch, '\'' | '"') {
                 if quote == Some(ch) {
                     quote = None;
@@ -89,6 +102,38 @@ pub(crate) fn tokens(line: &str, base: usize) -> Vec<Token> {
             i += 1;
         }
     }
+    out
+}
+
+/// Splits tokenized shell text at control operators without interpreting the
+/// command itself. Keeping this boundary in one place prevents detectors from
+/// associating an option in one command with a value in the next command.
+pub(crate) fn command_slices<'a>(tokens: &'a [Token], text: &str) -> Vec<&'a [Token]> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for index in 0..tokens.len().saturating_sub(1) {
+        let Some(gap_start) = tokens[index]
+            .byte_to_raw
+            .last()
+            .and_then(|offset| offset.checked_add(1))
+        else {
+            continue;
+        };
+        let Some(gap_end) = tokens[index + 1].byte_to_raw.first().copied() else {
+            continue;
+        };
+        if text
+            .get(gap_start..gap_end)
+            .is_some_and(|gap| gap.chars().any(is_control))
+        {
+            out.push(&tokens[start..=index]);
+            start = index + 1;
+        }
+    }
+    out.push(&tokens[start..]);
     out
 }
 
@@ -132,6 +177,10 @@ mod tests {
         assert_eq!(value.byte_to_raw.len(), value.value.len());
         assert_eq!(value.byte_to_raw[0], 30);
         assert_eq!(basename("C:\\Tools\\CURL.EXE"), "CURL");
+
+        let escaped = tokens(r#"tool --password 'bar \'bar' https://example.test"#, 0);
+        assert_eq!(escaped[2].value, "bar 'bar");
+        assert_eq!(escaped[3].value, "https://example.test");
     }
 
     #[test]
@@ -143,5 +192,28 @@ mod tests {
         assert_eq!(value.byte_to_raw[start], 24);
         assert!(!has_powershell_parameter(&tokens, "-ValuesX"));
         assert!(powershell_parameter_value(&tokens, "-Val").is_none());
+    }
+
+    #[test]
+    fn command_slices_do_not_cross_control_operators() {
+        let raw = "docker login -u user; echo -p project | tool --token secretvalue";
+        let tokens = tokens(raw, 0);
+        let commands = command_slices(&tokens, raw)
+            .into_iter()
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|token| token.value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            [
+                vec!["docker", "login", "-u", "user"],
+                vec!["echo", "-p", "project"],
+                vec!["tool", "--token", "secretvalue"],
+            ]
+        );
     }
 }
