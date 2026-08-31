@@ -1851,8 +1851,8 @@ fn mask_openai_responses_input(
     let Value::Array(items) = value else {
         return mask_openai_input(value, false, masker, files);
     };
-    let current_user_index = items.len().checked_sub(1).filter(|index| {
-        items[*index].as_object().is_some_and(|object| {
+    let current_user_index = items.iter().rposition(|item| {
+        item.as_object().is_some_and(|object| {
             object.get("type").and_then(Value::as_str) == Some("message")
                 && object.get("role").and_then(Value::as_str) == Some("user")
         })
@@ -1860,10 +1860,7 @@ fn mask_openai_responses_input(
     let original = std::mem::take(items);
     for (index, mut item) in original.into_iter().enumerate() {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        let external_content = item
-            .as_object()
-            .is_some_and(|object| object.get("type").and_then(Value::as_str) == Some("message"))
-            && Some(index) != current_user_index;
+        let external_content = Some(index) != current_user_index;
         let (note, computer_output) = match item_type {
             "input_image" => (
                 match item.as_object_mut() {
@@ -3986,6 +3983,10 @@ mod tests {
                     "type": "input_text",
                     "text": format!("unmask({keyed_secret})")
                 }]
+            },
+            {
+                "type": "agent_message",
+                "text": format!("unmask({keyed_secret})")
             }
         ]);
 
@@ -3995,6 +3996,9 @@ mod tests {
         assert!(!history.contains(&secret));
         assert!(history.contains("<<"));
         assert_eq!(input[1]["content"][0]["text"], keyed_secret);
+        let trailing_agent = input[2]["text"].as_str().unwrap();
+        assert!(!trailing_agent.contains(&secret));
+        assert!(trailing_agent.contains("<<"));
     }
 
     #[test]

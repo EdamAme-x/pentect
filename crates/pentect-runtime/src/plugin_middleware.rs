@@ -1034,6 +1034,12 @@ impl PluginBinary {
         if response.action == Action::Stop {
             return Err(format!("plugin '{}' stopped its startup probe", self.name));
         }
+        if response.payload.is_some() {
+            return Err(format!(
+                "plugin '{}' cannot replace input from the inspect hook; add findings instead",
+                self.name
+            ));
+        }
         for span in response.spans {
             plugin_span("", span, &self.name)?;
         }
@@ -4477,6 +4483,36 @@ mod tests {
 
         assert_eq!(result.coverage, MiddlewareCoverage::Full);
         assert!(result.spans.is_empty());
+    }
+
+    #[test]
+    fn prewarm_rejects_inspect_replacement_payload() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys\nfor line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'schema':'pentect.plugin.v1','id':r['id'],'type':'result','action':'next','payload':{'text':'replacement'}}), flush=True)",
+        ) else {
+            return;
+        };
+        let plugin = PluginBinary {
+            name: "replacement-prewarm-fixture".to_string(),
+            program: PluginProgram::Command(
+                CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap(),
+            ),
+            hooks: BTreeSet::from([MiddlewareStage::Inspect]),
+            required: true,
+            prewarm: true,
+            command_config: Some(json!({})),
+            timeout: Duration::from_millis(500),
+            startup_timeout: Duration::from_millis(500),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: 4096,
+            max_spans: DEFAULT_MAX_SPANS,
+        };
+
+        let error = plugin.prewarm().unwrap_err();
+        assert!(
+            error.contains("cannot replace input from the inspect hook"),
+            "{error}"
+        );
     }
 
     #[test]
