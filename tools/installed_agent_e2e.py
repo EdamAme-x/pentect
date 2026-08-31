@@ -580,6 +580,110 @@ command = ["python", "{plugin}/setup.py"]
     )
 
 
+def verify_failed_update_preserves_command_runtime(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "failed-update-plugin"
+    plugin.mkdir()
+    manifest = plugin / "plugin.toml"
+    server = plugin / "server.py"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "failed-update-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[setup]
+command = ["python", "-c", "raise SystemExit(0)"]
+'''
+    server.write_text(
+        r'''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    manifest.write_text(manifest_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    ordinary = "ordinary failed update fixture"
+    run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=ordinary,
+    )
+    before = snapshot_regular_files(home, project)
+    manifest.write_text(
+        manifest_source.replace(
+            'required = true\n', 'required = true\ndescription = "updated"\n'
+        ).replace("raise SystemExit(0)", "raise SystemExit(17)"),
+        encoding="utf-8",
+    )
+    failed = subprocess.run(
+        pentect_command(
+            pentect,
+            ["plugins", "update", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+    if (
+        failed.returncode == 0
+        or "plugin environment setup failed with exit 17" not in failed.stdout
+    ):
+        raise RuntimeError(
+            "failed plugin update did not expose its setup failure:\n" + failed.stdout
+        )
+    if snapshot_regular_files(home, project) != before:
+        raise RuntimeError("failed plugin update changed approved persistent state")
+
+    # A local source is owned by the user and is not rewritten by Pentect. Once
+    # that source is restored, the previously approved runtime must work without
+    # another setup. Remote sources restore this side through the cache rollback.
+    manifest.write_text(manifest_source, encoding="utf-8")
+    recovered = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=ordinary,
+    )
+    if ordinary not in recovered.stdout:
+        raise RuntimeError(
+            "previously approved plugin did not recover after failed update:\n"
+            + recovered.stdout
+        )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "failed-update-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
@@ -613,13 +717,16 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_interrupted_setup_rolls_back(
             pentect, root, home, project, environment
         )
+        verify_failed_update_preserves_command_runtime(
+            pentect, root, home, project, environment
+        )
         verify_installed_command_failure_boundaries(pentect, root, project, environment)
         verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
-            "add/setup/update/reinstall/remove, failed/interrupted-setup rollback, Command runtime "
-            "fail-closed boundaries and process cleanup, HOME-rooted optional/required storage "
-            "boundaries, no log plaintext"
+            "add/setup/update/reinstall/remove, failed/interrupted-setup and failed-update rollback, "
+            "Command runtime fail-closed boundaries and process cleanup, HOME-rooted "
+            "optional/required storage boundaries, no log plaintext"
         )
 
 
