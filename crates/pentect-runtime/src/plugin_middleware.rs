@@ -649,10 +649,6 @@ impl PluginBinary {
         Self::load_scoped(path, None)
     }
 
-    fn load_global(path: &Path, id: &str) -> Result<Self, String> {
-        Self::load_scoped(path, Some(id))
-    }
-
     fn load_from_environment(path: &Path, global_id: Option<&str>) -> Result<Option<Self>, String> {
         match Self::load_scoped(path, global_id) {
             Ok(plugin) => Ok(Some(plugin)),
@@ -4464,7 +4460,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let global = PluginMiddleware {
-            plugins: vec![PluginBinary::load_global(&manifest, &global_id).unwrap()],
+            plugins: vec![PluginBinary::load_scoped(&manifest, Some(&global_id)).unwrap()],
         };
         let result = global.detect_spans(&Input::text("SECRET"), None).unwrap();
         assert_eq!(result.spans.len(), 1);
