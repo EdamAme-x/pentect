@@ -389,13 +389,15 @@ command = ["python", "-c", "import sys; sys.exit(17)"]
 
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
-        prefix="pentect-plugin-e2e-", ignore_cleanup_errors=True
-    ) as raw_root:
+        prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
+    ) as raw_root, tempfile.TemporaryDirectory(
+        prefix="pentect-plugin-e2e-home-", ignore_cleanup_errors=True
+    ) as raw_home:
         root = Path(raw_root)
-        home = root / "home"
+        home = Path(raw_home)
         project = root / "project"
-        home.mkdir()
         project.mkdir()
+        (project / ".git").mkdir()
         environment = isolated_environment(home, root / "logs")
         plugin = install_detector_plugin(pentect, root, project, environment)
         masked = run_pentect(
