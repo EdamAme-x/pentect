@@ -257,6 +257,15 @@ def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
         "XDG_STATE_HOME": str(home / ".local" / "state"),
         "PENTECT_LOG_DIR": str(log_dir),
     })
+    if os.name == "nt":
+        local_app_data = home / "AppData" / "Local"
+        roaming_app_data = home / "AppData" / "Roaming"
+        local_app_data.mkdir(parents=True)
+        roaming_app_data.mkdir(parents=True)
+        environment.update({
+            "LOCALAPPDATA": str(local_app_data),
+            "APPDATA": str(roaming_app_data),
+        })
     return environment
 
 
