@@ -684,6 +684,176 @@ for line in sys.stdin:
     )
 
 
+def verify_command_runtime_concurrency_and_restart(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "concurrent-command-plugin"
+    plugin.mkdir()
+    workers = plugin / "workers"
+    workers.mkdir()
+    script = plugin / "server.py"
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "concurrent-command-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[execution]
+timeout_ms = 10000
+startup_timeout_ms = 10000
+''',
+        encoding="utf-8",
+    )
+    script.write_text(
+        r'''import json
+import os
+import sys
+import time
+from pathlib import Path
+
+workers = Path(__file__).parent / "workers"
+workers.mkdir(exist_ok=True)
+leader_file = workers / "leader"
+try:
+    descriptor = os.open(leader_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+except FileExistsError:
+    role = "follower"
+else:
+    os.close(descriptor)
+    role = "leader"
+marker = workers / f"{os.getpid()}.worker"
+marker.write_text(json.dumps({"parent": os.getppid(), "role": role}), encoding="utf-8")
+deadline = time.monotonic() + 5
+while len(list(workers.glob("*.worker"))) < 2 and time.monotonic() < deadline:
+    time.sleep(0.02)
+if len(list(workers.glob("*.worker"))) < 2:
+    raise SystemExit(23)
+if role == "follower":
+    release = workers / "release"
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not release.exists():
+        raise SystemExit(24)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    ordinary = "ordinary concurrent command fixture"
+
+    def invoke() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=environment,
+            input=ordinary,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+
+    processes = [
+        subprocess.Popen(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        assert process.stdin is not None
+        process.stdin.write(ordinary)
+        process.stdin.close()
+        process.stdin = None
+    deadline = time.monotonic() + 5
+    while len(list(workers.glob("*.worker"))) < 2 and time.monotonic() < deadline:
+        if any(process.poll() is not None for process in processes):
+            break
+        time.sleep(0.02)
+    marker_paths = list(workers.glob("*.worker"))
+    if len(marker_paths) != 2:
+        for process in processes:
+            process.kill()
+        outputs = [process.communicate()[0] for process in processes]
+        raise RuntimeError(
+            "concurrent Pentect processes did not start two plugin workers:\n"
+            + "\n".join(outputs)
+        )
+    markers = {
+        int(path.stem): json.loads(path.read_text(encoding="utf-8"))
+        for path in marker_paths
+    }
+    leaders = [(pid, data) for pid, data in markers.items() if data["role"] == "leader"]
+    followers = [(pid, data) for pid, data in markers.items() if data["role"] == "follower"]
+    if len(leaders) != 1 or len(followers) != 1:
+        raise RuntimeError("concurrent command workers did not elect one leader and one follower")
+    processes_by_pid = {process.pid: process for process in processes}
+    leader_worker, leader_data = leaders[0]
+    follower_worker, follower_data = followers[0]
+    leader = processes_by_pid.get(leader_data["parent"])
+    follower = processes_by_pid.get(follower_data["parent"])
+    if leader is None or follower is None:
+        raise RuntimeError("command worker markers did not identify their Pentect parents")
+    leader_output, _ = leader.communicate(timeout=15)
+    if leader.returncode != 0 or ordinary not in leader_output:
+        raise RuntimeError("leading concurrent command invocation failed:\n" + leader_output)
+    if follower.poll() is not None or not process_exists(follower_worker):
+        follower_output, _ = follower.communicate(timeout=5)
+        raise RuntimeError(
+            "ending one Pentect process terminated the other plugin worker:\n"
+            + follower_output
+        )
+    (workers / "release").write_text("continue\n", encoding="utf-8")
+    follower_output, _ = follower.communicate(timeout=15)
+    if follower.returncode != 0 or ordinary not in follower_output:
+        raise RuntimeError("following concurrent command invocation failed:\n" + follower_output)
+    first_workers = sorted(markers)
+    for pid in first_workers:
+        if not wait_for_process_exit(pid, timeout=2.0):
+            raise RuntimeError(f"concurrent command plugin worker {pid} survived its Pentect process")
+
+    restarted = invoke()
+    if restarted.returncode != 0 or ordinary not in restarted.stdout:
+        raise RuntimeError("restarted installed command invocation failed:\n" + restarted.stdout)
+    all_workers = sorted(int(path.stem) for path in workers.glob("*.worker"))
+    if len(all_workers) != 3 or not set(first_workers).issubset(all_workers):
+        raise RuntimeError("restarted Pentect did not create exactly one new plugin worker")
+    restarted_pid = next(pid for pid in all_workers if pid not in first_workers)
+    if not wait_for_process_exit(restarted_pid, timeout=2.0):
+        raise RuntimeError(
+            f"restarted command plugin worker {restarted_pid} survived its Pentect process"
+        )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "concurrent-command-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
@@ -720,13 +890,16 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_failed_update_preserves_command_runtime(
             pentect, root, home, project, environment
         )
+        verify_command_runtime_concurrency_and_restart(
+            pentect, root, project, environment
+        )
         verify_installed_command_failure_boundaries(pentect, root, project, environment)
         verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
             "add/setup/update/reinstall/remove, failed/interrupted-setup and failed-update rollback, "
-            "Command runtime fail-closed boundaries and process cleanup, HOME-rooted "
-            "optional/required storage boundaries, no log plaintext"
+            "Command runtime concurrency/restart, fail-closed boundaries and process cleanup, "
+            "HOME-rooted optional/required storage boundaries, no log plaintext"
         )
 
 
