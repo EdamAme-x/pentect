@@ -1311,16 +1311,26 @@ jobs:
 
 fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
+    let checks = plugin_checks(&active);
+    report_plugin_checks(&checks, json_output)?;
+    Ok(())
+}
+
+fn plugin_checks(active: &plugins::ActivePlugins) -> Vec<Check> {
     let mut checks = Vec::new();
     for path in active.config_paths() {
         checks.push(test_pack(path));
     }
-    for path in active.binary_paths() {
+    for path in active.all_binary_paths() {
         checks.push(test_binary(path));
     }
     if checks.is_empty() {
         checks.push(Check::fail("plugin", "empty"));
     }
+    checks
+}
+
+fn report_plugin_checks(checks: &[Check], json_output: bool) -> Result<(), String> {
     if json_output {
         println!(
             "{}",
@@ -1333,7 +1343,7 @@ fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             })
         );
     } else {
-        for check in &checks {
+        for check in checks {
             println!("{}: {}", check.name, check.status.as_str());
         }
     }
@@ -4971,9 +4981,29 @@ pattern = "token-[0-9]+"
         let _ = std::fs::remove_dir_all(&root);
         let plugin = root.join("global-command");
         std::fs::create_dir_all(&plugin).unwrap();
+        let output =
+            br#"{"schema":"pentect.plugin.v1","id":1,"type":"result","action":"next","spans":[]}"#;
+        let packed = ((2048_u64) << 32) | output.len() as u64;
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 2048) "{}")
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_inspect") (param i32 i32) (result i64)
+                    (i64.const {packed}))
+            )"#,
+            String::from_utf8_lossy(output).replace('"', "\\22")
+        ))
+        .unwrap();
+        std::fs::write(plugin.join("global-command.wasm"), wasm).unwrap();
         std::fs::write(
             plugin.join(plugins::PLUGIN_MANIFEST_FILE),
-            "schema = \"pentect.plugin.v1\"\nname = \"global-command\"\ncommand = [\"tool\"]\nhooks = [\"inspect\"]\n",
+            concat!(
+                "schema = \"pentect.plugin.v1\"\n",
+                "name = \"global-command\"\n",
+                "wasm = \"global-command.wasm\"\n",
+            ),
         )
         .unwrap();
 
@@ -4985,8 +5015,15 @@ pattern = "token-[0-9]+"
             false,
         )
         .unwrap();
-        assert!(active.binary_paths().is_empty());
         assert!(active.has_binary());
+        let paths = active.all_binary_paths().collect::<Vec<_>>();
+        let manifest = std::fs::canonicalize(plugin.join(plugins::PLUGIN_MANIFEST_FILE)).unwrap();
+        assert_eq!(paths, [manifest]);
+        let checks = plugin_checks(&active);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "binary");
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(checks[0].detail.contains("binary is not locked"));
 
         let row = plugin_row("global-command".to_string(), "user", &active)
             .expect("user-scoped binary should be listed");
