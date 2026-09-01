@@ -130,8 +130,11 @@ impl ActivePlugins {
         &self.config_paths
     }
 
-    pub(crate) fn binary_paths(&self) -> &[PathBuf] {
-        &self.binary_paths
+    pub(crate) fn all_binary_paths(&self) -> impl Iterator<Item = &Path> {
+        self.binary_paths
+            .iter()
+            .chain(&self.global_binary_paths)
+            .map(PathBuf::as_path)
     }
 
     pub(crate) fn has_binary(&self) -> bool {
