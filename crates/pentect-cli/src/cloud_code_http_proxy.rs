@@ -275,6 +275,7 @@ async fn proxy_request_inner(
         );
     }
     let is_stream = endpoint == CloudCodeEndpoint::StreamGenerateContent;
+    let mut request_coverage = None;
     let upstream_url =
         crate::upstream::join_url(&state.upstream, path_and_query, "Google Cloud Code")?;
     let request_headers = request.headers().clone();
@@ -301,6 +302,7 @@ async fn proxy_request_inner(
             &state.plugins,
             state.block_unknown_formats,
         )?;
+        request_coverage = Some(protected.coverage);
         if let Some(response) = protected.local_response {
             if is_stream {
                 return Ok(text_response(
@@ -371,7 +373,9 @@ async fn proxy_request_inner(
     }
     builder = builder.header(
         "x-pentect-coverage",
-        if protected { "full" } else { "none" },
+        request_coverage
+            .unwrap_or(crate::http_files::Coverage::None)
+            .as_header(),
     );
     if event_stream && endpoint == CloudCodeEndpoint::StreamGenerateContent && status.is_success() {
         return builder
@@ -561,6 +565,7 @@ fn enforce_known_endpoint(
 #[derive(Debug)]
 struct ProtectedRequest {
     body: Bytes,
+    coverage: crate::http_files::Coverage,
     local_response: Option<Bytes>,
 }
 
@@ -582,6 +587,7 @@ fn protect_request_body(
             proxy_diagnostic("request-invalid-json");
             return Ok(ProtectedRequest {
                 body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
                 local_response: None,
             });
         }
@@ -594,6 +600,7 @@ fn protect_request_body(
             value,
             Some(serde_json::json!({"provider": "google-cloud-code", "transport": "http"})),
         )?;
+    let mut plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",
@@ -607,6 +614,7 @@ fn protect_request_body(
             .map_err(|error| format!("could not encode plugin response: {error}"))?;
         return Ok(ProtectedRequest {
             body: Bytes::new(),
+            coverage: crate::http_files::Coverage::Full,
             local_response: Some(body),
         });
     }
@@ -627,6 +635,7 @@ fn protect_request_body(
             "http_json",
         )
     }?;
+    plugin_partial |= inline_file_partial;
     if block_unknown_formats && inline_file_partial {
         return Err(
             "unknown format blocked: a file plugin reported partial Google Cloud Code inline-file coverage"
@@ -646,6 +655,7 @@ fn protect_request_body(
             proxy_diagnostic("request-protection-skipped");
             return Ok(ProtectedRequest {
                 body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
                 local_response: None,
             });
         }
@@ -664,6 +674,11 @@ fn protect_request_body(
         })?;
     Ok(ProtectedRequest {
         body,
+        coverage: if plugin_partial {
+            crate::http_files::Coverage::Partial
+        } else {
+            crate::http_files::Coverage::Full
+        },
         local_response: None,
     })
 }
@@ -1492,6 +1507,24 @@ mod tests {
         let start = text.find("<<")?;
         let end = start + text[start..].find(">>")? + 2;
         Some(text[start..end].to_string())
+    }
+
+    #[test]
+    fn compatible_unprotected_request_reports_partial_coverage() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let protected = protect_request_body(
+            &Bytes::from_static(b"not-json"),
+            CloudCodeEndpoint::GenerateContent,
+            &masker,
+            &plugins,
+            false,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Partial);
     }
 
     fn mock_cloud_code_upstream() -> (

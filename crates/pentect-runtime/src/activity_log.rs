@@ -1264,6 +1264,7 @@ fn diagnostic_surface(value: &str) -> String {
         value,
         &[
             "claude",
+            "claude-app",
             "cloud-code",
             "decode",
             "gemini",
@@ -1289,6 +1290,7 @@ fn diagnostic_event(value: &str) -> String {
             "file-registry-unavailable",
             "gateway-busy",
             "gateway-stopped",
+            "no-protected-connection",
             "provider-mcp-credential-forwarded",
             "request-content-encoding-skipped",
             "request-encode-skipped",
@@ -1334,6 +1336,7 @@ fn diagnostic_kind(value: &str) -> String {
             "internal",
             "limit",
             "model-load",
+            "plugin",
             "policy",
             "preprocess",
             "protection",
@@ -1363,23 +1366,34 @@ fn diagnostic_endpoint(value: &str) -> String {
     allowed_diagnostic_identifier(
         value,
         &[
+            "audio-speech",
+            "audio-transcription",
+            "audio-translation",
+            "batch-embed-contents",
             "bundled",
             "chat-completions",
+            "complete",
+            "completions",
             "control",
             "count-tokens",
             "disabled",
+            "embed-content",
+            "embeddings",
             "files",
             "files-collection",
             "gateway",
             "generate-content",
             "health",
             "image",
+            "image-generation",
             "input-tokens",
             "macos",
             "messages",
+            "message-batches",
             "models",
             "responses",
             "responses-resource",
+            "standalone-search",
             "stream-generate-content",
             "telemetry",
             "tool-input",
@@ -1972,5 +1986,31 @@ mod tests {
         assert_eq!(event.endpoint.as_deref(), Some("unknown"));
         assert_eq!(event.method.as_deref(), Some("unknown"));
         assert_eq!(event.version, None);
+    }
+
+    #[test]
+    fn emitted_http_diagnostic_identifiers_are_preserved() {
+        assert_eq!(diagnostic_surface("claude-app"), "claude-app");
+        assert_eq!(
+            diagnostic_event("no-protected-connection"),
+            "no-protected-connection"
+        );
+        assert_eq!(diagnostic_kind("plugin"), "plugin");
+        for endpoint in [
+            "audio-speech",
+            "audio-transcription",
+            "audio-translation",
+            "batch-embed-contents",
+            "complete",
+            "completions",
+            "embed-content",
+            "embeddings",
+            "image-generation",
+            "message-batches",
+            "standalone-search",
+        ] {
+            assert_eq!(diagnostic_endpoint(endpoint), endpoint);
+        }
+        assert_eq!(diagnostic_kind("response"), "unknown");
     }
 }
