@@ -438,8 +438,73 @@ fn print_metric_group(title: &str, values: &BTreeMap<String, u64>) {
             .then_with(|| left_name.cmp(right_name))
     });
     for (name, count) in values {
-        println!("  {name}: {count}");
+        let readable = labels::description(name)
+            .map(str::to_string)
+            .unwrap_or_else(|| readable_metric_name(name));
+        if readable == *name {
+            println!("  {name}: {count}");
+        } else {
+            println!("  {name} ({readable}): {count}");
+        }
     }
+}
+
+fn readable_metric_name(name: &str) -> String {
+    let mut output = String::new();
+    for (index, word) in name
+        .split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .enumerate()
+    {
+        if index > 0 {
+            output.push(' ');
+        }
+        if is_metric_acronym(word) {
+            output.push_str(&word.to_ascii_uppercase());
+            continue;
+        }
+        let normalized = word.to_ascii_lowercase();
+        if index == 0 {
+            let mut chars = normalized.chars();
+            if let Some(first) = chars.next() {
+                output.extend(first.to_uppercase());
+                output.push_str(chars.as_str());
+            }
+        } else {
+            output.push_str(&normalized);
+        }
+    }
+    if output.is_empty() {
+        "Unknown".to_string()
+    } else {
+        output
+    }
+}
+
+fn is_metric_acronym(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "API"
+            | "AWS"
+            | "CLI"
+            | "CMD"
+            | "GPS"
+            | "HTTP"
+            | "IBAN"
+            | "JSON"
+            | "JWT"
+            | "MCP"
+            | "NINO"
+            | "OCR"
+            | "OPENAI"
+            | "OTP"
+            | "PII"
+            | "S3"
+            | "SSE"
+            | "UK"
+            | "URL"
+            | "UUID"
+    )
 }
 
 fn read_metrics(path: &Path) -> Result<PrivacyMetrics, String> {
@@ -1711,6 +1776,15 @@ mod tests {
     fn restoration_block_surfaces_are_bounded() {
         assert_eq!(restoration_block_surface("argv"), "argv");
         assert_eq!(restoration_block_surface("private-project-name"), "other");
+    }
+
+    #[test]
+    fn metric_names_are_readable_without_changing_the_stable_key() {
+        assert_eq!(readable_metric_name("AWS_S3_BUCKET"), "AWS S3 bucket");
+        assert_eq!(readable_metric_name("OPENAI_API_KEY"), "OPENAI API key");
+        assert_eq!(readable_metric_name("request-failed"), "Request failed");
+        assert_eq!(readable_metric_name("PII"), "PII");
+        assert_eq!(readable_metric_name(""), "Unknown");
     }
 
     #[test]
