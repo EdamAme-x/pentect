@@ -569,6 +569,8 @@ fn plugin_paths_for_named_scoped(
     validate_plugin_name(name)?;
     let project_dir = plugins_root()?.join(name);
     let official_dir = official_plugins_root()?.join(name);
+    let project_display = Path::new(PENTECT_DIR).join(PLUGINS_DIR).join(name);
+    let official_display = Path::new(OFFICIAL_PLUGINS_DIR).join(name);
 
     if scope == PluginScope::Project {
         if project_dir.is_dir() {
@@ -604,9 +606,9 @@ fn plugin_paths_for_named_scoped(
     };
     if scope == PluginScope::Project && (project_dir.is_dir() || official_dir.is_dir()) {
         let suggestion_dir = if project_dir.is_dir() {
-            &project_dir
+            &project_display
         } else {
-            &official_dir
+            &official_display
         };
         let mut message = format!(
             "plugin '{name}' has no detectors, Wasm, or command; add '{}' or '{}'",
@@ -622,11 +624,10 @@ fn plugin_paths_for_named_scoped(
     let mut message = match scope {
         PluginScope::User => format!("global plugin '{name}' was not found in the remote catalog"),
         PluginScope::Project => {
-            let project_display = Path::new(PENTECT_DIR).join(PLUGINS_DIR).join(name);
             format!(
                 "plugin '{name}' was not found at '{}' or '{}'",
                 project_display.display(),
-                official_dir.display()
+                official_display.display()
             )
         }
     };
@@ -2765,6 +2766,47 @@ label = "INLINE_SECRET"
             !err.contains(&plugins_root().unwrap().display().to_string()),
             "{err}"
         );
+        assert!(
+            err.contains(
+                &Path::new(OFFICIAL_PLUGINS_DIR)
+                    .join(&name)
+                    .display()
+                    .to_string()
+            ),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&official_plugins_root().unwrap().display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_named_plugin_suggestions_use_project_relative_paths() {
+        let name = format!(
+            "empty-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = plugins_root().unwrap().join(&name);
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let error = plugin_paths_for_named(&name, true).unwrap_err().to_string();
+
+        let display = Path::new(PENTECT_DIR).join(PLUGINS_DIR).join(&name);
+        assert!(
+            error.contains(&display.join(PLUGIN_CONFIG_FILE).display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains(&display.join(PLUGIN_MANIFEST_FILE).display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains(&directory.display().to_string()), "{error}");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
