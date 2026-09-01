@@ -268,6 +268,7 @@ async fn proxy_request_inner(
     let protected = endpoint.is_protected() && method == hyper::Method::POST;
     let is_stream = endpoint == GeminiEndpoint::StreamGenerateContent;
     let body_forbidden = endpoint == GeminiEndpoint::Models;
+    let mut request_coverage = None;
     if endpoint.is_protected() && method != hyper::Method::POST {
         return Err("unknown format blocked: Gemini model endpoints must use POST".to_string());
     }
@@ -307,6 +308,7 @@ async fn proxy_request_inner(
                 &state.plugins,
                 state.block_unknown_formats,
             )?;
+            request_coverage = Some(protected.coverage);
             if let Some(response) = protected.local_response {
                 if endpoint == GeminiEndpoint::StreamGenerateContent {
                     return Ok(text_response(
@@ -381,7 +383,9 @@ async fn proxy_request_inner(
     }
     builder = builder.header(
         "x-pentect-coverage",
-        if protected { "full" } else { "none" },
+        request_coverage
+            .unwrap_or(crate::http_files::Coverage::None)
+            .as_header(),
     );
     if event_stream && status.is_success() && endpoint == GeminiEndpoint::StreamGenerateContent {
         return builder
@@ -509,6 +513,7 @@ fn diagnostic_endpoint_name(request_path: &str, auth: &str) -> &'static str {
 
 struct ProtectedRequest {
     body: Bytes,
+    coverage: crate::http_files::Coverage,
     local_response: Option<Bytes>,
 }
 
@@ -530,6 +535,7 @@ fn protect_request_body(
             diagnostic("request-invalid-json");
             return Ok(ProtectedRequest {
                 body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
                 local_response: None,
             });
         }
@@ -542,6 +548,7 @@ fn protect_request_body(
             value,
             Some(serde_json::json!({"provider": "gemini", "transport": "http"})),
         )?;
+    let mut plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",
@@ -553,6 +560,7 @@ fn protect_request_body(
             .map(Bytes::from)
             .map(|local_response| ProtectedRequest {
                 body: Bytes::new(),
+                coverage: crate::http_files::Coverage::Full,
                 local_response: Some(local_response),
             })
             .map_err(|error| format!("could not encode plugin response: {error}"));
@@ -569,6 +577,7 @@ fn protect_request_body(
             .map_err(|_| "Gemini plugin lock was poisoned".to_string())?;
         crate::http_files::run_google_inline_file_stages(&value, &plugins, "gemini", "http_json")
     }?;
+    plugin_partial |= inline_file_partial;
     if block_unknown_formats && inline_file_partial {
         return Err(
             "unknown format blocked: a file plugin reported partial Gemini inline-file coverage"
@@ -585,6 +594,7 @@ fn protect_request_body(
             diagnostic("request-protection-skipped");
             return Ok(ProtectedRequest {
                 body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
                 local_response: None,
             });
         }
@@ -597,6 +607,11 @@ fn protect_request_body(
         .map(Bytes::from)
         .map(|body| ProtectedRequest {
             body,
+            coverage: if plugin_partial {
+                crate::http_files::Coverage::Partial
+            } else {
+                crate::http_files::Coverage::Full
+            },
             local_response: None,
         })
         .map_err(|error| format!("could not encode protected Gemini request: {error}"))
@@ -1301,6 +1316,24 @@ mod tests {
             socket.flush().unwrap();
         });
         (format!("http://{address}"), body_rx, thread)
+    }
+
+    #[test]
+    fn compatible_unprotected_request_reports_partial_coverage() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let protected = protect_request_body(
+            &Bytes::from_static(b"not-json"),
+            GeminiEndpoint::GenerateContent,
+            &masker,
+            &plugins,
+            false,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Partial);
     }
 
     fn mock_raw_response(response: String) -> (String, std::thread::JoinHandle<()>) {
