@@ -1241,7 +1241,13 @@ fn build_local_plugin(
         .output()
         .map_err(|error| format!("could not inspect Cargo build directory: {error}"))?;
     if !metadata.status.success() {
-        return Err("could not inspect Cargo build directory".to_string());
+        let detail = String::from_utf8_lossy(&metadata.stderr);
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            "could not inspect Cargo build directory".to_string()
+        } else {
+            format!("could not inspect Cargo build directory: {detail}")
+        });
     }
     let target_directory = serde_json::from_slice::<serde_json::Value>(&metadata.stdout)
         .ok()

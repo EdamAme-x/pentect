@@ -100,6 +100,7 @@ def run_pentect(
     cwd: Path,
     environment: dict[str, str],
     stdin: str | None = None,
+    timeout: float = 30,
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         pentect_command(pentect, arguments),
@@ -109,7 +110,7 @@ def run_pentect(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=30,
+        timeout=timeout,
     )
     if completed.returncode != 0:
         output = completed.stdout.replace(PLUGIN_PLAINTEXT, "<plugin-fixture>")
@@ -250,6 +251,8 @@ def remove_detector_plugin(
 
 def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
     environment = os.environ.copy()
+    original_home_value = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    original_home = Path(original_home_value) if original_home_value else None
     environment.update({
         "HOME": str(home),
         "USERPROFILE": str(home),
@@ -259,6 +262,14 @@ def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
         "XDG_STATE_HOME": str(home / ".local" / "state"),
         "PENTECT_LOG_DIR": str(log_dir),
     })
+    if original_home is not None:
+        for variable, directory in (
+            ("CARGO_HOME", ".cargo"),
+            ("RUSTUP_HOME", ".rustup"),
+        ):
+            candidate = original_home / directory
+            if variable not in environment and candidate.is_dir():
+                environment[variable] = str(candidate)
     if os.name == "nt":
         local_app_data = home / "AppData" / "Local"
         roaming_app_data = home / "AppData" / "Roaming"
@@ -1055,14 +1066,157 @@ def run_plugin_lifecycle(pentect: str) -> None:
             pentect, root, project, environment
         )
         verify_installed_command_failure_boundaries(pentect, root, project, environment)
+        verify_installed_wasm_failure_boundaries(pentect, root, project, environment)
         verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
             "add/setup/update/reinstall/remove, failed/interrupted-setup and failed-update rollback, "
             "Command runtime concurrency/restart, long-running serialized setup completion, "
-            "fail-closed boundaries and process cleanup, HOME-rooted optional/required storage "
-            "boundaries, no log plaintext"
+            "Command fail-closed boundaries and process cleanup, installed Wasm trap/timeout "
+            "required/optional boundaries, HOME-rooted optional/required storage boundaries, "
+            "no log plaintext"
         )
+
+
+def verify_installed_wasm_failure_boundaries(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "wasm-failure-plugin"
+    source = plugin / "src"
+    source.mkdir(parents=True)
+    repository = Path(__file__).resolve().parents[1]
+    sdk = repository / "sdk" / "rust" / "pentect-plugin"
+    if not sdk.is_dir():
+        raise RuntimeError(f"Pentect Rust plugin SDK is unavailable: {sdk}")
+    (plugin / "Cargo.toml").write_text(
+        f'''[package]
+name = "wasm-failure-e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pentect-plugin = {{ path = {json.dumps(sdk.as_posix())} }}
+
+[workspace]
+''',
+        encoding="utf-8",
+    )
+    manifest = plugin / "plugin.toml"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "wasm-failure-e2e"
+wasm = "wasm-failure-e2e.wasm"
+required = true
+
+[execution]
+timeout_ms = 1000
+max_output_bytes = 1024
+'''
+    manifest.write_text(manifest_source, encoding="utf-8")
+    (source / "lib.rs").write_text(
+        r'''use pentect_plugin::{Inspect, PluginResult};
+
+fn inspect(context: &mut Inspect) -> PluginResult {
+    let text = context.input().text.as_str();
+    if text == "Alice Smith" {
+        return Ok(());
+    }
+    if text.contains("WASM_TIMEOUT") {
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+    panic!("intentional installed Wasm E2E trap");
+}
+
+pentect_plugin::export!(inspect);
+''',
+        encoding="utf-8",
+    )
+    config_dir = project / ".pentect"
+    created_config_dir = not config_dir.exists()
+    config_dir.mkdir(exist_ok=True)
+    config = config_dir / "config.toml"
+    previous_config = config.read_text(encoding="utf-8") if config.exists() else None
+    config.write_text(
+        f"plugins = [{json.dumps(plugin.as_posix())}]\n",
+        encoding="utf-8",
+    )
+    wasm_environment = environment.copy()
+    wasm_environment["CARGO_TARGET_DIR"] = str(repository / "target")
+    wasm_environment["CARGO_NET_OFFLINE"] = "true"
+
+    def activate() -> None:
+        activated = run_pentect(
+            pentect,
+            ["plugins", "dev", str(plugin), "--yes"],
+            cwd=project,
+            environment=wasm_environment,
+            timeout=180,
+        )
+        if "active: local development build" not in activated.stdout:
+            raise RuntimeError(
+                "Wasm development plugin did not activate:\n" + activated.stdout
+            )
+
+    def invoke(text: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=wasm_environment,
+            input=text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+
+    try:
+        activate()
+        for text, reason in (
+            ("WASM_TRAP", "execution failed"),
+            ("WASM_TIMEOUT", "timed out"),
+        ):
+            completed = invoke(text)
+            if completed.returncode == 0 or reason not in completed.stdout:
+                raise RuntimeError(
+                    f"required installed Wasm plugin did not fail closed with {reason!r}:\n"
+                    + completed.stdout
+                )
+
+        manifest.write_text(
+            manifest_source.replace("required = true", "required = false"),
+            encoding="utf-8",
+        )
+        activate()
+        for text, reason in (
+            ("WASM_TRAP", "execution failed"),
+            ("WASM_TIMEOUT", "timed out"),
+        ):
+            completed = invoke(text)
+            if (
+                completed.returncode != 0
+                or text not in completed.stdout
+                or "optional plugin 'wasm-failure-e2e' skipped" not in completed.stdout
+                or reason not in completed.stdout
+            ):
+                raise RuntimeError(
+                    f"optional installed Wasm plugin did not fail open with {reason!r}:\n"
+                    + completed.stdout
+                )
+    finally:
+        if previous_config is None:
+            config.unlink(missing_ok=True)
+        else:
+            config.write_text(previous_config, encoding="utf-8")
+        if created_config_dir:
+            shutil.rmtree(config_dir, ignore_errors=True)
 
 
 def verify_installed_command_failure_boundaries(
