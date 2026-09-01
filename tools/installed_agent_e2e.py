@@ -1072,9 +1072,9 @@ def run_plugin_lifecycle(pentect: str) -> None:
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
             "add/setup/update/reinstall/remove, failed/interrupted-setup and failed-update rollback, "
             "Command runtime concurrency/restart, long-running serialized setup completion, "
-            "Command fail-closed boundaries and process cleanup, installed Wasm trap/timeout "
-            "required/optional boundaries, HOME-rooted optional/required storage boundaries, "
-            "no log plaintext"
+            "Command fail-closed boundaries and process cleanup, installed Wasm trap/timeout/"
+            "malformed/oversized required/optional boundaries, HOME-rooted optional/required "
+            "storage boundaries, no log plaintext"
         )
 
 
@@ -1120,22 +1120,51 @@ max_output_bytes = 1024
 '''
     manifest.write_text(manifest_source, encoding="utf-8")
     (source / "lib.rs").write_text(
-        r'''use pentect_plugin::{Inspect, PluginResult};
+        r'''use pentect_plugin::__serde_json as serde_json;
+use pentect_plugin::__serde_json::{json, Value};
 
-fn inspect(context: &mut Inspect) -> PluginResult {
-    let text = context.input().text.as_str();
-    if text == "Alice Smith" {
-        return Ok(());
-    }
+#[no_mangle]
+pub extern "C" fn pentect_alloc(len: i32) -> i32 {
+    let input = vec![0_u8; usize::try_from(len).expect("negative input length")]
+        .into_boxed_slice();
+    Box::into_raw(input) as *mut u8 as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pentect_inspect(pointer: i32, len: i32) -> i64 {
+    let pointer = usize::try_from(pointer).expect("negative input pointer");
+    let len = usize::try_from(len).expect("negative input length");
+    let input = unsafe {
+        Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer as *mut u8, len))
+    };
+    let request: Value = serde_json::from_slice(&input).expect("invalid fixture input");
+    let text = request["payload"]["text"].as_str().unwrap_or_default();
     if text.contains("WASM_TIMEOUT") {
         loop {
             std::hint::spin_loop();
         }
     }
-    panic!("intentional installed Wasm E2E trap");
+    if text.contains("WASM_TRAP") {
+        panic!("intentional installed Wasm E2E trap");
+    }
+    let output = if text.contains("WASM_MALFORMED") {
+        b"not-json".to_vec()
+    } else if text.contains("WASM_OVERSIZED") {
+        vec![b'x'; 2048]
+    } else {
+        serde_json::to_vec(&json!({
+            "schema": "pentect.plugin.v1",
+            "id": request["id"],
+            "type": "result",
+            "action": "next"
+        }))
+        .expect("fixture response serialization failed")
+    }
+    .into_boxed_slice();
+    let output_len = u32::try_from(output.len()).expect("fixture output too large");
+    let output_pointer = Box::into_raw(output) as *mut u8 as u32;
+    (((output_pointer as u64) << 32) | u64::from(output_len)) as i64
 }
-
-pentect_plugin::export!(inspect);
 ''',
         encoding="utf-8",
     )
@@ -1182,6 +1211,8 @@ pentect_plugin::export!(inspect);
         for text, reason in (
             ("WASM_TRAP", "execution failed"),
             ("WASM_TIMEOUT", "timed out"),
+            ("WASM_MALFORMED", "returned invalid JSON"),
+            ("WASM_OVERSIZED", "returned too much output"),
         ):
             completed = invoke(text)
             if completed.returncode == 0 or reason not in completed.stdout:
@@ -1198,6 +1229,8 @@ pentect_plugin::export!(inspect);
         for text, reason in (
             ("WASM_TRAP", "execution failed"),
             ("WASM_TIMEOUT", "timed out"),
+            ("WASM_MALFORMED", "returned invalid JSON"),
+            ("WASM_OVERSIZED", "returned too much output"),
         ):
             completed = invoke(text)
             if (
