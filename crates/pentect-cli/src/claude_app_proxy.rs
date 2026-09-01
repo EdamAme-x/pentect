@@ -2558,6 +2558,28 @@ struct ProtectedChatRequest {
     local_response: Option<Bytes>,
 }
 
+fn enforce_chat_request_plugin_result(
+    run: &pentect_agent::MiddlewareRun,
+    block_unknown_formats: bool,
+) -> Result<(), String> {
+    if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message.as_deref().unwrap_or("request blocked")
+        ));
+    }
+    if run.stopped.is_none()
+        && block_unknown_formats
+        && run.coverage == pentect_agent::MiddlewareCoverage::Partial
+    {
+        return Err(
+            "unknown format blocked: a Claude App plugin reported partial request coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn protect_chat_request(
     body: &Bytes,
     masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
@@ -2582,20 +2604,9 @@ fn protect_chat_request(
             value,
             Some(serde_json::json!({"provider": "claude", "transport": "desktop-http"})),
         )?;
-    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
-        return Err(
-            "unknown format blocked: a Claude App plugin reported partial request coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
-                .to_string(),
-        );
-    }
+    enforce_chat_request_plugin_result(&run, block_unknown_formats)?;
     value = run.payload;
-    if let Some(outcome) = run.stopped {
-        if outcome == pentect_agent::StopOutcome::Block {
-            return Err(format!(
-                "plugin blocked: {}",
-                run.message.unwrap_or_else(|| "request blocked".to_string())
-            ));
-        }
+    if run.stopped.is_some() {
         let body = serde_json::to_vec(&value)
             .map(Bytes::from)
             .map_err(|error| format!("could not encode Claude App plugin response: {error}"))?;
@@ -2852,6 +2863,14 @@ fn inspect_chat_image(
         .get_mut("source")
         .and_then(serde_json::Value::as_object_mut)
     {
+        if let Some(id) = ["file_id", "id"]
+            .into_iter()
+            .find_map(|key| source.get(key).and_then(serde_json::Value::as_str))
+        {
+            if files.get(id) == Some(&crate::http_files::Coverage::Full) {
+                return Ok(None);
+            }
+        }
         if source.get("type").and_then(serde_json::Value::as_str) == Some("base64")
             && source
                 .get("media_type")
@@ -3369,15 +3388,15 @@ fn looks_like_uuid(segment: &str) -> bool {
 
 fn remove_hop_by_hop_headers(headers: &mut hyper::HeaderMap) {
     let connection_headers = headers
-        .get(hyper::header::CONNECTION)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
             value
                 .split(',')
                 .filter_map(|name| name.trim().parse::<hyper::header::HeaderName>().ok())
-                .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
     for name in connection_headers {
         headers.remove(name);
     }
@@ -4428,6 +4447,65 @@ mod tests {
     }
 
     #[test]
+    fn explicit_plugin_stop_precedes_partial_request_coverage() {
+        let responding = pentect_agent::MiddlewareRun {
+            payload: serde_json::json!({"response": "local"}),
+            coverage: pentect_agent::MiddlewareCoverage::Partial,
+            stopped: Some(pentect_agent::StopOutcome::Respond),
+            message: None,
+        };
+        assert!(enforce_chat_request_plugin_result(&responding, true).is_ok());
+
+        let blocking = pentect_agent::MiddlewareRun {
+            payload: serde_json::json!({}),
+            coverage: pentect_agent::MiddlewareCoverage::Partial,
+            stopped: Some(pentect_agent::StopOutcome::Block),
+            message: Some("policy denied the request".to_string()),
+        };
+        assert_eq!(
+            enforce_chat_request_plugin_result(&blocking, true).unwrap_err(),
+            "plugin blocked: policy denied the request"
+        );
+
+        let partial = pentect_agent::MiddlewareRun {
+            payload: serde_json::json!({}),
+            coverage: pentect_agent::MiddlewareCoverage::Partial,
+            stopped: None,
+            message: None,
+        };
+        assert!(enforce_chat_request_plugin_result(&partial, true)
+            .unwrap_err()
+            .starts_with("unknown format blocked:"));
+    }
+
+    #[test]
+    fn inspected_image_source_file_references_are_accepted() {
+        for id_key in ["file_id", "id"] {
+            let mut object = serde_json::json!({
+                "type": "image",
+                "source": {"type": "file"}
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            object
+                .get_mut("source")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(
+                    id_key.to_string(),
+                    serde_json::Value::String("file-inspected".to_string()),
+                );
+            let files = HashMap::from([(
+                "file-inspected".to_string(),
+                crate::http_files::Coverage::Full,
+            )]);
+            assert_eq!(inspect_chat_image(&mut object, &files).unwrap(), None);
+        }
+    }
+
+    #[test]
     fn chat_request_masks_content_without_rewriting_protocol_metadata() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -4740,12 +4818,20 @@ mod tests {
     #[test]
     fn proxy_removes_standard_and_connection_named_hop_headers() {
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(
+        headers.append(
             hyper::header::CONNECTION,
-            hyper::header::HeaderValue::from_static("keep-alive, x-private-hop"),
+            hyper::header::HeaderValue::from_static("keep-alive, x-first-hop"),
+        );
+        headers.append(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("x-second-hop"),
         );
         headers.insert(
-            hyper::header::HeaderName::from_static("x-private-hop"),
+            hyper::header::HeaderName::from_static("x-first-hop"),
+            hyper::header::HeaderValue::from_static("remove"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-second-hop"),
             hyper::header::HeaderValue::from_static("remove"),
         );
         headers.insert(
@@ -4754,7 +4840,8 @@ mod tests {
         );
         remove_hop_by_hop_headers(&mut headers);
         assert!(!headers.contains_key(hyper::header::CONNECTION));
-        assert!(!headers.contains_key("x-private-hop"));
+        assert!(!headers.contains_key("x-first-hop"));
+        assert!(!headers.contains_key("x-second-hop"));
         assert_eq!(headers["x-end-to-end"], "keep");
     }
 
