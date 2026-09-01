@@ -417,6 +417,7 @@ pub fn resolve_text_from_active_memory_store(text: &str) -> Result<Option<String
     let store = MemoryStore::for_session(&session);
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
+        activity_log::record_restoration_blocked("exec-server");
         return Err("unknown masked handle in exec-server request".to_string());
     }
     Ok(Some(resolved))
@@ -1604,6 +1605,7 @@ fn resolve_command_args(
         let mut resolved = resolve_command_text(store, arg)?;
         if resolved != *arg && !allow_secret_argv {
             resolved.zeroize();
+            activity_log::record_restoration_blocked("argv");
             return Err(
                 "refusing to place a restored secret in process arguments; prefer target-specific stdin, file-descriptor, or configuration support, or pass --allow-secret-argv after reviewing same-user process visibility (a shell protects the model-facing command only, not child-process arguments)"
                     .to_string(),
@@ -1617,6 +1619,7 @@ fn resolve_command_args(
 fn resolve_command_text(store: &MemoryStore, text: &str) -> Result<String, String> {
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
+        activity_log::record_restoration_blocked("command");
         return Err(
             "unknown masked handle; use it inside the same running Pentect-launched agent session or re-register it with `pentect exec`"
                 .to_string(),
@@ -3353,12 +3356,14 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
 fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, String> {
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
+        activity_log::record_restoration_blocked("file-repair");
         return Err(
             "masked handle is unavailable in this running Pentect session; re-read the source and retry."
                 .to_string(),
         );
     }
     if resolved == content {
+        activity_log::record_restoration_blocked("file-repair");
         return Err("masked handle is unavailable in this running Pentect session.".to_string());
     }
     Ok(resolved)

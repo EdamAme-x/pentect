@@ -171,8 +171,9 @@ enabled = true
 `true`. Metrics are calculated on demand from retained diagnostic logs and are
 never sent externally. Setting it to `false` disables the summary; diagnostic
 logging and rotation continue independently so crashes remain diagnosable.
-The summary includes masked and restored occurrence counts, blocked operations,
-plugin failures and timeouts, and warnings grouped by a bounded reason code.
+The summary includes masked and restored occurrence counts, blocked restoration
+attempts, blocked operations, plugin failures and timeouts, and warnings grouped
+by a bounded reason code.
 Plugin names, error text, values, handles, paths, URLs, and account identifiers
 are not metric dimensions. Plugin timeout counts are a subset of plugin failure
 counts, not an additional failure total.
