@@ -83,6 +83,7 @@ struct PrivacyMetrics {
     redacted_image_occurrences: u64,
     blocked_image_occurrences: u64,
     restoration_operations: u64,
+    blocked_restoration_occurrences: u64,
     blocked_occurrences: u64,
     warning_occurrences: u64,
     plugin_failure_occurrences: u64,
@@ -397,6 +398,10 @@ pub(crate) fn print_metrics(json: bool) -> Result<(), String> {
         "Local restoration operations: {}",
         metrics.restoration_operations
     );
+    println!(
+        "Blocked restoration attempts: {}",
+        metrics.blocked_restoration_occurrences
+    );
     println!("Blocked operations: {}", metrics.blocked_occurrences);
     println!("Warnings: {}", metrics.warning_occurrences);
     println!(
@@ -507,6 +512,11 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
         "resolve" => {
             metrics.restoration_operations =
                 metrics.restoration_operations.saturating_add(event.count);
+        }
+        "restoration-blocked" => {
+            metrics.blocked_restoration_occurrences = metrics
+                .blocked_restoration_occurrences
+                .saturating_add(event.count);
         }
         "block" => {
             metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
@@ -640,6 +650,23 @@ pub(crate) fn record_summary(
         labels,
         target.map(safe_target),
     ));
+}
+
+pub(crate) fn record_restoration_blocked(surface: &str) {
+    record_summary(
+        "restoration-blocked",
+        restoration_block_surface(surface),
+        1,
+        BTreeMap::new(),
+        None,
+    );
+}
+
+fn restoration_block_surface(surface: &str) -> &str {
+    match surface {
+        "argv" | "command" | "exec-server" | "file-repair" => surface,
+        _ => "other",
+    }
 }
 
 pub(crate) fn record_image(secret_images: usize, detected_labels: &BTreeMap<String, u64>) {
@@ -1597,6 +1624,13 @@ mod tests {
             None,
         );
         let restored = ActivityEvent::new("resolve", "tool", 2, BTreeMap::new(), None);
+        let restoration_blocked = ActivityEvent::new(
+            "restoration-blocked",
+            "command",
+            4,
+            BTreeMap::new(),
+            Some("private-restoration-target".to_string()),
+        );
         let warning = ActivityEvent::diagnostic(
             "openai",
             "request-failed",
@@ -1633,6 +1667,7 @@ mod tests {
             [
                 redacted,
                 restored,
+                restoration_blocked,
                 warning,
                 untrusted_warning,
                 plugin_failure,
@@ -1651,6 +1686,7 @@ mod tests {
         assert_eq!(metrics.masked_text_occurrences, 3);
         assert_eq!(metrics.redacted_image_occurrences, 1);
         assert_eq!(metrics.restoration_operations, 2);
+        assert_eq!(metrics.blocked_restoration_occurrences, 4);
         assert_eq!(metrics.warning_occurrences, 2);
         assert_eq!(metrics.plugin_failure_occurrences, 5);
         assert_eq!(metrics.plugin_timeout_occurrences, 3);
@@ -1666,8 +1702,15 @@ mod tests {
         assert!(!output.contains("private-project"));
         assert!(!output.contains("private-account"));
         assert!(!output.contains("private-plugin"));
+        assert!(!output.contains("private-restoration"));
         assert!(!output.contains(".env"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restoration_block_surfaces_are_bounded() {
+        assert_eq!(restoration_block_surface("argv"), "argv");
+        assert_eq!(restoration_block_surface("private-project-name"), "other");
     }
 
     #[test]
