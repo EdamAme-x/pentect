@@ -855,6 +855,163 @@ for line in sys.stdin:
     )
 
 
+def verify_long_setup_and_waiter_complete(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "concurrent-setup-plugin"
+    plugin.mkdir()
+    runs = plugin / "setup-runs"
+    runs.mkdir()
+    manifest = plugin / "plugin.toml"
+    server = plugin / "server.py"
+    setup = plugin / "setup.py"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "concurrent-setup-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[execution]
+timeout_ms = 1000
+startup_timeout_ms = 1000
+'''
+    server.write_text(
+        r'''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    setup.write_text(
+        r'''import json
+import os
+import time
+from pathlib import Path
+
+runs = Path(__file__).parent / "setup-runs"
+first_file = runs / "first"
+try:
+    descriptor = os.open(first_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+except FileExistsError:
+    role = "fast"
+else:
+    os.close(descriptor)
+    role = "slow"
+(runs / f"{os.getpid()}.setup").write_text(
+    json.dumps({"parent": os.getppid(), "role": role}), encoding="utf-8"
+)
+if role == "slow":
+    time.sleep(6)
+''',
+        encoding="utf-8",
+    )
+    manifest.write_text(manifest_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    manifest.write_text(
+        manifest_source
+        + '''
+[setup]
+command = ["python", "{plugin}/setup.py"]
+''',
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    processes = [
+        subprocess.Popen(
+            pentect_command(
+                pentect,
+                ["plugins", "setup", str(plugin), "--project", "--yes"],
+            ),
+            cwd=project,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    deadline = time.monotonic() + 5
+    while len(list(runs.glob("*.setup"))) < 1 and time.monotonic() < deadline:
+        if any(process.poll() is not None for process in processes):
+            break
+        time.sleep(0.02)
+    initial_markers = list(runs.glob("*.setup"))
+    if len(initial_markers) != 1 or any(process.poll() is not None for process in processes):
+        for process in processes:
+            process.kill()
+        outputs = [process.communicate()[0] for process in processes]
+        raise RuntimeError(
+            "concurrent setup was not serialized before the first setup completed:\n"
+            + "\n".join(outputs)
+        )
+    first_data = json.loads(initial_markers[0].read_text(encoding="utf-8"))
+    if first_data["role"] != "slow":
+        raise RuntimeError("first concurrent setup did not enter the long-running fixture")
+    outputs = {process.pid: process.communicate(timeout=20)[0] for process in processes}
+    elapsed = time.monotonic() - started
+    markers = {
+        int(path.stem): json.loads(path.read_text(encoding="utf-8"))
+        for path in runs.glob("*.setup")
+    }
+    if len(markers) != 2:
+        raise RuntimeError(f"serialized setup started {len(markers)} setup children, expected 2")
+    if {data["parent"] for data in markers.values()} != {process.pid for process in processes}:
+        raise RuntimeError("setup child markers did not identify their Pentect parents")
+    if {data["role"] for data in markers.values()} != {"slow", "fast"}:
+        raise RuntimeError("serialized setup did not run one slow and one fast setup child")
+    for process in processes:
+        if process.returncode != 0 or "setup: complete" not in outputs[process.pid]:
+            raise RuntimeError(
+                "long-running serialized setup did not complete:\n" + outputs[process.pid]
+            )
+    waiting = [
+        output
+        for output in outputs.values()
+        if "waiting for another plugin operation to finish" in output
+    ]
+    if len(waiting) != 1:
+        raise RuntimeError("exactly one concurrent setup did not wait for the mutation lock")
+    if elapsed < 5.5:
+        raise RuntimeError("long-running setup fixture did not exercise its six-second operation")
+    for setup_pid in markers:
+        if not wait_for_process_exit(setup_pid, timeout=2.0):
+            raise RuntimeError(f"serialized setup child {setup_pid} survived completion")
+
+    ordinary = "ordinary long-running setup fixture"
+    recovered = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=ordinary,
+    )
+    if ordinary not in recovered.stdout:
+        raise RuntimeError("plugin was unusable after long-running serialized setup completed")
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "concurrent-setup-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
@@ -894,13 +1051,17 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_command_runtime_concurrency_and_restart(
             pentect, root, project, environment
         )
+        verify_long_setup_and_waiter_complete(
+            pentect, root, project, environment
+        )
         verify_installed_command_failure_boundaries(pentect, root, project, environment)
         verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
             "add/setup/update/reinstall/remove, failed/interrupted-setup and failed-update rollback, "
-            "Command runtime concurrency/restart, fail-closed boundaries and process cleanup, "
-            "HOME-rooted optional/required storage boundaries, no log plaintext"
+            "Command runtime concurrency/restart, long-running serialized setup completion, "
+            "fail-closed boundaries and process cleanup, HOME-rooted optional/required storage "
+            "boundaries, no log plaintext"
         )
 
 
