@@ -318,6 +318,32 @@ pub struct PluginMiddleware {
 }
 
 impl PluginMiddleware {
+    #[cfg(test)]
+    pub(crate) fn from_test_command(
+        argv: Vec<String>,
+        hooks: impl IntoIterator<Item = MiddlewareStage>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            plugins: vec![PluginBinary {
+                name: "test-command".to_string(),
+                program: PluginProgram::Command(CommandProgram::new(
+                    argv,
+                    std::env::current_dir().map_err(|error| error.to_string())?,
+                    DEFAULT_MAX_OUTPUT_BYTES,
+                )?),
+                hooks: hooks.into_iter().collect(),
+                required: true,
+                prewarm: false,
+                command_config: Some(json!({})),
+                timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                startup_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                max_spans: DEFAULT_MAX_SPANS,
+            }],
+        })
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let mut plugins = Vec::new();
         if let Some(value) = std::env::var_os(GLOBAL_BINARIES_ENV) {

@@ -1119,6 +1119,67 @@ fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
 }
 
 #[test]
+fn prompt_masking_runs_prepare_and_finalize_once() {
+    let Some(python) = ["python3", "python"].into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }) else {
+        return;
+    };
+    let root = temp_root("prompt-plugin-stage-count");
+    std::fs::create_dir_all(&root).unwrap();
+    let calls = root.join("calls.txt");
+    let script = r#"import json,sys
+path=sys.argv[1]
+for line in sys.stdin:
+    request=json.loads(line)
+    with open(path, 'a', encoding='utf-8') as output:
+        output.write(request['hook'] + '\t' + request['payload']['text'] + '\n')
+    print(json.dumps({
+        'schema':'pentect.plugin.v1',
+        'id':request['id'],
+        'type':'result',
+        'action':'next',
+        'payload':request['payload'],
+    }), flush=True)
+"#;
+    let plugins = plugin_middleware::PluginMiddleware::from_test_command(
+        vec![
+            python.to_string(),
+            "-u".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            calls.display().to_string(),
+        ],
+        [
+            plugin_middleware::MiddlewareStage::Prepare,
+            plugin_middleware::MiddlewareStage::Finalize,
+        ],
+    )
+    .unwrap();
+    let session = Session::open_capability_at(&root, "stage-count").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let mut masker = masking::OutputMasker::new_shared_with_plugins(store, plugins).unwrap();
+
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    masker
+        .mask_prompt_text(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap();
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let calls = calls.lines().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].starts_with("prepare\tOPENAI_API_KEY=<<"));
+    assert!(calls[1].starts_with("finalize\tOPENAI_API_KEY=<<"));
+    assert!(calls.iter().all(|call| !call.contains(raw)), "{calls:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn active_prompt_masker_reuses_bounded_cached_result() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-cache");
