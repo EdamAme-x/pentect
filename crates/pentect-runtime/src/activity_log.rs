@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
@@ -1463,11 +1463,27 @@ fn basename_source_location(value: &str) -> String {
 
 fn safe_target(path: &Path) -> String {
     if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(relative) = path.strip_prefix(&cwd) {
+        let cwd = normalize_path_lexically(&cwd);
+        let absolute = if path.is_absolute() {
+            normalize_path_lexically(path)
+        } else {
+            normalize_path_lexically(&cwd.join(path))
+        };
+        if let Ok(relative) = absolute.strip_prefix(&cwd) {
             return display_path(relative);
         }
+        return absolute
+            .file_name()
+            .map(PathBuf::from)
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_else(|| "external".to_string());
     }
-    if path.is_relative() {
+    if path.is_relative()
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
         return display_path(path);
     }
     path.file_name()
@@ -1475,6 +1491,28 @@ fn safe_target(path: &Path) -> String {
         .as_deref()
         .map(display_path)
         .unwrap_or_else(|| "external".to_string())
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let anchored = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !anchored {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn display_path(path: &Path) -> String {
@@ -1626,6 +1664,30 @@ mod tests {
             Path::new("/home/name/secret/.env")
         };
         assert_eq!(safe_target(path), ".env");
+        assert_eq!(
+            safe_target(Path::new("../../outside/secret.env")),
+            "secret.env"
+        );
+    }
+
+    #[test]
+    fn safe_target_preserves_only_normalized_project_relative_paths() {
+        assert_eq!(
+            safe_target(Path::new("config/../secrets.env")),
+            "secrets.env"
+        );
+        assert_eq!(
+            safe_target(Path::new("config/nested.env")),
+            "config/nested.env"
+        );
+    }
+
+    #[test]
+    fn lexical_normalization_preserves_consecutive_leading_parent_components() {
+        assert_eq!(
+            normalize_path_lexically(Path::new("../../secret.env")),
+            PathBuf::from("../../secret.env")
+        );
     }
 
     #[test]
