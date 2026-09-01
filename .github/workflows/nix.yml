@@ -55,6 +55,7 @@ jobs:
         run: |
           profile="$RUNNER_TEMP/pentect-profile"
           version="$(jq -r .version packaging/release.json)"
+          test "$(nix run .#pentect -- version)" = "pentect $version"
           nix profile install .#pentect --profile "$profile"
           test "$("$profile/bin/pentect" version)" = "pentect $version"
           nix profile remove pentect --profile "$profile"
