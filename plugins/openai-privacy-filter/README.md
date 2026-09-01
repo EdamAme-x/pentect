@@ -40,6 +40,13 @@ plaintext, and returns a complete local response that Codex must consume
 without a plugin timeout. No OpenAI request is made by that step. It may
 download several gigabytes when the managed environment is not ready.
 
+This is currently a manual test. Pull-request CI runs the bridge unit tests and
+Pentect's deterministic installed-plugin fixtures on Linux, macOS, and Windows,
+but it does not install or load the real model, exercise CUDA, or run this
+script. A green pull request does not claim real-model coverage. The planned
+cache-backed scheduled CPU smoke and optional CUDA smoke are not implemented
+yet.
+
 ```sh
 python3 plugins/openai-privacy-filter/tests/live_e2e.py \
   --pentect ./target/debug/pentect \
