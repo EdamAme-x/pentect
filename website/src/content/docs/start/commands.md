@@ -109,7 +109,7 @@ when a command can consume a handle without creating a plaintext file.
 | View persistent diagnostics | `pentect log` | Values, bodies, headers, and URLs are not logged |
 | Locate the log file | `pentect log --path` | Prints the local path |
 | Machine-readable diagnostics | `pentect log --json` | Suitable for support tooling |
-| View local protection statistics | `pentect metrics` | Counts occurrences, blocked restorations, bounded warning reasons, and plugin failures/timeouts; never shows values, handles, paths, URLs, plugin names, error text, or account identifiers |
+| View local protection statistics | `pentect metrics` | Shows stable metric keys with readable names, occurrence counts, blocked restorations, bounded warning reasons, and plugin failures/timeouts; never shows values, handles, paths, URLs, plugin names, error text, or account identifiers |
 | Machine-readable statistics | `pentect metrics --json` | Local JSON; no telemetry is sent |
 | Check readiness | `pentect doctor` | Does not change configuration |
 | Offer safe repairs | `pentect doctor --fix` | Confirms changes interactively |

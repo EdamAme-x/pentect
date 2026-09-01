@@ -9,7 +9,7 @@ pub type Label = String;
 /// retyped (and drifting) across detectors.
 pub mod labels {
     macro_rules! define_canonical_labels {
-        ($( $(#[$meta:meta])* $name:ident = $value:literal; )+) => {
+        ($( $(#[$meta:meta])* $name:ident = $value:literal => $description:literal; )+) => {
             $(
                 $(#[$meta])*
                 pub const $name: &str = $value;
@@ -22,52 +22,60 @@ pub mod labels {
             pub fn is_canonical(value: &str) -> bool {
                 ALL.contains(&value)
             }
+
+            /// A short user-facing explanation for a canonical detector label.
+            pub fn description(value: &str) -> Option<&'static str> {
+                match value {
+                    $($value => Some($description),)+
+                    _ => None,
+                }
+            }
         };
     }
 
     define_canonical_labels! {
         /// High-entropy run with no anchoring context (entropy detector).
-        LIKELY_SECRET = "LIKELY_SECRET";
+        LIKELY_SECRET = "LIKELY_SECRET" => "high-entropy value that may be a secret";
         /// Decodes to binary-looking bytes ("looks encrypted") with no inner secret.
-        OPAQUE_BLOB = "OPAQUE_BLOB";
+        OPAQUE_BLOB = "OPAQUE_BLOB" => "encoded or encrypted-looking data";
         /// Value masked because its key name looks sensitive.
-        SECRET = "SECRET";
+        SECRET = "SECRET" => "value associated with a sensitive name";
         /// Ambiguous personally identifying information.
-        PII = "PII";
+        PII = "PII" => "personally identifying information";
         /// Ambiguous identifier.
-        IDENTIFIER = "IDENTIFIER";
+        IDENTIFIER = "IDENTIFIER" => "potentially sensitive identifier";
         /// Ambiguous endpoint.
-        ENDPOINT = "ENDPOINT";
+        ENDPOINT = "ENDPOINT" => "potentially sensitive service endpoint";
         /// Sensitive value whose category could not be narrowed further.
-        SENSITIVE = "SENSITIVE";
+        SENSITIVE = "SENSITIVE" => "sensitive value of an unspecified type";
         /// Value masked because a plaintext key/value structure carries a sensitive key.
-        KEYED_SECRET = "KEYED_SECRET";
+        KEYED_SECRET = "KEYED_SECRET" => "value associated with a sensitive key";
         /// One-time password or verification code.
-        OTP = "OTP";
+        OTP = "OTP" => "one-time password or verification code";
         /// BIP-39 wallet recovery phrase.
-        BIP39_MNEMONIC = "BIP39_MNEMONIC";
+        BIP39_MNEMONIC = "BIP39_MNEMONIC" => "cryptocurrency wallet recovery phrase";
         /// Body of a PEM private-key block.
-        PRIVATE_KEY = "PRIVATE_KEY";
+        PRIVATE_KEY = "PRIVATE_KEY" => "private cryptographic key";
         /// Host/authority of an internal service URL.
-        INTERNAL_ENDPOINT = "INTERNAL_ENDPOINT";
+        INTERNAL_ENDPOINT = "INTERNAL_ENDPOINT" => "internal service host or authority";
         /// Resource identifier inside an internal URL path.
-        RESOURCE_ID = "RESOURCE_ID";
+        RESOURCE_ID = "RESOURCE_ID" => "internal resource identifier";
         /// User-info credential portion of a URL authority.
-        URL_CREDENTIAL = "URL_CREDENTIAL";
+        URL_CREDENTIAL = "URL_CREDENTIAL" => "credential embedded in a URL";
         /// Password-like value passed through a shell or PowerShell command option.
-        CMD_PASSWORD = "CMD_PASSWORD";
+        CMD_PASSWORD = "CMD_PASSWORD" => "password supplied to a command";
         /// UUID/GUID value in an identifier-bearing slot.
-        UUID = "UUID";
+        UUID = "UUID" => "UUID or GUID in an identifier field";
         /// Bucket name in an Amazon S3 hostname.
-        AWS_S3_BUCKET = "AWS_S3_BUCKET";
+        AWS_S3_BUCKET = "AWS_S3_BUCKET" => "Amazon S3 bucket name";
         /// Firebase project/database prefix in a Realtime Database hostname.
-        FIREBASE_PROJECT_ID = "FIREBASE_PROJECT_ID";
+        FIREBASE_PROJECT_ID = "FIREBASE_PROJECT_ID" => "Firebase project or database identifier";
         /// Query parameter value in an internal URL.
-        URL_QUERY_VALUE = "URL_QUERY_VALUE";
+        URL_QUERY_VALUE = "URL_QUERY_VALUE" => "sensitive URL query value";
         /// Fragment value in an internal URL.
-        URL_FRAGMENT = "URL_FRAGMENT";
+        URL_FRAGMENT = "URL_FRAGMENT" => "sensitive URL fragment";
         /// Location metadata embedded in image EXIF GPS tags.
-        IMAGE_GPS_METADATA = "IMAGE_GPS_METADATA";
+        IMAGE_GPS_METADATA = "IMAGE_GPS_METADATA" => "GPS location stored in image metadata";
     }
 }
 
