@@ -1500,7 +1500,12 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !normalized.pop() && !anchored {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !anchored {
                     normalized.push(component.as_os_str());
                 }
             }
@@ -1674,6 +1679,14 @@ mod tests {
         assert_eq!(
             safe_target(Path::new("config/nested.env")),
             "config/nested.env"
+        );
+    }
+
+    #[test]
+    fn lexical_normalization_preserves_consecutive_leading_parent_components() {
+        assert_eq!(
+            normalize_path_lexically(Path::new("../../secret.env")),
+            PathBuf::from("../../secret.env")
         );
     }
 
