@@ -187,15 +187,6 @@ impl OutputMasker {
         let (protected, unmasked_values) =
             protect_prompt_unmask_markers(text, &self.store.session.identity_key);
         let remasked = self.remask_all(&protected)?;
-        let remasked = if run_plugins {
-            self.run_text_plugins(
-                crate::plugin_middleware::MiddlewareStage::Prepare,
-                remasked,
-                &Kind::Text,
-            )?
-        } else {
-            remasked
-        };
         // Prompt scalars are text. Only opt into dotenv parsing when the
         // payload actually contains assignment syntax; treating every
         // `Label: prose` sentence as Env turns ordinary messages into secrets.
@@ -240,20 +231,10 @@ impl OutputMasker {
                 .masked_count
                 .saturating_add(env_result.summary.masked_count);
         }
-        let initially_masked = std::mem::take(&mut result.masked);
-        let masked = if run_plugins {
-            self.run_text_plugins(
-                crate::plugin_middleware::MiddlewareStage::Finalize,
-                initially_masked,
-                &Kind::Text,
-            )?
-        } else {
-            initially_masked
-        };
         let final_result = self.prompt_engine.mask(
             Input {
                 kind: Kind::Text,
-                data: masked,
+                data: std::mem::take(&mut result.masked),
             },
             &Config {
                 disclose_length: false,
