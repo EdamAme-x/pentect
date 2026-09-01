@@ -966,6 +966,20 @@ impl PluginBinary {
         context: Option<&Value>,
         budget: &mut PluginChainBudget,
     ) -> Result<PluginResponse, String> {
+        let result = self.invoke_bounded_inner(hook, payload, context, budget);
+        if let Err(error) = &result {
+            record_plugin_failure(&self.name, error);
+        }
+        result
+    }
+
+    fn invoke_bounded_inner(
+        &self,
+        hook: MiddlewareStage,
+        payload: &Value,
+        context: Option<&Value>,
+        budget: &mut PluginChainBudget,
+    ) -> Result<PluginResponse, String> {
         let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let request = json!({
             "schema": PROTOCOL_SCHEMA,
@@ -2741,6 +2755,28 @@ fn record_plugin_access(name: &str, operation: &str) {
     );
 }
 
+fn record_plugin_failure(plugin_name: &str, error: &str) {
+    let reason = plugin_failure_reason(plugin_name, error);
+    activity_log::record_summary(
+        "plugin-failure",
+        "plugin",
+        1,
+        BTreeMap::from([(reason.to_string(), 1)]),
+        None,
+    );
+}
+
+fn plugin_failure_reason(plugin_name: &str, error: &str) -> &'static str {
+    let plugin_prefix = format!("plugin '{plugin_name}'");
+    let error_without_name = error.strip_prefix(&plugin_prefix).unwrap_or(error);
+    if error_without_name.contains("timed out") || error_without_name.contains("deadline exceeded")
+    {
+        "timeout"
+    } else {
+        "failure"
+    }
+}
+
 fn replace_host_file(staged: &Path, destination: &Path) -> Result<(), String> {
     if !destination.exists() {
         return std::fs::rename(staged, destination).map_err(|error| error.to_string());
@@ -4296,6 +4332,32 @@ mod tests {
         .invoke(b"{}", Duration::from_secs(15), "fixture")
         .unwrap_err();
         assert!(oversized.contains("exceeds its limit"), "{oversized}");
+    }
+
+    #[test]
+    fn plugin_failure_metrics_distinguish_timeouts_without_exposing_errors() {
+        assert_eq!(
+            plugin_failure_reason("private-name", "plugin 'private-name' timed out"),
+            "timeout"
+        );
+        assert_eq!(
+            plugin_failure_reason(
+                "private-name",
+                "plugin 'private-name' command chain deadline exceeded"
+            ),
+            "timeout"
+        );
+        assert_eq!(
+            plugin_failure_reason(
+                "private-name",
+                "plugin 'private-name' returned invalid JSON"
+            ),
+            "failure"
+        );
+        assert_eq!(
+            plugin_failure_reason("timed out", "plugin 'timed out' returned invalid JSON"),
+            "failure"
+        );
     }
 
     #[test]

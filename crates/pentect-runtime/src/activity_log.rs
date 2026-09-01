@@ -85,8 +85,11 @@ struct PrivacyMetrics {
     restoration_operations: u64,
     blocked_occurrences: u64,
     warning_occurrences: u64,
+    plugin_failure_occurrences: u64,
+    plugin_timeout_occurrences: u64,
     by_secret_type: BTreeMap<String, u64>,
     by_surface: BTreeMap<String, u64>,
+    by_warning_reason: BTreeMap<String, u64>,
     records_read: u64,
     records_skipped: u64,
 }
@@ -396,11 +399,17 @@ pub(crate) fn print_metrics(json: bool) -> Result<(), String> {
     );
     println!("Blocked operations: {}", metrics.blocked_occurrences);
     println!("Warnings: {}", metrics.warning_occurrences);
+    println!(
+        "Plugin failures (including timeouts): {}",
+        metrics.plugin_failure_occurrences
+    );
+    println!("Plugin timeouts: {}", metrics.plugin_timeout_occurrences);
     print_metric_group(
         "Secret types (text masks and image redactions)",
         &metrics.by_secret_type,
     );
     print_metric_group("Protection surfaces", &metrics.by_surface);
+    print_metric_group("Warning reasons", &metrics.by_warning_reason);
     if metrics.records_skipped > 0 {
         println!(
             "Skipped unreadable records: {} (counts may be incomplete)",
@@ -509,6 +518,11 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
         }
         "warning" => {
             metrics.warning_occurrences = metrics.warning_occurrences.saturating_add(event.count);
+            increment_metric(
+                &mut metrics.by_warning_reason,
+                diagnostic_event(event.event.as_deref().unwrap_or("unknown")),
+                event.count,
+            );
             if is_block_event(event.event.as_deref()) {
                 metrics.blocked_occurrences =
                     metrics.blocked_occurrences.saturating_add(event.count);
@@ -516,6 +530,16 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
         }
         "diagnostic" if is_block_event(event.event.as_deref()) => {
             metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
+        }
+        "plugin-failure" => {
+            metrics.plugin_failure_occurrences = metrics
+                .plugin_failure_occurrences
+                .saturating_add(event.count);
+            if event.labels.iter().any(|label| label.name == "timeout") {
+                metrics.plugin_timeout_occurrences = metrics
+                    .plugin_timeout_occurrences
+                    .saturating_add(event.count);
+            }
         }
         _ => {}
     }
@@ -1583,6 +1607,22 @@ mod tests {
             Some(true),
             None,
         );
+        let mut untrusted_warning = warning.clone();
+        untrusted_warning.event = Some("private-account-warning".to_string());
+        let plugin_failure = ActivityEvent::new(
+            "plugin-failure",
+            "plugin",
+            2,
+            BTreeMap::from([("failure".to_string(), 2)]),
+            Some("private-plugin-name".to_string()),
+        );
+        let plugin_timeout = ActivityEvent::new(
+            "plugin-failure",
+            "plugin",
+            3,
+            BTreeMap::from([("timeout".to_string(), 3)]),
+            None,
+        );
         std::fs::write(
             rotated_log_path(&path, 1),
             format!("{}\n", serde_json::to_string(&masked).unwrap()),
@@ -1590,11 +1630,18 @@ mod tests {
         .unwrap();
         std::fs::write(
             &path,
-            [redacted, restored, warning]
-                .iter()
-                .map(|event| serde_json::to_string(event).unwrap())
-                .collect::<Vec<_>>()
-                .join("\n")
+            [
+                redacted,
+                restored,
+                warning,
+                untrusted_warning,
+                plugin_failure,
+                plugin_timeout,
+            ]
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
                 + "\nnot-json\n",
         )
         .unwrap();
@@ -1604,15 +1651,21 @@ mod tests {
         assert_eq!(metrics.masked_text_occurrences, 3);
         assert_eq!(metrics.redacted_image_occurrences, 1);
         assert_eq!(metrics.restoration_operations, 2);
-        assert_eq!(metrics.warning_occurrences, 1);
+        assert_eq!(metrics.warning_occurrences, 2);
+        assert_eq!(metrics.plugin_failure_occurrences, 5);
+        assert_eq!(metrics.plugin_timeout_occurrences, 3);
         assert_eq!(metrics.by_secret_type["AWS_AKID"], 3);
         assert_eq!(metrics.by_secret_type["EMAIL_ADDRESS"], 1);
         assert_eq!(metrics.by_surface["prompt"], 3);
         assert_eq!(metrics.by_surface["image"], 1);
+        assert_eq!(metrics.by_warning_reason["request-failed"], 1);
+        assert_eq!(metrics.by_warning_reason["unknown"], 1);
         assert_eq!(metrics.records_skipped, 1);
 
         let output = serde_json::to_string(&metrics).unwrap();
         assert!(!output.contains("private-project"));
+        assert!(!output.contains("private-account"));
+        assert!(!output.contains("private-plugin"));
         assert!(!output.contains(".env"));
         std::fs::remove_dir_all(root).unwrap();
     }
