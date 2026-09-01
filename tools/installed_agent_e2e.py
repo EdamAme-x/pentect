@@ -1120,7 +1120,8 @@ max_output_bytes = 1024
 '''
     manifest.write_text(manifest_source, encoding="utf-8")
     (source / "lib.rs").write_text(
-        r'''use pentect_plugin::__serde_json::{self, json, Value};
+        r'''use pentect_plugin::__serde_json as serde_json;
+use pentect_plugin::__serde_json::{json, Value};
 
 #[no_mangle]
 pub extern "C" fn pentect_alloc(len: i32) -> i32 {
