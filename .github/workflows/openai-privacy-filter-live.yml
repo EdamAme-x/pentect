@@ -18,7 +18,7 @@ permissions:
 
 concurrency:
   group: openai-privacy-filter-live-${{ inputs.profile || 'cpu' }}
-  cancel-in-progress: ${{ 1 == 0 }}
+  cancel-in-progress: false
 
 jobs:
   live:
@@ -27,14 +27,30 @@ jobs:
     timeout-minutes: 150
     env:
       OPF_PROFILE: ${{ inputs.profile || 'cpu' }}
-      PENTECT_OPF_ROOT: ${{ runner.temp }}/pentect-opf-${{ inputs.profile || 'cpu' }}
-      PENTECT_LOG_DIR: ${{ runner.temp }}/pentect-opf-live-logs
       OPENAI_API_KEY: not-a-real-openai-key
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
-          persist-credentials: ${{ 1 == 0 }}
+          persist-credentials: false
+      - name: Configure bounded live-smoke paths
+        id: live-paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/pentect-opf-$OPF_PROFILE"
+          logs="$RUNNER_TEMP/pentect-opf-live-logs"
+          report="$RUNNER_TEMP/pentect-opf-live-e2e.json"
+          {
+            echo "PENTECT_OPF_ROOT=$root"
+            echo "PENTECT_LOG_DIR=$logs"
+            echo "PENTECT_OPF_REPORT=$report"
+          } >> "$GITHUB_ENV"
+          {
+            echo "root=$root"
+            echo "logs=$logs"
+            echo "report=$report"
+          } >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/rust-toolchain
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -51,9 +67,9 @@ jobs:
           shared-key: opf-live-${{ inputs.profile || 'cpu' }}
       - name: Restore managed OpenAI Privacy Filter environment
         id: opf-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.PENTECT_OPF_ROOT }}
+          path: ${{ steps.live-paths.outputs.root }}
           key: opf-${{ runner.os }}-${{ runner.arch }}-py312-${{ inputs.profile || 'cpu' }}-${{ hashFiles('plugins/openai-privacy-filter/setup.py') }}
       - name: Build Pentect with standard features
         run: cargo build --locked -p pentect-cli
@@ -62,16 +78,17 @@ jobs:
       - name: Run real-model installation-to-Codex smoke
         id: live
         shell: bash
+        env:
+          CACHE_HIT: ${{ steps.opf-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           mkdir -p "$PENTECT_LOG_DIR"
-          report="$RUNNER_TEMP/pentect-opf-live-e2e.json"
           python plugins/openai-privacy-filter/tests/live_e2e.py \
             --pentect "$GITHUB_WORKSPACE/target/debug/pentect" \
             --codex "$(command -v codex)" \
             --profile "$OPF_PROFILE" \
             --timeout-seconds 1800 \
-            | tee "$report"
+            | tee "$PENTECT_OPF_REPORT"
           jq -e '
             .schema == "pentect.opf-live-e2e.v2" and
             .status == "ok" and
@@ -82,19 +99,25 @@ jobs:
             (.cold_seconds | numbers) >= 0 and
             (.restart_seconds | numbers) >= 0 and
             (.codex_seconds | numbers) >= 0
-          ' "$report"
+          ' "$PENTECT_OPF_REPORT"
           {
             echo "### OpenAI Privacy Filter live smoke"
             echo
-            echo "- Profile: `$(jq -r .profile "$report")`"
-            echo "- Managed environment cache hit: `${{ steps.opf-cache.outputs.cache-hit }}`"
-            echo "- Setup: `$(jq -r .setup_seconds "$report")s`"
-            echo "- Direct startup: `$(jq -r .plugin_startup_seconds "$report")s`"
-            echo "- Warm request: `$(jq -r .warm_request_seconds "$report")s`"
-            echo "- Pentect cold process: `$(jq -r .cold_seconds "$report")s`"
-            echo "- Pentect restart: `$(jq -r .restart_seconds "$report")s`"
-            echo "- Codex/local upstream: `$(jq -r .codex_seconds "$report")s`"
+            printf -- '- Profile: `%s`\n' "$(jq -r .profile "$PENTECT_OPF_REPORT")"
+            printf -- '- Managed environment cache hit: `%s`\n' "${CACHE_HIT:-miss}"
+            printf -- '- Setup: `%ss`\n' "$(jq -r .setup_seconds "$PENTECT_OPF_REPORT")"
+            printf -- '- Direct startup: `%ss`\n' "$(jq -r .plugin_startup_seconds "$PENTECT_OPF_REPORT")"
+            printf -- '- Warm request: `%ss`\n' "$(jq -r .warm_request_seconds "$PENTECT_OPF_REPORT")"
+            printf -- '- Pentect cold process: `%ss`\n' "$(jq -r .cold_seconds "$PENTECT_OPF_REPORT")"
+            printf -- '- Pentect restart: `%ss`\n' "$(jq -r .restart_seconds "$PENTECT_OPF_REPORT")"
+            printf -- '- Codex/local upstream: `%ss`\n' "$(jq -r .codex_seconds "$PENTECT_OPF_REPORT")"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save managed OpenAI Privacy Filter environment
+        if: steps.live.outcome == 'success' && steps.opf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.live-paths.outputs.root }}
+          key: ${{ steps.opf-cache.outputs.cache-primary-key }}
       - name: Verify artifacts contain no fixture plaintext
         id: verify-artifacts
         if: always()
@@ -105,7 +128,37 @@ jobs:
         with:
           name: openai-privacy-filter-live-${{ inputs.profile || 'cpu' }}
           path: |
-            ${{ runner.temp }}/pentect-opf-live-e2e.json
-            ${{ env.PENTECT_LOG_DIR }}/pentect.log
+            ${{ steps.live-paths.outputs.report }}
+            ${{ steps.live-paths.outputs.logs }}/
           if-no-files-found: warn
           retention-days: 14
+      - name: Clean live-smoke state from the runner
+        if: always()
+        env:
+          OPF_ROOT_TO_CLEAN: ${{ steps.live-paths.outputs.root }}
+          OPF_LOGS_TO_CLEAN: ${{ steps.live-paths.outputs.logs }}
+          OPF_REPORT_TO_CLEAN: ${{ steps.live-paths.outputs.report }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+
+          temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
+          for name in (
+              "OPF_ROOT_TO_CLEAN",
+              "OPF_LOGS_TO_CLEAN",
+              "OPF_REPORT_TO_CLEAN",
+          ):
+              configured = os.environ.get(name)
+              if not configured:
+                  continue
+              path = Path(configured).resolve()
+              if temporary not in path.parents:
+                  raise RuntimeError(f"refusing to clean path outside RUNNER_TEMP: {name}")
+              if path.is_dir():
+                  shutil.rmtree(path)
+              elif path.exists():
+                  path.unlink()
+          PY

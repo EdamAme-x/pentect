@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Callable
 
 
 SAMPLE = "Please contact Alice Example at alice@example.com or +1 415-555-0100."
@@ -133,11 +133,13 @@ def _readline_with_timeout(stream: Any, timeout: float, operation: str) -> str:
     return line
 
 
-def _validate_protocol_response(line: str) -> None:
+def _validate_protocol_response(line: str) -> dict[str, Any]:
     try:
         response = json.loads(line)
     except json.JSONDecodeError as error:
         raise RuntimeError("real OPF returned invalid protocol JSON") from error
+    if not isinstance(response, dict):
+        raise RuntimeError("real OPF returned a non-object protocol response")
     labels = {
         span.get("label")
         for span in response.get("spans", [])
@@ -146,6 +148,7 @@ def _validate_protocol_response(line: str) -> None:
     missing = {"PRIVATE_EMAIL", "PRIVATE_PHONE"} - labels
     if missing:
         raise RuntimeError(f"real OPF protocol probe missed {sorted(missing)!r}")
+    return response
 
 
 def inspect_plugin_twice(
@@ -154,6 +157,7 @@ def inspect_plugin_twice(
     environment: dict[str, str],
     timeout: float,
     profile: str,
+    response_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[float, float]:
     process = subprocess.Popen(
         [
@@ -187,17 +191,19 @@ def inspect_plugin_twice(
                 process.stdout, timeout, f"real OPF request {request_id}"
             )
             samples.append(time.monotonic() - started)
-            _validate_protocol_response(line)
+            response = _validate_protocol_response(line)
+            if response_observer is not None:
+                response_observer(response)
         process.stdin.close()
         return samples[0], samples[1]
     finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=10)
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
         if process.stdout is not None:
             process.stdout.close()
 
@@ -232,17 +238,24 @@ def fixture_plaintext() -> tuple[bytes, ...]:
     return tuple(value.encode() for value in sorted(values))
 
 
-def assert_value_free_logs(environment: dict[str, str]) -> None:
+def assert_value_free_logs(
+    environment: dict[str, str], *, must_exist: bool = False
+) -> None:
     configured = environment.get("PENTECT_LOG_DIR")
     if not configured:
+        if must_exist:
+            raise RuntimeError("persistent OPF smoke log directory is not configured")
         return
     root = Path(configured).expanduser()
     if not root.is_dir():
+        if must_exist:
+            raise RuntimeError("persistent OPF smoke log directory is missing")
         return
+    files = [path for path in root.rglob("*") if path.is_file()]
+    if must_exist and not files:
+        raise RuntimeError("persistent OPF smoke log directory contains no logs")
     needles = fixture_plaintext()
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in files:
         try:
             contents = path.read_bytes()
         except OSError:

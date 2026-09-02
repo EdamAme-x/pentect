@@ -24,13 +24,18 @@ class LiveE2ETests(unittest.TestCase):
             (plugin / "server.py").write_text(
                 """\
 import json
+import os
 import sys
 
+served = 0
 for line in sys.stdin:
     request = json.loads(line)
+    served += 1
     response = {
         "schema": "pentect.plugin.v1",
         "id": request["id"],
+        "pid": os.getpid(),
+        "served": served,
         "spans": [
             {"start": 0, "end": 1, "label": "PRIVATE_EMAIL"},
             {"start": 2, "end": 3, "label": "PRIVATE_PHONE"},
@@ -40,11 +45,19 @@ for line in sys.stdin:
 """,
                 encoding="utf-8",
             )
+            responses = []
             startup, warm = LIVE.inspect_plugin_twice(
-                plugin, root, os.environ.copy(), 5.0, "cpu"
+                plugin,
+                root,
+                os.environ.copy(),
+                5.0,
+                "cpu",
+                responses.append,
             )
             self.assertGreaterEqual(startup, 0)
             self.assertGreaterEqual(warm, 0)
+            self.assertEqual([response["served"] for response in responses], [1, 2])
+            self.assertEqual(len({response["pid"] for response in responses}), 1)
 
     def test_child_failure_does_not_copy_captured_output(self) -> None:
         result = subprocess.CompletedProcess(
@@ -75,6 +88,20 @@ for line in sys.stdin:
                 "<<PRIVATE_EMAIL_0123456789abcdef>>\n", encoding="utf-8"
             )
             LIVE.assert_value_free_logs({"PENTECT_LOG_DIR": directory})
+
+    def test_log_scan_can_require_the_configured_directory(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "not configured"):
+            LIVE.assert_value_free_logs({}, must_exist=True)
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            with self.assertRaisesRegex(RuntimeError, "is missing"):
+                LIVE.assert_value_free_logs(
+                    {"PENTECT_LOG_DIR": str(missing)}, must_exist=True
+                )
+            with self.assertRaisesRegex(RuntimeError, "contains no logs"):
+                LIVE.assert_value_free_logs(
+                    {"PENTECT_LOG_DIR": directory}, must_exist=True
+                )
 
 
 if __name__ == "__main__":
