@@ -133,13 +133,15 @@ def _readline_with_timeout(stream: Any, timeout: float, operation: str) -> str:
     return line
 
 
-def _validate_protocol_response(line: str) -> dict[str, Any]:
+def _validate_protocol_response(line: str, request_id: int) -> dict[str, Any]:
     try:
         response = json.loads(line)
     except json.JSONDecodeError as error:
         raise RuntimeError("real OPF returned invalid protocol JSON") from error
     if not isinstance(response, dict):
         raise RuntimeError("real OPF returned a non-object protocol response")
+    if response.get("id") != request_id:
+        raise RuntimeError("real OPF returned a mismatched protocol response ID")
     labels = {
         span.get("label")
         for span in response.get("spans", [])
@@ -191,7 +193,7 @@ def inspect_plugin_twice(
                 process.stdout, timeout, f"real OPF request {request_id}"
             )
             samples.append(time.monotonic() - started)
-            response = _validate_protocol_response(line)
+            response = _validate_protocol_response(line, request_id)
             if response_observer is not None:
                 response_observer(response)
         process.stdin.close()

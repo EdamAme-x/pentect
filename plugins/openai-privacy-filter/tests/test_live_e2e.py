@@ -16,6 +16,11 @@ SPEC.loader.exec_module(LIVE)
 
 
 class LiveE2ETests(unittest.TestCase):
+    def test_protocol_probe_rejects_a_mismatched_response_id(self) -> None:
+        response = '{"id":2,"spans":[]}'
+        with self.assertRaisesRegex(RuntimeError, "mismatched protocol response ID"):
+            LIVE._validate_protocol_response(response, 1)
+
     def test_protocol_probe_reuses_one_worker_for_two_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
