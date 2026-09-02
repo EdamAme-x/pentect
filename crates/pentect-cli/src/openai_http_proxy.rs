@@ -288,15 +288,16 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let request_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
     let context = crate::gateway_diagnostics::RequestContext {
-        endpoint: classify_openai_endpoint(
-            request
-                .uri()
-                .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/"),
-        )
-        .diagnostic_name(),
+        endpoint: authenticated_request_path(request_path, &state.auth)
+            .map(classify_openai_endpoint)
+            .unwrap_or(OpenAiEndpoint::Unknown)
+            .diagnostic_name(),
         method: crate::gateway_diagnostics::method_name(request.method()),
     };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
@@ -3498,7 +3499,15 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         OpenAiEndpoint::InputTokens
     } else if matches!(
         segments.as_slice(),
-        ["v1", "alpha", "search"] | ["backend-api", "codex", "alpha", "search"]
+        // Codex resolves `alpha/search` relative to its configured base URL.
+        // Pentect replaces that base with the authenticated local gateway, so
+        // the gateway receives the bare form even though the final ChatGPT URL
+        // is /backend-api/codex/alpha/search. Keep the fully rooted forms for
+        // custom providers and already released Codex clients.
+        ["alpha", "search"]
+            | ["v1", "alpha", "search"]
+            | ["api", "codex", "alpha", "search"]
+            | ["backend-api", "codex", "alpha", "search"]
     ) {
         OpenAiEndpoint::StandaloneSearch
     } else if path.ends_with("/responses") {
@@ -4556,7 +4565,15 @@ mod tests {
             OpenAiEndpoint::InputTokens
         );
         assert_eq!(
+            classify_openai_endpoint("/alpha/search"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/alpha/search"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
+            classify_openai_endpoint("/api/codex/alpha/search"),
             OpenAiEndpoint::StandaloneSearch
         );
         assert_eq!(
@@ -4624,6 +4641,7 @@ mod tests {
             "/v1/unknown/files/file_123",
             "/v1/unknown/models/model_123",
             "/v1/unknown/alpha/search",
+            "/api/unknown/alpha/search",
             "/backend-api/unknown/alpha/search",
         ] {
             assert_eq!(
@@ -5407,13 +5425,10 @@ mod tests {
         ]
         .concat();
         let (upstream, captured, thread) = mock_chat_upstream();
-        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+        let proxy = OpenAiHttpProxyGuard::start(format!("{upstream}/backend-api/codex")).unwrap();
 
         let response = reqwest::blocking::Client::new()
-            .post(format!(
-                "{}/backend-api/codex/alpha/search",
-                proxy.base_url()
-            ))
+            .post(format!("{}/alpha/search", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::to_vec(&serde_json::json!({
