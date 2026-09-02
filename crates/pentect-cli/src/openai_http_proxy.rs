@@ -288,15 +288,16 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let request_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
     let context = crate::gateway_diagnostics::RequestContext {
-        endpoint: classify_openai_endpoint(
-            request
-                .uri()
-                .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/"),
-        )
-        .diagnostic_name(),
+        endpoint: authenticated_request_path(request_path, &state.auth)
+            .map(classify_openai_endpoint)
+            .unwrap_or(OpenAiEndpoint::Unknown)
+            .diagnostic_name(),
         method: crate::gateway_diagnostics::method_name(request.method()),
     };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
