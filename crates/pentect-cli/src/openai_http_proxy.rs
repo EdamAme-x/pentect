@@ -3498,10 +3498,13 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         OpenAiEndpoint::InputTokens
     } else if matches!(
         segments.as_slice(),
-        // Current Codex uses /api/codex for ChatGPT-backed search, while
-        // custom Responses providers use /v1. Keep the older backend-api form
-        // for already released Codex clients.
-        ["v1", "alpha", "search"]
+        // Codex resolves `alpha/search` relative to its configured base URL.
+        // Pentect replaces that base with the authenticated local gateway, so
+        // the gateway receives the bare form even though the final ChatGPT URL
+        // is /backend-api/codex/alpha/search. Keep the fully rooted forms for
+        // custom providers and already released Codex clients.
+        ["alpha", "search"]
+            | ["v1", "alpha", "search"]
             | ["api", "codex", "alpha", "search"]
             | ["backend-api", "codex", "alpha", "search"]
     ) {
@@ -4561,6 +4564,10 @@ mod tests {
             OpenAiEndpoint::InputTokens
         );
         assert_eq!(
+            classify_openai_endpoint("/alpha/search"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/alpha/search"),
             OpenAiEndpoint::StandaloneSearch
         );
@@ -5417,10 +5424,10 @@ mod tests {
         ]
         .concat();
         let (upstream, captured, thread) = mock_chat_upstream();
-        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+        let proxy = OpenAiHttpProxyGuard::start(format!("{upstream}/backend-api/codex")).unwrap();
 
         let response = reqwest::blocking::Client::new()
-            .post(format!("{}/api/codex/alpha/search", proxy.base_url()))
+            .post(format!("{}/alpha/search", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::to_vec(&serde_json::json!({
@@ -5443,7 +5450,7 @@ mod tests {
             .unwrap();
         thread.join().unwrap();
         assert!(
-            headers.starts_with("POST /api/codex/alpha/search "),
+            headers.starts_with("POST /backend-api/codex/alpha/search "),
             "{headers}"
         );
         assert!(!request.contains(&secret), "{request}");
