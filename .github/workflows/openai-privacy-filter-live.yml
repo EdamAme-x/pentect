@@ -1,0 +1,111 @@
+name: OpenAI Privacy Filter live smoke
+
+on:
+  schedule:
+    - cron: "23 5 * * 3"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Real-model runtime profile
+        type: choice
+        options:
+          - cpu
+          - cuda
+        default: cpu
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openai-privacy-filter-live-${{ inputs.profile || 'cpu' }}
+  cancel-in-progress: ${{ 1 == 0 }}
+
+jobs:
+  live:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ${{ inputs.profile == 'cuda' && fromJSON('["self-hosted","linux","x64","gpu","nvidia"]') || 'ubuntu-22.04' }}
+    timeout-minutes: 150
+    env:
+      OPF_PROFILE: ${{ inputs.profile || 'cpu' }}
+      PENTECT_OPF_ROOT: ${{ runner.temp }}/pentect-opf-${{ inputs.profile || 'cpu' }}
+      PENTECT_LOG_DIR: ${{ runner.temp }}/pentect-opf-live-logs
+      OPENAI_API_KEY: not-a-real-openai-key
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: ${{ 1 == 0 }}
+      - uses: ./.github/actions/rust-toolchain
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/alcatraz-helper/go.mod
+          cache-dependency-path: tools/alcatraz-helper/go.sum
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: opf-live-${{ inputs.profile || 'cpu' }}
+      - name: Restore managed OpenAI Privacy Filter environment
+        id: opf-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PENTECT_OPF_ROOT }}
+          key: opf-${{ runner.os }}-${{ runner.arch }}-py312-${{ inputs.profile || 'cpu' }}-${{ hashFiles('plugins/openai-privacy-filter/setup.py') }}
+      - name: Build Pentect with standard features
+        run: cargo build --locked -p pentect-cli
+      - name: Install a current downloadable Codex
+        run: python tools/install_portable_client_smoke.py --mode latest --only codex
+      - name: Run real-model installation-to-Codex smoke
+        id: live
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PENTECT_LOG_DIR"
+          report="$RUNNER_TEMP/pentect-opf-live-e2e.json"
+          python plugins/openai-privacy-filter/tests/live_e2e.py \
+            --pentect "$GITHUB_WORKSPACE/target/debug/pentect" \
+            --codex "$(command -v codex)" \
+            --profile "$OPF_PROFILE" \
+            --timeout-seconds 1800 \
+            | tee "$report"
+          jq -e '
+            .schema == "pentect.opf-live-e2e.v2" and
+            .status == "ok" and
+            .profile == env.OPF_PROFILE and
+            (.setup_seconds | numbers) >= 0 and
+            (.plugin_startup_seconds | numbers) >= 0 and
+            (.warm_request_seconds | numbers) >= 0 and
+            (.cold_seconds | numbers) >= 0 and
+            (.restart_seconds | numbers) >= 0 and
+            (.codex_seconds | numbers) >= 0
+          ' "$report"
+          {
+            echo "### OpenAI Privacy Filter live smoke"
+            echo
+            echo "- Profile: `$(jq -r .profile "$report")`"
+            echo "- Managed environment cache hit: `${{ steps.opf-cache.outputs.cache-hit }}`"
+            echo "- Setup: `$(jq -r .setup_seconds "$report")s`"
+            echo "- Direct startup: `$(jq -r .plugin_startup_seconds "$report")s`"
+            echo "- Warm request: `$(jq -r .warm_request_seconds "$report")s`"
+            echo "- Pentect cold process: `$(jq -r .cold_seconds "$report")s`"
+            echo "- Pentect restart: `$(jq -r .restart_seconds "$report")s`"
+            echo "- Codex/local upstream: `$(jq -r .codex_seconds "$report")s`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify artifacts contain no fixture plaintext
+        id: verify-artifacts
+        if: always()
+        run: python plugins/openai-privacy-filter/tests/verify_artifacts.py
+      - name: Upload bounded live-smoke evidence
+        if: always() && steps.verify-artifacts.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openai-privacy-filter-live-${{ inputs.profile || 'cpu' }}
+          path: |
+            ${{ runner.temp }}/pentect-opf-live-e2e.json
+            ${{ env.PENTECT_LOG_DIR }}/pentect.log
+          if-no-files-found: warn
+          retention-days: 14

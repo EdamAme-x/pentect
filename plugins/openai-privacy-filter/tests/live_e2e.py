@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from queue import Empty, Queue
 from typing import Any
 
 
@@ -24,6 +25,8 @@ EXPECTED_HANDLE_GROUPS = (
 )
 CODEX_SAMPLE = "The synthetic test contact is alice@example.com. Reply exactly OK."
 EMAIL_HANDLE = re.compile(rb"<<(?:PRIVATE_EMAIL|EMAIL_ADDRESS)_[0-9a-f]{16,64}>>")
+FIXTURE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+FIXTURE_PHONE = re.compile(r"\+?\d[\d ()-]{7,}\d")
 
 
 def live_environment() -> dict[str, str]:
@@ -58,6 +61,14 @@ def run(
     )
 
 
+def require_success(
+    result: subprocess.CompletedProcess[str], operation: str
+) -> None:
+    """Report a bounded phase and exit code without copying child output."""
+    if result.returncode != 0:
+        raise RuntimeError(f"{operation} failed with exit code {result.returncode}")
+
+
 def assert_live_setup(environment: dict[str, str]) -> None:
     root = Path(
         environment.get(
@@ -83,30 +94,23 @@ def assert_live_setup(environment: dict[str, str]) -> None:
 
 def mask_once(
     pentect: Path,
-    plugin: Path,
     project: Path,
     environment: dict[str, str],
     timeout: float,
 ) -> float:
     started = time.monotonic()
     result = run(
-        [str(pentect), "mask", "--plugins", str(plugin)],
+        [str(pentect), "mask"],
         cwd=project,
         environment=environment,
         timeout=timeout,
         input_text=SAMPLE + "\n",
     )
     elapsed = time.monotonic() - started
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Pentect mask failed ({result.returncode}): {result.stderr.strip()}"
-        )
+    require_success(result, "Pentect mask")
     for labels in EXPECTED_HANDLE_GROUPS:
         if not any(f"<<{label}_" in result.stdout for label in labels):
-            raise RuntimeError(
-                f"Pentect did not produce one of {labels!r}; "
-                f"stdout={result.stdout.strip()!r}; stderr={result.stderr.strip()!r}"
-            )
+            raise RuntimeError(f"Pentect mask missed expected label group {labels!r}")
     if "alice@example.com" in result.stdout or "+1 415-555-0100" in result.stdout:
         raise RuntimeError("real OPF allowed synthetic PII through unchanged")
     if "preparing plugin 'openai-privacy-filter'" not in result.stderr:
@@ -116,41 +120,24 @@ def mask_once(
     return elapsed
 
 
-def inspect_plugin_once(
-    plugin: Path,
-    project: Path,
-    environment: dict[str, str],
-    timeout: float,
-    profile: str,
-) -> float:
-    request = {
-        "schema": "pentect.plugin.v1",
-        "id": 1,
-        "hook": "inspect",
-        "payload": {"text": SAMPLE},
-    }
-    started = time.monotonic()
-    result = run(
-        [
-            shutil.which("python3") or "python3",
-            str(plugin / "server.py"),
-            "--device",
-            "cpu" if profile == "auto" else profile,
-        ],
-        cwd=project,
-        environment=environment,
-        timeout=timeout,
-        input_text=json.dumps(request, separators=(",", ":")) + "\n",
-    )
-    elapsed = time.monotonic() - started
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"real OPF protocol probe failed ({result.returncode}): {result.stderr.strip()}"
-        )
+def _readline_with_timeout(stream: Any, timeout: float, operation: str) -> str:
+    lines: Queue[str] = Queue(maxsize=1)
+    thread = threading.Thread(target=lambda: lines.put(stream.readline()), daemon=True)
+    thread.start()
     try:
-        response = json.loads(result.stdout.strip())
+        line = lines.get(timeout=timeout)
+    except Empty as error:
+        raise RuntimeError(f"{operation} timed out") from error
+    if not line:
+        raise RuntimeError(f"{operation} ended before returning a response")
+    return line
+
+
+def _validate_protocol_response(line: str) -> None:
+    try:
+        response = json.loads(line)
     except json.JSONDecodeError as error:
-        raise RuntimeError(f"real OPF returned invalid protocol JSON: {error}") from error
+        raise RuntimeError("real OPF returned invalid protocol JSON") from error
     labels = {
         span.get("label")
         for span in response.get("spans", [])
@@ -158,10 +145,110 @@ def inspect_plugin_once(
     }
     missing = {"PRIVATE_EMAIL", "PRIVATE_PHONE"} - labels
     if missing:
-        raise RuntimeError(
-            f"real OPF protocol probe missed {sorted(missing)!r}; response={response!r}"
-        )
-    return elapsed
+        raise RuntimeError(f"real OPF protocol probe missed {sorted(missing)!r}")
+
+
+def inspect_plugin_twice(
+    plugin: Path,
+    project: Path,
+    environment: dict[str, str],
+    timeout: float,
+    profile: str,
+) -> tuple[float, float]:
+    process = subprocess.Popen(
+        [
+            shutil.which("python3") or "python3",
+            str(plugin / "server.py"),
+            "--device",
+            "cpu" if profile == "auto" else profile,
+        ],
+        cwd=project,
+        env=environment,
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("real OPF protocol pipes are unavailable")
+        samples: list[float] = []
+        for request_id in (1, 2):
+            request = {
+                "schema": "pentect.plugin.v1",
+                "id": request_id,
+                "hook": "inspect",
+                "payload": {"text": SAMPLE},
+            }
+            started = time.monotonic()
+            process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+            line = _readline_with_timeout(
+                process.stdout, timeout, f"real OPF request {request_id}"
+            )
+            samples.append(time.monotonic() - started)
+            _validate_protocol_response(line)
+        process.stdin.close()
+        return samples[0], samples[1]
+    finally:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def assert_no_plugin_process(plugin: Path, timeout: float = 10.0) -> None:
+    """On Linux CI, prove that the real plugin worker did not outlive Pentect."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return
+    marker = str(plugin / "server.py").encode()
+    deadline = time.monotonic() + timeout
+    while True:
+        alive = 0
+        for entry in proc.iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                command = (entry / "cmdline").read_bytes()
+            except OSError:
+                continue
+            alive += marker in command
+        if alive == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{alive} real OPF worker process(es) remained alive")
+        time.sleep(0.1)
+
+
+def fixture_plaintext() -> tuple[bytes, ...]:
+    text = f"{SAMPLE}\n{CODEX_SAMPLE}"
+    values = {*FIXTURE_EMAIL.findall(text), *FIXTURE_PHONE.findall(text)}
+    return tuple(value.encode() for value in sorted(values))
+
+
+def assert_value_free_logs(environment: dict[str, str]) -> None:
+    configured = environment.get("PENTECT_LOG_DIR")
+    if not configured:
+        return
+    root = Path(configured).expanduser()
+    if not root.is_dir():
+        return
+    needles = fixture_plaintext()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            contents = path.read_bytes()
+        except OSError:
+            continue
+        if any(needle in contents for needle in needles):
+            raise RuntimeError("persistent OPF smoke logs contain fixture plaintext")
 
 
 class ProtectedUpstream:
@@ -321,7 +408,6 @@ def _completed_response_stream() -> bytes:
 def codex_once(
     pentect: Path,
     codex: Path,
-    plugin: Path,
     project: Path,
     environment: dict[str, str],
     timeout: float,
@@ -339,8 +425,6 @@ def codex_once(
                 "codex",
                 "--upstream",
                 upstream.base_url,
-                "--plugins",
-                str(plugin),
                 "--",
                 "exec",
                 "--ephemeral",
@@ -355,17 +439,13 @@ def codex_once(
             timeout=timeout,
         )
         elapsed = time.monotonic() - started
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Pentect Codex E2E failed ({result.returncode}): "
-                f"{result.stderr.strip()} {result.stdout.strip()}"
-            )
+        require_success(result, "Pentect Codex E2E")
         if not upstream.request_seen.is_set():
             raise RuntimeError("Pentect Codex E2E never reached the local upstream")
         if upstream.error is not None:
             raise RuntimeError(upstream.error)
         if "timed out" in result.stderr or "plugin 'openai-privacy-filter' skipped" in result.stderr:
-            raise RuntimeError(f"real OPF did not remain active: {result.stderr.strip()}")
+            raise RuntimeError("real OPF did not remain active during Codex E2E")
         if '"text":"OK"' not in result.stdout:
             raise RuntimeError("Codex did not consume the local upstream response")
         return elapsed
@@ -396,11 +476,12 @@ def main() -> None:
     environment = live_environment()
     with tempfile.TemporaryDirectory(prefix="pentect-opf-live-") as directory:
         project = Path(directory)
+        setup_started = time.monotonic()
         setup = run(
             [
                 str(pentect),
                 "plugins",
-                "setup",
+                "add",
                 str(plugin),
                 "--project",
                 "--profile",
@@ -411,20 +492,20 @@ def main() -> None:
             environment=environment,
             timeout=args.timeout_seconds,
         )
-        if setup.returncode != 0:
-            raise RuntimeError(
-                f"real OPF setup failed ({setup.returncode}): {setup.stderr.strip()}"
-            )
+        require_success(setup, "real OPF installation and setup")
+        setup_seconds = time.monotonic() - setup_started
         assert_live_setup(environment)
-        plugin_seconds = inspect_plugin_once(
+        plugin_startup_seconds, warm_request_seconds = inspect_plugin_twice(
             plugin, project, environment, args.timeout_seconds, args.profile
         )
         cold_seconds = mask_once(
-            pentect, plugin, project, environment, args.timeout_seconds
+            pentect, project, environment, args.timeout_seconds
         )
+        assert_no_plugin_process(plugin)
         restart_seconds = mask_once(
-            pentect, plugin, project, environment, args.timeout_seconds
+            pentect, project, environment, args.timeout_seconds
         )
+        assert_no_plugin_process(plugin)
         codex_seconds = None
         if not args.skip_codex:
             if args.codex is None:
@@ -432,19 +513,44 @@ def main() -> None:
             codex_seconds = codex_once(
                 pentect,
                 args.codex.expanduser().absolute(),
-                plugin,
                 project,
                 environment,
                 args.timeout_seconds,
                 args.model,
             )
+            assert_no_plugin_process(plugin)
+        removal = run(
+            [
+                str(pentect),
+                "plugins",
+                "remove",
+                "openai-privacy-filter",
+                "--project",
+            ],
+            cwd=project,
+            environment=environment,
+            timeout=args.timeout_seconds,
+        )
+        require_success(removal, "real OPF removal")
+        listing = run(
+            [str(pentect), "plugins", "list"],
+            cwd=project,
+            environment=environment,
+            timeout=args.timeout_seconds,
+        )
+        require_success(listing, "post-removal plugin listing")
+        if "openai-privacy-filter" in listing.stdout:
+            raise RuntimeError("real OPF remained enabled after removal")
+        assert_value_free_logs(environment)
 
     print(
         json.dumps(
             {
-                "schema": "pentect.opf-live-e2e.v1",
+                "schema": "pentect.opf-live-e2e.v2",
                 "profile": args.profile,
-                "plugin_seconds": round(plugin_seconds, 3),
+                "setup_seconds": round(setup_seconds, 3),
+                "plugin_startup_seconds": round(plugin_startup_seconds, 3),
+                "warm_request_seconds": round(warm_request_seconds, 3),
                 "cold_seconds": round(cold_seconds, 3),
                 "restart_seconds": round(restart_seconds, 3),
                 "codex_seconds": (
