@@ -40,12 +40,20 @@ plaintext, and returns a complete local response that Codex must consume
 without a plugin timeout. No OpenAI request is made by that step. It may
 download several gigabytes when the managed environment is not ready.
 
-This is currently a manual test. Pull-request CI runs the bridge unit tests and
-Pentect's deterministic installed-plugin fixtures on Linux, macOS, and Windows,
-but it does not install or load the real model, exercise CUDA, or run this
-script. A green pull request does not claim real-model coverage. The planned
-cache-backed scheduled CPU smoke and optional CUDA smoke are not implemented
-yet.
+Pull-request CI runs the bridge unit tests and Pentect's deterministic
+installed-plugin fixtures on Linux, macOS, and Windows, but it does not install
+or load the real model or exercise CUDA. A green pull request therefore does
+not claim real-model coverage.
+
+The `OpenAI Privacy Filter live smoke` workflow runs this script every week on
+a hosted Linux CPU runner and can be started manually with the CPU profile. It
+caches the managed environment and checkpoint by OS, architecture, Python
+version, profile, and setup revision. The smoke installs the plugin, records
+setup, direct startup, warm request, Pentect restart, and Codex/local-upstream
+durations, verifies worker cleanup, removes the plugin, and uploads only
+fixture-plaintext-free logs and timing evidence. The manual CUDA profile
+targets a separately managed self-hosted runner labeled `gpu` and `nvidia`;
+CUDA availability is not a pull-request or scheduled-release gate.
 
 ```sh
 python3 plugins/openai-privacy-filter/tests/live_e2e.py \

@@ -102,10 +102,17 @@ not claim that those heavyweight boundaries were exercised.
 The repository includes a separate
 [`live_e2e.py`](https://github.com/EdamAme-x/pentect/blob/main/plugins/openai-privacy-filter/tests/live_e2e.py)
 for the real model. It verifies real setup and checkpoint state, the direct
-plugin protocol, cold and restarted Pentect masking, and an installed Codex
-flow against a localhost recorder without sending a request to OpenAI. This
-test is currently manual, not a required or scheduled GitHub Actions job. A
-cache-backed scheduled CPU smoke and an optional CUDA smoke remain planned.
+plugin protocol including a warm second request, cold and restarted Pentect
+masking, worker cleanup, removal, and an installed Codex flow against a
+localhost recorder without sending a request to OpenAI.
+
+The `OpenAI Privacy Filter live smoke` workflow runs this test weekly with the
+CPU profile and also supports manual CPU runs. The managed Python environment
+and checkpoint are cached by the setup revision and runtime identity. Its
+bounded artifact contains timing evidence and persistent logs only after a
+fixture-plaintext scan succeeds. A manually selected CUDA profile targets a
+separately managed self-hosted Linux runner labeled `gpu` and `nvidia`; CUDA is
+not a pull-request or scheduled-release gate.
 
 ### How it connects
 
