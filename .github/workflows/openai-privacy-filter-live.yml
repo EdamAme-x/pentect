@@ -38,7 +38,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/pentect-opf-$OPF_PROFILE"
+          home="$RUNNER_TEMP/pentect-opf-home-$OPF_PROFILE"
+          root="$home/.pentect/openai-privacy-filter"
           logs="$RUNNER_TEMP/pentect-opf-live-logs"
           report="$RUNNER_TEMP/pentect-opf-live-e2e.json"
           {
@@ -47,6 +48,7 @@ jobs:
             echo "PENTECT_OPF_REPORT=$report"
           } >> "$GITHUB_ENV"
           {
+            echo "home=$home"
             echo "root=$root"
             echo "logs=$logs"
             echo "report=$report"
@@ -80,6 +82,7 @@ jobs:
         shell: bash
         env:
           CACHE_HIT: ${{ steps.opf-cache.outputs.cache-hit }}
+          HOME: ${{ steps.live-paths.outputs.home }}
         run: |
           set -euo pipefail
           mkdir -p "$PENTECT_LOG_DIR"
@@ -135,7 +138,7 @@ jobs:
       - name: Clean live-smoke state from the runner
         if: always()
         env:
-          OPF_ROOT_TO_CLEAN: ${{ steps.live-paths.outputs.root }}
+          OPF_HOME_TO_CLEAN: ${{ steps.live-paths.outputs.home }}
           OPF_LOGS_TO_CLEAN: ${{ steps.live-paths.outputs.logs }}
           OPF_REPORT_TO_CLEAN: ${{ steps.live-paths.outputs.report }}
         shell: bash
@@ -147,7 +150,7 @@ jobs:
 
           temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
           for name in (
-              "OPF_ROOT_TO_CLEAN",
+              "OPF_HOME_TO_CLEAN",
               "OPF_LOGS_TO_CLEAN",
               "OPF_REPORT_TO_CLEAN",
           ):
