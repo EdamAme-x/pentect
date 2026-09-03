@@ -278,8 +278,11 @@ jobs:
         if: needs.changes.outputs.detector == 'true'
         run: cargo test -p pentect-runtime --lib --locked canonical_engine_construction_stays_off_the_warm_up_path -- --nocapture
       - name: Test plugin runtime
-        if: needs.changes.outputs.plugins == 'true'
+        if: needs.changes.outputs.plugins == 'true' && runner.os != 'Windows'
         run: cargo test -p pentect-runtime plugin_middleware::tests --locked
+      - name: Test plugin runtime without Windows process-start contention
+        if: needs.changes.outputs.plugins == 'true' && runner.os == 'Windows'
+        run: cargo test -p pentect-runtime plugin_middleware::tests --locked -- --test-threads=1
       - name: Test plugin CLI
         if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-cli plugins::tests --bin pentect --locked
