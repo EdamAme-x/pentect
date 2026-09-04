@@ -243,6 +243,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("__plugin-setup-supervisor") {
         std::process::exit(plugins_cmd::cmd_setup_supervisor(&args));
     }
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("version" | "--version" | "-V")
+    ) {
+        update::cmd_version();
+        return;
+    }
     let surface = diagnostic_surface(&args);
     install_panic_logger(surface.clone());
     pentect_agent::record_process_activity(

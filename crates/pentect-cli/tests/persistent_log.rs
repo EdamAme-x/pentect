@@ -26,13 +26,13 @@ fn process_lifecycle_is_persisted_without_arguments_or_environment() {
     let root = temp_root("persistent-log");
     let secret = "sk-pentect-persistent-log-secret";
     let output = Command::new(env!("CARGO_BIN_EXE_pentect"))
-        .arg("version")
+        .arg("not-a-command")
         .arg(secret)
         .env("PENTECT_LOG_DIR", &root)
         .env("PENTECT_TEST_SECRET", secret)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
 
     let path = root.join("pentect.log");
     let raw = std::fs::read_to_string(&path).unwrap();
@@ -41,10 +41,32 @@ fn process_lifecycle_is_persisted_without_arguments_or_environment() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["event"], "started");
     assert_eq!(events[1]["event"], "finished");
-    assert_eq!(events[1]["exit_code"], 0);
+    assert_eq!(events[1]["exit_code"], 2);
     assert_eq!(events[1]["version"], env!("CARGO_PKG_VERSION"));
-    assert!(events.iter().all(|event| event["surface"] == "version"));
+    assert!(events.iter().all(|event| event["surface"] == "unknown"));
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn version_forms_do_not_initialize_persistent_logging() {
+    for form in ["version", "--version", "-V"] {
+        let root = temp_root("version-fast-path");
+        let output = Command::new(env!("CARGO_BIN_EXE_pentect"))
+            .arg(form)
+            .env("PENTECT_LOG_DIR", &root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{form}: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("pentect {}\n", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(
+            !root.exists(),
+            "{form} initialized persistent logging at {}",
+            root.display()
+        );
+    }
 }
 
 #[test]
