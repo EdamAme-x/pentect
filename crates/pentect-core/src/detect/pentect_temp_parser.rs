@@ -47,8 +47,10 @@ fn cli_compatibility_candidate(line: &str) -> bool {
         || shell::contains_ascii_ci(line, "--pass")
         || shell::contains_ascii_ci(line, "--mnemonic")
         || shell::contains_ascii_ci(line, "--seed-phrase")
+        || shell::contains_ascii_ci(line, "--seed_phrase")
         || shell::contains_ascii_ci(line, "--recovery-phrase")
-        || shell::contains_ascii_ci(line, " config ")
+        || shell::contains_ascii_ci(line, "--recovery_phrase")
+        || shell::contains_ascii_ci(line, "config")
 }
 
 fn cli_compatibility(view: &NormalizedView, line: &str, offset: usize, out: &mut Vec<Span>) {
@@ -398,7 +400,9 @@ mod tests {
             "app --passphrase '秘密 phrase 123'",
             "wallet --mnemonic recoveryWords123",
             "wallet --seed-phrase seedWords123",
+            "wallet --seed_phrase seedWords123",
             "wallet --recovery-phrase recoveryWords123",
+            "wallet --recovery_phrase recoveryWords123",
         ] {
             assert_eq!(values(raw).len(), 1, "{raw}");
         }
@@ -419,6 +423,7 @@ mod tests {
         for raw in [
             "npm config set _authToken npm_syntheticToken123",
             "pnpm config set _password '秘密Password123'",
+            "npm\tconfig\tset\t_authToken\ttabSeparatedToken123",
             "git config user.password hunter2XyzAbc123",
         ] {
             assert_eq!(values(raw).len(), 1, "{raw}");
