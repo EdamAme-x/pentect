@@ -58,6 +58,8 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$RUNNER_TEMP/codex-app-smoke-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           node --check tools/smoke_pi_package.mjs
+          sh tools/test_wait_for_npm_version.sh
+          python tools/test_npm_release_workflow.py
           sh tools/test_propose_automation_pr.sh
           sh tools/test_wait_for_automation_pr.sh
       - name: Validate PowerShell installer
@@ -845,7 +847,7 @@ jobs:
 
   promote:
     name: Publish stable release
-    needs: [lifecycle, apt-repository, npm-publish]
+    needs: [lifecycle, apt-repository, npm-readiness]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -862,7 +864,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      actions: write
       contents: read
       id-token: write
     steps:
@@ -884,11 +885,35 @@ jobs:
         run: |
           set -euo pipefail
           version=${GITHUB_REF_NAME#v}
-          if npm view "pentect@$version" version >/dev/null 2>&1; then
-            echo "pentect@$version is already published"
+          if tools/wait_for_npm_version.sh pentect "$version" 1 0; then
+            exit 0
           else
-            npm publish --access public
+            status=$?
           fi
+          test "$status" = 4
+          npm publish --access public
+
+  npm-readiness:
+    name: Wait for npm registry and publish Pi
+    needs: npm-publish
+    runs-on: ubuntu-latest
+    # Each registry gate is at most ~5 minutes nominally (30 five-second
+    # requests plus 29 five-second delays); leave room for the Pi workflow.
+    timeout-minutes: 40
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Wait for exact npm version visibility
+        shell: bash
+        run: tools/wait_for_npm_version.sh pentect "${GITHUB_REF_NAME#v}" 30 5
       - name: Trigger matching Pi extension release
         shell: bash
         env:
@@ -919,6 +944,7 @@ jobs:
           done
           test -n "$run_id"
           gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+          tools/wait_for_npm_version.sh @pentect/pi "$version" 30 5
 
   package-metadata:
     name: Update package metadata
