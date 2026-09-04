@@ -3045,6 +3045,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -3638,7 +3639,7 @@ mod tests {
             }
             write!(
                 stream,
-                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                "X-Pentect-Coverage: forged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             )
             .unwrap();
@@ -3818,7 +3819,7 @@ mod tests {
         let (anthropic_upstream, anthropic_request, anthropic_thread) =
             mock_upstream(MockProvider::Anthropic);
         let anthropic_proxy = ClaudeHttpProxyGuard::start(anthropic_upstream).unwrap();
-        let anthropic_response: Value = reqwest::blocking::Client::new()
+        let anthropic_response = reqwest::blocking::Client::new()
             .post(format!("{}/v1/messages", anthropic_proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(
@@ -3835,7 +3836,17 @@ mod tests {
             .send()
             .unwrap()
             .error_for_status()
-            .unwrap()
+            .unwrap();
+        assert_eq!(anthropic_response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            anthropic_response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
+        let anthropic_response: Value = anthropic_response
             .bytes()
             .map(|body| serde_json::from_slice(&body).unwrap())
             .unwrap();
