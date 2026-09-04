@@ -4,6 +4,12 @@ Pentect validates its HTTP gateways against provider-shaped mock servers in
 the Rust test suite. Every release also launches these exact public CLI builds
 through the release binary:
 
+The current official coding-client scope is four clients: **Codex CLI, Claude
+Code, OpenCode, and Pi**. Pentect is concentrating compatibility work on these
+four rather than adding more client launchers. Desktop rows below are separate
+surfaces within the Codex and Claude client families, not additional core
+clients.
+
 | Client | Release gate | Protected mode |
 | --- | --- | --- |
 | Codex CLI `0.149.0` | real launch on Linux and all installer platforms | `pentect codex` |

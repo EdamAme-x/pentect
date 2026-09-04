@@ -59,9 +59,11 @@ process arguments, or debuggers. The protected boundary is provider traffic.
 
 ## Supported surfaces
 
-Pentect supports Codex, Claude, OpenCode, and Pi, plus supported Codex App and
-Claude Desktop routes. It also offers local masking commands, custom gateways,
-and safe plugins.
+Pentect currently supports four core AI coding clients: Codex CLI, Claude Code,
+OpenCode, and Pi. Compatibility work is focused on these four rather than on
+adding more client launchers. Supported Codex App and Claude Desktop routes are
+separate surfaces within the same client families. Pentect also offers local
+masking commands, custom gateways, and safe plugins.
 
 Antigravity, Aider, Continue, Cline, Roo Code, Zed, Goose, Junie, and Gemini
 CLI are documented as [not implemented](/reference/compatibility/#not-implemented).
