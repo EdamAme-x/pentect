@@ -6,7 +6,8 @@ mod sweep;
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CliCredentialDetector, CredSweeperNativeDetector,
     DecodeConfig, DecodeDetector, Detector, EnvValueDetector, ExplicitSecretDetector, JwtDetector,
-    KeyValueDetector, SensitiveKeyDetector, StructuralDetector, UrlDetector, SECRET_VALUE_HINT,
+    KeyValueDetector, PentectTempParser, SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    SECRET_VALUE_HINT,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -704,6 +705,7 @@ impl EngineBuilder {
             .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
+            .detector(Box::new(PentectTempParser))
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
@@ -729,6 +731,7 @@ impl EngineBuilder {
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
+            .detector(Box::new(PentectTempParser))
             .detector(Box::new(JwtDetector))
             .detector(Box::new(KeyValueDetector))
             .detector(Box::new(UrlDetector))

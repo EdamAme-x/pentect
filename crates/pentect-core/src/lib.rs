@@ -36,7 +36,8 @@ pub use detect::{
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats, DecodeConfig, DecodeDetector, DecodeLimitReason, Detector,
     EnvValueDetector, ExplicitSecretDetector, KeyValueDetector, PatternMatchDetector, PatternSpec,
-    RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    PentectTempParser, RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector,
+    UrlDetector,
 };
 pub use model::{
     ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
