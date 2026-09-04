@@ -23,6 +23,11 @@
 Pentect is a local security boundary between supported AI clients and their
 providers. Start with the [documentation](https://pentect.dev/).
 
+Pentect currently focuses official client support on four AI coding clients:
+**Codex CLI, Claude Code, OpenCode, and Pi**. Supported Codex App and Claude
+Desktop routes are documented separately as desktop surfaces of those client
+families; additional client integrations are outside the current support scope.
+
 ## Repository guides
 
 - [Compatibility](COMPATIBILITY.md)

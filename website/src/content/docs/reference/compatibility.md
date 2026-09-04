@@ -8,6 +8,12 @@ installs and starts every public client launcher with the release binary. A
 daily workflow installs current upstream client versions so compatibility
 drift is visible before the next release.
 
+Pentect currently supports four core AI coding clients: **Codex CLI, Claude
+Code, OpenCode, and Pi**. Compatibility work is focused on these four rather
+than on adding more client launchers. Codex App and Claude Desktop entries are
+separate desktop surfaces within those client families, not additional core
+clients.
+
 | Client | Test | Protected launch |
 | --- | --- | --- |
 | Codex CLI `0.149.0` | Real launch on Linux and all installer platforms | `pentect codex` |

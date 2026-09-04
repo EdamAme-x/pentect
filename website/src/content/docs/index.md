@@ -23,6 +23,9 @@ aside: false
 
 ## Clients
 
+Pentect currently focuses official support on four AI coding clients: Codex
+CLI, Claude Code, OpenCode, and Pi.
+
 <DocsGrid class="is-compact">
   <a href="/clients/codex/" class="docs-grid__item">
     <small>CLI + Desktop</small><strong>Codex</strong>
