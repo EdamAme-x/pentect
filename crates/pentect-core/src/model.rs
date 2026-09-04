@@ -270,6 +270,8 @@ pub enum DetectorId {
     DecodeOpaque,
     /// Added by the global identity sweep, not a real detector.
     Sweep,
+    /// Temporary compatibility coverage pending an engine-level replacement.
+    PentectTempParser,
 }
 
 impl DetectorId {
@@ -286,6 +288,7 @@ impl DetectorId {
             DetectorId::Pem => "pem",
             DetectorId::Structural => "structural",
             DetectorId::Sweep => "sweep",
+            DetectorId::PentectTempParser => "pentect_temp_parser",
         }
     }
 }

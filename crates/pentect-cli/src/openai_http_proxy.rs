@@ -1805,6 +1805,7 @@ fn mask_openai_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
+    remove_codex_request_metadata(value);
     if let Some(Value::String(instructions)) = value.get_mut("instructions") {
         // Instructions are supplied by the client or provider, not authored by
         // the current user. Prompt-only unmask markers must never take effect
@@ -1842,6 +1843,16 @@ fn mask_openai_request(
         }
     }
     Ok(())
+}
+
+fn remove_codex_request_metadata(value: &mut Value) {
+    let Some(client_metadata) = value
+        .get_mut("client_metadata")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    client_metadata.remove("x-codex-turn-metadata");
 }
 
 fn mask_openai_responses_input(
@@ -3632,6 +3643,7 @@ fn should_forward_request_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "accept-encoding"
+            | "x-codex-turn-metadata"
     )
 }
 
@@ -3649,6 +3661,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -3718,6 +3731,28 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_turn_metadata_is_not_forwarded() {
+        assert!(!should_forward_request_header("x-codex-turn-metadata"));
+        assert!(!should_forward_request_header("X-Codex-Turn-Metadata"));
+
+        let mut request = serde_json::json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "cwd": "/synthetic/private/workspace",
+                    "origin": "https://synthetic.invalid/repository"
+                },
+                "protocol_field": "preserved"
+            }
+        });
+        remove_codex_request_metadata(&mut request);
+
+        assert_eq!(request["client_metadata"]["protocol_field"], "preserved");
+        assert!(request["client_metadata"]
+            .get("x-codex-turn-metadata")
+            .is_none());
+    }
 
     #[test]
     fn openai_response_partial_coverage_obeys_strict_and_ignore_policy() {
@@ -4159,7 +4194,7 @@ mod tests {
             .to_string();
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Pentect-Coverage: forged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response.len(),
                 response
             )
@@ -4231,9 +4266,16 @@ mod tests {
         let response = reqwest::blocking::Client::new()
             .post(format!("{}/v1/chat/completions", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("X-Codex-Turn-Metadata", "synthetic-header-metadata")
             .body(
                 serde_json::to_vec(&serde_json::json!({
                     "model": "test",
+                    "client_metadata": {
+                        "x-codex-turn-metadata": {
+                            "cwd": "/synthetic/chat/workspace"
+                        },
+                        "protocol_field": "preserved"
+                    },
                     "messages": [{
                         "role": "user",
                         "content": format!("Use RUNPOD_API_KEY={secret}")
@@ -4275,10 +4317,20 @@ mod tests {
                 .any(|line| line.eq_ignore_ascii_case("authorization: Bearer provider-test-key")),
             "provider bearer header did not reach the upstream"
         );
+        assert!(!headers
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-metadata:"));
         assert!(!request.contains(&secret), "{request}");
         let handle = first_handle(&request).unwrap();
         assert!(request.matches(&handle).count() >= 3);
         let protected_request: Value = serde_json::from_str(&request).unwrap();
+        assert!(protected_request["client_metadata"]
+            .get("x-codex-turn-metadata")
+            .is_none());
+        assert_eq!(
+            protected_request["client_metadata"]["protocol_field"],
+            "preserved"
+        );
         assert_eq!(protected_request["messages"][0]["content"], HANDLE_CONTRACT);
         assert_eq!(response["choices"][0]["message"]["content"], secret);
         let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
@@ -4467,6 +4519,12 @@ mod tests {
         let payload = serde_json::to_vec(&serde_json::json!({
             "model": "test",
             "input": format!("Use RUNPOD_API_KEY={secret}"),
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "cwd": "/synthetic/compressed/workspace"
+                },
+                "protocol_field": "preserved"
+            },
             "stream": false
         }))
         .unwrap();
@@ -4478,6 +4536,7 @@ mod tests {
             .post(format!("{}/responses", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::CONTENT_ENCODING, "zstd")
+            .header("x-codex-turn-metadata", "synthetic-compressed-metadata")
             .body(compressed)
             .send()
             .unwrap()
@@ -4489,9 +4548,16 @@ mod tests {
             .unwrap();
         thread.join().unwrap();
         assert!(!headers.to_ascii_lowercase().contains("content-encoding:"));
+        assert!(!headers
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-metadata:"));
         assert!(!request.contains(&secret));
         assert!(first_handle(&request).is_some());
-        serde_json::from_str::<Value>(&request).unwrap();
+        let protected: Value = serde_json::from_str(&request).unwrap();
+        assert!(protected["client_metadata"]
+            .get("x-codex-turn-metadata")
+            .is_none());
+        assert_eq!(protected["client_metadata"]["protocol_field"], "preserved");
     }
 
     #[tokio::test]
@@ -5445,6 +5511,14 @@ mod tests {
             .error_for_status()
             .unwrap();
         assert_eq!(response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
 
         let (headers, request) = captured
             .recv_timeout(std::time::Duration::from_secs(5))
