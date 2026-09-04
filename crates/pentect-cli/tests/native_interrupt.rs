@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
-use std::process::Command;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 const PROBE: &str = r##"
 import os
@@ -108,4 +110,73 @@ fn terminal_first_ctrl_c_belongs_to_client_and_repeat_stops_wrapper() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "pentect-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_native_client(root: &Path, body: &str) -> Output {
+    let home = root.join("home");
+    let project = root.join("project");
+    std::fs::create_dir_all(home.join(".pentect")).unwrap();
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        home.join(".pentect/config.toml"),
+        "[update]\ncheck = false\n",
+    )
+    .unwrap();
+    let client = root.join("client.sh");
+    std::fs::write(&client, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut permissions = std::fs::metadata(&client).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&client, permissions).unwrap();
+
+    Command::new(env!("CARGO_BIN_EXE_pentect"))
+        .args(["codex", "--codex"])
+        .arg(client)
+        .current_dir(project)
+        .env("HOME", home)
+        .env_remove("USERPROFILE")
+        .env("PENTECT_LOG_DIR", root.join("log"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn native_client_exit_codes_preserve_normal_and_signal_status() {
+    for (body, expected) in [
+        ("exit 37", 37),
+        ("kill -INT $$", 130),
+        ("kill -TERM $$", 143),
+    ] {
+        let fixture = TestDirectory::new("native-exit-status");
+        let output = run_native_client(&fixture.0, body);
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "body={body:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
