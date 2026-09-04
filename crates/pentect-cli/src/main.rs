@@ -38,10 +38,10 @@ use serde_json::Value;
 #[cfg(any(windows, test))]
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,10 +70,11 @@ const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const GATEWAY_STARTUP_TIMEOUT: Duration =
     Duration::from_secs(pentect_agent::MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT.as_secs() + 10);
 const NATIVE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+const NATIVE_REPEAT_INTERRUPT_WINDOW: Duration = Duration::from_secs(2);
 const NATIVE_CHILD_POLL: Duration = Duration::from_millis(20);
 const MAX_MEMORY_STORE_STARTUP_STDERR: usize = 64 * 1024;
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
-static NATIVE_COMMAND_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static NATIVE_COMMAND_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_INTERRUPT_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2333,7 +2334,8 @@ fn run_native_command_with_guards<G>(
     _guards: G,
 ) -> Result<std::process::ExitStatus, String> {
     install_native_interrupt_handler()?;
-    NATIVE_COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    let interactive = std::io::stdin().is_terminal();
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -2342,11 +2344,13 @@ fn run_native_command_with_guards<G>(
         .map_err(|error| format!("could not run '{}': {error}", display.display()))?;
     let status = wait_for_native_child(
         &mut child,
-        &NATIVE_COMMAND_INTERRUPTED,
+        &NATIVE_COMMAND_INTERRUPTS,
+        interactive,
+        NATIVE_REPEAT_INTERRUPT_WINDOW,
         NATIVE_INTERRUPT_GRACE,
     )
     .map_err(|error| format!("could not wait for '{}': {error}", display.display()))?;
-    NATIVE_COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
     Ok(status)
 }
 
@@ -2354,7 +2358,11 @@ fn install_native_interrupt_handler() -> Result<(), String> {
     NATIVE_INTERRUPT_HANDLER
         .get_or_init(|| {
             ctrlc::set_handler(|| {
-                NATIVE_COMMAND_INTERRUPTED.store(true, Ordering::SeqCst);
+                let _ = NATIVE_COMMAND_INTERRUPTS.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |count| Some(count.saturating_add(1)),
+                );
             })
             .map_err(|error| format!("could not install client cleanup handler: {error}"))
         })
@@ -2363,16 +2371,39 @@ fn install_native_interrupt_handler() -> Result<(), String> {
 
 fn wait_for_native_child(
     child: &mut Child,
-    interrupted: &AtomicBool,
+    interrupts: &AtomicUsize,
+    interactive: bool,
+    repeat_window: Duration,
     grace: Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let mut interrupted_at = None;
+    let mut observed_interrupts = 0;
+    let mut first_interrupted_at = None;
+    let mut shutdown_at = None;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if interrupted.load(Ordering::SeqCst) {
-            let started = interrupted_at.get_or_insert_with(Instant::now);
+        let interrupt_count = interrupts.load(Ordering::SeqCst);
+        if interrupt_count != observed_interrupts {
+            let now = Instant::now();
+            let new_interrupts = interrupt_count.saturating_sub(observed_interrupts);
+            observed_interrupts = interrupt_count;
+            if !interactive
+                || new_interrupts >= 2
+                || first_interrupted_at
+                    .is_some_and(|started: Instant| now.duration_since(started) <= repeat_window)
+            {
+                shutdown_at.get_or_insert(now);
+            } else {
+                // A terminal sends Ctrl-C to the foreground client as well as
+                // Pentect. Let the client own an isolated cancellation.
+                first_interrupted_at = Some(now);
+            }
+        }
+        if first_interrupted_at.is_some_and(|started| started.elapsed() > repeat_window) {
+            first_interrupted_at = None;
+        }
+        if let Some(started) = shutdown_at {
             if started.elapsed() >= grace {
                 let _ = child.kill();
                 return child.wait();
@@ -4167,8 +4198,8 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_native_child_is_forced_down_after_the_grace_period() {
-        let interrupted = std::sync::Arc::new(AtomicBool::new(false));
+    fn noninteractive_native_child_is_forced_down_after_one_interrupt() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
         let mut command;
         #[cfg(windows)]
         {
@@ -4193,19 +4224,169 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = command.spawn().unwrap();
-        let setter = std::sync::Arc::clone(&interrupted);
+        let setter = std::sync::Arc::clone(&interrupts);
         let trigger = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            setter.store(true, Ordering::SeqCst);
+            setter.store(1, Ordering::SeqCst);
         });
 
         let started = Instant::now();
-        let status =
-            wait_for_native_child(&mut child, &interrupted, Duration::from_millis(50)).unwrap();
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            false,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .unwrap();
         trigger.join().unwrap();
 
         assert!(!status.success());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn interactive_native_child_owns_the_first_interrupt() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 150; exit 37",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "sleep 0.15; exit 37"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupts);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            setter.store(1, Ordering::SeqCst);
+        });
+
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        trigger.join().unwrap();
+
+        assert_eq!(status.code(), Some(37));
+    }
+
+    #[test]
+    fn repeated_interactive_interrupt_forces_shutdown_after_grace_period() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "trap '' INT TERM; sleep 30"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupts);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            setter.store(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(30));
+            setter.store(2, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        trigger.join().unwrap();
+
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn separated_interactive_interrupts_remain_client_owned() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 220; exit 37",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "sleep 0.22; exit 37"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupts);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            setter.store(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(100));
+            setter.store(2, Ordering::SeqCst);
+        });
+
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            true,
+            Duration::from_millis(40),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        trigger.join().unwrap();
+
+        assert_eq!(status.code(), Some(37));
     }
 
     #[test]
