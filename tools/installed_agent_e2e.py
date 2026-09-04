@@ -591,6 +591,116 @@ command = ["python", "{plugin}/setup.py"]
     )
 
 
+def verify_forced_setup_termination_is_clean(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "forced-setup-plugin"
+    plugin.mkdir()
+    setup = plugin / "setup.py"
+    setup.write_text(
+        '''import json
+import os
+import time
+
+with open("setup-pid.txt", "w", encoding="utf-8") as marker:
+    json.dump({"setup": os.getpid(), "supervisor": os.getppid()}, marker)
+while True:
+    time.sleep(1)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "server.py").write_text(
+        '''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "forced-setup-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+
+[setup]
+command = ["python", "{plugin}/setup.py"]
+''',
+        encoding="utf-8",
+    )
+    before = snapshot_regular_files(home, project)
+    process = subprocess.Popen(
+        pentect_command(
+            pentect,
+            ["plugins", "add", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    marker = plugin / "setup-pid.txt"
+    deadline = time.monotonic() + 10
+    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not marker.exists():
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        raise RuntimeError("plugin setup did not reach its forced-termination fixture:\n" + output)
+    setup_processes = json.loads(marker.read_text(encoding="utf-8"))
+    setup_pid = int(setup_processes["setup"])
+    supervisor_pid = int(setup_processes["supervisor"])
+    if supervisor_pid == process.pid:
+        process.kill()
+        process.communicate(timeout=5)
+        raise RuntimeError("plugin setup did not run below a distinct supervisor")
+    process.kill()
+    process.communicate(timeout=5)
+    if not wait_for_process_exit(setup_pid, timeout=3.0):
+        raise RuntimeError(f"forced plugin setup process {setup_pid} survived its Pentect owner")
+    if not wait_for_process_exit(supervisor_pid, timeout=3.0):
+        raise RuntimeError(
+            f"forced plugin setup supervisor {supervisor_pid} survived its Pentect owner"
+        )
+    if snapshot_regular_files(home, project) != before:
+        raise RuntimeError("forced plugin setup termination left partial persistent state")
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "forced-setup-e2e:" in listed.stdout:
+        raise RuntimeError("forced plugin setup termination left the plugin enabled")
+
+    setup.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "forced-setup-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
 def verify_failed_update_preserves_command_runtime(
     pentect: str,
     root: Path,
@@ -983,8 +1093,9 @@ command = ["python", "{plugin}/setup.py"]
     }
     if len(markers) != 2:
         raise RuntimeError(f"serialized setup started {len(markers)} setup children, expected 2")
-    if {data["parent"] for data in markers.values()} != {process.pid for process in processes}:
-        raise RuntimeError("setup child markers did not identify their Pentect parents")
+    supervisor_pids = {data["parent"] for data in markers.values()}
+    if len(supervisor_pids) != 2 or supervisor_pids & {process.pid for process in processes}:
+        raise RuntimeError("setup child markers did not identify distinct setup supervisors")
     if {data["role"] for data in markers.values()} != {"slow", "fast"}:
         raise RuntimeError("serialized setup did not run one slow and one fast setup child")
     for process in processes:
@@ -1004,6 +1115,11 @@ command = ["python", "{plugin}/setup.py"]
     for setup_pid in markers:
         if not wait_for_process_exit(setup_pid, timeout=2.0):
             raise RuntimeError(f"serialized setup child {setup_pid} survived completion")
+    for supervisor_pid in supervisor_pids:
+        if not wait_for_process_exit(supervisor_pid, timeout=2.0):
+            raise RuntimeError(
+                f"serialized setup supervisor {supervisor_pid} survived completion"
+            )
 
     ordinary = "ordinary long-running setup fixture"
     recovered = run_pentect(
@@ -1056,6 +1172,9 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_interrupted_setup_rolls_back(
             pentect, root, home, project, environment
         )
+        verify_forced_setup_termination_is_clean(
+            pentect, root, home, project, environment
+        )
         verify_failed_update_preserves_command_runtime(
             pentect, root, home, project, environment
         )
@@ -1070,7 +1189,7 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
-            "add/setup/update/reinstall/remove, failed/interrupted-setup and failed-update rollback, "
+            "add/setup/update/reinstall/remove, failed/interrupted/forced-setup and failed-update rollback, "
             "Command runtime concurrency/restart, long-running serialized setup completion, "
             "Command fail-closed boundaries and process cleanup, installed Wasm trap/timeout/"
             "malformed/oversized required/optional boundaries, HOME-rooted optional/required "
