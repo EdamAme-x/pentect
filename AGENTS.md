@@ -13,6 +13,6 @@ Values such as `<<API_KEY_ab12...>>` are opaque handles:
   surface and let the user choose a documented compatibility setting.
 - Do not assume that remote or cloud agents use the local Pentect gateway.
 
-Use `pentect doctor` to check the installation and `pentect log` for
-value-free diagnostics. Product support and limits are documented at
+Use `pentect doctor` to check the installation and `pentect log --once --tail
+100` for bounded, value-free diagnostics. Product support and limits are documented at
 https://pentect.dev/reference/compatibility/.

@@ -106,9 +106,10 @@ when a command can consume a handle without creating a plaintext file.
 
 | Task | Command | Notes |
 | --- | --- | --- |
-| View persistent diagnostics | `pentect log` | Values, bodies, headers, and URLs are not logged |
+| View recent persistent diagnostics | `pentect log --once --tail 100` | Bounded output; values, bodies, headers, and URLs are not logged |
+| Follow diagnostics | `pentect log --follow` | Reads retained history, then waits for live events |
 | Locate the log file | `pentect log --path` | Prints the local path |
-| Machine-readable diagnostics | `pentect log --json` | Suitable for support tooling |
+| Machine-readable diagnostics | `pentect log --json --once --tail 100` | Bounded JSONL suitable for support tooling |
 | View local protection statistics | `pentect metrics` | Shows stable metric keys with readable names, occurrence counts, blocked restorations, bounded warning reasons, and plugin failures/timeouts; never shows values, handles, paths, URLs, plugin names, error text, or account identifiers |
 | Machine-readable statistics | `pentect metrics --json` | Local JSON; no telemetry is sent |
 | Check readiness | `pentect doctor` | Does not change configuration |
@@ -117,7 +118,7 @@ when a command can consume a handle without creating a plaintext file.
 | Update Pentect | `pentect update` | Uses the recorded package-manager scope when available |
 | Remove Pentect | `pentect uninstall` | Keeps project data |
 
-For failures, include the value-free reason shown by `pentect log --json` and
+For failures, include the value-free reason shown by `pentect log --json --once --tail 100` and
 follow [Troubleshooting](/reference/troubleshooting/). Installation-specific
 commands are documented in [Install](/start/install/), and the complete option
 list is in the [CLI reference](/reference/cli/).

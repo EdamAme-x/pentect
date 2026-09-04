@@ -38,10 +38,10 @@ use serde_json::Value;
 #[cfg(any(windows, test))]
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,10 +70,11 @@ const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const GATEWAY_STARTUP_TIMEOUT: Duration =
     Duration::from_secs(pentect_agent::MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT.as_secs() + 10);
 const NATIVE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+const NATIVE_REPEAT_INTERRUPT_WINDOW: Duration = Duration::from_secs(2);
 const NATIVE_CHILD_POLL: Duration = Duration::from_millis(20);
 const MAX_MEMORY_STORE_STARTUP_STDERR: usize = 64 * 1024;
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
-static NATIVE_COMMAND_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static NATIVE_COMMAND_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_INTERRUPT_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,8 +155,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "log",
-        usage: "pentect log [--json | --path]",
-        summary: "Show persistent diagnostics and live protection events",
+        usage: "pentect log [--json] [--once [--tail N] | --follow | --path]",
+        summary: "Follow value-free events, or use --once for the latest 100 records (1-10000)",
         audience: CommandAudience::Public,
     },
     CommandSpec {
@@ -252,28 +253,51 @@ fn main() {
     }
     let surface = diagnostic_surface(&args);
     install_panic_logger(surface.clone());
-    pentect_agent::record_process_activity(
-        "started",
-        &surface,
-        env!("CARGO_PKG_VERSION"),
-        None,
-        None,
-        None,
-    );
+    let record_process = should_record_process_activity(&args);
+    if record_process {
+        pentect_agent::record_process_activity(
+            "started",
+            &surface,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+            None,
+        );
+    }
     let code = catch_cli_exit(|| run(args));
     let exit_code = code.unwrap_or(0);
-    pentect_agent::record_process_activity(
-        "finished",
-        &surface,
-        env!("CARGO_PKG_VERSION"),
-        Some(exit_code),
-        None,
-        None,
-    );
-    pentect_agent::flush_activity_log();
+    if record_process {
+        pentect_agent::record_process_activity(
+            "finished",
+            &surface,
+            env!("CARGO_PKG_VERSION"),
+            Some(exit_code),
+            None,
+            None,
+        );
+        pentect_agent::flush_activity_log();
+    }
     if let Some(code) = code {
         std::process::exit(code);
     }
+}
+
+fn should_record_process_activity(args: &[String]) -> bool {
+    !is_bounded_log_request(args)
+}
+
+fn is_bounded_log_request(args: &[String]) -> bool {
+    let option_start = match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("log"), _) => 2,
+        (Some("agent"), Some("log")) => 3,
+        _ => return false,
+    };
+    args.iter()
+        .skip(option_start)
+        .any(|arg| arg == "--once" || arg == "--path")
 }
 
 fn diagnostic_surface(args: &[String]) -> String {
@@ -337,7 +361,9 @@ fn run(args: Vec<String>) -> Option<i32> {
     }
     let inherited_env_is_trusted =
         command_uses_agent_runtime(&args) && pentect_agent::active_memory_store_ready();
-    update::start_update_notification(&args);
+    if !is_bounded_log_request(&args) {
+        update::start_update_notification(&args);
+    }
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
     }
@@ -443,13 +469,7 @@ fn is_memory_store_server(args: &[String]) -> bool {
 /// One-shot inspection commands would only add startup cost and disappear
 /// before a useful handoff can occur.
 fn supports_process_host(args: &[String]) -> bool {
-    if matches!(
-        (
-            args.get(1).map(String::as_str),
-            args.get(2).map(String::as_str),
-        ),
-        (Some("log"), Some("--path"))
-    ) {
+    if is_bounded_log_request(args) {
         return false;
     }
     matches!(
@@ -717,7 +737,7 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
             .unwrap_or_else(|| "pentect".to_string()),
     );
     agent_args.extend(forward_args);
-    let log_store = if agent_args.get(1).is_some_and(|arg| arg == "log") {
+    let log_store = if log_needs_memory_store(&agent_args) {
         let pentect = default_pentect_path();
         Some(start_memory_store(&pentect).unwrap_or_else(|e| die_with_issue(e)))
     } else {
@@ -744,6 +764,10 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
     drop(log_store);
     drop(plugin_env);
     code
+}
+
+fn log_needs_memory_store(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "log") && !is_bounded_log_request(args)
 }
 
 fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[String]) -> i32 {
@@ -776,7 +800,21 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     record_child_exit(tool.name, &status);
-    status.code().unwrap_or(1)
+    child_exit_code(&status)
+}
+
+fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
 }
 
 fn record_child_exit(surface: &str, status: &std::process::ExitStatus) {
@@ -1719,18 +1757,17 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let args = opts.tool_args.clone();
-    let caller_settings = ClaudeCallerSettings::from_args(&args)?;
+    let plan = ClaudeLaunchPlan::resolve(opts, &args)?;
     if opts.dry_run {
-        let args = caller_settings.gateway_args(&args, "<pentect-settings>");
+        let args = plan
+            .caller_settings
+            .gateway_args(&args, "<pentect-settings>");
         print_dry_run(&opts.command, &args);
+        println!(
+            "[pentect] route provider=anthropic-messages model=client-selected upstream=<pentect-upstream>"
+        );
         return Ok(success_status());
     }
-    reject_unsupported_claude_provider(&caller_settings)?;
-    preflight_managed_claude_routing()?;
-    let upstream = claude_effective_upstream(opts, &caller_settings)?;
-    let enable_tool_search = is_official_anthropic_upstream(&upstream)
-        && caller_settings.env_string("ENABLE_TOOL_SEARCH")?.is_none()
-        && std::env::var_os("ENABLE_TOOL_SEARCH").is_none();
 
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
@@ -1742,7 +1779,7 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
-        upstream,
+        plan.upstream,
         &opts.upstream_header_env,
     )?;
     cmd.env("ANTHROPIC_BASE_URL", http_proxy.base_url());
@@ -1751,7 +1788,8 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     // existing --settings payload. The provider-managed-host switch is not
     // used here because it also disables normal Claude subscription auth.
     let gateway_settings =
-        caller_settings.with_gateway(&args, http_proxy.base_url(), enable_tool_search)?;
+        plan.caller_settings
+            .with_gateway(&args, http_proxy.base_url(), plan.enable_tool_search)?;
     cmd.args(gateway_settings.args());
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
 }
@@ -1845,6 +1883,35 @@ const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
 ];
+
+#[derive(Debug)]
+struct ClaudeLaunchPlan {
+    caller_settings: ClaudeCallerSettings,
+    upstream: String,
+    enable_tool_search: bool,
+}
+
+impl ClaudeLaunchPlan {
+    /// Resolve every route input without starting listeners, writing generated
+    /// settings, or contacting a provider. Dry-run and launch share this exact
+    /// validation boundary.
+    fn resolve(opts: &AgentToolOpts, args: &[String]) -> Result<Self, String> {
+        let caller_settings = ClaudeCallerSettings::from_args(args)?;
+        reject_unsupported_claude_provider(&caller_settings)?;
+        preflight_managed_claude_routing()?;
+        let upstream = claude_effective_upstream(opts, &caller_settings)?;
+        claude_http_proxy::parse_upstream_base(&upstream)?;
+        upstream::header_overrides(&opts.upstream_header_env)?;
+        let enable_tool_search = is_official_anthropic_upstream(&upstream)
+            && caller_settings.env_string("ENABLE_TOOL_SEARCH")?.is_none()
+            && std::env::var_os("ENABLE_TOOL_SEARCH").is_none();
+        Ok(Self {
+            caller_settings,
+            upstream,
+            enable_tool_search,
+        })
+    }
+}
 
 #[derive(Debug)]
 struct ClaudeCallerSettings {
@@ -2333,7 +2400,8 @@ fn run_native_command_with_guards<G>(
     _guards: G,
 ) -> Result<std::process::ExitStatus, String> {
     install_native_interrupt_handler()?;
-    NATIVE_COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    let interactive = std::io::stdin().is_terminal();
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -2342,11 +2410,13 @@ fn run_native_command_with_guards<G>(
         .map_err(|error| format!("could not run '{}': {error}", display.display()))?;
     let status = wait_for_native_child(
         &mut child,
-        &NATIVE_COMMAND_INTERRUPTED,
+        &NATIVE_COMMAND_INTERRUPTS,
+        interactive,
+        NATIVE_REPEAT_INTERRUPT_WINDOW,
         NATIVE_INTERRUPT_GRACE,
     )
     .map_err(|error| format!("could not wait for '{}': {error}", display.display()))?;
-    NATIVE_COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
     Ok(status)
 }
 
@@ -2354,7 +2424,11 @@ fn install_native_interrupt_handler() -> Result<(), String> {
     NATIVE_INTERRUPT_HANDLER
         .get_or_init(|| {
             ctrlc::set_handler(|| {
-                NATIVE_COMMAND_INTERRUPTED.store(true, Ordering::SeqCst);
+                let _ = NATIVE_COMMAND_INTERRUPTS.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |count| Some(count.saturating_add(1)),
+                );
             })
             .map_err(|error| format!("could not install client cleanup handler: {error}"))
         })
@@ -2363,16 +2437,39 @@ fn install_native_interrupt_handler() -> Result<(), String> {
 
 fn wait_for_native_child(
     child: &mut Child,
-    interrupted: &AtomicBool,
+    interrupts: &AtomicUsize,
+    interactive: bool,
+    repeat_window: Duration,
     grace: Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let mut interrupted_at = None;
+    let mut observed_interrupts = 0;
+    let mut first_interrupted_at = None;
+    let mut shutdown_at = None;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if interrupted.load(Ordering::SeqCst) {
-            let started = interrupted_at.get_or_insert_with(Instant::now);
+        let interrupt_count = interrupts.load(Ordering::SeqCst);
+        if interrupt_count != observed_interrupts {
+            let now = Instant::now();
+            let new_interrupts = interrupt_count.saturating_sub(observed_interrupts);
+            observed_interrupts = interrupt_count;
+            if !interactive
+                || new_interrupts >= 2
+                || first_interrupted_at
+                    .is_some_and(|started: Instant| now.duration_since(started) <= repeat_window)
+            {
+                shutdown_at.get_or_insert(now);
+            } else {
+                // A terminal sends Ctrl-C to the foreground client as well as
+                // Pentect. Let the client own an isolated cancellation.
+                first_interrupted_at = Some(now);
+            }
+        }
+        if first_interrupted_at.is_some_and(|started| started.elapsed() > repeat_window) {
+            first_interrupted_at = None;
+        }
+        if let Some(started) = shutdown_at {
             if started.elapsed() >= grace {
                 let _ = child.kill();
                 return child.wait();
@@ -4091,6 +4188,15 @@ mod tests {
             "log".to_string(),
             "--path".to_string(),
         ]));
+        for args in [
+            vec!["pentect", "log", "--json", "--once"],
+            vec!["pentect", "agent", "log", "--once", "--tail", "5"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(is_bounded_log_request(&args));
+            assert!(!supports_process_host(&args));
+            assert!(!should_record_process_activity(&args));
+        }
     }
 
     #[test]
@@ -4167,8 +4273,8 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_native_child_is_forced_down_after_the_grace_period() {
-        let interrupted = std::sync::Arc::new(AtomicBool::new(false));
+    fn noninteractive_native_child_is_forced_down_after_one_interrupt() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
         let mut command;
         #[cfg(windows)]
         {
@@ -4193,19 +4299,183 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = command.spawn().unwrap();
-        let setter = std::sync::Arc::clone(&interrupted);
+        let setter = std::sync::Arc::clone(&interrupts);
         let trigger = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            setter.store(true, Ordering::SeqCst);
+            setter.store(1, Ordering::SeqCst);
         });
 
         let started = Instant::now();
-        let status =
-            wait_for_native_child(&mut child, &interrupted, Duration::from_millis(50)).unwrap();
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            false,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .unwrap();
         trigger.join().unwrap();
 
         assert!(!status.success());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn interactive_native_child_owns_the_first_interrupt() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 150; exit 37",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "sleep 0.15; exit 37"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupts);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            setter.store(1, Ordering::SeqCst);
+        });
+
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        trigger.join().unwrap();
+
+        assert_eq!(status.code(), Some(37));
+    }
+
+    #[test]
+    fn repeated_interactive_interrupt_forces_shutdown_after_grace_period() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "trap '' INT TERM; sleep 30"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupts);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            setter.store(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(30));
+            setter.store(2, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        trigger.join().unwrap();
+
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn separated_interactive_interrupts_remain_client_owned() {
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new(windows_system_executable(
+                "WindowsPowerShell\\v1.0\\powershell.exe",
+            ));
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 220; exit 37",
+            ]);
+        }
+        #[cfg(unix)]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "sleep 0.22; exit 37"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let setter = std::sync::Arc::clone(&interrupts);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            setter.store(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(100));
+            setter.store(2, Ordering::SeqCst);
+        });
+
+        let status = wait_for_native_child(
+            &mut child,
+            &interrupts,
+            true,
+            Duration::from_millis(40),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        trigger.join().unwrap();
+
+        assert_eq!(status.code(), Some(37));
+    }
+
+    #[test]
+    fn normal_and_signal_child_exit_codes_are_preserved() {
+        assert_eq!(child_exit_code(&exit_status_from_code(37)), 37);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(child_exit_code(&std::process::ExitStatus::from_raw(2)), 130);
+            assert_eq!(
+                child_exit_code(&std::process::ExitStatus::from_raw(15)),
+                143
+            );
+        }
     }
 
     #[test]
@@ -4351,6 +4621,37 @@ mod tests {
                 "--model=claude-test".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn claude_managed_policy_route_rejections_match_documentation() {
+        for name in CLAUDE_CLOUD_PROVIDER_FLAGS {
+            let mut settings = serde_json::json!({"env": {}});
+            settings["env"][*name] = serde_json::Value::String("1".to_string());
+            assert!(reject_managed_routing_value(&settings)
+                .unwrap_err()
+                .contains(name));
+        }
+        assert!(reject_managed_routing_value(&serde_json::json!({
+            "env": {"ANTHROPIC_BASE_URL": "https://managed.invalid"}
+        }))
+        .is_err());
+        assert!(
+            reject_managed_routing_value(&serde_json::json!({"policyHelper": "helper"})).is_err()
+        );
+
+        let client_docs = include_str!("../../../website/src/content/docs/clients/claude.md");
+        let compatibility = include_str!("../../../COMPATIBILITY.md");
+        for transport in ["Bedrock", "Vertex", "Foundry", "Mantle"] {
+            assert!(
+                client_docs.contains(transport),
+                "missing {transport} client docs"
+            );
+            assert!(
+                compatibility.contains(transport),
+                "missing {transport} compatibility docs"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -89,7 +89,7 @@ pentect pi --model gpt-5
 | `pentect read PATH` | Print a masked preview of a file |
 | `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
 | `pentect view HANDLE` | Show handle details without revealing its value |
-| `pentect log [--json \| --path]` | Show persistent diagnostics and follow protection events |
+| `pentect log [--json] [--once [--tail N] \| --follow \| --path]` | Show bounded persistent diagnostics or follow protection events |
 | `pentect metrics [--json]` | Show local counts by secret type and protection surface |
 
 Image statistics distinguish blocked operations from blocked images: one tool
@@ -154,6 +154,13 @@ process argument. Use `--allow-secret-argv` only when the target program
 requires a secret argument and you have reviewed that exposure. `--live` keeps
 interactive progress visible but still masks output in chunks before it is
 written.
+
+For an interactive client launched through Pentect, the first <kbd>Ctrl</kbd>+<kbd>C</kbd>
+is left to the client so it can cancel the current operation without exiting.
+Press it again within two seconds to request shutdown; Pentect allows a short
+cleanup period before forcing the client to exit. Interrupts farther apart stay
+client-owned cancellations. When input is not a terminal, one interrupt starts
+that bounded shutdown period immediately.
 
 For programs that accept a credential on stdin, `--secret-stdin` avoids both
 secret arguments and environment inheritance:

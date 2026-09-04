@@ -21,8 +21,17 @@ pass through, and `app` opens Claude Desktop without changing the official app.
 Prerequisites:
 
 - Claude Code or Claude Desktop is already installed and starts normally.
-- The selected Anthropic or managed-provider login already works.
+- An Anthropic login/API key, or credentials for an Anthropic
+  Messages-compatible custom gateway, already works.
 - Run `pentect doctor` after installing or updating Claude.
+
+`pentect claude` does not currently route Claude Code's Bedrock, Vertex AI,
+Foundry, or Mantle transports. Pentect rejects those switches before launch.
+A centrally managed policy is supported when it leaves the Anthropic Messages
+route available; "managed policy" does not mean that managed cloud-provider
+transports are supported. If your organization requires one of those
+transports, use Claude Code without `pentect claude` and do not assume that the
+remote session passes through Pentect's local gateway.
 
 | Launch | Scope |
 | --- | --- |
@@ -94,6 +103,13 @@ pentect claude --upstream http://127.0.0.1:8080/anthropic
 The selected provider manages login and model routing. Pentect keeps the
 Anthropic Messages API format and protects supported requests, response events,
 and completed tool calls.
+
+Supported combinations are Anthropic's Messages endpoint with normal Claude
+login/API-key authentication, or a custom upstream that implements the same
+Messages and streaming contract with credentials supplied as described in the
+custom-upstream guide. Native Bedrock, Vertex AI, Foundry, and Mantle protocols
+are different transports and are rejected even when Claude Code can authenticate
+to them directly.
 
 An endpoint that accepts similar JSON but does not implement Anthropic Messages
 and its streaming events is not supported. Put a compatible adapter in front of

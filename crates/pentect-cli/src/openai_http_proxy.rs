@@ -3620,7 +3620,7 @@ fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Optio
     }
 }
 
-fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
+pub(crate) fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
     crate::upstream::parse_base(value, "OpenAI Responses")
 }
 
