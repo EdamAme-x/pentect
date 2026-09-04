@@ -2410,9 +2410,21 @@ fn setup_plugin_source_inner(
         if !approved && !confirm_setup()? {
             return Err("plugin setup was not approved".to_string());
         }
-        write_command_lock(&name, &source, &manifest)?;
+        let remote_command = !plugins::remote_command_files(&source)
+            .map_err(|error| error.to_string())?
+            .is_empty();
+        // A local setup does not need runtime metadata. Commit it only after
+        // the external setup succeeds, so SIGKILL cannot leave a new lock.
+        // Remote setup executes from the managed command directory and must
+        // still stage that directory first.
+        if remote_command {
+            write_command_lock(&name, &source, &manifest)?;
+        }
         if let Some(setup) = manifest.setup.as_ref() {
             run_command_environment_setup(&name, &source, setup, profile)?;
+        }
+        if !remote_command {
+            write_command_lock(&name, &source, &manifest)?;
         }
         manifest.hooks.clone()
     };
@@ -2478,10 +2490,8 @@ fn run_command_environment_setup(
     install_setup_interrupt_handler()?;
     SETUP_INTERRUPTED.store(false, Ordering::SeqCst);
     println!("environment setup: starting");
-    let mut command = Command::new(executable);
+    let mut command = setup_supervisor_command(&root, &executable, &argv[1..])?;
     command
-        .args(&argv[1..])
-        .current_dir(&root)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -2489,6 +2499,11 @@ fn run_command_environment_setup(
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start plugin environment setup: {error}"))?;
+    let _tree = SetupProcessTree::attach(&child).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        format!("could not isolate plugin environment setup: {error}")
+    })?;
     let status = wait_for_setup_child(&mut child)?;
     let interrupted = SETUP_INTERRUPTED.swap(false, Ordering::SeqCst);
     if interrupted {
@@ -2505,6 +2520,119 @@ fn run_command_environment_setup(
     }
     println!("environment setup: complete");
     Ok(())
+}
+
+#[cfg(not(test))]
+fn setup_supervisor_command(
+    root: &Path,
+    executable: &Path,
+    args: &[String],
+) -> Result<Command, String> {
+    let parent_pid = std::process::id();
+    let parent_started = process_start_time(parent_pid)
+        .ok_or_else(|| "could not identify the plugin setup owner process".to_string())?;
+    let pentect = std::env::current_exe()
+        .map_err(|error| format!("could not locate Pentect for plugin setup: {error}"))?;
+    let mut command = Command::new(pentect);
+    command
+        .arg("__plugin-setup-supervisor")
+        .arg(parent_pid.to_string())
+        .arg(parent_started.to_string())
+        .arg(root)
+        .arg(executable)
+        .args(args);
+    Ok(command)
+}
+
+#[cfg(test)]
+fn setup_supervisor_command(
+    root: &Path,
+    executable: &Path,
+    args: &[String],
+) -> Result<Command, String> {
+    let mut command = Command::new(executable);
+    command.args(args).current_dir(root);
+    Ok(command)
+}
+
+pub(crate) fn cmd_setup_supervisor(args: &[String]) -> i32 {
+    match run_setup_supervisor(args) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("[pentect] {error}");
+            1
+        }
+    }
+}
+
+fn run_setup_supervisor(args: &[String]) -> Result<i32, String> {
+    let parent_pid = args
+        .get(2)
+        .ok_or_else(|| "plugin setup supervisor is missing its owner PID".to_string())?
+        .parse::<u32>()
+        .map_err(|_| "plugin setup supervisor owner PID is invalid".to_string())?;
+    let parent_started = args
+        .get(3)
+        .ok_or_else(|| "plugin setup supervisor is missing its owner identity".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "plugin setup supervisor owner identity is invalid".to_string())?;
+    let cwd = args
+        .get(4)
+        .ok_or_else(|| "plugin setup supervisor is missing its working directory".to_string())?;
+    let executable = args
+        .get(5)
+        .ok_or_else(|| "plugin setup supervisor is missing its executable".to_string())?;
+    if !process_identity_matches(parent_pid, parent_started) {
+        return Err("plugin setup owner exited before setup could start".to_string());
+    }
+    let mut child = Command::new(executable)
+        .args(&args[6..])
+        .current_dir(cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("could not start plugin environment setup command: {error}"))?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(status.code().unwrap_or(1));
+            }
+            Ok(None) if process_identity_matches(parent_pid, parent_started) => {
+                thread::sleep(SETUP_CHILD_POLL);
+            }
+            Ok(None) => {
+                terminate_setup_process_tree(std::process::id(), true);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("plugin setup owner exited".to_string());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "could not wait for plugin environment setup command: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).and_then(|process| {
+        (process.status() != sysinfo::ProcessStatus::Zombie).then(|| process.start_time())
+    })
+}
+
+fn process_identity_matches(pid: u32, started: u64) -> bool {
+    process_start_time(pid).is_some_and(|observed| observed == started)
 }
 
 fn install_setup_interrupt_handler() -> Result<(), String> {
@@ -2556,6 +2684,72 @@ fn configure_setup_process_tree(command: &mut Command) {
 
 #[cfg(not(any(unix, windows)))]
 fn configure_setup_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+struct SetupProcessTree;
+
+#[cfg(unix)]
+impl SetupProcessTree {
+    fn attach(_child: &Child) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+struct SetupProcessTree {
+    job: usize,
+}
+
+#[cfg(windows)]
+impl SetupProcessTree {
+    fn attach(child: &Child) -> Result<Self, String> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err("could not create a Windows Job Object".to_string());
+        }
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(information).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured
+            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } != 0;
+        if !assigned {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            return Err("could not assign plugin setup to a Windows Job Object".to_string());
+        }
+        Ok(Self { job: job as usize })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SetupProcessTree {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job as *mut _) };
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct SetupProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+impl SetupProcessTree {
+    fn attach(_child: &Child) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
 
 #[cfg(unix)]
 fn terminate_setup_process_tree(pid: u32, force: bool) {

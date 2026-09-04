@@ -240,6 +240,9 @@ const COMMANDS: &[CommandSpec] = &[
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("__plugin-setup-supervisor") {
+        std::process::exit(plugins_cmd::cmd_setup_supervisor(&args));
+    }
     let surface = diagnostic_surface(&args);
     install_panic_logger(surface.clone());
     pentect_agent::record_process_activity(
