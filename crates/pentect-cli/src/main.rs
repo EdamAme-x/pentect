@@ -777,7 +777,21 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     record_child_exit(tool.name, &status);
-    status.code().unwrap_or(1)
+    child_exit_code(&status)
+}
+
+fn child_exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
 }
 
 fn record_child_exit(surface: &str, status: &std::process::ExitStatus) {
@@ -4387,6 +4401,20 @@ mod tests {
         trigger.join().unwrap();
 
         assert_eq!(status.code(), Some(37));
+    }
+
+    #[test]
+    fn normal_and_signal_child_exit_codes_are_preserved() {
+        assert_eq!(child_exit_code(&exit_status_from_code(37)), 37);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(child_exit_code(&std::process::ExitStatus::from_raw(2)), 130);
+            assert_eq!(
+                child_exit_code(&std::process::ExitStatus::from_raw(15)),
+                143
+            );
+        }
     }
 
     #[test]
