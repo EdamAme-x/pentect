@@ -993,10 +993,10 @@ fn bridge_session_exports_only_the_owned_runtime_session() {
     std::env::set_var("PENTECT_BIN", "/tmp/pentect-bin");
 
     let session = bridge_session_value().unwrap();
-    assert!(session["contract"]
-        .as_str()
-        .unwrap()
-        .contains("Session rules"));
+    let contract = session["contract"].as_str().unwrap();
+    assert!(contract.contains("Session rules"));
+    assert!(contract.contains("not corruption, truncation, invalid file content"));
+    assert!(contract.contains("Preserve every handle byte-for-byte"));
     let environment = session["environment"].as_object().unwrap();
     assert_eq!(environment.len(), 4);
     for name in [ENV_ADDR, ENV_TOKEN, PENTECT_AGENT_LAUNCHED_ENV] {
