@@ -85,7 +85,7 @@ unknown-handle behavior.
 | `pentect exec --live "COMMAND"` | Stream masked output while the command runs |
 | `pentect view HANDLE` | Show handle details without revealing the real value |
 | `pentect resolve [PATH...]` | Restore known handles from stdin or selected files |
-| `pentect log [--json \| --path]` | Show persistent diagnostics and follow protection events without secret values |
+| `pentect log [--json] [--once [--tail N] \| --follow \| --path]` | Show bounded persistent diagnostics or follow events without secret values |
 | `pentect metrics [--json]` | Show local value-free counts by secret type and protection surface |
 | `pentect doctor [--json]` | Check the installation and supported clients |
 | `pentect doctor --fix` | Offer repairable configuration changes |

@@ -886,7 +886,7 @@ fn usage() {
          pentect exec \"<command>\"\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
-         pentect log [--json | --path]\n\
+         pentect log [--json] [--once [--tail N] | --follow | --path]\n\
          pentect metrics [--json]\n\
          \n\
          exec: masked output\n\
@@ -898,15 +898,54 @@ fn usage() {
 }
 
 fn cmd_log(args: &[String]) -> i32 {
-    if args.get(2).map(String::as_str) == Some("--path") && args.len() == 3 {
+    const DEFAULT_TAIL: usize = 100;
+    const MAX_TAIL: usize = 10_000;
+
+    let mut json = false;
+    let mut once = false;
+    let mut follow = false;
+    let mut path = false;
+    let mut tail = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !json => json = true,
+            "--once" if !once => once = true,
+            "--follow" if !follow => follow = true,
+            "--path" if !path => path = true,
+            "--tail" if tail.is_none() => {
+                index += 1;
+                let Some(raw) = args.get(index) else {
+                    return die("log --tail requires a record count");
+                };
+                tail = match raw.parse::<usize>() {
+                    Ok(value) if (1..=MAX_TAIL).contains(&value) => Some(value),
+                    _ => return die("log --tail must be between 1 and 10000"),
+                };
+            }
+            _ => return die("log [--json] [--once [--tail N] | --follow | --path]"),
+        }
+        index += 1;
+    }
+    if path {
+        if json || once || follow || tail.is_some() {
+            return die("log --path cannot be combined with other options");
+        }
         println!("{}", activity_log::persistent_log_path().display());
         return 0;
     }
-    let json = match args.get(2).map(String::as_str) {
-        None => false,
-        Some("--json") if args.len() == 3 => true,
-        _ => return die("log [--json | --path]"),
-    };
+    if once && follow {
+        return die("log --once and --follow cannot be combined");
+    }
+    if tail.is_some() && !once {
+        return die("log --tail requires --once");
+    }
+    if once {
+        return match activity_log::print_tail(json, tail.unwrap_or(DEFAULT_TAIL)) {
+            Ok(()) => 0,
+            Err(error) => die(&error),
+        };
+    }
     match activity_log::follow(json) {
         Ok(()) => 0,
         Err(error) => die(&error),
