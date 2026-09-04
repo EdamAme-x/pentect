@@ -11,6 +11,28 @@ fn temp_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("pentect-{name}-{}-{nonce}", std::process::id()))
 }
 
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        let path = temp_dir(name);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn command(home: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
     command
@@ -61,7 +83,9 @@ fn write_manifest(root: &Path, name: &str, label: &str, pattern: &str) {
 
 #[test]
 fn plugins_are_user_global_by_default_and_project_scope_is_explicit() {
-    let root = temp_dir("plugin-scope");
+    let fixture = TestDirectory::new("plugin-scope");
+    std::fs::create_dir_all(fixture.path().join(".git")).unwrap();
+    let root = fixture.path().join("fixture");
     let home = root.join("home");
     let first_project = root.join("first-project");
     let second_project = root.join("second-project");
@@ -70,6 +94,8 @@ fn plugins_are_user_global_by_default_and_project_scope_is_explicit() {
     for path in [&home, &first_project, &second_project] {
         std::fs::create_dir_all(path).unwrap();
     }
+    std::fs::create_dir_all(first_project.join(".git")).unwrap();
+    std::fs::create_dir_all(second_project.join(".git")).unwrap();
     write_manifest(
         &global_plugin,
         "global-test",
@@ -127,8 +153,7 @@ fn plugins_are_user_global_by_default_and_project_scope_is_explicit() {
     assert!(inside_nested.contains("<<GLOBAL_TEST_"), "{inside_nested}");
     assert!(inside_nested.contains("<<PROJECT_TEST_"), "{inside_nested}");
     assert!(!nested.join(".pentect/config.toml").exists());
-
-    std::fs::remove_dir_all(root).unwrap();
+    assert!(!fixture.path().join(".pentect").exists());
 }
 
 #[test]
