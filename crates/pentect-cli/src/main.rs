@@ -154,7 +154,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "log",
-        usage: "pentect log [--json | --path]",
+        usage: "pentect log [--json] [--once [--tail N] | --follow | --path]",
         summary: "Show persistent diagnostics and live protection events",
         audience: CommandAudience::Public,
     },
@@ -252,28 +252,51 @@ fn main() {
     }
     let surface = diagnostic_surface(&args);
     install_panic_logger(surface.clone());
-    pentect_agent::record_process_activity(
-        "started",
-        &surface,
-        env!("CARGO_PKG_VERSION"),
-        None,
-        None,
-        None,
-    );
+    let record_process = should_record_process_activity(&args);
+    if record_process {
+        pentect_agent::record_process_activity(
+            "started",
+            &surface,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+            None,
+        );
+    }
     let code = catch_cli_exit(|| run(args));
     let exit_code = code.unwrap_or(0);
-    pentect_agent::record_process_activity(
-        "finished",
-        &surface,
-        env!("CARGO_PKG_VERSION"),
-        Some(exit_code),
-        None,
-        None,
-    );
-    pentect_agent::flush_activity_log();
+    if record_process {
+        pentect_agent::record_process_activity(
+            "finished",
+            &surface,
+            env!("CARGO_PKG_VERSION"),
+            Some(exit_code),
+            None,
+            None,
+        );
+        pentect_agent::flush_activity_log();
+    }
     if let Some(code) = code {
         std::process::exit(code);
     }
+}
+
+fn should_record_process_activity(args: &[String]) -> bool {
+    !is_bounded_log_request(args)
+}
+
+fn is_bounded_log_request(args: &[String]) -> bool {
+    let option_start = match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("log"), _) => 2,
+        (Some("agent"), Some("log")) => 3,
+        _ => return false,
+    };
+    args.iter()
+        .skip(option_start)
+        .any(|arg| arg == "--once" || arg == "--path")
 }
 
 fn diagnostic_surface(args: &[String]) -> String {
@@ -337,7 +360,9 @@ fn run(args: Vec<String>) -> Option<i32> {
     }
     let inherited_env_is_trusted =
         command_uses_agent_runtime(&args) && pentect_agent::active_memory_store_ready();
-    update::start_update_notification(&args);
+    if !is_bounded_log_request(&args) {
+        update::start_update_notification(&args);
+    }
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
     }
@@ -443,13 +468,7 @@ fn is_memory_store_server(args: &[String]) -> bool {
 /// One-shot inspection commands would only add startup cost and disappear
 /// before a useful handoff can occur.
 fn supports_process_host(args: &[String]) -> bool {
-    if matches!(
-        (
-            args.get(1).map(String::as_str),
-            args.get(2).map(String::as_str),
-        ),
-        (Some("log"), Some("--path"))
-    ) {
+    if is_bounded_log_request(args) {
         return false;
     }
     matches!(
@@ -717,7 +736,7 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
             .unwrap_or_else(|| "pentect".to_string()),
     );
     agent_args.extend(forward_args);
-    let log_store = if agent_args.get(1).is_some_and(|arg| arg == "log") {
+    let log_store = if log_needs_memory_store(&agent_args) {
         let pentect = default_pentect_path();
         Some(start_memory_store(&pentect).unwrap_or_else(|e| die_with_issue(e)))
     } else {
@@ -744,6 +763,10 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
     drop(log_store);
     drop(plugin_env);
     code
+}
+
+fn log_needs_memory_store(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "log") && !is_bounded_log_request(args)
 }
 
 fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[String]) -> i32 {
@@ -4091,6 +4114,15 @@ mod tests {
             "log".to_string(),
             "--path".to_string(),
         ]));
+        for args in [
+            vec!["pentect", "log", "--json", "--once"],
+            vec!["pentect", "agent", "log", "--once", "--tail", "5"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(is_bounded_log_request(&args));
+            assert!(!supports_process_host(&args));
+            assert!(!should_record_process_activity(&args));
+        }
     }
 
     #[test]

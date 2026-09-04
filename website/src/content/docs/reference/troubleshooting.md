@@ -190,13 +190,17 @@ attach a request sample.
 ```sh
 pentect log
 pentect log --json
+pentect log --once --tail 100
+pentect log --json --once --tail 100
 pentect log --path
 ```
 
 Pentect persists process starts, exit codes, gateway activity, and panic
 diagnostics to `~/.pentect/logs/pentect.log`. `pentect log` reads that history
-before following live events, `--json` keeps the JSONL representation, and
-`--path` prints the exact file location. Panic entries include the Pentect
+before following live events, `--once` prints a bounded snapshot and exits,
+`--tail` selects 1 to 10,000 records (`--once` defaults to 100), `--json` keeps
+the JSONL representation, and `--path` prints the exact file location. Use
+`--follow` to request the existing live-follow behavior explicitly. Panic entries include the Pentect
 version, OS, architecture, PID, source location, and a backtrace so a crash can
 be investigated after the process exits.
 

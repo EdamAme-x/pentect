@@ -89,7 +89,7 @@ pentect pi --model gpt-5
 | `pentect read PATH` | Print a masked preview of a file |
 | `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
 | `pentect view HANDLE` | Show handle details without revealing its value |
-| `pentect log [--json \| --path]` | Show persistent diagnostics and follow protection events |
+| `pentect log [--json] [--once [--tail N] \| --follow \| --path]` | Show bounded persistent diagnostics or follow protection events |
 | `pentect metrics [--json]` | Show local counts by secret type and protection surface |
 
 Image statistics distinguish blocked operations from blocked images: one tool

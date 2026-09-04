@@ -823,6 +823,118 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
     }
 }
 
+pub(crate) fn print_tail(json: bool, limit: usize) -> Result<(), String> {
+    let path = persistent_log_path();
+    let mut payloads = Vec::with_capacity(limit);
+    for generation in 0..=LOG_ROTATIONS {
+        if payloads.len() == limit {
+            break;
+        }
+        let path = if generation == 0 {
+            path.clone()
+        } else {
+            rotated_log_path(&path, generation)
+        };
+        let remaining = limit - payloads.len();
+        payloads.extend(read_lines_newest_first(&path, remaining)?);
+    }
+    payloads.reverse();
+
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    for payload in payloads {
+        let event: ActivityEvent = serde_json::from_str(&payload)
+            .map_err(|error| format!("invalid persistent log event: {error}"))?;
+        if json {
+            writeln!(output, "{payload}")
+                .map_err(|error| format!("could not write persistent log: {error}"))?;
+        } else {
+            writeln!(output, "{}", format_event(&event))
+                .map_err(|error| format!("could not write persistent log: {error}"))?;
+        }
+    }
+    output
+        .flush()
+        .map_err(|error| format!("could not flush persistent log: {error}"))
+}
+
+fn read_lines_newest_first(path: &Path, limit: usize) -> Result<Vec<String>, String> {
+    const READ_CHUNK: usize = 16 * 1024;
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
+    const MAX_SCAN_BYTES: u64 = LOG_MAX_BYTES;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not open persistent activity log: {error}")),
+    };
+    let mut position = file
+        .metadata()
+        .map_err(|error| format!("could not inspect persistent activity log: {error}"))?
+        .len();
+    if position == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(position - 1))
+        .map_err(|error| format!("could not seek persistent activity log: {error}"))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|error| format!("could not read persistent activity log: {error}"))?;
+    let mut skip_incomplete_tail = last[0] != b'\n';
+    let mut pending = Vec::new();
+    let mut lines = Vec::with_capacity(limit);
+    let mut scanned = 0_u64;
+
+    while position > 0 && lines.len() < limit {
+        let start = position.saturating_sub(READ_CHUNK as u64);
+        let length = (position - start) as usize;
+        scanned = scanned.saturating_add(length as u64);
+        if scanned > MAX_SCAN_BYTES {
+            return Err("persistent activity log tail exceeds the read limit".to_string());
+        }
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| format!("could not seek persistent activity log: {error}"))?;
+        let mut combined = vec![0_u8; length];
+        file.read_exact(&mut combined)
+            .map_err(|error| format!("could not read persistent activity log: {error}"))?;
+        combined.extend_from_slice(&pending);
+
+        let mut segments = combined.split(|byte| *byte == b'\n');
+        pending = segments.next().unwrap_or_default().to_vec();
+        if pending.len() > MAX_LINE_BYTES {
+            return Err("persistent activity log event exceeds the line limit".to_string());
+        }
+        let complete = segments.collect::<Vec<_>>();
+        for segment in complete.into_iter().rev() {
+            if skip_incomplete_tail {
+                skip_incomplete_tail = false;
+                continue;
+            }
+            if segment.is_empty() {
+                continue;
+            }
+            if segment.len() > MAX_LINE_BYTES {
+                return Err("persistent activity log event exceeds the line limit".to_string());
+            }
+            lines.push(
+                String::from_utf8(segment.to_vec())
+                    .map_err(|_| "persistent activity log is not valid UTF-8".to_string())?,
+            );
+            if lines.len() == limit {
+                break;
+            }
+        }
+        position = start;
+    }
+    if position == 0 && lines.len() < limit && !pending.is_empty() && !skip_incomplete_tail {
+        lines.push(
+            String::from_utf8(pending)
+                .map_err(|_| "persistent activity log is not valid UTF-8".to_string())?,
+        );
+    }
+    Ok(lines)
+}
+
 impl LifecycleSource {
     fn open() -> Self {
         Self::open_at(codex_lifecycle_log_path())
