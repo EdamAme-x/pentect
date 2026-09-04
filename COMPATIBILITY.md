@@ -13,7 +13,7 @@ through the release binary:
 | ChatGPT desktop app (Codex mode) | launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop | protocol tests; signed app `1.24012.9` was manually launch-tested, while `1.34493.1` is known incompatible | `pentect claude app` only on an explicitly compatible build |
 
-Release pins are intentionally separate from the scheduled current-client
+Release pins are intentionally separate from the daily current-client
 monitor. The latest successful monitor on 2026-09-03 exercised the published
 Pentect binary and the then-current downloadable clients on Windows, macOS,
 and Linux:
