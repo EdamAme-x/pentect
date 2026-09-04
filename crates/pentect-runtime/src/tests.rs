@@ -3746,8 +3746,12 @@ fn pretool_rewrites_direct_read_tool_to_masked_copy() {
 
 #[test]
 fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
-    let (root, session) = empty_session("hook-pre-read-many-secret");
-    let project = temp_root("pentect-read-many-secret");
+    let session_fixture = TestDirectory::new("hook-pre-read-many-secret-session");
+    let session = Session::open_at(session_fixture.path(), "t").unwrap();
+    let fixture = TestDirectory::new("pentect-read-many-secret");
+    std::fs::create_dir_all(fixture.path().join(".pentect")).unwrap();
+    let project = fixture.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
     let result = {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _cwd = enter_temp_cwd(&project);
@@ -3785,8 +3789,7 @@ fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
     };
     assert!(result.contains("<<RUNPOD_API_KEY_"), "{result}");
     assert!(!result.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    let _ = std::fs::remove_dir_all(project);
-    let _ = std::fs::remove_dir_all(root);
+    assert_directory_empty(&fixture.path().join(".pentect"));
 }
 
 #[test]
@@ -3834,10 +3837,12 @@ fn masked_read_copy_path_mirrors_relative_paths() {
 #[test]
 fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let root = temp_root("masked-read-external-collision");
+    let fixture = TestDirectory::new("masked-read-external-collision");
+    std::fs::create_dir_all(fixture.path().join(".pentect")).unwrap();
+    let root = fixture.path();
     let project = root.join("project");
     let external = root.join("external");
-    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(project.join(".git")).unwrap();
     std::fs::create_dir_all(external.join("one")).unwrap();
     std::fs::create_dir_all(external.join("two")).unwrap();
     let first = external.join("one").join(".env");
@@ -3872,7 +3877,7 @@ fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let second_text = std::fs::read_to_string(&second_masked).unwrap();
     assert!(first_text.contains("<<RUNPOD_API_KEY_"), "{first_text}");
     assert!(second_text.contains("<<OPENAI_API_KEY_"), "{second_text}");
-    let _ = std::fs::remove_dir_all(root);
+    assert_directory_empty(&root.join(".pentect"));
 }
 
 #[test]
@@ -4433,6 +4438,36 @@ fn temp_root(name: &str) -> PathBuf {
         std::process::id(),
         unix_millis()
     ))
+}
+
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        let path = temp_root(name);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn assert_directory_empty(path: &Path) {
+    assert!(
+        std::fs::read_dir(path).unwrap().next().is_none(),
+        "hostile ancestor was modified: {}",
+        path.display()
+    );
 }
 
 fn write_project_config(root: &Path, config: &str) {
