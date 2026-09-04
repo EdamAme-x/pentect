@@ -13,6 +13,24 @@ fn temp_root(label: &str) -> PathBuf {
     ))
 }
 
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new(label: &str) -> Self {
+        let path = temp_root(label);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn events(path: &std::path::Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -23,11 +41,24 @@ fn events(path: &std::path::Path) -> Vec<Value> {
 
 #[test]
 fn process_lifecycle_is_persisted_without_arguments_or_environment() {
-    let root = temp_root("persistent-log");
+    let fixture = TestDirectory::new("persistent-log");
+    let root = fixture.path.join("log");
+    let home = fixture.path.join("home");
+    let project = fixture.path.join("project");
+    std::fs::create_dir_all(home.join(".pentect")).unwrap();
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        home.join(".pentect/config.toml"),
+        "[update]\ncheck = false\n",
+    )
+    .unwrap();
     let secret = "sk-pentect-persistent-log-secret";
     let output = Command::new(env!("CARGO_BIN_EXE_pentect"))
         .arg("not-a-command")
         .arg(secret)
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
         .env("PENTECT_LOG_DIR", &root)
         .env("PENTECT_TEST_SECRET", secret)
         .output()
@@ -44,7 +75,6 @@ fn process_lifecycle_is_persisted_without_arguments_or_environment() {
     assert_eq!(events[1]["exit_code"], 2);
     assert_eq!(events[1]["version"], env!("CARGO_PKG_VERSION"));
     assert!(events.iter().all(|event| event["surface"] == "unknown"));
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
