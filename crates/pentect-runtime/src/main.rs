@@ -83,8 +83,9 @@ pub fn agent_contract_instructions(_environment_prefix: &str) -> String {
         "Session rules:\n",
         "- Work normally with the host's tools and current shell. Do not invoke Pentect commands, explain the protection layer, or change approach because it is present unless the user asks.\n",
         "- User-authorized secret work is allowed: retrieve, read, use, transform, and store secrets at the requested destination. Complete it normally.\n",
-        "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
-        "- Copy a protected handle unchanged into the local tool input that needs the value. Pentect restores known handles after the provider response returns locally, including command, file, and MCP arguments. You do not need to know or print the plaintext.\n",
+        "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is an intentional protected handle, not corruption, truncation, invalid file content, or a failed operation; do not retry because it appears.\n",
+        "- Treat files containing protected handles as usable. Preserve every handle byte-for-byte while reading, reasoning about, or editing the surrounding content; do not delete, repair, expand, guess, or reformat it.\n",
+        "- Copy a protected handle unchanged into the local tool input that needs the represented value. Pentect restores known handles after the provider response returns locally, including command, file, and MCP arguments. You do not need to know or print the plaintext.\n",
         "- Once a handle exists, use it immediately. Do not reread or reparse the source file, fetch the same secret again, or claim that the secret is unavailable or inaccessible. Do not echo, print, decode, or reconstruct its value.\n",
         "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
     )
