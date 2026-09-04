@@ -3661,6 +3661,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -4193,7 +4194,7 @@ mod tests {
             .to_string();
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Pentect-Coverage: forged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response.len(),
                 response
             )
@@ -5510,6 +5511,14 @@ mod tests {
             .error_for_status()
             .unwrap();
         assert_eq!(response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
 
         let (headers, request) = captured
             .recv_timeout(std::time::Duration::from_secs(5))
