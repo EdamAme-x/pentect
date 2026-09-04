@@ -45,7 +45,7 @@ pub fn register_candidate(
         pid,
     };
     write_endpoint(&path, &endpoint)?;
-    if let Err(error) = ensure_host_at(root) {
+    if let Err(error) = ensure_host_at_with_candidate(root, Some(&path)) {
         let _ = std::fs::remove_file(&path);
         return Err(error);
     }
@@ -226,17 +226,39 @@ fn platform_process_host_root() -> Result<PathBuf, String> {
 }
 
 fn ensure_host_at(root: &Path) -> Result<ProcessHostEndpoint, String> {
+    ensure_host_at_with_candidate(root, None)
+}
+
+fn ensure_host_at_with_candidate(
+    root: &Path,
+    registering_candidate: Option<&Path>,
+) -> Result<ProcessHostEndpoint, String> {
+    ensure_host_at_with_probe(root, registering_candidate, endpoint_is_alive)
+}
+
+fn ensure_host_at_with_probe(
+    root: &Path,
+    registering_candidate: Option<&Path>,
+    mut is_alive: impl FnMut(&ProcessHostEndpoint) -> bool,
+) -> Result<ProcessHostEndpoint, String> {
     for _ in 0..ELECTION_ATTEMPTS {
         if let Some(endpoint) = current_host_at(root)? {
-            if endpoint_is_alive(&endpoint) {
+            if is_alive(&endpoint) {
                 return Ok(endpoint);
             }
             invalidate_host_at(root, Some(&endpoint));
         }
 
         for (candidate, path) in candidates_at(root)? {
-            if !endpoint_is_alive(&candidate) {
-                let _ = std::fs::remove_file(path);
+            if !is_alive(&candidate) {
+                // A candidate being registered may already have passed its
+                // store readiness check but miss one short probe while its
+                // handler is being scheduled. Keep only that exact candidate
+                // for the bounded election retries; ordinary stale candidates
+                // are still removed immediately.
+                if registering_candidate != Some(path.as_path()) {
+                    let _ = std::fs::remove_file(path);
+                }
                 continue;
             }
             match publish_host(root, &candidate) {
@@ -481,6 +503,104 @@ mod tests {
             unregister_candidate(&candidate);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn registering_candidate_retries_a_transient_failed_probe() {
+        let root = test_root("registration-retry");
+        let path = runtime_dir(&root).join(format!("{CANDIDATE_PREFIX}404{CANDIDATE_SUFFIX}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let endpoint = ProcessHostEndpoint {
+            addr: "127.0.0.1:4040".to_string(),
+            store_token_hash: store_token_hash("memory"),
+            read_token: "read".to_string(),
+            write_token: "write".to_string(),
+            pid: 404,
+        };
+        write_endpoint(&path, &endpoint).unwrap();
+
+        let mut probes = 0;
+        let elected = ensure_host_at_with_probe(&root, Some(&path), |_| {
+            probes += 1;
+            probes > 1
+        })
+        .unwrap();
+
+        assert_eq!(elected, endpoint);
+        assert_eq!(probes, 2);
+        assert!(path.exists());
+        unregister_candidate(&path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registering_candidate_stops_after_the_bounded_attempts() {
+        let root = test_root("registration-bounded-failure");
+        let path = runtime_dir(&root).join(format!("{CANDIDATE_PREFIX}405{CANDIDATE_SUFFIX}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let endpoint = ProcessHostEndpoint {
+            addr: "127.0.0.1:4050".to_string(),
+            store_token_hash: store_token_hash("memory"),
+            read_token: "read".to_string(),
+            write_token: "write".to_string(),
+            pid: 405,
+        };
+        write_endpoint(&path, &endpoint).unwrap();
+
+        let mut probes = 0;
+        let error = ensure_host_at_with_probe(&root, Some(&path), |_| {
+            probes += 1;
+            false
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "no running Delegated Process Host");
+        assert_eq!(probes, ELECTION_ATTEMPTS);
+        assert!(path.exists());
+        unregister_candidate(&path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registration_retry_still_removes_other_stale_candidates() {
+        let root = test_root("registration-stale-peer");
+        let dir = runtime_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let registering_path = dir.join(format!("{CANDIDATE_PREFIX}406{CANDIDATE_SUFFIX}"));
+        let stale_path = dir.join(format!("{CANDIDATE_PREFIX}407{CANDIDATE_SUFFIX}"));
+        for (path, pid) in [(&registering_path, 406), (&stale_path, 407)] {
+            write_endpoint(
+                path,
+                &ProcessHostEndpoint {
+                    addr: format!("127.0.0.1:{pid}"),
+                    store_token_hash: store_token_hash("memory"),
+                    read_token: "read".to_string(),
+                    write_token: "write".to_string(),
+                    pid,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut registering_probes = 0;
+        let mut stale_probes = 0;
+        let error = ensure_host_at_with_probe(&root, Some(&registering_path), |endpoint| {
+            if endpoint.pid == 406 {
+                registering_probes += 1;
+            } else {
+                stale_probes += 1;
+            }
+            false
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "no running Delegated Process Host");
+        assert_eq!(registering_probes, ELECTION_ATTEMPTS);
+        assert_eq!(stale_probes, 1);
+        assert!(registering_path.exists());
+        assert!(!stale_path.exists());
+        unregister_candidate(&registering_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
