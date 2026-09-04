@@ -155,7 +155,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "log",
         usage: "pentect log [--json] [--once [--tail N] | --follow | --path]",
-        summary: "Show persistent diagnostics and live protection events",
+        summary: "Follow value-free events, or use --once for the latest 100 records (1-10000)",
         audience: CommandAudience::Public,
     },
     CommandSpec {

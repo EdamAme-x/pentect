@@ -753,6 +753,7 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
     let mut lifecycle = LifecycleSource::open();
     let mut persistent = LifecycleSource::open_at(persistent_log_path());
     let mut seen = SeenActivity::default();
+    let mut following_announced = false;
 
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -813,6 +814,12 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
                 source = activity_source()?;
                 continue;
             }
+        }
+        if !json && !following_announced {
+            writeln!(output, "-- following live events; press Ctrl-C to stop --")
+                .map_err(|error| format!("could not write activity log: {error}"))?;
+            following_announced = true;
+            wrote = true;
         }
         if wrote {
             output
