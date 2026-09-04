@@ -2935,7 +2935,7 @@ fn masker_scoped_resolver(
     })
 }
 
-fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
+pub(crate) fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
     crate::upstream::parse_base(value, "Anthropic Messages")
 }
 

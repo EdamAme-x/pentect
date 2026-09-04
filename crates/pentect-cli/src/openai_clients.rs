@@ -287,8 +287,15 @@ fn run_opencode(
     }
 
     let api = ClientApi::parse(opts.api.as_deref())?;
+    let route = OpenCodeRoute::resolve(opts)?;
+    validate_opencode_route(&route, &opts.upstream_header_env)?;
     if opts.dry_run {
         crate::print_dry_run(&opts.command, &opts.tool_args);
+        println!(
+            "[pentect] route provider={} model={} upstream=<pentect-upstream>",
+            route.provider,
+            route.model.as_deref().unwrap_or("<picker>")
+        );
         return Ok(crate::success_status());
     }
 
@@ -299,7 +306,6 @@ fn run_opencode(
         return run_opencode_picker(opts, pentect, &active_plugins, memory_store);
     }
 
-    let route = OpenCodeRoute::resolve(opts)?;
     let (proxy, header_env, child_key_env) =
         start_opencode_proxy(&route, &opts.upstream_header_env)?;
     let package = opts.upstream.as_ref().map(|_| api.opencode_package());
@@ -316,6 +322,26 @@ fn run_opencode(
     command.env("OPENCODE_CONFIG_CONTENT", config);
     command.args(&opts.tool_args);
     crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+}
+
+fn validate_opencode_route(
+    route: &OpenCodeRoute,
+    base_header_env: &[String],
+) -> Result<(), String> {
+    match route.protocol {
+        OpenCodeProtocol::OpenAi => {
+            crate::openai_http_proxy::parse_upstream_base(&route.upstream)?;
+        }
+        OpenCodeProtocol::Anthropic => {
+            crate::claude_http_proxy::parse_upstream_base(&route.upstream)?;
+        }
+        OpenCodeProtocol::Gemini => {
+            crate::upstream::parse_base(&route.upstream, "Gemini")?;
+        }
+    }
+    let (header_env, bearer_env, _) = opencode_proxy_auth(route, base_header_env);
+    crate::upstream::header_overrides_with_bearer_env(&header_env, bearer_env)?;
+    Ok(())
 }
 
 fn start_opencode_proxy(

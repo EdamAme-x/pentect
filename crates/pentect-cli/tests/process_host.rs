@@ -99,6 +99,140 @@ fn claude_dry_run_shows_the_generated_gateway_settings() {
 }
 
 #[test]
+fn claude_dry_run_rejects_every_managed_cloud_transport() {
+    for name in [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+    ] {
+        let root = test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = Cleanup {
+            root: root.clone(),
+            host_pid: None,
+            command_pids: Vec::new(),
+        };
+        let mut command = isolated_command(&root, &["claude", "--dry-run", "--version"]);
+        for other in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
+        ] {
+            command.env_remove(other);
+        }
+        let output = command.env(name, "1").output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(name),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn opencode_dry_run_validates_and_displays_split_and_assignment_models() {
+    for model_args in [
+        vec!["--model", "unsupported/model"],
+        vec!["--model=unsupported/model"],
+    ] {
+        let root = test_root();
+        let mut args = vec!["opencode", "--dry-run"];
+        args.extend(model_args);
+        args.push("--version");
+        let output = isolated_command(&root, &args).output().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not routed yet"));
+    }
+
+    let root = test_root();
+    let output = isolated_command(
+        &root,
+        &[
+            "opencode",
+            "--dry-run",
+            "--model=openrouter/anthropic/claude-sonnet",
+            "--version",
+        ],
+    )
+    .output()
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("provider=openrouter"), "{rendered}");
+    assert!(
+        rendered.contains("model=openrouter/anthropic/claude-sonnet"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("upstream=<pentect-upstream>"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("https://openrouter.ai"), "{rendered}");
+}
+
+#[test]
+fn claude_and_opencode_dry_run_reject_invalid_upstreams_in_both_argument_forms() {
+    for (client, upstream_args) in [
+        ("claude", vec!["--upstream", "file:///tmp/not-http"]),
+        ("claude", vec!["--upstream=file:///tmp/not-http"]),
+        ("opencode", vec!["--upstream", "https://"]),
+        ("opencode", vec!["--upstream=https://"]),
+    ] {
+        let root = test_root();
+        let mut args = vec![client, "--dry-run"];
+        args.extend(upstream_args);
+        args.push("--version");
+        let output = isolated_command(&root, &args).output().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(output.status.code(), Some(2), "{client}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("upstream"),
+            "{client}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn isolated_command(root: &Path, args: &[&str]) -> Command {
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join(".pentect")).unwrap();
+    std::fs::write(
+        root.join(".pentect/config.toml"),
+        "[update]\ncheck = false\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
+    command
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("APPDATA", root)
+        .env("PROGRAMDATA", root)
+        .env("CLAUDE_CONFIG_DIR", root.join("claude"));
+    for name in PRIVATE_ENV.iter().chain(
+        [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
+        ]
+        .iter(),
+    ) {
+        command.env_remove(name);
+    }
+    command
+}
+
+#[test]
 fn log_hosts_while_running_but_help_does_not() {
     let root = test_root();
     std::fs::create_dir_all(&root).unwrap();

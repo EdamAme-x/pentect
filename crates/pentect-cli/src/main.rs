@@ -1719,18 +1719,17 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let args = opts.tool_args.clone();
-    let caller_settings = ClaudeCallerSettings::from_args(&args)?;
+    let plan = ClaudeLaunchPlan::resolve(opts, &args)?;
     if opts.dry_run {
-        let args = caller_settings.gateway_args(&args, "<pentect-settings>");
+        let args = plan
+            .caller_settings
+            .gateway_args(&args, "<pentect-settings>");
         print_dry_run(&opts.command, &args);
+        println!(
+            "[pentect] route provider=anthropic-messages model=client-selected upstream=<pentect-upstream>"
+        );
         return Ok(success_status());
     }
-    reject_unsupported_claude_provider(&caller_settings)?;
-    preflight_managed_claude_routing()?;
-    let upstream = claude_effective_upstream(opts, &caller_settings)?;
-    let enable_tool_search = is_official_anthropic_upstream(&upstream)
-        && caller_settings.env_string("ENABLE_TOOL_SEARCH")?.is_none()
-        && std::env::var_os("ENABLE_TOOL_SEARCH").is_none();
 
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
@@ -1742,7 +1741,7 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
-        upstream,
+        plan.upstream,
         &opts.upstream_header_env,
     )?;
     cmd.env("ANTHROPIC_BASE_URL", http_proxy.base_url());
@@ -1751,7 +1750,8 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     // existing --settings payload. The provider-managed-host switch is not
     // used here because it also disables normal Claude subscription auth.
     let gateway_settings =
-        caller_settings.with_gateway(&args, http_proxy.base_url(), enable_tool_search)?;
+        plan.caller_settings
+            .with_gateway(&args, http_proxy.base_url(), plan.enable_tool_search)?;
     cmd.args(gateway_settings.args());
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
 }
@@ -1845,6 +1845,35 @@ const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
 ];
+
+#[derive(Debug)]
+struct ClaudeLaunchPlan {
+    caller_settings: ClaudeCallerSettings,
+    upstream: String,
+    enable_tool_search: bool,
+}
+
+impl ClaudeLaunchPlan {
+    /// Resolve every route input without starting listeners, writing generated
+    /// settings, or contacting a provider. Dry-run and launch share this exact
+    /// validation boundary.
+    fn resolve(opts: &AgentToolOpts, args: &[String]) -> Result<Self, String> {
+        let caller_settings = ClaudeCallerSettings::from_args(args)?;
+        reject_unsupported_claude_provider(&caller_settings)?;
+        preflight_managed_claude_routing()?;
+        let upstream = claude_effective_upstream(opts, &caller_settings)?;
+        claude_http_proxy::parse_upstream_base(&upstream)?;
+        upstream::header_overrides(&opts.upstream_header_env)?;
+        let enable_tool_search = is_official_anthropic_upstream(&upstream)
+            && caller_settings.env_string("ENABLE_TOOL_SEARCH")?.is_none()
+            && std::env::var_os("ENABLE_TOOL_SEARCH").is_none();
+        Ok(Self {
+            caller_settings,
+            upstream,
+            enable_tool_search,
+        })
+    }
+}
 
 #[derive(Debug)]
 struct ClaudeCallerSettings {
@@ -4351,6 +4380,37 @@ mod tests {
                 "--model=claude-test".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn claude_managed_policy_route_rejections_match_documentation() {
+        for name in CLAUDE_CLOUD_PROVIDER_FLAGS {
+            let mut settings = serde_json::json!({"env": {}});
+            settings["env"][*name] = serde_json::Value::String("1".to_string());
+            assert!(reject_managed_routing_value(&settings)
+                .unwrap_err()
+                .contains(name));
+        }
+        assert!(reject_managed_routing_value(&serde_json::json!({
+            "env": {"ANTHROPIC_BASE_URL": "https://managed.invalid"}
+        }))
+        .is_err());
+        assert!(
+            reject_managed_routing_value(&serde_json::json!({"policyHelper": "helper"})).is_err()
+        );
+
+        let client_docs = include_str!("../../../website/src/content/docs/clients/claude.md");
+        let compatibility = include_str!("../../../COMPATIBILITY.md");
+        for transport in ["Bedrock", "Vertex", "Foundry", "Mantle"] {
+            assert!(
+                client_docs.contains(transport),
+                "missing {transport} client docs"
+            );
+            assert!(
+                compatibility.contains(transport),
+                "missing {transport} compatibility docs"
+            );
+        }
     }
 
     #[cfg(unix)]
