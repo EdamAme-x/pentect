@@ -264,6 +264,47 @@ fn log_hosts_while_running_but_help_does_not() {
     assert!(!host_root(&help_root).join("runtime").exists());
 }
 
+#[test]
+fn human_log_marks_when_it_starts_following_live_events() {
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cleanup = Cleanup {
+        root: root.clone(),
+        host_pid: None,
+        command_pids: Vec::new(),
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
+    command
+        .arg("log")
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for name in PRIVATE_ENV {
+        command.env_remove(name);
+    }
+    configure_runtime_root(&mut command, &root);
+    let mut log = command.spawn().unwrap();
+    cleanup.command_pids.push(log.id());
+    let stdout = log.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.contains("following live events") {
+                let _ = sender.send(line);
+                return;
+            }
+        }
+    });
+
+    let indicator = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(indicator.contains("Ctrl-C"), "{indicator}");
+    log.kill().unwrap();
+    log.wait().unwrap();
+    cleanup.command_pids.clear();
+    reader.join().unwrap();
+}
+
 fn spawn_command(root: &Path, args: &[&str]) -> std::process::Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
     command

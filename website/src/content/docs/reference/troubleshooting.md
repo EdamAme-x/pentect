@@ -200,7 +200,11 @@ diagnostics to `~/.pentect/logs/pentect.log`. `pentect log` reads that history
 before following live events, `--once` prints a bounded snapshot and exits,
 `--tail` selects 1 to 10,000 records (`--once` defaults to 100), `--json` keeps
 the JSONL representation, and `--path` prints the exact file location. Use
-`--follow` to request the existing live-follow behavior explicitly. Panic entries include the Pentect
+`--follow` to request the existing live-follow behavior explicitly. A bounded
+read is best effort during concurrent writes or rotation; it can omit or repeat
+an event across files rather than claiming an atomic multi-file snapshot. Human
+follow output marks the transition to waiting for live events; JSONL contains
+events only. Panic entries include the Pentect
 version, OS, architecture, PID, source location, and a backtrace so a crash can
 be investigated after the process exits.
 
