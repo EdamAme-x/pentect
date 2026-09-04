@@ -86,9 +86,14 @@ or unsupported attachment formats are blocked by default.
 
 Codex Responses-compatible, OpenAI Chat Completions-compatible, and Anthropic Messages-compatible upstreams can be
 selected with `--upstream URL`. Existing Codex provider configuration and
-Claude's managed/user endpoint configuration are preserved as the upstream
-when Pentect inserts its local gateway. Unsupported wire protocols are rejected
-before launch.
+Claude user endpoint configuration are preserved as the upstream when Pentect
+inserts its local gateway. Claude supports the Anthropic Messages HTTP route
+with normal Anthropic authentication and gateways implementing that contract.
+Claude Code's Bedrock, Vertex AI, Foundry, and Mantle transports are rejected
+before launch; they require separate authenticated transport designs. Managed
+policy/configuration remains compatible only when it does not select one of
+those transports, override the enforced route, or use a policy helper whose
+route cannot be verified.
 
 Bifrost's `/openai/v1` and `/anthropic` integration base paths are covered by
 the URL-routing tests. This verifies Pentect's protocol boundary and path
