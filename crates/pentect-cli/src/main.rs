@@ -4662,7 +4662,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_gateway_settings_use_and_remove_a_private_temp_directory() {
+    fn claude_gateway_settings_are_prepared_without_writing_a_temp_file() {
         let settings = ClaudeCallerSettings {
             value: serde_json::json!({}),
             effective_env: serde_json::Map::new(),
@@ -4672,14 +4672,17 @@ mod tests {
         let gateway = settings
             .with_gateway(&[], "http://127.0.0.1:1234", false)
             .unwrap();
-        let path = PathBuf::from(&gateway.args()[1]);
-        let directory = path.parent().unwrap().to_path_buf();
-        assert!(path.is_file());
-        assert!(directory.starts_with(std::env::temp_dir()));
-
-        drop(gateway);
-        assert!(!path.exists());
-        assert!(!directory.exists());
+        assert_eq!(
+            gateway
+                .args_with_settings_path("<pentect-settings>")
+                .unwrap(),
+            ["--settings", "<pentect-settings>"]
+        );
+        let encoded: serde_json::Value = serde_json::from_slice(&gateway.encoded).unwrap();
+        assert_eq!(
+            encoded["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:1234"
+        );
     }
 
     #[test]
@@ -4754,10 +4757,14 @@ mod tests {
         let gateway = settings
             .with_gateway(&args, "http://127.0.0.1:1234", false)
             .unwrap();
-        let generated = PathBuf::from(&gateway.args()[1]);
-        assert_ne!(generated.parent(), Some(source_directory.as_path()));
+        assert_eq!(
+            gateway
+                .args_with_settings_path("<pentect-settings>")
+                .unwrap()[1],
+            "<pentect-settings>"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"{}");
 
-        drop(gateway);
         std::fs::set_permissions(&source_directory, std::fs::Permissions::from_mode(0o700))
             .unwrap();
         std::fs::remove_file(source).unwrap();
