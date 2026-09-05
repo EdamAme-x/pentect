@@ -45,6 +45,7 @@ jobs:
               - 'crates/pentect-cli/src/*supervisor*.rs'
               - 'crates/pentect-cli/tests/client_store_isolation.rs'
               - 'crates/pentect-cli/tests/native_interrupt.rs'
+              - 'crates/pentect-cli/tests/native_linux_fallback.rs'
               - 'crates/pentect-cli/tests/native_unix_supervisor.rs'
               - 'crates/pentect-cli/tests/native_windows_supervisor.rs'
               - 'crates/pentect-cli/tests/*claude*.rs'
@@ -176,6 +177,10 @@ jobs:
           --test claude_unix_supervisor
           --test claude_guardian_boundary
           --test claude_guardian_loss
+      - name: Test Linux native supervisor compatibility fallback (PR)
+        if: github.event_name == 'pull_request' && runner.os == 'Linux'
+        timeout-minutes: 2
+        run: cargo test -p pentect-cli --locked --test native_linux_fallback
       - name: Install current portable clients
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients

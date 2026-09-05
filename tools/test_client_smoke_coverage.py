@@ -53,6 +53,7 @@ def main() -> None:
         "crates/pentect-cli/src/*supervisor*.rs",
         "crates/pentect-cli/tests/client_store_isolation.rs",
         "crates/pentect-cli/tests/native_interrupt.rs",
+        "crates/pentect-cli/tests/native_linux_fallback.rs",
         "crates/pentect-cli/tests/native_unix_supervisor.rs",
         "crates/pentect-cli/tests/native_windows_supervisor.rs",
         "crates/pentect-cli/tests/*claude*.rs",
@@ -64,6 +65,17 @@ def main() -> None:
     assert "--claude-parent-kill" in workflow
     assert "--codex-parent-kill" in workflow
     assert "--test claude_guardian_loss" in workflow
+    linux_fallback_step = re.search(
+        r"      - name: Test Linux native supervisor compatibility fallback \(PR\)\n"
+        r"        if: github\.event_name == 'pull_request' && runner\.os == 'Linux'\n"
+        r"        timeout-minutes: 2\n"
+        r"        run: (?P<command>.+)\n",
+        workflow,
+    )
+    assert linux_fallback_step is not None
+    assert linux_fallback_step.group("command") == (
+        "cargo test -p pentect-cli --locked --test native_linux_fallback"
+    )
 
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}" in ci
