@@ -130,7 +130,12 @@ for name in os.listdir(fd_root):
             value = socket.socket(fileno=duplicate)
         except OSError as error:
             socket_error = error.errno
-            os.close(duplicate)
+            try:
+                os.close(duplicate)
+            except OSError:
+                # CPython may already own and close fileno after partial
+                # socket-object construction. Diagnostics must still finish.
+                pass
         else:
             with value:
                 try:
