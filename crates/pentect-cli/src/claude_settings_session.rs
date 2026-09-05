@@ -100,6 +100,15 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn root() -> PathBuf {
         let mut nonce = [0_u8; 16];
@@ -144,6 +153,7 @@ mod tests {
     #[test]
     fn cleanup_rejects_links_and_unexpected_files() {
         let root = root();
+        let _cleanup = Cleanup(root.clone());
         let session = Session::create_in(&root, b"synthetic-safe").unwrap();
         let path = session.directory.clone();
         drop(session);
@@ -159,6 +169,160 @@ mod tests {
         std::fs::remove_file(path.join(SETTINGS)).unwrap();
         std::fs::remove_file(path.join(OWNER)).unwrap();
         std::fs::remove_dir(path).unwrap();
+        finish(&root);
+    }
+
+    fn released_session(root: &Path, contents: &[u8]) -> PathBuf {
+        let session = Session::create_in(root, contents).unwrap();
+        let path = session.directory.clone();
+        drop(session);
+        private_file(&path.join(RELEASED), b"", "test marker").unwrap();
+        path
+    }
+
+    fn remove_session(path: &Path) {
+        for name in [SETTINGS, RELEASED, OWNER] {
+            let candidate = path.join(name);
+            let _ = std::fs::remove_file(&candidate);
+            let _ = std::fs::remove_dir(&candidate);
+        }
+        let _ = std::fs::remove_dir(path);
+    }
+
+    #[test]
+    fn cleanup_preserves_hardlinked_settings() {
+        let root = root();
+        let _cleanup = Cleanup(root.clone());
+        let path = released_session(&root, b"synthetic-hardlink");
+        let external = root.join("external-hardlink");
+        std::fs::hard_link(path.join(SETTINGS), &external).unwrap();
+
+        cleanup_released(&root);
+
+        assert_eq!(
+            std::fs::read(path.join(SETTINGS)).unwrap(),
+            b"synthetic-hardlink"
+        );
+        assert_eq!(std::fs::read(&external).unwrap(), b"synthetic-hardlink");
+        std::fs::remove_file(external).unwrap();
+        remove_session(&path);
+        finish(&root);
+    }
+
+    #[test]
+    fn cleanup_preserves_symlink_dangling_link_and_fifo_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = root();
+        let _cleanup = Cleanup(root.clone());
+        for (label, install) in [("symlink", 0_u8), ("dangling", 1_u8), ("fifo", 2_u8)] {
+            let path = released_session(&root, label.as_bytes());
+            std::fs::remove_file(path.join(SETTINGS)).unwrap();
+            match install {
+                0 => {
+                    let target = root.join("symlink-target");
+                    std::fs::write(&target, b"outside").unwrap();
+                    symlink(&target, path.join(SETTINGS)).unwrap();
+                }
+                1 => symlink(root.join("missing-target"), path.join(SETTINGS)).unwrap(),
+                _ => {
+                    let raw =
+                        std::ffi::CString::new(path.join(SETTINGS).as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+                }
+            }
+
+            cleanup_released(&root);
+
+            assert!(path.exists(), "{label} session was removed");
+            assert!(std::fs::symlink_metadata(path.join(SETTINGS)).is_ok());
+            remove_session(&path);
+        }
+        assert_eq!(
+            std::fs::read(root.join("symlink-target")).unwrap(),
+            b"outside"
+        );
+        std::fs::remove_file(root.join("symlink-target")).unwrap();
+        finish(&root);
+    }
+
+    #[test]
+    fn cleanup_preserves_unknown_legacy_and_unreleased_entries() {
+        let root = root();
+        let _cleanup = Cleanup(root.clone());
+        let unreleased = Session::create_in(&root, b"synthetic-unreleased").unwrap();
+        let unreleased_path = unreleased.directory.clone();
+        drop(unreleased);
+        let unknown = released_session(&root, b"synthetic-unknown");
+        std::fs::write(unknown.join("future-field"), b"keep").unwrap();
+        let legacy = root.join("session-legacy-v0");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join(SETTINGS), b"synthetic-legacy").unwrap();
+
+        cleanup_released(&root);
+
+        assert_eq!(
+            std::fs::read(unreleased_path.join(SETTINGS)).unwrap(),
+            b"synthetic-unreleased"
+        );
+        assert_eq!(
+            std::fs::read(unknown.join("future-field")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::read(legacy.join(SETTINGS)).unwrap(),
+            b"synthetic-legacy"
+        );
+        std::fs::remove_file(unknown.join("future-field")).unwrap();
+        remove_session(&unknown);
+        remove_session(&unreleased_path);
+        std::fs::remove_file(legacy.join(SETTINGS)).unwrap();
+        std::fs::remove_dir(legacy).unwrap();
+        finish(&root);
+    }
+
+    #[test]
+    fn existing_release_marker_still_allows_immediate_cleanup() {
+        let root = root();
+        let _cleanup = Cleanup(root.clone());
+        let session = Session::create_in(&root, b"synthetic-release").unwrap();
+        let path = session.directory.clone();
+        private_file(&path.join(RELEASED), b"", "test marker").unwrap();
+
+        session.release();
+
+        assert!(!path.exists());
+        finish(&root);
+    }
+
+    #[test]
+    fn create_new_failure_does_not_change_an_existing_inode() {
+        let root = root();
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("known-inode");
+        std::fs::write(&path, b"owned-before").unwrap();
+
+        assert!(private_file(&path, b"replacement", "test file").is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"owned-before");
+        std::fs::remove_file(path).unwrap();
+        finish(&root);
+    }
+
+    #[test]
+    fn root_lock_contention_fails_within_the_bounded_window() {
+        let root = root();
+        let _cleanup = Cleanup(root.clone());
+        let held = root_lock(&root.join(ROOT_LOCK)).unwrap();
+        let started = std::time::Instant::now();
+
+        let error = Session::create_in(&root, b"synthetic-contended").unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("could not lock Claude settings cleanup lock"));
+        assert!(elapsed >= std::time::Duration::from_secs(2));
+        assert!(elapsed < std::time::Duration::from_secs(4));
+        drop(held);
         finish(&root);
     }
 }
