@@ -105,7 +105,7 @@ pub(crate) fn run(
                 OsString::from("--model"),
                 OsString::from(format!("pentect/{model}")),
             ]);
-            crate::run_native_command_with_guards(
+            crate::run_managed_native_command_with_guards(
                 command,
                 &opts.command,
                 (proxy, memory_store, extension),
@@ -298,7 +298,7 @@ fn run_opencode(
         let mut command = Command::new(&opts.command);
         crate::clear_pentect_control_env(&mut command);
         command.args(&tool_args);
-        return crate::run_native_command_with_guards(command, &opts.command, ());
+        return crate::run_managed_native_command_with_guards(command, &opts.command, ());
     }
 
     let api = ClientApi::parse(opts.api.as_deref())?;
@@ -338,7 +338,7 @@ fn run_opencode(
         command.env(name, "pentect-local");
     }
     apply_opencode_protection(&mut command, config, &opts.tool_args);
-    crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+    crate::run_managed_native_command_with_guards(command, &opts.command, (proxy, memory_store))
 }
 
 fn apply_opencode_protection(command: &mut Command, config: String, args: &[String]) {
@@ -604,7 +604,7 @@ fn run_opencode_picker(
         command.env(name, "pentect-local");
     }
     apply_opencode_protection(&mut command, config, &opts.tool_args);
-    crate::run_native_command_with_guards(command, &opts.command, (proxies, memory_store))
+    crate::run_managed_native_command_with_guards(command, &opts.command, (proxies, memory_store))
 }
 
 fn is_opencode_auth_command(args: &[String]) -> bool {

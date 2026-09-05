@@ -45,6 +45,9 @@ jobs:
               - 'crates/pentect-cli/src/*supervisor*.rs'
               - 'crates/pentect-cli/tests/client_store_isolation.rs'
               - 'crates/pentect-cli/tests/native_interrupt.rs'
+              - 'crates/pentect-cli/tests/native_linux_fallback.rs'
+              - 'crates/pentect-cli/tests/native_unix_supervisor.rs'
+              - 'crates/pentect-cli/tests/native_windows_supervisor.rs'
               - 'crates/pentect-cli/tests/*claude*.rs'
               - 'crates/pentect-runtime/src/masking.rs'
               - 'crates/pentect-runtime/src/plugin_middleware.rs'
@@ -170,9 +173,14 @@ jobs:
         run: >-
           cargo test -p pentect-cli --locked
           --test native_interrupt
+          --test native_unix_supervisor
           --test claude_unix_supervisor
           --test claude_guardian_boundary
           --test claude_guardian_loss
+      - name: Test Linux native supervisor compatibility fallback (PR)
+        if: github.event_name == 'pull_request' && runner.os == 'Linux'
+        timeout-minutes: 2
+        run: cargo test -p pentect-cli --locked --test native_linux_fallback
       - name: Install current portable clients
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
@@ -189,6 +197,12 @@ jobs:
           python tools/installed_agent_e2e.py
           --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
           --claude-parent-kill
+      - name: Verify installed Codex descendants stop after parent exit (Linux PR)
+        if: github.event_name == 'pull_request' && runner.os == 'Linux'
+        run: >-
+          python tools/installed_agent_e2e.py
+          --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
+          --codex-parent-kill
       - name: Start both protected desktop app contracts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

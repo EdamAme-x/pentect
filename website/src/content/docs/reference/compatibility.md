@@ -14,6 +14,24 @@ than on adding more client launchers. Codex App and Claude Desktop entries are
 separate desktop surfaces within those client families, not additional core
 clients.
 
+The four protected CLI launchers supervise their native client processes while
+preserving normal exit status and terminal job control. On Linux, the guardian
+uses subreaper support, pidfds, and `/proc` child discovery, when available, to
+stop ordinary descendants even when a client gives them another process group.
+If those facilities are unavailable, Pentect warns and falls back to managing
+only the original process group; this does not impose a new minimum kernel
+version. On macOS, supervision is process-group based, so a client or ordinary
+child such as an MCP server can create another group outside that boundary.
+
+On Windows, a kill-on-close job contains ordinary descendants of protected
+Codex, Claude Code, OpenCode, and Pi launches; this path must pass its Windows
+CI lifecycle gate before release. These are lifecycle boundaries, not a
+sandbox or a universal cleanup mechanism. Killing the guardian itself, an
+unkillable kernel wait, or an intentional OS-level containment escape can
+remain outside the guarantee, and cleanup of temporary files owned by the
+wrapper or client is not universal. Desktop launchers have separate lifecycle
+contracts.
+
 | Client | Test | Protected launch |
 | --- | --- | --- |
 | Codex CLI `0.149.0` | Real launch on Linux and all installer platforms | `pentect codex` |

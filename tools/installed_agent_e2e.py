@@ -1827,6 +1827,33 @@ def descendant_processes(parent_pid: int) -> dict[int, tuple[int, str]]:
     return descendants
 
 
+def linux_process_diagnostics(
+    pids: list[int], identities: dict[int, str]
+) -> list[dict[str, object]]:
+    diagnostics: list[dict[str, object]] = []
+    for pid in pids:
+        try:
+            raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+            _, separator, suffix = raw.rpartition(") ")
+            fields = suffix.split()
+            if not separator or len(fields) <= 19:
+                raise RuntimeError("malformed stat")
+            executable = os.readlink(Path("/proc") / str(pid) / "exe")
+            diagnostics.append({
+                "pid": pid,
+                "basename": Path(executable).name,
+                "ppid": int(fields[1]),
+                "pgid": int(fields[2]),
+                "sid": int(fields[3]),
+                "state": fields[0],
+                "recorded_identity": identities.get(pid),
+                "current_identity": fields[19],
+            })
+        except (FileNotFoundError, ProcessLookupError):
+            diagnostics.append({"pid": pid, "state": "exited"})
+    return diagnostics
+
+
 def tool_response(sequence: int, source: str) -> bytes:
     response_id = f"resp_e2e_{sequence}"
     item_id = f"ct_e2e_{sequence}"
@@ -2613,6 +2640,232 @@ def capture_descendant_identities(wrapper_pid: int, identities: dict[int, str]) 
             identities.setdefault(pid, identity)
 
 
+def run_codex_parent_kill(pentect: str) -> None:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("Codex parent-exit E2E currently requires Linux pidfd cleanup")
+    state = State("unused-valid", "unused-invalid", hold_model=True)
+    server = FixtureServer(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process: subprocess.Popen[str] | None = None
+    recorded_identities: dict[int, str] = {}
+    before_kill: list[dict[str, object]] = []
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pentect-codex-parent-kill-", ignore_cleanup_errors=True
+        ) as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            project = root / "project"
+            runtime = root / "runtime"
+            temporary = root / "tmp"
+            for directory in (home, project, runtime, temporary):
+                directory.mkdir()
+            (project / ".git").mkdir()
+            synthetic_input = project / "lifecycle-input.txt"
+            synthetic_input.write_text("ordinary lifecycle fixture\n", encoding="utf-8")
+            input_snapshot = synthetic_input.read_bytes()
+
+            marker = root / "mcp-ready.json"
+            mcp_server = root / "mcp-lifecycle.py"
+            mcp_server.write_text(
+                r'''import json
+import os
+import signal
+import subprocess
+import sys
+
+marker = sys.argv[1]
+if len(sys.argv) == 3 and sys.argv[2] == "--child":
+    while True:
+        signal.pause()
+
+child = subprocess.Popen([sys.executable, __file__, marker, "--child"])
+
+def publish(initialized):
+    temporary = marker + ".tmp"
+    with open(temporary, "x", encoding="utf-8") as output:
+        json.dump({
+            "server_pid": os.getpid(),
+            "child_pid": child.pid,
+            "initialized": initialized,
+        }, output, separators=(",", ":"))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, marker)
+
+publish(False)
+for line in sys.stdin:
+    request = json.loads(line)
+    identifier = request.get("id")
+    method = request.get("method")
+    if identifier is None:
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": request.get("params", {}).get(
+                "protocolVersion", "2025-06-18"
+            ),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "pentect-lifecycle-fixture", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": []}
+    elif method == "ping":
+        result = {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": identifier, "result": result},
+                     separators=(",", ":")), flush=True)
+    if method == "initialize":
+        publish(True)
+''',
+                encoding="utf-8",
+            )
+            server_snapshot = mcp_server.read_bytes()
+
+            codex_home = home / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                f"[projects.{json.dumps(str(project.resolve()))}]\n"
+                'trust_level = "trusted"\n\n'
+                "[mcp_servers.pentect_lifecycle]\n"
+                f"command = {json.dumps(sys.executable)}\n"
+                f"args = {json.dumps([str(mcp_server), str(marker)])}\n"
+                "startup_timeout_sec = 10\n",
+                encoding="utf-8",
+            )
+            config_snapshot = config.read_bytes()
+            environment = isolated_environment(home, root / "logs")
+            for name in tuple(environment):
+                upper = name.upper()
+                if any(
+                    marker in upper
+                    for marker in ("TOKEN", "SECRET", "API_KEY", "PASSWORD", "CREDENTIAL")
+                ):
+                    environment.pop(name)
+            environment.update({
+                "CODEX_HOME": str(codex_home),
+                "OPENAI_API_KEY": "local-fixture",
+                "TMP": str(temporary),
+                "TEMP": str(temporary),
+                "TMPDIR": str(temporary),
+                "XDG_RUNTIME_DIR": str(runtime),
+                "PENTECT_DISABLE_UPDATE_CHECK": "1",
+            })
+            command = [
+                pentect,
+                "codex",
+                "--upstream",
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "--model",
+                "gpt-5.6-luna",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "Wait for the local lifecycle fixture response.",
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            ready: dict[str, object] | None = None
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                capture_descendant_identities(process.pid, recorded_identities)
+                if marker.exists():
+                    try:
+                        candidate = json.loads(marker.read_text(encoding="utf-8"))
+                        if candidate.get("initialized") is True:
+                            ready = candidate
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
+                if ready is not None and state.model_request_seen.is_set():
+                    break
+                if process.poll() is not None:
+                    break
+                state.model_request_seen.wait(timeout=0.05)
+            capture_descendant_identities(process.pid, recorded_identities)
+            if ready is None:
+                raise RuntimeError("installed Codex did not initialize the synthetic MCP server")
+            if not state.model_request_seen.is_set():
+                raise RuntimeError("installed Codex did not reach the local model fixture")
+            mcp_pids = [int(ready["server_pid"]), int(ready["child_pid"])]
+            descendants = descendant_processes(process.pid)
+            if any(pid not in descendants for pid in mcp_pids):
+                raise RuntimeError(
+                    "synthetic MCP server tree was not below the Pentect wrapper: "
+                    + repr({pid: descendants.get(pid) for pid in mcp_pids})
+                )
+            for pid in mcp_pids:
+                identity = process_identity(pid)
+                if identity is None:
+                    raise RuntimeError(f"synthetic MCP process {pid} exited before parent kill")
+                recorded_identities[pid] = identity
+            if config.read_bytes() != config_snapshot:
+                raise RuntimeError("Codex modified the caller-owned lifecycle config")
+            if synthetic_input.read_bytes() != input_snapshot:
+                raise RuntimeError("Codex modified the synthetic lifecycle input")
+
+            before_kill = linux_process_diagnostics(
+                sorted(recorded_identities), recorded_identities
+            )
+            process.kill()
+            process.wait(timeout=10)
+            surviving = wait_for_process_identities_exit(recorded_identities, 10)
+            if surviving:
+                raise RuntimeError(
+                    "installed Codex descendants survived wrapper exit: "
+                    + json.dumps(
+                        linux_process_diagnostics(surviving, recorded_identities),
+                        separators=(",", ":"),
+                    )
+                    + "; before wrapper kill: "
+                    + json.dumps(before_kill, separators=(",", ":"))
+                )
+            if config.read_bytes() != config_snapshot:
+                raise RuntimeError("Codex changed lifecycle config after wrapper exit")
+            if synthetic_input.read_bytes() != input_snapshot:
+                raise RuntimeError("Codex changed lifecycle input after wrapper exit")
+            runtime_root = home / ".cache" / "pentect" / "runtime"
+            residue = list(runtime_root.glob("process-host-candidate-*.json"))
+            residue.extend(runtime_root.glob("delegated-process-host.json"))
+            if residue:
+                raise RuntimeError(
+                    "Pentect left process-host registration after Codex parent exit: "
+                    + ", ".join(path.name for path in residue)
+                )
+            if mcp_server.read_bytes() != server_snapshot:
+                raise RuntimeError("Codex modified the synthetic MCP fixture")
+            print(
+                "installed Codex parent-exit E2E passed: initialized MCP server, "
+                "ordinary child, and client tree exited"
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        for pid in surviving_cleanup:
+            terminate_process_identity(pid, recorded_identities[pid])
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        state.release_model_request.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        if surviving_cleanup:
+            raise RuntimeError(
+                "test cleanup could not reap recorded Codex identities: "
+                + ", ".join(map(str, surviving_cleanup))
+            )
+
+
 def run_claude_parent_kill(pentect: str) -> None:
     if os.name == "nt" and Path(pentect).suffix.lower() != ".exe":
         raise RuntimeError(
@@ -2901,6 +3154,7 @@ def main() -> int:
         dest="clients",
     )
     parser.add_argument("--skip-image", action="store_true")
+    parser.add_argument("--codex-parent-kill", action="store_true")
     parser.add_argument("--claude-parent-kill", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
     args = parser.parse_args()
@@ -2909,6 +3163,9 @@ def main() -> int:
         args.pentect = str(candidate.resolve())
     if args.plugin_lifecycle_only:
         run_plugin_lifecycle(args.pentect)
+        return 0
+    if args.codex_parent_kill:
+        run_codex_parent_kill(args.pentect)
         return 0
     if args.claude_parent_kill:
         run_claude_parent_kill(args.pentect)
