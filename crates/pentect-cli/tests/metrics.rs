@@ -54,7 +54,7 @@ fn metrics_human_describes_stable_codes_without_echoing_untrusted_values() {
     std::fs::create_dir(fixture.0.join(".git")).unwrap();
     std::fs::write(
         home.join(".pentect/config.toml"),
-        "[metrics]\nenabled = true\n",
+        "[metrics]\nenabled = true\n\n[update]\ncheck = false\n",
     )
     .unwrap();
 
