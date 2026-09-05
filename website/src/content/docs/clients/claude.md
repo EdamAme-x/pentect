@@ -48,6 +48,13 @@ for deliberately detached processes. If the guardian itself is also forcibly
 killed, Pentect preserves the unreleased private settings session rather than
 risking deletion while its Claude process might still be active.
 
+On Windows, a protected launch ties the helper and Claude process tree to a
+kill-on-close job owned by the shell-facing Pentect process. Generated settings
+are held with delete-on-close and are removed after their handles close; the
+caller-owned settings input is never modified. Forced termination can leave an
+empty private temporary directory behind. This does not claim recovery for a
+deliberately detached process or an independently terminated helper.
+
 ## Use a clickable App launcher
 
 For regular use, create a separate protected launcher:
