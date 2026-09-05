@@ -34,6 +34,9 @@ jobs:
               - '.github/workflows/release.yml'
               - 'crates/pentect-cli/src/main.rs'
               - 'crates/pentect-cli/src/client_descriptor.rs'
+              - 'crates/pentect-cli/src/claude_unix_supervisor.rs'
+              - 'crates/pentect-cli/tests/claude_guardian_boundary.rs'
+              - 'crates/pentect-cli/tests/claude_unix_supervisor.rs'
               - 'crates/pentect-cli/src/openai_clients.rs'
               - 'crates/pentect-cli/src/plugins.rs'
               - 'crates/pentect-cli/src/plugins_cmd.rs'
@@ -161,6 +164,14 @@ jobs:
           binary="$GITHUB_WORKSPACE/target/debug/pentect"
           test -x "$binary"
           printf 'PENTECT_AGENT_E2E_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
+      - name: Test POSIX Claude guardian and terminal behavior (PR)
+        if: github.event_name == 'pull_request' && runner.os != 'Windows'
+        timeout-minutes: 5
+        run: >-
+          cargo test -p pentect-cli --locked
+          --test native_interrupt
+          --test claude_unix_supervisor
+          --test claude_guardian_boundary
       - name: Install current portable clients
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
