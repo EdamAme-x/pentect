@@ -123,11 +123,21 @@ for name in os.listdir(fd_root):
     is_socket = stat.S_ISSOCK(info.st_mode)
     family = None
     socket_type = None
+    socket_error = None
     if is_socket:
         duplicate = os.dup(int(name))
-        with socket.socket(fileno=duplicate) as value:
-            family = int(value.family)
-            socket_type = value.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        try:
+            value = socket.socket(fileno=duplicate)
+        except OSError as error:
+            socket_error = error.errno
+            os.close(duplicate)
+        else:
+            with value:
+                try:
+                    family = int(value.family)
+                    socket_type = value.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                except OSError as error:
+                    socket_error = error.errno
     descriptors.append({
         "fd": int(name),
         "dev": info.st_dev,
@@ -136,6 +146,7 @@ for name in os.listdir(fd_root):
         "socket": is_socket,
         "socket_family": family,
         "socket_type": socket_type,
+        "socket_error": socket_error,
         "owner_lock": owner is not None and (info.st_dev, info.st_ino) == (owner.st_dev, owner.st_ino),
     })
 
