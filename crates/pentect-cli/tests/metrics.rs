@@ -103,6 +103,7 @@ fn metrics_human_describes_stable_codes_without_echoing_untrusted_values() {
             .env("XDG_CACHE_HOME", fixture.0.join("cache"))
             .env("XDG_STATE_HOME", fixture.0.join("state"))
             .env("XDG_RUNTIME_DIR", fixture.0.join("runtime"))
+            .env("LOCALAPPDATA", fixture.0.join("local-app-data"))
             .env("PENTECT_LOG_DIR", &logs)
             .env("TMPDIR", fixture.0.join("tmp"));
         if json {
@@ -161,5 +162,15 @@ fn metrics_human_describes_stable_codes_without_echoing_untrusted_values() {
     assert!(!String::from_utf8(encoded.stdout)
         .unwrap()
         .contains(sentinel));
-    assert!(!fixture.0.join("state/pentect/update-check.json").exists());
+    for cache in [
+        fixture.0.join("state/pentect/update-check.json"),
+        home.join("Library/Application Support/pentect/update-check.json"),
+        fixture.0.join("local-app-data/pentect/update-check.json"),
+    ] {
+        assert!(
+            !cache.exists(),
+            "update check wrote cache {}",
+            cache.display()
+        );
+    }
 }
