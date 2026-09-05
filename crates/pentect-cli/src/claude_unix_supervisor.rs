@@ -1079,10 +1079,12 @@ fn reap_linux_adopted_zombies(client: i32, relay: i32, cursor: &mut usize) -> Re
     }
     let start = *cursor % children.len();
     let count = children.len().min(256);
+    let mut visited = 0;
     for offset in 0..count {
         if std::time::Instant::now() >= deadline {
             break;
         }
+        visited += 1;
         let pid = children[(start + offset) % children.len()];
         if pid == client || pid == relay {
             continue;
@@ -1120,8 +1122,13 @@ fn reap_linux_adopted_zombies(client: i32, relay: i32, cursor: &mut usize) -> Re
             }
         }
     }
-    *cursor = (start + count) % children.len();
+    *cursor = advance_reap_cursor(start, visited, children.len());
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn advance_reap_cursor(start: usize, visited: usize, length: usize) -> usize {
+    (start + visited) % length
 }
 
 #[cfg(target_os = "linux")]
@@ -1376,6 +1383,14 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(open_verified_child_pidfd(pid).unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopted_zombie_cursor_advances_only_past_visited_children() {
+        assert_eq!(advance_reap_cursor(0, 3, 10), 3);
+        assert_eq!(advance_reap_cursor(8, 3, 10), 1);
+        assert_eq!(advance_reap_cursor(4, 0, 10), 4);
     }
 
     #[test]
