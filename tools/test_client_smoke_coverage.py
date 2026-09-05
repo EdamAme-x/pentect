@@ -42,6 +42,23 @@ def main() -> None:
     )
     assert set(SMOKE.APP_SURFACES) == {"codex-app", "claude-app"}
 
+    workflow = (ROOT / ".github/workflows/current-clients.yml").read_text(
+        encoding="utf-8"
+    )
+    for boundary in (
+        "crates/pentect-cli/src/main.rs",
+        "crates/pentect-cli/src/openai_clients.rs",
+        "crates/pentect-cli/src/secure_temp.rs",
+        "crates/pentect-cli/src/*supervisor*.rs",
+        "crates/pentect-cli/tests/client_store_isolation.rs",
+        "crates/pentect-cli/tests/native_interrupt.rs",
+        "crates/pentect-cli/tests/*claude*.rs",
+        "tools/installed_agent_e2e.py",
+    ):
+        assert f"- '{boundary}'" in workflow, (
+            f"current-client workflow does not watch launch boundary {boundary}"
+        )
+
 
 if __name__ == "__main__":
     main()
