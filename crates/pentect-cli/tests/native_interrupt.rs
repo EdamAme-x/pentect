@@ -127,13 +127,16 @@ with tempfile.TemporaryDirectory(prefix="pentect-claude-job-") as root:
     except OSError: break
   return output.count(needle)>=count
  def wait_reaped(timeout):
+  global output
   end=time.monotonic()+timeout
   while time.monotonic()<end:
-   try: observed,_=os.waitpid(pid,os.WNOHANG)
-   except ChildProcessError: return True
-   if observed!=0: return True
-   time.sleep(.05)
-  return False
+   if select.select([fd],[],[],.05)[0]:
+    try: output+=os.read(fd,4096)
+    except OSError: pass
+   try: observed,status=os.waitpid(pid,os.WNOHANG)
+   except ChildProcessError: return 0
+   if observed!=0: return status
+  return None
  try:
   if not until(b"PENTECT-PROMPT> ",1,5): raise RuntimeError(repr(output))
   shell_group=os.tcgetpgrp(fd)
@@ -153,16 +156,19 @@ with tempfile.TemporaryDirectory(prefix="pentect-claude-job-") as root:
   time.sleep(.2); os.write(fd,b"hello\n")
   if not until(b"GOT=hello",1,5): raise RuntimeError("resume/read failed "+repr(output))
   if not until(b"PENTECT-PROMPT> ",4,5): raise RuntimeError("final prompt missing "+repr(output))
+  wrapper=None
   os.write(fd,b"exit\n")
-  if not wait_reaped(5): raise RuntimeError("shell did not exit "+repr(output))
+  status=wait_reaped(5)
+  if status is None: raise RuntimeError("shell did not exit "+repr(output))
+  if os.waitstatus_to_exitcode(status)!=0: raise RuntimeError("shell exit status "+str(status)+" "+repr(output))
   reaped=True
  finally:
   if not reaped:
    if wrapper:
     try: os.kill(wrapper,signal.SIGKILL)
-    except ProcessLookupError: pass
+    except OSError: pass
    try: os.killpg(pid,signal.SIGKILL)
-   except ProcessLookupError: pass
+   except OSError: pass
    wait_reaped(5)
   os.close(fd)
 "##;
