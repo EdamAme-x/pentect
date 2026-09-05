@@ -85,8 +85,7 @@ pub(crate) fn run(
     command.env_remove("GOOSE_PROVIDER__API_KEY");
     command.env_remove("JUNIE_OPENAI_API_KEY");
     crate::apply_plugin_env(&mut command, &active_plugins)?;
-    crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
-    crate::apply_memory_store_env(&mut command, Some(&memory_store));
+    crate::apply_untrusted_client_env(&mut command, pentect)?;
 
     match injection {
         crate::client_descriptor::OpenAiInjection::InlineConfig => {
@@ -331,7 +330,7 @@ fn run_opencode(
         route.model.as_deref(),
         package,
     )?;
-    let mut command = opencode_command(opts, pentect, &active_plugins, &memory_store, &header_env)?;
+    let mut command = opencode_command(opts, pentect, &active_plugins, &header_env)?;
     if let Some(name) = child_key_env {
         command.env(name, "pentect-local");
     }
@@ -498,7 +497,6 @@ fn opencode_command(
     opts: &crate::AgentToolOpts,
     pentect: &Path,
     active_plugins: &crate::plugins::ActivePlugins,
-    memory_store: &crate::MemoryStoreGuard,
     header_env: &[String],
 ) -> Result<Command, String> {
     let mut command = Command::new(&opts.command);
@@ -516,8 +514,7 @@ fn opencode_command(
         command.env_remove(name);
     }
     crate::apply_plugin_env(&mut command, active_plugins)?;
-    crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
-    crate::apply_memory_store_env(&mut command, Some(memory_store));
+    crate::apply_untrusted_client_env(&mut command, pentect)?;
     Ok(command)
 }
 
@@ -578,13 +575,7 @@ fn run_opencode_picker(
         proxies.push(proxy);
     }
     let config = opencode_picker_config(&provider_urls)?;
-    let mut command = opencode_command(
-        opts,
-        pentect,
-        active_plugins,
-        &memory_store,
-        &hidden_header_env,
-    )?;
+    let mut command = opencode_command(opts, pentect, active_plugins, &hidden_header_env)?;
     child_key_env.sort_unstable();
     child_key_env.dedup();
     for name in child_key_env {

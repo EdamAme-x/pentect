@@ -66,6 +66,7 @@ const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
+const PENTECT_UNTRUSTED_CLIENT_ENV: &str = "PENTECT_UNTRUSTED_CLIENT";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const GATEWAY_STARTUP_TIMEOUT: Duration =
     Duration::from_secs(pentect_agent::MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT.as_secs() + 10);
@@ -359,6 +360,12 @@ fn run(args: Vec<String>) -> Option<i32> {
         print!("{help}");
         return None;
     }
+    if unsupported_nested_helper(&args) {
+        eprintln!(
+            "[pentect] this helper is unavailable inside a Pentect-launched client; use the client's normal shell, file, or MCP tools"
+        );
+        return Some(2);
+    }
     let inherited_env_is_trusted =
         command_uses_agent_runtime(&args) && pentect_agent::active_memory_store_ready();
     if !is_bounded_log_request(&args) {
@@ -375,6 +382,23 @@ fn run(args: Vec<String>) -> Option<i32> {
     drop(_process_host_env);
     drop(process_host);
     exit_code
+}
+
+fn unsupported_nested_helper(args: &[String]) -> bool {
+    if std::env::var_os(PENTECT_UNTRUSTED_CLIENT_ENV).is_none() {
+        return false;
+    }
+    matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str)
+        ),
+        (Some("read" | "exec" | "resolve" | "bridge" | "hook"), _)
+            | (
+                Some("agent"),
+                Some("read" | "exec" | "resolve" | "bridge" | "hook")
+            )
+    )
 }
 
 fn command_uses_agent_runtime(args: &[String]) -> bool {
@@ -1749,8 +1773,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     clear_pentect_control_env(&mut cmd);
     upstream::hide_header_source_env(&mut cmd, &opts.upstream_header_env);
     apply_plugin_env(&mut cmd, &active_plugins)?;
-    apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
-    apply_memory_store_env(&mut cmd, Some(&memory_store));
+    apply_untrusted_client_env(&mut cmd, pentect)?;
     cmd.args(args);
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, memory_store))
 }
@@ -1776,8 +1799,7 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     clear_pentect_control_env(&mut cmd);
     upstream::hide_header_source_env(&mut cmd, &opts.upstream_header_env);
     apply_plugin_env(&mut cmd, &active_plugins)?;
-    apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
-    apply_memory_store_env(&mut cmd, Some(&memory_store));
+    apply_untrusted_client_env(&mut cmd, pentect)?;
     let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
         plan.upstream,
         &opts.upstream_header_env,
@@ -1828,8 +1850,7 @@ fn run_endpoint_env(
     clear_pentect_control_env(&mut command);
     upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
     apply_plugin_env(&mut command, &active_plugins)?;
-    apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
-    apply_memory_store_env(&mut command, Some(&memory_store));
+    apply_untrusted_client_env(&mut command, pentect)?;
     command.args(&opts.tool_args);
     match tool.protocol {
         client_descriptor::Protocol::CloudCode => {
@@ -2766,6 +2787,12 @@ fn apply_pentect_env(
     Ok(())
 }
 
+fn apply_untrusted_client_env(cmd: &mut Command, pentect: &Path) -> Result<(), String> {
+    apply_pentect_env(cmd, pentect, None)?;
+    cmd.env(PENTECT_UNTRUSTED_CLIENT_ENV, "1");
+    Ok(())
+}
+
 fn clear_pentect_control_env(command: &mut Command) {
     for name in pentect_agent::pentect_control_env_names() {
         command.env_remove(name);
@@ -2778,14 +2805,6 @@ fn clear_pentect_control_env(command: &mut Command) {
             command.env_remove(name);
         }
     }
-}
-
-fn apply_memory_store_env(cmd: &mut Command, memory_store: Option<&MemoryStoreGuard>) {
-    let Some(memory_store) = memory_store else {
-        return;
-    };
-    cmd.env(PENTECT_MEMORY_STORE_ADDR_ENV, &memory_store.addr);
-    cmd.env(PENTECT_MEMORY_STORE_TOKEN_ENV, &memory_store.token);
 }
 
 fn memory_store_parent_env_guard(pentect: &Path, memory_store: &MemoryStoreGuard) -> EnvVarGuard {
