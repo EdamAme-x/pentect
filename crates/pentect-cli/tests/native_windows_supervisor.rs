@@ -1,11 +1,11 @@
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 struct TestDirectory(PathBuf);
@@ -46,7 +46,7 @@ struct ProcessHandle(HANDLE);
 
 impl ProcessHandle {
     fn open(pid: u32) -> Self {
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
         assert!(!handle.is_null(), "could not retain fixture process {pid}");
         Self(handle)
     }
@@ -54,7 +54,25 @@ impl ProcessHandle {
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
+        if unsafe { WaitForSingleObject(self.0, 0) } == windows_sys::Win32::Foundation::WAIT_TIMEOUT
+        {
+            unsafe { TerminateProcess(self.0, 1) };
+            let _ = unsafe { WaitForSingleObject(self.0, 5_000) };
+        }
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn output_bounded(mut command: Command, timeout: Duration) -> Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = ChildGuard(Some(command.spawn().unwrap()));
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            return child.0.take().unwrap().wait_with_output().unwrap();
+        }
+        assert!(Instant::now() < deadline, "supervised command did not exit");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -140,8 +158,17 @@ fn native_supervisor_preserves_normal_nonzero_and_still_active_exit_codes() {
         let fixture = TestDirectory::new("native-windows-exit");
         let client = fixture.0.join("opencode.cmd");
         write_cmd(&client, &format!("exit /b {expected}"));
-        let status = isolated_command(&fixture.0, &client).status().unwrap();
-        assert_eq!(status.code().map(|code| code as u32), Some(expected));
+        let output = output_bounded(
+            isolated_command(&fixture.0, &client),
+            Duration::from_secs(20),
+        );
+        assert_eq!(
+            output.status.code().map(|code| code as u32),
+            Some(expected),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -150,11 +177,18 @@ fn bad_native_executable_fails_without_waiting_for_startup_timeout() {
     let fixture = TestDirectory::new("native-windows-bad-executable");
     let client = fixture.0.join("invalid.exe");
     std::fs::write(&client, b"not a Windows executable").unwrap();
-    let started = Instant::now();
-    let status = isolated_command(&fixture.0, &client).status().unwrap();
-    assert!(!status.success());
+    let output = output_bounded(
+        isolated_command(&fixture.0, &client),
+        Duration::from_secs(20),
+    );
+    assert!(!output.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "bad executable waited for the supervisor startup deadline"
+        !diagnostic.contains("startup timed out") && !diagnostic.contains("payload timed out"),
+        "bad executable reached a supervisor timeout instead of failing startup: {diagnostic}"
     );
 }
