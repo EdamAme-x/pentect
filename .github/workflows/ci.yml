@@ -195,6 +195,8 @@ jobs:
               - 'crates/pentect-cli/src/claude_unix_supervisor.rs'
               - 'crates/pentect-cli/src/claude_windows_supervisor.rs'
               - 'crates/pentect-cli/tests/native_interrupt.rs'
+              - 'crates/pentect-cli/tests/native_unix_supervisor.rs'
+              - 'crates/pentect-cli/tests/native_windows_supervisor.rs'
               - 'crates/pentect-cli/tests/*claude*.rs'
             runtime_log:
               - 'crates/pentect-runtime/src/activity_log.rs'
@@ -379,10 +381,13 @@ jobs:
       - name: Test Windows Claude supervisor
         if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'Windows'
         run: cargo test -p pentect-cli --no-default-features --bin pentect claude_windows_supervisor::tests --locked
+      - name: Test Windows native supervisor
+        if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'Windows'
+        run: cargo test -p pentect-cli --no-default-features --test native_windows_supervisor --locked
       - name: Test macOS Claude supervisor boundaries
         if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'macOS'
         timeout-minutes: 5
-        run: cargo test -p pentect-cli --no-default-features --locked --test claude_guardian_boundary --test claude_unix_supervisor --test native_interrupt
+        run: cargo test -p pentect-cli --no-default-features --locked --test claude_guardian_boundary --test claude_unix_supervisor --test native_interrupt --test native_unix_supervisor
       - name: No app changes
         if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true' && needs.changes.outputs.claude_supervisor != 'true'
         run: echo "No app changes"
