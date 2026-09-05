@@ -291,7 +291,8 @@ time.sleep(15)
             .stderr(Stdio::piped());
         fixture.wrapper = Some(command.spawn().unwrap());
         let (client_pid, middle_pid, child_pid, state) = wait_ready(&ready);
-        assert_eq!(state, format!("{}:unset:no", project.display()));
+        let canonical_project = project.canonicalize().unwrap();
+        assert_eq!(state, format!("{}:unset:no", canonical_project.display()));
 
         #[cfg(target_os = "linux")]
         let identities = [
