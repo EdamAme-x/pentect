@@ -63,13 +63,25 @@ impl Drop for ProcessHandle {
     }
 }
 
-fn output_bounded(mut command: Command, timeout: Duration) -> Output {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = ChildGuard(Some(command.spawn().unwrap()));
+fn output_bounded(mut command: Command, root: &Path, timeout: Duration) -> Output {
+    let stdout_path = root.join("wrapper.stdout");
+    let stderr_path = root.join("wrapper.stderr");
+    command
+        .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
+    let spawned = command.spawn().unwrap();
+    // Do not retain the parent's copies of the fixture output handles.
+    drop(command);
+    let mut child = ChildGuard(Some(spawned));
     let deadline = Instant::now() + timeout;
     loop {
-        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
-            return child.0.take().unwrap().wait_with_output().unwrap();
+        if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+            drop(child.0.take());
+            return Output {
+                status,
+                stdout: std::fs::read(&stdout_path).unwrap(),
+                stderr: std::fs::read(&stderr_path).unwrap(),
+            };
         }
         assert!(Instant::now() < deadline, "supervised command did not exit");
         std::thread::sleep(Duration::from_millis(20));
@@ -160,6 +172,7 @@ fn native_supervisor_preserves_normal_nonzero_and_still_active_exit_codes() {
         write_cmd(&client, &format!("exit /b {expected}"));
         let output = output_bounded(
             isolated_command(&fixture.0, &client),
+            &fixture.0,
             Duration::from_secs(20),
         );
         assert_eq!(
@@ -179,6 +192,7 @@ fn bad_native_executable_fails_without_waiting_for_startup_timeout() {
     std::fs::write(&client, b"not a Windows executable").unwrap();
     let output = output_bounded(
         isolated_command(&fixture.0, &client),
+        &fixture.0,
         Duration::from_secs(20),
     );
     assert!(!output.status.success());
