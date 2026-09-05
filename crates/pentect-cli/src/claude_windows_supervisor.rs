@@ -326,6 +326,10 @@ pub(crate) fn run_helper(argv: &[String]) -> i32 {
         {
             return 2;
         }
+        if crate::install_native_interrupt_handler().is_err() {
+            return 2;
+        }
+        crate::NATIVE_COMMAND_INTERRUPTS.store(0, std::sync::atomic::Ordering::SeqCst);
         let settings = match PrivateSettings::create(&payload.settings) {
             Ok(value) => value,
             Err(_) => return 2,
@@ -352,12 +356,6 @@ pub(crate) fn run_helper(argv: &[String]) -> i32 {
             let _ = child.wait();
             return 2;
         }
-        if crate::install_native_interrupt_handler().is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return 2;
-        }
-        crate::NATIVE_COMMAND_INTERRUPTS.store(0, std::sync::atomic::Ordering::SeqCst);
         match crate::wait_for_native_child(
             &mut child,
             &crate::NATIVE_COMMAND_INTERRUPTS,
@@ -366,7 +364,11 @@ pub(crate) fn run_helper(argv: &[String]) -> i32 {
             crate::NATIVE_INTERRUPT_GRACE,
         ) {
             Ok(status) => status.code().unwrap_or(1),
-            Err(_) => 2,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                2
+            }
         }
     })
 }
@@ -501,7 +503,7 @@ pub(crate) fn launch(
         version: PROTOCOL_VERSION,
         wrapper_pid: std::process::id(),
         program: wide(client.get_program()),
-        cwd: client.get_current_dir().map(wide),
+        cwd: client.get_current_dir().map(|path| wide(path.as_os_str())),
         args: prepared.args,
         settings: prepared.encoded,
         location,
@@ -519,16 +521,16 @@ pub(crate) fn launch(
         return Err("Claude supervisor did not confirm client startup".to_string());
     }
     drop(pipe);
-    let mut child = guard.child.take().expect("helper retained");
-    let job = guard.job.take().expect("job retained");
     let status = crate::wait_for_native_child(
-        &mut child,
+        guard.child.as_mut().expect("helper retained"),
         &crate::NATIVE_COMMAND_INTERRUPTS,
         std::io::stdin().is_terminal(),
         crate::NATIVE_REPEAT_INTERRUPT_WINDOW,
         crate::NATIVE_INTERRUPT_GRACE,
     )
     .map_err(|error| format!("could not wait for '{}': {error}", display.display()))?;
+    drop(guard.child.take());
+    let job = guard.job.take().expect("job retained");
     drop(job);
     Ok(status)
 }
