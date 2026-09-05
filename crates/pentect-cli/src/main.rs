@@ -3,6 +3,8 @@
 mod app_launcher;
 mod claude_app_proxy;
 mod claude_http_proxy;
+#[cfg(windows)]
+mod claude_windows_supervisor;
 mod client_descriptor;
 mod cloud_code_http_proxy;
 mod codex_app;
