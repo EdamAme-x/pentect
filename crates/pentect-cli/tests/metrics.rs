@@ -121,7 +121,7 @@ fn metrics_human_describes_stable_codes_without_echoing_untrusted_values() {
     for expected in [
         "prompt (Text sent to a model): 2",
         "OTHER (Other protected surface): 4",
-        "API_KEY (Api Key): 2",
+        "API_KEY (API key): 2",
         "OTHER (Other): 7",
         "unknown (Unknown or unclassified warning): 5",
         "upstream-response (A provider response status was observed): 4",
