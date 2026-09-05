@@ -324,12 +324,15 @@ fn run_opencode(
     let (proxy, header_env, child_key_env) =
         start_opencode_proxy(&route, &opts.upstream_header_env)?;
     let package = opts.upstream.as_ref().map(|_| api.opencode_package());
-    let config = opencode_config(
+    let mut config = opencode_config(
         proxy.base_url(),
         &route.provider,
         route.model.as_deref(),
         package,
     )?;
+    if crate::execution_boundary::opencode_server_command(&opts.tool_args) {
+        config = opencode_loopback_server_config(&config)?;
+    }
     let mut command = opencode_command(opts, pentect, &active_plugins, &header_env)?;
     if let Some(name) = child_key_env {
         command.env(name, "pentect-local");
@@ -574,7 +577,10 @@ fn run_opencode_picker(
         }
         proxies.push(proxy);
     }
-    let config = opencode_picker_config(&provider_urls)?;
+    let mut config = opencode_picker_config(&provider_urls)?;
+    if crate::execution_boundary::opencode_server_command(&opts.tool_args) {
+        config = opencode_loopback_server_config(&config)?;
+    }
     let mut command = opencode_command(opts, pentect, active_plugins, &hidden_header_env)?;
     child_key_env.sort_unstable();
     child_key_env.dedup();
@@ -682,6 +688,25 @@ fn selected_model(explicit: Option<&str>) -> Result<String, String> {
     let model = explicit.unwrap_or(DEFAULT_MODEL).to_string();
     validate_model(&model)?;
     Ok(model)
+}
+
+fn opencode_loopback_server_config(config: &str) -> Result<String, String> {
+    let mut root = serde_json::from_str::<Value>(config)
+        .map_err(|_| "generated OpenCode config is invalid".to_string())?;
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| "generated OpenCode config must be an object".to_string())?;
+    let server = object
+        .entry("server")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "OpenCode server config must be an object".to_string())?;
+    server.insert(
+        "hostname".to_string(),
+        Value::String("127.0.0.1".to_string()),
+    );
+    server.insert("mdns".to_string(), Value::Bool(false));
+    serde_json::to_string(&root).map_err(|_| "could not encode OpenCode config".to_string())
 }
 
 fn validate_model(model: &str) -> Result<(), String> {
@@ -1095,6 +1120,21 @@ mod tests {
             &["--export=not-a-pi-option".to_string()],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn opencode_server_config_cannot_widen_the_generated_listener() {
+        let value: Value = serde_json::from_str(
+            &opencode_loopback_server_config(
+                r#"{"theme":"dark","server":{"hostname":"0.0.0.0","mdns":true,"port":4096}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["server"]["hostname"], "127.0.0.1");
+        assert_eq!(value["server"]["mdns"], false);
+        assert_eq!(value["server"]["port"], 4096);
     }
 
     #[test]

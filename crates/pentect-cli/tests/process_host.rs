@@ -198,6 +198,53 @@ fn claude_and_opencode_dry_run_reject_invalid_upstreams_in_both_argument_forms()
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn remote_execution_preflight_rejects_before_dry_run_or_real_child_spawn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (client, boundary_args, expected) in [
+        ("codex", &["cloud", "list"][..], "Codex Cloud"),
+        ("claude", &["--cloud=fixture"][..], "Claude remote"),
+        (
+            "opencode",
+            &["run", "--attach=http://localhost:4096", "hello"][..],
+            "OpenCode attach",
+        ),
+    ] {
+        for dry_run in [false, true] {
+            let root = test_root();
+            std::fs::create_dir_all(&root).unwrap();
+            let marker = root.join("child-started");
+            let child = root.join("synthetic-client.sh");
+            std::fs::write(
+                &child,
+                format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let child_arg = child.to_string_lossy().into_owned();
+            let mut args = vec![client, "--tool", child_arg.as_str()];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            args.extend(boundary_args);
+            let output = isolated_command(&root, &args).output().unwrap();
+            assert_eq!(output.status.code(), Some(2), "{client}");
+            assert!(!marker.exists(), "{client}");
+            let rendered = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(rendered.contains(expected), "{client}: {rendered}");
+            assert!(!rendered.contains("<pentect-gateway>"), "{rendered}");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
 fn isolated_command(root: &Path, args: &[&str]) -> Command {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::create_dir_all(root.join(".pentect")).unwrap();

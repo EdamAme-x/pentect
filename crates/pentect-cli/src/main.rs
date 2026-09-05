@@ -8,6 +8,7 @@ mod cloud_code_http_proxy;
 mod codex_app;
 mod default_launch;
 mod doctor;
+mod execution_boundary;
 mod gateway_diagnostics;
 mod gemini_http_proxy;
 mod handle_contract;
@@ -805,6 +806,7 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
         Ok(o) => o,
         Err(e) => die(&e),
     };
+    execution_boundary::validate(tool, &opts.tool_args).unwrap_or_else(|error| die(error));
     if !opts.dry_run {
         opts.command = resolve_agent_command(&opts.command).unwrap_or_else(|error| die(error));
     }
