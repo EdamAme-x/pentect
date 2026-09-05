@@ -117,21 +117,22 @@ for name in os.listdir(fd_root):
         continue
     try:
         info = os.fstat(int(name))
+        fd_flags = fcntl.fcntl(int(name), fcntl.F_GETFD)
     except OSError:
         continue
     is_socket = stat.S_ISSOCK(info.st_mode)
     family = None
     socket_type = None
     if is_socket:
-        value = socket.socket(fileno=int(name))
-        family = int(value.family)
-        socket_type = value.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
-        value.detach()
+        duplicate = os.dup(int(name))
+        with socket.socket(fileno=duplicate) as value:
+            family = int(value.family)
+            socket_type = value.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
     descriptors.append({
         "fd": int(name),
         "dev": info.st_dev,
         "ino": info.st_ino,
-        "cloexec": bool(fcntl.fcntl(int(name), fcntl.F_GETFD) & fcntl.FD_CLOEXEC),
+        "cloexec": bool(fd_flags & fcntl.FD_CLOEXEC),
         "socket": is_socket,
         "socket_family": family,
         "socket_type": socket_type,
