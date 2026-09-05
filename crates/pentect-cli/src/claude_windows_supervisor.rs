@@ -565,9 +565,16 @@ impl ClaudeJob {
 mod tests {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        EqualSid, GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
+        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 
     fn payload(location: SettingsLocation, args: &[&str]) -> LaunchPayload {
@@ -665,6 +672,36 @@ mod tests {
             );
             assert!(!dacl.is_null());
             assert_eq!(unsafe { (*dacl).AceCount }, 1);
+            let mut control = 0;
+            let mut revision = 0;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+                0
+            );
+            assert_ne!(control & SE_DACL_PROTECTED, 0);
+            let mut raw_ace = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, 0, &mut raw_ace) }, 0);
+            let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            assert_eq!(ace.Header.AceType, 0); // ACCESS_ALLOWED_ACE_TYPE
+            let sid_text: Vec<u16> = std::ffi::OsStr::new(&current_user_sid().unwrap())
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let mut expected_sid = std::ptr::null_mut();
+            assert_ne!(
+                unsafe { ConvertStringSidToSidW(sid_text.as_ptr(), &mut expected_sid) },
+                0
+            );
+            assert_ne!(
+                unsafe {
+                    EqualSid(
+                        std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+                        expected_sid,
+                    )
+                },
+                0
+            );
+            unsafe { LocalFree(expected_sid.cast()) };
             unsafe { LocalFree(descriptor.cast()) };
         }
         drop(settings);
@@ -675,8 +712,13 @@ mod tests {
     #[test]
     fn dropping_startup_guard_terminates_and_reaps_helper() {
         let job = ClaudeJob::new().unwrap();
-        let child = Command::new("cmd.exe")
-            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
             .spawn()
             .unwrap();
         job.assign_live(&child).unwrap();
@@ -687,7 +729,7 @@ mod tests {
             job: Some(job),
         };
         drop(guard);
-        assert_ne!(unsafe { WaitForSingleObject(process, 1000) }, WAIT_TIMEOUT);
+        assert_eq!(unsafe { WaitForSingleObject(process, 1000) }, WAIT_OBJECT_0);
         unsafe { windows_sys::Win32::Foundation::CloseHandle(process) };
     }
 }
