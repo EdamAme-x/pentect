@@ -94,7 +94,9 @@ fn actual_noninteractive_claude_keeps_guardian_authority_out_of_client() {
         &probe,
         r#"#!/usr/bin/env python3
 import json
+import fcntl
 import os
+import socket
 import stat
 import sys
 
@@ -107,7 +109,8 @@ for index, argument in enumerate(sys.argv[1:]):
 
 fd_root = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
 positive = open(os.environ["FD_CONTROL"], "rb")
-owner = os.stat(os.path.join(os.path.dirname(settings), "owner.lock"))
+owner_path = os.path.join(os.path.dirname(settings), "owner.lock")
+owner = os.stat(owner_path) if os.path.exists(owner_path) else None
 descriptors = []
 for name in os.listdir(fd_root):
     if not name.isdigit() or int(name) < 3:
@@ -116,10 +119,23 @@ for name in os.listdir(fd_root):
         info = os.fstat(int(name))
     except OSError:
         continue
+    is_socket = stat.S_ISSOCK(info.st_mode)
+    family = None
+    socket_type = None
+    if is_socket:
+        value = socket.socket(fileno=int(name))
+        family = int(value.family)
+        socket_type = value.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        value.detach()
     descriptors.append({
         "fd": int(name),
-        "socket": stat.S_ISSOCK(info.st_mode),
-        "owner_lock": (info.st_dev, info.st_ino) == (owner.st_dev, owner.st_ino),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "cloexec": bool(fcntl.fcntl(int(name), fcntl.F_GETFD) & fcntl.FD_CLOEXEC),
+        "socket": is_socket,
+        "socket_family": family,
+        "socket_type": socket_type,
+        "owner_lock": owner is not None and (info.st_dev, info.st_ino) == (owner.st_dev, owner.st_ino),
     })
 
 authority = {}
@@ -152,6 +168,26 @@ raise SystemExit(37)
     )
     .unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let baseline_report = root.join("baseline-report.json");
+    let mut baseline = Command::new(&probe);
+    baseline
+        .args(["--settings"])
+        .arg(&input_settings)
+        .env("REPORT", &baseline_report)
+        .env("FD_CONTROL", &fd_control)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let baseline_output = wait_bounded(baseline.spawn().unwrap(), Duration::from_secs(10));
+    assert_eq!(
+        baseline_output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&baseline_output.stderr)
+    );
+    let baseline_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&baseline_report).unwrap()).unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
     command
@@ -215,10 +251,23 @@ raise SystemExit(37)
         assert_eq!(value["authority"][name], false, "client inherited {name}");
     }
     for descriptor in value["descriptors"].as_array().unwrap() {
-        assert_eq!(
-            descriptor["socket"], false,
-            "client inherited a control socket"
-        );
+        if descriptor["socket"] == true {
+            let inherited = baseline_value["descriptors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|baseline| {
+                    baseline["socket"] == true
+                        && baseline["dev"] == descriptor["dev"]
+                        && baseline["ino"] == descriptor["ino"]
+                        && baseline["socket_family"] == descriptor["socket_family"]
+                        && baseline["socket_type"] == descriptor["socket_type"]
+                });
+            assert!(
+                inherited,
+                "protected client gained a socket absent from the direct baseline: {descriptor}"
+            );
+        }
         assert_eq!(
             descriptor["owner_lock"], false,
             "client inherited the settings owner lease"
