@@ -1827,6 +1827,33 @@ def descendant_processes(parent_pid: int) -> dict[int, tuple[int, str]]:
     return descendants
 
 
+def linux_process_diagnostics(
+    pids: list[int], identities: dict[int, str]
+) -> list[dict[str, object]]:
+    diagnostics: list[dict[str, object]] = []
+    for pid in pids:
+        try:
+            raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+            _, separator, suffix = raw.rpartition(") ")
+            fields = suffix.split()
+            if not separator or len(fields) <= 19:
+                raise RuntimeError("malformed stat")
+            executable = os.readlink(Path("/proc") / str(pid) / "exe")
+            diagnostics.append({
+                "pid": pid,
+                "basename": Path(executable).name,
+                "ppid": int(fields[1]),
+                "pgid": int(fields[2]),
+                "sid": int(fields[3]),
+                "state": fields[0],
+                "recorded_identity": identities.get(pid),
+                "current_identity": fields[19],
+            })
+        except (FileNotFoundError, ProcessLookupError):
+            diagnostics.append({"pid": pid, "state": "exited"})
+    return diagnostics
+
+
 def tool_response(sequence: int, source: str) -> bytes:
     response_id = f"resp_e2e_{sequence}"
     item_id = f"ct_e2e_{sequence}"
@@ -2622,6 +2649,7 @@ def run_codex_parent_kill(pentect: str) -> None:
     thread.start()
     process: subprocess.Popen[str] | None = None
     recorded_identities: dict[int, str] = {}
+    before_kill: list[dict[str, object]] = []
     try:
         with tempfile.TemporaryDirectory(
             prefix="pentect-codex-parent-kill-", ignore_cleanup_errors=True
@@ -2785,13 +2813,21 @@ for line in sys.stdin:
             if synthetic_input.read_bytes() != input_snapshot:
                 raise RuntimeError("Codex modified the synthetic lifecycle input")
 
+            before_kill = linux_process_diagnostics(
+                sorted(recorded_identities), recorded_identities
+            )
             process.kill()
             process.wait(timeout=10)
             surviving = wait_for_process_identities_exit(recorded_identities, 10)
             if surviving:
                 raise RuntimeError(
                     "installed Codex descendants survived wrapper exit: "
-                    + ", ".join(map(str, surviving))
+                    + json.dumps(
+                        linux_process_diagnostics(surviving, recorded_identities),
+                        separators=(",", ":"),
+                    )
+                    + "; before wrapper kill: "
+                    + json.dumps(before_kill, separators=(",", ":"))
                 )
             if config.read_bytes() != config_snapshot:
                 raise RuntimeError("Codex changed lifecycle config after wrapper exit")
