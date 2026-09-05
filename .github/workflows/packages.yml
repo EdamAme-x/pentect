@@ -18,6 +18,10 @@ on:
         description: Optional release-run correlation identifier
         required: false
         type: string
+      expected_sha:
+        description: Expected workflow commit for a correlated release publication
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -37,6 +41,11 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Verify expected publication commit
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          test -z "$EXPECTED_SHA" || test "$GITHUB_SHA" = "$EXPECTED_SHA" || { echo "package publication commit does not match dispatcher expectation" >&2; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false

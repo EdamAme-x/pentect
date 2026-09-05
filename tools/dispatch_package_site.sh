@@ -52,7 +52,8 @@ gh workflow run packages.yml \
   --repo "$repository" \
   --ref main \
   -f tag="$tag" \
-  -f correlation="$correlation"
+  -f correlation="$correlation" \
+  -f expected_sha="$main_sha"
 
 run_id=
 run_sha=

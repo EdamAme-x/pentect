@@ -61,7 +61,7 @@ run_helper() {
 output=$(run_helper)
 printf '%s\n' "$output" | grep -Fx \
   'APT site sync: https://github.example/example/project/actions/runs/41'
-grep -F -- 'workflow run packages.yml --repo example/project --ref main -f tag=v1.2.3 -f correlation=release-700-2' \
+grep -F -- 'workflow run packages.yml --repo example/project --ref main -f tag=v1.2.3 -f correlation=release-700-2 -f expected_sha=main-sha' \
   "$tmp/state/dispatch"
 test "$(cat "$tmp/state/polls")" -eq 2
 

@@ -87,6 +87,17 @@ grep -Fq 'run-name: Publish packages / sync-${{ inputs.correlation || github.run
 grep -Fq 'contents: read' "$workflow"
 grep -Fq 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' "$workflow"
 grep -Fq 'sh tools/prepare_stable_debs.sh debs "$TAG" 3' "$workflow"
+guard='test -z "$EXPECTED_SHA" || test "$GITHUB_SHA" = "$EXPECTED_SHA" || { echo "package publication commit does not match dispatcher expectation" >&2; exit 1; }'
+grep -Fq "$guard" "$workflow"
+guard_line=$(grep -nF 'name: Verify expected publication commit' "$workflow" | cut -d: -f1)
+checkout_line=$(grep -nF 'uses: actions/checkout@' "$workflow" | cut -d: -f1)
+test "$guard_line" -lt "$checkout_line"
+EXPECTED_SHA= GITHUB_SHA=new-sha sh -c "$guard"
+EXPECTED_SHA=new-sha GITHUB_SHA=new-sha sh -c "$guard"
+if EXPECTED_SHA=old-sha GITHUB_SHA=new-sha sh -c "$guard" >/dev/null 2>&1; then
+  echo "mismatched package publication commit unexpectedly passed" >&2
+  exit 1
+fi
 if grep -Eq 'release upload|--clobber|package_deb\.sh|ref: main' "$workflow"; then
   echo "packages workflow may not rebuild or overwrite stable assets" >&2
   exit 1
