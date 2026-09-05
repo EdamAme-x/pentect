@@ -308,7 +308,7 @@ pub(crate) fn run_helper(argv: &[String]) -> i32 {
             Ok(Ok(frame)) => frame,
             _ => return 2,
         };
-        let payload: LaunchPayload = match serde_json::from_slice(&frame) {
+        let payload = match serde_json::from_slice::<LaunchPayload>(&frame) {
             Ok(payload) if payload.version == PROTOCOL_VERSION => payload,
             _ => return 2,
         };
@@ -568,7 +568,7 @@ mod tests {
     use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
-    use windows_sys::Win32::System::Threading::{OpenProcess, SYNCHRONIZE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 
     fn payload(location: SettingsLocation, args: &[&str]) -> LaunchPayload {
         LaunchPayload {
@@ -680,7 +680,7 @@ mod tests {
             .spawn()
             .unwrap();
         job.assign_live(&child).unwrap();
-        let process = unsafe { OpenProcess(SYNCHRONIZE, 0, child.id()) };
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child.id()) };
         assert!(!process.is_null());
         let guard = StartupGuard {
             child: Some(child),
