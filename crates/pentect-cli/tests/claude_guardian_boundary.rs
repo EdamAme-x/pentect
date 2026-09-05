@@ -191,7 +191,14 @@ raise SystemExit(37)
         serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
     assert_eq!(value["settings_exists"], true);
     let generated = PathBuf::from(value["settings"].as_str().unwrap());
-    assert!(generated.starts_with(generated_root(&home, &runtime)));
+    let expected_root = std::fs::canonicalize(generated_root(&home, &runtime))
+        .expect("generated Claude settings root was not created");
+    assert!(
+        generated.starts_with(&expected_root),
+        "generated settings path {} is outside expected root {}",
+        generated.display(),
+        expected_root.display()
+    );
     assert!(!generated.exists());
     assert_eq!(std::fs::read(&input_settings).unwrap(), input_bytes);
     assert_eq!(value["untrusted"], "1");
