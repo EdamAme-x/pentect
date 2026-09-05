@@ -97,7 +97,7 @@ enum Arity {
     Many,
 }
 
-fn first_command<'a>(args: &'a [String], arity: fn(&str) -> Arity) -> Option<(usize, &'a str)> {
+fn first_command(args: &[String], arity: fn(&str) -> Arity) -> Option<(usize, &str)> {
     let mut index = 0;
     while index < args.len() {
         let argument = args[index].as_str();
