@@ -1401,7 +1401,9 @@ required = true
 
 [execution]
 timeout_ms = 1000
-startup_timeout_ms = 1000
+# Leave enough bounded startup time for Windows Python to publish the child
+# identities before this fixture intentionally withholds its first response.
+startup_timeout_ms = 3000
 max_output_bytes = 1024
 '''
     script_source = r'''import json
@@ -1419,8 +1421,9 @@ for line in sys.stdin:
         print("x" * 2048, flush=True)
     elif mode == "timeout":
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        with open("timeout-pids.json", "w", encoding="utf-8") as marker:
+        with open("timeout-pids.json.tmp", "w", encoding="utf-8") as marker:
             json.dump([os.getpid(), child.pid], marker)
+        os.replace("timeout-pids.json.tmp", "timeout-pids.json")
         time.sleep(30)
     elif mode == "exit":
         sys.exit(17)
@@ -1484,7 +1487,13 @@ for line in sys.stdin:
         set_mode(mode)
         expect_mask_failure(reason)
 
-    timeout_pids = json.loads((plugin / "timeout-pids.json").read_text(encoding="utf-8"))
+    timeout_marker = plugin / "timeout-pids.json"
+    if not timeout_marker.exists():
+        raise RuntimeError(
+            "timed-out command plugin did not publish its process identities "
+            "before the bounded startup deadline"
+        )
+    timeout_pids = json.loads(timeout_marker.read_text(encoding="utf-8"))
     for pid in timeout_pids:
         if not wait_for_process_exit(pid, timeout=2.0):
             raise RuntimeError(f"timed-out command plugin process {pid} was not terminated")
