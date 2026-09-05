@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::IsTerminal as _;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -13,44 +14,27 @@ const READY: u8 = 2;
 const ACK: u8 = 3;
 const STATUS: u8 = 4;
 const GO: u8 = 5;
+const RELAY_READY: u8 = 6;
+const INTERRUPT: u8 = 7;
+const STOPPED: u8 = 8;
+const CONTINUE: u8 = 9;
+const CANCEL: u8 = 10;
+const STATUS_ACK: u8 = 11;
+static RELAY_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 pub(crate) fn hidden_main(args: &[String]) -> Option<i32> {
     match args.get(1).map(String::as_str) {
         Some("__claude-unix-guardian") => Some(guardian_main(args)),
         Some("__claude-unix-bootstrap") => Some(bootstrap_main(args)),
-        #[cfg(debug_assertions)]
-        Some("__test-claude-unix-wrapper") => Some(test_wrapper(args)),
+        Some("__claude-unix-relay") => Some(relay_main(args)),
         _ => None,
-    }
-}
-
-#[cfg(debug_assertions)]
-fn test_wrapper(args: &[String]) -> i32 {
-    let Some(program) = args.get(2) else { return 2 };
-    let command = Command::new(program);
-    let prepared = crate::PreparedClaudeGateway {
-        encoded: br#"{"synthetic":"guardian-test"}"#.to_vec(),
-        args: args[3..].to_vec(),
-        settings_arg: crate::ClaudeSettingsArg::InsertFront,
-    };
-    match spawn_claude(&command, &prepared).and_then(|(child, owner)| wait(child, owner)) {
-        Ok(status) => {
-            use std::os::unix::process::ExitStatusExt as _;
-            status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
-        }
-        Err(error) => {
-            eprintln!("[pentect] {error}");
-            1
-        }
     }
 }
 
 pub(crate) fn spawn_claude(
     command: &Command,
     prepared: &crate::PreparedClaudeGateway,
-) -> Result<(Child, UnixStream), String> {
+) -> Result<Supervised, String> {
     let payload = encode_payload(command, prepared)?;
     let (mut owner, inherited) = UnixStream::pair()
         .map_err(|error| format!("could not create Claude guardian socket: {error}"))?;
@@ -94,44 +78,88 @@ pub(crate) fn spawn_claude(
     drop(inherited);
     let mut hello = [0];
     if let Err(error) = owner.read_exact(&mut hello) {
-        cleanup_startup_guardian(&mut child, owner);
+        cleanup_startup_guardian(&mut child, &owner);
         return Err(format!("Claude guardian did not start: {error}"));
     }
     if hello[0] != HELLO {
-        cleanup_startup_guardian(&mut child, owner);
+        cleanup_startup_guardian(&mut child, &owner);
         return Err("Claude guardian returned an invalid hello".to_string());
     }
     if let Err(error) = owner
         .write_all(&(payload.len() as u32).to_ne_bytes())
         .and_then(|_| owner.write_all(&payload))
     {
-        cleanup_startup_guardian(&mut child, owner);
+        cleanup_startup_guardian(&mut child, &owner);
         return Err(format!("could not configure Claude guardian: {error}"));
     }
-    let mut ready = [0];
+    let mut ready = [0; 5];
     if let Err(error) = owner.read_exact(&mut ready) {
-        cleanup_startup_guardian(&mut child, owner);
+        cleanup_startup_guardian(&mut child, &owner);
         return Err(format!("Claude guardian startup failed: {error}"));
     }
     if ready[0] != READY {
-        cleanup_startup_guardian(&mut child, owner);
+        cleanup_startup_guardian(&mut child, &owner);
         return Err("Claude guardian returned invalid readiness".to_string());
     }
+    let pgid = i32::from_ne_bytes(ready[1..].try_into().unwrap());
+    if pgid <= 0 {
+        cleanup_startup_guardian(&mut child, &owner);
+        return Err("Claude guardian returned invalid process group".to_string());
+    }
+    let foreground = match Foreground::give_to(pgid) {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_startup_guardian(&mut child, &owner);
+            return Err(error);
+        }
+    };
     if let Err(error) = owner.write_all(&[ACK]) {
-        cleanup_startup_guardian(&mut child, owner);
+        cleanup_startup_guardian(&mut child, &owner);
         return Err(format!("could not release Claude bootstrap: {error}"));
     }
-    owner
+    if let Err(error) = owner
         .set_read_timeout(None)
-        .map_err(|error| error.to_string())?;
-    owner
-        .set_write_timeout(None)
-        .map_err(|error| error.to_string())?;
-    Ok((child, owner))
+        .and_then(|_| owner.set_write_timeout(None))
+    {
+        cleanup_startup_guardian(&mut child, &owner);
+        return Err(error.to_string());
+    }
+    Ok(Supervised {
+        guardian: child,
+        owner,
+        pgid,
+        foreground,
+    })
 }
 
-fn cleanup_startup_guardian(child: &mut Child, owner: UnixStream) {
-    drop(owner);
+pub(crate) struct Supervised {
+    guardian: Child,
+    owner: UnixStream,
+    pgid: i32,
+    foreground: Option<Foreground>,
+}
+
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        drop(self.foreground.take());
+        let _ = self.owner.shutdown(std::net::Shutdown::Both);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.guardian.try_wait() {
+                Ok(Some(_)) => break,
+                _ if std::time::Instant::now() >= deadline => {
+                    let _ = self.guardian.kill();
+                    let _ = self.guardian.wait();
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+fn cleanup_startup_guardian(child: &mut Child, owner: &UnixStream) {
+    let _ = owner.shutdown(std::net::Shutdown::Both);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match child.try_wait() {
@@ -144,20 +172,77 @@ fn cleanup_startup_guardian(child: &mut Child, owner: UnixStream) {
     let _ = child.wait();
 }
 
-pub(crate) fn wait(mut guardian: Child, mut owner: UnixStream) -> Result<ExitStatus, String> {
+pub(crate) fn wait(mut managed: Supervised) -> Result<ExitStatus, String> {
+    managed
+        .owner
+        .set_nonblocking(true)
+        .map_err(|e| e.to_string())?;
     let mut message = [0_u8; 5];
-    if let Err(error) = owner.read_exact(&mut message) {
-        cleanup_startup_guardian(&mut guardian, owner);
-        return Err(format!("Claude guardian exited without status: {error}"));
+    let mut received = 0;
+    let mut interrupts = 0;
+    loop {
+        if managed.foreground.is_none()
+            && std::io::stdin().is_terminal()
+            && unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp() }
+        {
+            managed.foreground = Foreground::give_to(managed.pgid)?;
+            managed
+                .owner
+                .write_all(&[CONTINUE])
+                .map_err(|e| e.to_string())?;
+        }
+        let count = crate::NATIVE_COMMAND_INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst);
+        if count != interrupts {
+            interrupts = count;
+            managed
+                .owner
+                .write_all(&[CANCEL])
+                .map_err(|e| e.to_string())?;
+        }
+        match managed.owner.read(&mut message[received..]) {
+            Ok(0) => {
+                drop(managed.foreground.take());
+                cleanup_startup_guardian(&mut managed.guardian, &managed.owner);
+                return Err("Claude guardian exited without status".to_string());
+            }
+            Ok(n) => {
+                received += n;
+                if received == 5 {
+                    match message[0] {
+                        STATUS => {
+                            drop(managed.foreground.take());
+                            managed
+                                .owner
+                                .write_all(&[STATUS_ACK])
+                                .map_err(|e| e.to_string())?;
+                            let _ = managed.guardian.wait();
+                            use std::os::unix::process::ExitStatusExt as _;
+                            return Ok(ExitStatus::from_raw(i32::from_ne_bytes(
+                                message[1..].try_into().unwrap(),
+                            )));
+                        }
+                        STOPPED => {
+                            drop(managed.foreground.take());
+                            unsafe {
+                                libc::kill(libc::getpid(), libc::SIGSTOP);
+                            }
+                            managed.foreground = Foreground::give_to(managed.pgid)?;
+                            managed
+                                .owner
+                                .write_all(&[CONTINUE])
+                                .map_err(|e| e.to_string())?;
+                        }
+                        _ => return Err("Claude guardian returned invalid event".to_string()),
+                    }
+                    received = 0;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let _ = guardian.wait();
-    if message[0] != STATUS {
-        return Err("Claude guardian returned invalid status".to_string());
-    }
-    use std::os::unix::process::ExitStatusExt as _;
-    Ok(ExitStatus::from_raw(i32::from_ne_bytes(
-        message[1..].try_into().unwrap(),
-    )))
 }
 
 fn encode_payload(
@@ -263,7 +348,7 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
             return Err(error.to_string());
         }
     };
-    let mut client = Command::new(executable);
+    let mut client = Command::new(&executable);
     client
         .arg("__claude-unix-bootstrap")
         .arg(barrier_fd.to_string())
@@ -291,48 +376,185 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
         }
     };
     drop(barrier_reader);
-    if let Err(error) = owner.write_all(&[READY]) {
-        terminate_anchored(&mut client)?;
+    let (mut relay_events, relay_inherited) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            terminate_anchored(&mut client)?;
+            session.abort();
+            return Err(error.to_string());
+        }
+    };
+    let relay_fd = relay_inherited.as_raw_fd();
+    let group = client.id() as i32;
+    let mut relay_command = Command::new(&executable);
+    relay_command
+        .arg("__claude-unix-relay")
+        .arg(relay_fd.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    unsafe {
+        relay_command.pre_exec(move || {
+            if libc::setpgid(0, group) == -1 || libc::fcntl(relay_fd, libc::F_SETFD, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut relay = match relay_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            terminate_anchored(&mut client)?;
+            session.abort();
+            return Err(error.to_string());
+        }
+    };
+    drop(relay_inherited);
+    if let Err(error) = relay_events.set_read_timeout(Some(std::time::Duration::from_secs(5))) {
+        terminate_managed(&mut client, &mut relay)?;
         session.abort();
         return Err(error.to_string());
     }
-    match rx.recv().unwrap_or(None) {
+    let mut relay_ready = [0];
+    if relay_events.read_exact(&mut relay_ready).is_err() || relay_ready[0] != RELAY_READY {
+        terminate_managed(&mut client, &mut relay)?;
+        session.abort();
+        return Err("Claude signal relay did not start".to_string());
+    }
+    if let Err(error) = relay_events.set_nonblocking(true) {
+        terminate_managed(&mut client, &mut relay)?;
+        session.abort();
+        return Err(error.to_string());
+    }
+    let mut ready = [READY, 0, 0, 0, 0];
+    ready[1..].copy_from_slice(&(client.id() as i32).to_ne_bytes());
+    if let Err(error) = owner.write_all(&ready) {
+        terminate_managed(&mut client, &mut relay)?;
+        session.abort();
+        return Err(error.to_string());
+    }
+    match rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or(None)
+    {
         Some(ACK) => {
             if let Err(error) = (&barrier_writer).write_all(&[GO]) {
-                terminate_anchored(&mut client)?;
+                terminate_managed(&mut client, &mut relay)?;
                 session.abort();
                 return Err(error.to_string());
             }
         }
         _ => {
-            terminate_anchored(&mut client)?;
+            terminate_managed(&mut client, &mut relay)?;
             session.abort();
             return Err("Claude owner exited during startup".to_string());
         }
     }
+    let mut first_interrupt = None;
+    let mut shutdown = None;
+    let mut forced = false;
     loop {
-        if matches!(
-            rx.try_recv(),
-            Ok(None) | Err(mpsc::TryRecvError::Disconnected)
-        ) {
-            terminate_anchored(&mut client)?;
-            session.release();
-            return Ok(1);
+        match rx.try_recv() {
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                terminate_managed(&mut client, &mut relay)?;
+                session.release();
+                return Ok(1);
+            }
+            Ok(Some(CANCEL)) => {
+                if shutdown.is_none() {
+                    unsafe {
+                        libc::kill(-(client.id() as i32), libc::SIGINT);
+                    }
+                    shutdown = Some(std::time::Instant::now());
+                }
+            }
+            Ok(Some(CONTINUE)) => unsafe {
+                libc::kill(-(client.id() as i32), libc::SIGCONT);
+            },
+            _ => {}
         }
-        let exited = match exited_without_reaping(client.id()) {
-            Ok(exited) => exited,
+        let mut signal = [0];
+        match relay_events.read(&mut signal) {
+            Ok(1) if signal[0] == INTERRUPT => {
+                let now = std::time::Instant::now();
+                if first_interrupt.is_some_and(|at: std::time::Instant| {
+                    now.duration_since(at) <= std::time::Duration::from_secs(2)
+                }) {
+                    shutdown.get_or_insert(now);
+                } else {
+                    first_interrupt = Some(now);
+                }
+            }
+            Ok(0) => {
+                unsafe {
+                    libc::kill(-(client.id() as i32), libc::SIGKILL);
+                }
+                forced = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) | Ok(_) => {
+                unsafe {
+                    libc::kill(-(client.id() as i32), libc::SIGKILL);
+                }
+                forced = true;
+            }
+        }
+        if first_interrupt.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(2)) {
+            first_interrupt = None;
+        }
+        if !forced && shutdown.is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(2)) {
+            unsafe {
+                libc::kill(-(client.id() as i32), libc::SIGKILL);
+            }
+            forced = true;
+        }
+        let stopped = match stopped_without_reaping(client.id()) {
+            Ok(stopped) => stopped,
             Err(error) => {
-                terminate_anchored(&mut client)?;
+                terminate_managed(&mut client, &mut relay)?;
                 session.release();
                 return Err(error);
             }
         };
-        if exited {
-            let status = terminate_anchored(&mut client)?;
-            let raw = raw_status(status);
+        if stopped {
+            let event = [STOPPED, 0, 0, 0, 0];
+            if let Err(error) = owner.write_all(&event) {
+                terminate_managed(&mut client, &mut relay)?;
+                session.release();
+                return Err(error.to_string());
+            }
+        }
+        let exited = match raw_status_without_reaping(client.id()) {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_managed(&mut client, &mut relay)?;
+                session.release();
+                return Err(error);
+            }
+        };
+        if let Some(raw) = exited {
+            unsafe {
+                libc::kill(-(client.id() as i32), libc::SIGKILL);
+            }
             let mut message = [STATUS, 0, 0, 0, 0];
             message[1..].copy_from_slice(&raw.to_ne_bytes());
-            let _ = owner.write_all(&message);
+            if let Err(error) = owner.write_all(&message) {
+                terminate_managed(&mut client, &mut relay)?;
+                session.release();
+                return Err(error.to_string());
+            }
+            // Keep the direct Claude child unreaped as the PGID anchor until
+            // the live wrapper confirms it restored terminal ownership. Owner
+            // EOF remains the fail-safe when the wrapper dies while paused.
+            if rx.recv().unwrap_or(None) != Some(STATUS_ACK) {
+                terminate_managed(&mut client, &mut relay)?;
+                session.release();
+                return Ok(1);
+            }
+            client.wait().map_err(|error| error.to_string())?;
+            relay.wait().map_err(|error| error.to_string())?;
             session.release();
             return Ok(0);
         }
@@ -444,7 +666,7 @@ fn parse_socket(args: &[String]) -> Result<i32, String> {
         .map_err(|_| "invalid Claude guardian socket")?;
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     if fd < 3
-        || unsafe { libc::getpid() == libc::getpgrp() } == false
+        || unsafe { libc::getpid() != libc::getpgrp() }
         || unsafe { libc::fstat(fd, &mut stat) } != 0
         || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
     {
@@ -491,7 +713,62 @@ fn bootstrap_main(args: &[String]) -> i32 {
     })
 }
 
-fn exited_without_reaping(pid: u32) -> Result<bool, String> {
+extern "C" fn relay_interrupt(_: i32) {
+    let fd = RELAY_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = INTERRUPT;
+        unsafe {
+            libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
+
+fn relay_main(args: &[String]) -> i32 {
+    let result = (|| -> Result<(), String> {
+        let fd = args
+            .get(2)
+            .ok_or("missing relay socket")?
+            .parse::<i32>()
+            .map_err(|_| "invalid relay socket")?;
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if fd < 3
+            || unsafe { libc::fstat(fd, &mut stat) } != 0
+            || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+            || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+        {
+            return Err("invalid relay socket".to_string());
+        }
+        RELAY_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = relay_interrupt as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+        }
+        if unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) } == -1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let ready = RELAY_READY;
+        if unsafe { libc::write(fd, &ready as *const u8 as *const libc::c_void, 1) } != 1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    })();
+    result.map(|_| 0).unwrap_or_else(|error| {
+        eprintln!("[pentect] {error}");
+        1
+    })
+}
+
+fn raw_status_without_reaping(pid: u32) -> Result<Option<i32>, String> {
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     let result = unsafe {
         libc::waitid(
@@ -503,6 +780,31 @@ fn exited_without_reaping(pid: u32) -> Result<bool, String> {
     };
     if result == -1 {
         Err(std::io::Error::last_os_error().to_string())
+    } else {
+        if unsafe { info.si_pid() } != pid as i32 {
+            return Ok(None);
+        }
+        let code = info.si_code;
+        let status = unsafe { info.si_status() };
+        Ok(Some(if code == libc::CLD_EXITED {
+            status << 8
+        } else {
+            status
+        }))
+    }
+}
+
+fn stopped_without_reaping(pid: u32) -> Result<bool, String> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result =
+        unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WSTOPPED | libc::WNOHANG) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            Ok(false)
+        } else {
+            Err(error.to_string())
+        }
     } else {
         Ok(unsafe { info.si_pid() } == pid as i32)
     }
@@ -517,9 +819,60 @@ fn terminate_anchored(child: &mut Child) -> Result<ExitStatus, String> {
         .map_err(|error| format!("could not reap Claude: {error}"))
 }
 
-fn raw_status(status: ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt as _;
-    status.into_raw()
+fn terminate_managed(client: &mut Child, relay: &mut Child) -> Result<ExitStatus, String> {
+    let status = terminate_anchored(client)?;
+    relay
+        .wait()
+        .map_err(|error| format!("could not reap Claude signal relay: {error}"))?;
+    Ok(status)
+}
+
+struct Foreground {
+    terminal: i32,
+    original: i32,
+}
+
+impl Foreground {
+    fn give_to(group: i32) -> Result<Option<Self>, String> {
+        if !std::io::stdin().is_terminal() {
+            return Ok(None);
+        }
+        let terminal = libc::STDIN_FILENO;
+        let original = unsafe { libc::tcgetpgrp(terminal) };
+        if original == -1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if original != unsafe { libc::getpgrp() } {
+            return Ok(None);
+        }
+        set_foreground(terminal, group)?;
+        Ok(Some(Self { terminal, original }))
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        let _ = set_foreground(self.terminal, self.original);
+    }
+}
+
+fn set_foreground(terminal: i32, group: i32) -> Result<(), String> {
+    let mut block = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let mut old = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+    }
+    let result = unsafe { libc::tcsetpgrp(terminal, group) };
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+    }
+    if result == -1 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

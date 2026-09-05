@@ -1835,36 +1835,36 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
         return claude_windows_supervisor::launch(&cmd, gateway_settings, &opts.command);
     }
     #[cfg(unix)]
-    {
-        if !std::io::stdin().is_terminal() {
-            return run_noninteractive_claude_with_guards(
-                cmd,
-                &opts.command,
-                gateway_settings,
-                http_proxy,
-            );
-        }
-        let gateway_settings = gateway_settings.materialize()?;
-        cmd.args(gateway_settings.args());
-        run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
-    }
+    return run_supervised_claude_with_guards(cmd, &opts.command, gateway_settings, http_proxy);
+    #[cfg(not(any(unix, windows)))]
+    let gateway_settings = gateway_settings.materialize()?;
+    #[cfg(not(any(unix, windows)))]
+    cmd.args(gateway_settings.args());
+    #[cfg(not(any(unix, windows)))]
+    run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
 }
 
 #[cfg(unix)]
-fn run_noninteractive_claude_with_guards<G>(
+fn run_supervised_claude_with_guards<G>(
     mut command: Command,
     display: &Path,
     prepared: PreparedClaudeGateway,
     _guards: G,
 ) -> Result<std::process::ExitStatus, String> {
+    install_native_interrupt_handler()?;
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let (guardian, owner) = claude_unix_supervisor::spawn_claude(&command, &prepared)
-        .map_err(|error| format!("could not run '{}': {error}", display.display()))?;
-    claude_unix_supervisor::wait(guardian, owner)
-        .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
+    let result = claude_unix_supervisor::spawn_claude(&command, &prepared)
+        .map_err(|error| format!("could not run '{}': {error}", display.display()))
+        .and_then(|managed| {
+            claude_unix_supervisor::wait(managed)
+                .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
+        });
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    result
 }
 
 fn run_endpoint_env(
@@ -2135,7 +2135,7 @@ pub(crate) struct PreparedClaudeGateway {
 }
 
 impl PreparedClaudeGateway {
-    #[cfg(any(not(windows), test))]
+    #[cfg(any(not(any(unix, windows)), test))]
     fn args_with_settings_path(&self, settings_path: &str) -> Result<Vec<String>, String> {
         let mut args = self.args.clone();
         match self.settings_arg {
@@ -2165,7 +2165,7 @@ impl PreparedClaudeGateway {
         Ok(args)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(unix, windows)))]
     fn materialize(self) -> Result<ClaudeGatewaySettings, String> {
         let directory = secure_temp::SecureTempDirectory::create(
             "pentect-claude-settings-",
@@ -2188,14 +2188,14 @@ impl PreparedClaudeGateway {
 }
 
 #[derive(Debug)]
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 struct ClaudeGatewaySettings {
     args: Vec<String>,
     _file: secure_temp::SecureTempFile,
     _directory: secure_temp::SecureTempDirectory,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 impl ClaudeGatewaySettings {
     fn args(&self) -> &[String] {
         &self.args

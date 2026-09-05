@@ -33,18 +33,14 @@ fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
     let script = root.join("client.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\nsettings=\nnext=0\nfor arg in \"$@\"; do [ \"$arg\" = slow37 ] && { sleep 6; exit 37; }; if [ \"$next\" = 1 ]; then settings=$arg; next=0; elif [ \"$arg\" = --settings ]; then next=1; fi; done\nprintf '%s\\n%s\\n' \"$$\" \"$settings\" > \"$READY\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\nsettings=\nnext=0\nfor arg in \"$@\"; do [ \"$arg\" = slow37 ] && { sleep 6; exit 37; }; [ \"$arg\" = catchint ] && trap '' INT; if [ \"$next\" = 1 ]; then settings=$arg; next=0; elif [ \"$arg\" = --settings ]; then next=1; fi; done\nprintf '%s\\n%s\\n' \"$$\" \"$settings\" > \"$READY\"\nwhile :; do sleep 1; done\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pentect = env!("CARGO_BIN_EXE_pentect");
 
     let status = Command::new(pentect)
-        .args([
-            "__test-claude-unix-wrapper",
-            script.to_str().unwrap(),
-            "slow37",
-        ])
+        .args(["claude", "--claude", script.to_str().unwrap(), "slow37"])
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_CACHE_HOME", &cache)
         .env("XDG_STATE_HOME", &state)
@@ -58,11 +54,7 @@ fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
     assert_eq!(status.code(), Some(37));
 
     let mut wrapper = Command::new(pentect)
-        .args([
-            "__test-claude-unix-wrapper",
-            script.to_str().unwrap(),
-            "block",
-        ])
+        .args(["claude", "--claude", script.to_str().unwrap(), "block"])
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_CACHE_HOME", &cache)
         .env("XDG_STATE_HOME", &state)
@@ -92,6 +84,37 @@ fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
     }
     assert_ne!(unsafe { libc::kill(client, 0) }, 0);
     assert!(!settings.exists());
+
+    std::fs::remove_file(&ready).unwrap();
+    let mut interrupted = Command::new(pentect)
+        .args(["claude", "--claude", script.to_str().unwrap(), "catchint"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("READY", &ready)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let interrupted_settings = std::path::PathBuf::from(
+        std::fs::read_to_string(&ready)
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap(),
+    );
+    unsafe {
+        libc::kill(interrupted.id() as i32, libc::SIGINT);
+    }
+    let status = interrupted.wait().unwrap();
+    assert_eq!(status.code(), Some(137));
+    assert!(!interrupted_settings.exists());
 
     std::fs::remove_file(ready).unwrap();
     std::fs::remove_file(script).unwrap();

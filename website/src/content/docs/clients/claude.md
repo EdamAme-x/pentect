@@ -41,6 +41,13 @@ remote session passes through Pentect's local gateway.
 | `pentect claude app` | One supported Claude Desktop launch |
 | `pentect claude --plugins NAME` | One launch with the selected plugin set |
 
+On Unix, if the shell-facing Pentect process is forcibly killed, its guardian
+stops the Claude process group before releasing generated settings. This covers
+ordinary descendants that remain in that group. It does not promise cleanup
+for deliberately detached processes. If the guardian itself is also forcibly
+killed, Pentect preserves the unreleased private settings session rather than
+risking deletion while its Claude process might still be active.
+
 ## Use a clickable App launcher
 
 For regular use, create a separate protected launcher:
