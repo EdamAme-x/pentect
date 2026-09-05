@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 struct Fixture {
     root: std::path::PathBuf,
     wrapper: Option<Child>,
-    group: Option<i32>,
 }
 
 impl Fixture {
@@ -24,7 +23,6 @@ impl Fixture {
         Self {
             root,
             wrapper: None,
-            group: None,
         }
     }
 
@@ -41,15 +39,6 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop_wrapper();
-        if let Some(group) = self.group {
-            // The managed client is the group leader. Only clean this exact
-            // fixture group while that leader identity still exists.
-            if unsafe { libc::getpgid(group) } == group {
-                unsafe {
-                    libc::kill(-group, libc::SIGKILL);
-                }
-            }
-        }
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -115,7 +104,7 @@ fn typed_native_clients_terminate_their_ordinary_process_groups() {
         std::fs::write(
             &script,
             r##"#!/bin/sh
-(while :; do sleep 1; done) &
+(sleep 15) &
 child=$!
 settings=no
 for arg in "$@"; do case "$arg" in --settings|--settings=*) settings=yes;; esac; done
@@ -149,7 +138,6 @@ wait "$child"
             .stderr(Stdio::piped());
         fixture.wrapper = Some(command.spawn().unwrap());
         let (client_pid, child_pid, state) = wait_ready(&ready);
-        fixture.group = Some(client_pid);
         assert_eq!(state, format!("{}:unset:no", project.display()));
 
         fixture.stop_wrapper();
@@ -161,6 +149,5 @@ wait "$child"
             wait_dead(child_pid),
             "{client} descendant survived wrapper kill"
         );
-        fixture.group = None;
     }
 }
