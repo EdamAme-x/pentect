@@ -79,6 +79,7 @@ def main() -> None:
         "crates/pentect-cli/src/claude_settings_session.rs",
         "crates/pentect-cli/src/claude_unix_supervisor.rs",
         "crates/pentect-cli/src/claude_windows_supervisor.rs",
+        "crates/pentect-cli/tests/native_interrupt.rs",
         "crates/pentect-cli/tests/*claude*.rs",
     ):
         assert f"- '{boundary}'" in supervisor_filter.group("body"), (

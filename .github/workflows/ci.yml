@@ -189,6 +189,7 @@ jobs:
               - 'crates/pentect-cli/src/claude_settings_session.rs'
               - 'crates/pentect-cli/src/claude_unix_supervisor.rs'
               - 'crates/pentect-cli/src/claude_windows_supervisor.rs'
+              - 'crates/pentect-cli/tests/native_interrupt.rs'
               - 'crates/pentect-cli/tests/*claude*.rs'
             runtime_log:
               - 'crates/pentect-runtime/src/activity_log.rs'
