@@ -2087,13 +2087,25 @@ pub(crate) struct PreparedClaudeGateway {
 }
 
 impl PreparedClaudeGateway {
-    fn args_with_settings_path(&self, settings_path: &str) -> Vec<String> {
+    fn args_with_settings_path(&self, settings_path: &str) -> Result<Vec<String>, String> {
         let mut args = self.args.clone();
         match self.settings_arg {
             ClaudeSettingsArg::Inline { index } => {
+                if !args
+                    .get(index)
+                    .is_some_and(|arg| arg.starts_with("--settings="))
+                {
+                    return Err("prepared Claude inline settings argument is invalid".to_string());
+                }
                 args[index] = format!("--settings={settings_path}");
             }
             ClaudeSettingsArg::Separate { value_index } => {
+                if value_index == 0
+                    || args.get(value_index - 1).map(String::as_str) != Some("--settings")
+                    || args.get(value_index).is_none()
+                {
+                    return Err("prepared Claude settings argument is invalid".to_string());
+                }
                 args[value_index] = settings_path.to_string();
             }
             ClaudeSettingsArg::InsertFront => {
@@ -2101,7 +2113,7 @@ impl PreparedClaudeGateway {
                 args.insert(0, "--settings".to_string());
             }
         }
-        args
+        Ok(args)
     }
 
     fn materialize(self) -> Result<ClaudeGatewaySettings, String> {
@@ -2118,7 +2130,7 @@ impl PreparedClaudeGateway {
         )?;
         let path = file.path().to_string_lossy().into_owned();
         Ok(ClaudeGatewaySettings {
-            args: self.args_with_settings_path(&path),
+            args: self.args_with_settings_path(&path)?,
             _file: file,
             _directory: directory,
         })
