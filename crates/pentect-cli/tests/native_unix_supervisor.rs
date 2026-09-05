@@ -40,11 +40,21 @@ impl Fixture {
     }
 
     fn wait_wrapper(&mut self) -> std::process::ExitStatus {
-        self.wrapper
-            .take()
-            .expect("wrapper was not started")
-            .wait()
-            .unwrap()
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = self
+                .wrapper
+                .as_mut()
+                .expect("wrapper was not started")
+                .try_wait()
+                .unwrap();
+            if let Some(status) = status {
+                self.wrapper.take();
+                return status;
+            }
+            assert!(Instant::now() < deadline, "wrapper did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -97,7 +107,10 @@ if middle == 0:
         marker.write(f"{os.getppid()}\n{os.getpid()}\n{leaf}\nready")
     os.replace(temporary, os.environ["READY"])
     time.sleep(15)
-while not os.path.exists(os.environ["READY"]):
+deadline = time.monotonic() + 15
+while not os.path.exists(os.environ["GO"]):
+    if time.monotonic() >= deadline:
+        raise SystemExit(2)
     time.sleep(0.01)
 raise SystemExit(37)
 "##,
@@ -117,6 +130,7 @@ raise SystemExit(37)
             .env("XDG_CONFIG_HOME", config)
             .env("PENTECT_LOG_DIR", fixture.root.join("log"))
             .env("READY", &ready)
+            .env("GO", fixture.root.join("go"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -129,6 +143,7 @@ raise SystemExit(37)
         fixture.track(middle),
         fixture.track(leaf),
     ];
+    std::fs::write(fixture.root.join("go"), b"go").unwrap();
     assert_eq!(fixture.wait_wrapper().code(), Some(37));
     for identity in identities {
         assert!(wait_pidfd_dead(&fixture.observed[identity]));
