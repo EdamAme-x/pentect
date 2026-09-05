@@ -418,9 +418,6 @@ fn native_command(payload: &NativeLaunchPayload) -> Result<Command, String> {
 fn native_helper_command(client: &Command, executable: &Path, pipe_name: &str) -> Command {
     let mut helper = Command::new(executable);
     helper.arg("__native-windows-supervisor").arg(pipe_name);
-    if let Some(cwd) = client.get_current_dir() {
-        helper.current_dir(cwd);
-    }
     for (name, value) in client.get_envs() {
         match value {
             Some(value) => helper.env(name, value),
@@ -436,6 +433,19 @@ fn native_helper_command(client: &Command, executable: &Path, pipe_name: &str) -
 
 fn native_exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+fn native_payload(client: &Command) -> Result<NativeLaunchPayload, String> {
+    let payload = NativeLaunchPayload {
+        version: PROTOCOL_VERSION,
+        wrapper_pid: std::process::id(),
+        program: wide(client.get_program()),
+        cwd: client.get_current_dir().map(|path| wide(path.as_os_str())),
+        args: client.get_args().map(wide).collect(),
+    };
+    // Validate before a contained helper receives anything that could launch.
+    native_command(&payload)?;
+    Ok(payload)
 }
 
 fn run_native_helper(argv: &[String]) -> i32 {
@@ -715,15 +725,7 @@ pub(crate) fn launch_native(client: &Command, display: &Path) -> Result<ExitStat
         .as_ref()
         .expect("job retained")
         .assign_live_check(child)?;
-    let payload = NativeLaunchPayload {
-        version: PROTOCOL_VERSION,
-        wrapper_pid: std::process::id(),
-        program: wide(client.get_program()),
-        cwd: client.get_current_dir().map(|path| wide(path.as_os_str())),
-        args: client.get_args().map(wide).collect(),
-    };
-    // Validate before sending anything that could cause a client launch.
-    native_command(&payload)?;
+    let payload = native_payload(client)?;
     let encoded = serde_json::to_vec(&payload)
         .map_err(|_| "could not encode native supervisor payload".to_string())?;
     runtime
@@ -915,11 +917,11 @@ mod tests {
     }
 
     #[test]
-    fn native_helper_receives_only_control_args_and_command_environment_deltas() {
+    fn native_transport_applies_relative_cwd_once_and_keeps_client_args_off_helper_argv() {
         let mut client = Command::new("client.exe");
         client
             .args(["ordinary", "--literal=secret-looking"])
-            .current_dir(r"C:\fixture")
+            .current_dir("relative-project")
             .env("PENTECT_NATIVE_SET", "fixture-value")
             .env_remove("PENTECT_NATIVE_REMOVE");
         let helper =
@@ -932,7 +934,22 @@ mod tests {
                 OsStr::new(r"\\.\pipe\fixture")
             ]
         );
-        assert_eq!(helper.get_current_dir(), Some(Path::new(r"C:\fixture")));
+        // Relative client working directories are resolved exactly once by the
+        // eventual client, never first by the blocked helper.
+        assert_eq!(helper.get_current_dir(), None);
+        let payload = native_payload(&client).unwrap();
+        assert_eq!(
+            from_wide(payload.cwd.as_deref().unwrap()),
+            "relative-project"
+        );
+        assert_eq!(
+            payload
+                .args
+                .iter()
+                .map(|arg| from_wide(arg))
+                .collect::<Vec<_>>(),
+            ["ordinary", "--literal=secret-looking"]
+        );
         let env = helper
             .get_envs()
             .collect::<std::collections::BTreeMap<_, _>>();
