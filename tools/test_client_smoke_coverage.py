@@ -60,6 +60,7 @@ def main() -> None:
             f"current-client workflow does not watch launch boundary {boundary}"
         )
     assert "--claude-parent-kill" in workflow
+    assert "--test claude_guardian_loss" in workflow
 
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}" in ci

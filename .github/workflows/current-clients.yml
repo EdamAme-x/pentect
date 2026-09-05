@@ -172,6 +172,7 @@ jobs:
           --test native_interrupt
           --test claude_unix_supervisor
           --test claude_guardian_boundary
+          --test claude_guardian_loss
       - name: Install current portable clients
         run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
