@@ -61,6 +61,36 @@ def main() -> None:
         )
     assert "--claude-parent-kill" in workflow
 
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}" in ci
+    supervisor_filter = re.search(
+        r"^            claude_supervisor:\n(?P<body>(?:              - .+\n)+)",
+        ci,
+        re.MULTILINE,
+    )
+    assert supervisor_filter is not None
+    for boundary in (
+        ".github/workflows/ci.yml",
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/pentect-cli/Cargo.toml",
+        "crates/pentect-cli/src/main.rs",
+        "crates/pentect-cli/src/claude_settings_session.rs",
+        "crates/pentect-cli/src/claude_windows_supervisor.rs",
+        "crates/pentect-cli/tests/*claude*.rs",
+    ):
+        assert f"- '{boundary}'" in supervisor_filter.group("body"), (
+            f"Windows Claude supervisor tests do not watch {boundary}"
+        )
+    supervisor_guard = "needs.changes.outputs.claude_supervisor == 'true'"
+    # Checkout, toolchain, linker, cache, and the test itself share the same
+    # positive change predicate. The no-op step carries the inverse predicate.
+    assert ci.count(supervisor_guard) == 5
+    assert (
+        "cargo test -p pentect-cli --no-default-features --bin pentect "
+        "claude_windows_supervisor::tests --locked"
+    ) in ci
+
 
 if __name__ == "__main__":
     main()
