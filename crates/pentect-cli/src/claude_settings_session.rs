@@ -32,6 +32,10 @@ impl Session {
             .map_err(|error| format!("could not resolve Pentect runtime directory: {error}"))?;
         let private = private_directory(&runtime.join("private"), "Pentect private runtime")?;
         let root = private_directory(&private.join(ROOT), "Claude settings recovery")?;
+        Self::create_in(&root, contents)
+    }
+
+    fn create_in(root: &Path, contents: &[u8]) -> Result<Self, String> {
         let root_lock = root_lock(&root.join(ROOT_LOCK))?;
         cleanup_released(&root);
 
@@ -90,6 +94,72 @@ impl Session {
     pub(crate) fn abort(mut self) {
         self.released = true;
         cleanup_session(&self.directory);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> PathBuf {
+        let mut nonce = [0_u8; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-claude-session-test-{}-{}",
+            std::process::id(),
+            data_encoding::HEXLOWER.encode(&nonce)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        root
+    }
+
+    fn finish(root: &Path) {
+        let _ = std::fs::remove_file(root.join(ROOT_LOCK));
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn unreleased_session_is_preserved_but_released_session_is_removed() {
+        let root = root();
+        let active = Session::create_in(&root, b"synthetic-active").unwrap();
+        let active_path = active.directory.clone();
+        drop(active);
+        let released = Session::create_in(&root, b"synthetic-released").unwrap();
+        let released_path = released.directory.clone();
+        released.release();
+        assert!(!released_path.exists());
+
+        let next = Session::create_in(&root, b"synthetic-next").unwrap();
+        assert!(active_path.join(SETTINGS).is_file());
+        next.release();
+        std::fs::remove_file(active_path.join(SETTINGS)).unwrap();
+        std::fs::remove_file(active_path.join(OWNER)).unwrap();
+        std::fs::remove_dir(active_path).unwrap();
+        finish(&root);
+    }
+
+    #[test]
+    fn cleanup_rejects_links_and_unexpected_files() {
+        let root = root();
+        let session = Session::create_in(&root, b"synthetic-safe").unwrap();
+        let path = session.directory.clone();
+        drop(session);
+        private_file(&path.join(RELEASED), b"", "test marker").unwrap();
+        std::fs::write(path.join("unexpected"), b"keep").unwrap();
+        cleanup_released(&root);
+        assert_eq!(
+            std::fs::read(path.join(SETTINGS)).unwrap(),
+            b"synthetic-safe"
+        );
+        std::fs::remove_file(path.join("unexpected")).unwrap();
+        std::fs::remove_file(path.join(RELEASED)).unwrap();
+        std::fs::remove_file(path.join(SETTINGS)).unwrap();
+        std::fs::remove_file(path.join(OWNER)).unwrap();
+        std::fs::remove_dir(path).unwrap();
+        finish(&root);
     }
 }
 
