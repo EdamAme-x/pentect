@@ -2039,49 +2039,25 @@ impl ClaudeCallerSettings {
             );
         }
 
+        let directory = secure_temp::SecureTempDirectory::create(
+            "pentect-claude-settings-",
+            "Claude settings",
+        )?;
         let encoded = serde_json::to_vec(&settings)
             .map_err(|error| format!("could not encode protected Claude settings: {error}"))?;
-        #[cfg(unix)]
-        let storage = {
-            // Unix ownership and mode checks make stale-session recovery safe.
-            let session = secure_temp::ClaudeSettingsSession::create(&encoded)?;
-            ClaudeGatewaySettingsStorage::Recovery(session)
-        };
-        #[cfg(unix)]
-        let path = match &storage {
-            ClaudeGatewaySettingsStorage::Recovery(session) => {
-                session.settings_path().to_string_lossy().into_owned()
-            }
-        };
-        #[cfg(windows)]
-        let (path, storage) = {
-            // Preserve the pre-recovery Windows behavior until owner-SID and
-            // ACL validation are available. Normal Drop cleans this random
-            // directory; forced termination can leave it behind.
-            let directory = secure_temp::SecureTempDirectory::create(
-                "pentect-claude-settings-",
-                "Claude settings",
-            )?;
-            let file = secure_temp::SecureTempFile::create(
-                directory.path(),
-                ".pentect-claude-settings-",
-                ".json",
-                &encoded,
-                "Claude settings",
-            )?;
-            let path = file.path().to_string_lossy().into_owned();
-            (
-                path,
-                ClaudeGatewaySettingsStorage::Ephemeral {
-                    _file: file,
-                    _directory: directory,
-                },
-            )
-        };
+        let file = secure_temp::SecureTempFile::create(
+            directory.path(),
+            ".pentect-claude-settings-",
+            ".json",
+            &encoded,
+            "Claude settings",
+        )?;
+        let path = file.path().to_string_lossy().into_owned();
         let out = self.gateway_args(args, &path);
         Ok(ClaudeGatewaySettings {
             args: out,
-            _storage: storage,
+            _file: file,
+            _directory: directory,
         })
     }
 
@@ -2104,18 +2080,8 @@ impl ClaudeCallerSettings {
 #[derive(Debug)]
 struct ClaudeGatewaySettings {
     args: Vec<String>,
-    _storage: ClaudeGatewaySettingsStorage,
-}
-
-#[derive(Debug)]
-enum ClaudeGatewaySettingsStorage {
-    #[cfg(unix)]
-    Recovery(secure_temp::ClaudeSettingsSession),
-    #[cfg(windows)]
-    Ephemeral {
-        _file: secure_temp::SecureTempFile,
-        _directory: secure_temp::SecureTempDirectory,
-    },
+    _file: secure_temp::SecureTempFile,
+    _directory: secure_temp::SecureTempDirectory,
 }
 
 impl ClaudeGatewaySettings {
@@ -3685,22 +3651,6 @@ mod tests {
         std::env::temp_dir().join(format!("pentect-{name}-{}-{nonce}", std::process::id()))
     }
 
-    fn isolated_process_host_environment(
-        name: &str,
-    ) -> (std::sync::MutexGuard<'static, ()>, EnvVarGuard, PathBuf) {
-        let lock = TEST_PROCESS_ENV_LOCK.lock().unwrap();
-        let root = command_test_directory(name);
-        std::fs::create_dir_all(&root).unwrap();
-        let environment = EnvVarGuard::set_optional([
-            ("HOME", Some(root.clone().into_os_string())),
-            ("XDG_RUNTIME_DIR", Some(root.clone().into_os_string())),
-            ("XDG_CACHE_HOME", Some(root.clone().into_os_string())),
-            ("LOCALAPPDATA", Some(root.clone().into_os_string())),
-            ("USERPROFILE", Some(root.clone().into_os_string())),
-        ]);
-        (lock, environment, root)
-    }
-
     #[test]
     fn windows_npm_cmd_shim_is_found_via_pathext() {
         let directory = command_test_directory("npm-shim-resolution");
@@ -4651,11 +4601,8 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn claude_gateway_settings_use_and_remove_a_private_recovery_directory() {
-        let (_lock, _environment, isolated_root) =
-            isolated_process_host_environment("claude-recovery-runtime");
+    fn claude_gateway_settings_use_and_remove_a_private_temp_directory() {
         let settings = ClaudeCallerSettings {
             value: serde_json::json!({}),
             effective_env: serde_json::Map::new(),
@@ -4668,13 +4615,11 @@ mod tests {
         let path = PathBuf::from(&gateway.args()[1]);
         let directory = path.parent().unwrap().to_path_buf();
         assert!(path.is_file());
-        let runtime = std::fs::canonicalize(pentect_agent::process_host_root().unwrap()).unwrap();
-        assert!(directory.starts_with(runtime.join("private/claude-settings-v1")));
+        assert!(directory.starts_with(std::env::temp_dir()));
 
         drop(gateway);
         assert!(!path.exists());
         assert!(!directory.exists());
-        std::fs::remove_dir_all(isolated_root).unwrap();
     }
 
     #[test]
@@ -4730,37 +4675,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn claude_spawn_failure_drops_generated_settings_without_logging_contents() {
-        let (_lock, _environment, isolated_root) =
-            isolated_process_host_environment("claude-spawn-failure-runtime");
-        let confidential = "synthetic-confidential-claude-setting";
-        let args = vec![format!(
-            r#"--settings={{"env":{{"ANTHROPIC_API_KEY":"{confidential}"}}}}"#
-        )];
-        let settings = ClaudeCallerSettings::from_args(&args).unwrap();
-        let gateway = settings
-            .with_gateway(&args, "http://127.0.0.1:1234", false)
-            .unwrap();
-        let path = PathBuf::from(&gateway.args()[0]["--settings=".len()..]);
-        let error = Command::new(path.with_extension("missing-executable"))
-            .spawn()
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains(confidential));
-        drop(gateway);
-        assert!(!path.exists());
-        assert!(!path.parent().unwrap().exists());
-        std::fs::remove_dir_all(isolated_root).unwrap();
-    }
-
     #[cfg(unix)]
     #[test]
     fn claude_gateway_settings_do_not_write_beside_a_read_only_source() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (_lock, _environment, isolated_root) =
-            isolated_process_host_environment("claude-read-only-runtime");
         let source_directory = command_test_directory("claude-read-only-settings");
         std::fs::create_dir(&source_directory).unwrap();
         let source = source_directory.join("settings.json");
@@ -4783,6 +4702,5 @@ mod tests {
             .unwrap();
         std::fs::remove_file(source).unwrap();
         std::fs::remove_dir(source_directory).unwrap();
-        std::fs::remove_dir_all(isolated_root).unwrap();
     }
 }
