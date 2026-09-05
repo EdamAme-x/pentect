@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -118,17 +119,47 @@ fn write_cmd(path: &Path, body: &str) {
     std::fs::write(path, format!("@echo off\r\n{body}\r\n")).unwrap();
 }
 
-fn wait_for_pid(marker: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn diagnostic_tail(path: &Path) -> String {
+    const LIMIT: u64 = 4 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let length = file.metadata().map(|value| value.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(length.saturating_sub(LIMIT)));
+    let mut bytes = Vec::with_capacity(LIMIT as usize);
+    let _ = file.take(LIMIT).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn wrapper_diagnostics(stdout: &Path, stderr: &Path) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        diagnostic_tail(stdout),
+        diagnostic_tail(stderr)
+    )
+}
+
+fn wait_for_pid(marker: &Path, wrapper: &mut ChildGuard, stdout: &Path, stderr: &Path) -> u32 {
+    // This fixture deadline includes the synthetic PowerShell startup after
+    // cmd.exe launches; it is separate from each supervisor protocol stage.
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(value) = std::fs::read_to_string(marker) {
             if let Ok(pid) = value.trim().parse() {
                 return pid;
             }
         }
+        if let Some(status) = wrapper.0.as_mut().unwrap().try_wait().unwrap() {
+            drop(wrapper.0.take());
+            panic!(
+                "native fixture exited before readiness with {status}: {}",
+                wrapper_diagnostics(stdout, stderr)
+            );
+        }
         assert!(
             Instant::now() < deadline,
-            "native fixture did not become ready"
+            "native fixture did not become ready: {}",
+            wrapper_diagnostics(stdout, stderr)
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -144,13 +175,18 @@ fn wrapper_hard_kill_terminates_the_exact_native_client_descendant() {
         r#"powershell.exe -NoLogo -NoProfile -NonInteractive -Command "[IO.File]::WriteAllText($env:PENTECT_NATIVE_MARKER, [string]$PID); Start-Sleep -Seconds 30""#,
     );
     let mut wrapper = isolated_command(&fixture.0, &client);
+    let stdout = fixture.0.join("parent-kill.stdout");
+    let stderr = fixture.0.join("parent-kill.stderr");
     wrapper
         .env("PENTECT_NATIVE_MARKER", &marker)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut wrapper = ChildGuard(Some(wrapper.spawn().unwrap()));
-    let client_pid = wait_for_pid(&marker);
+        .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
+    let spawned = wrapper.spawn().unwrap();
+    // Do not retain parent copies of output handles while observing readiness.
+    drop(wrapper);
+    let mut wrapper = ChildGuard(Some(spawned));
+    let client_pid = wait_for_pid(&marker, &mut wrapper, &stdout, &stderr);
     let client = ProcessHandle::open(client_pid);
 
     // Child::kill targets only the retained wrapper process handle. Closing
