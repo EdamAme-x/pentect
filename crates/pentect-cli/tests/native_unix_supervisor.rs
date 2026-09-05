@@ -39,6 +39,7 @@ impl Fixture {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn wait_wrapper(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
