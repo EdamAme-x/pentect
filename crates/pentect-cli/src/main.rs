@@ -250,8 +250,8 @@ const COMMANDS: &[CommandSpec] = &[
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     #[cfg(windows)]
-    if args.get(1).map(String::as_str) == Some("__claude-windows-supervisor") {
-        std::process::exit(claude_windows_supervisor::run_helper(&args));
+    if let Some(code) = claude_windows_supervisor::hidden_main(&args) {
+        std::process::exit(code);
     }
     #[cfg(unix)]
     if let Some(code) = claude_unix_supervisor::hidden_main(&args) {
@@ -1791,7 +1791,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_untrusted_client_env(&mut cmd, pentect)?;
     cmd.args(args);
-    run_native_command_with_guards(cmd, &opts.command, (http_proxy, memory_store))
+    run_managed_native_command_with_guards(cmd, &opts.command, (http_proxy, memory_store))
 }
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
@@ -1857,12 +1857,15 @@ fn run_supervised_claude_with_guards<G>(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let result = claude_unix_supervisor::spawn_claude(&command, &prepared)
-        .map_err(|error| format!("could not run '{}': {error}", display.display()))
-        .and_then(|managed| {
-            claude_unix_supervisor::wait(managed)
-                .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
-        });
+    let result = claude_unix_supervisor::spawn_native(
+        &command,
+        claude_unix_supervisor::NativeSetup::Claude(&prepared),
+    )
+    .map_err(|error| format!("could not run '{}': {error}", display.display()))
+    .and_then(|managed| {
+        claude_unix_supervisor::wait(managed)
+            .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
+    });
     NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
     result
 }
@@ -2553,6 +2556,53 @@ fn run_native_command_with_guards<G>(
     .map_err(|error| format!("could not wait for '{}': {error}", display.display()))?;
     NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
     Ok(status)
+}
+
+#[cfg(unix)]
+pub(crate) fn run_managed_native_command_with_guards<G>(
+    mut cmd: Command,
+    display: &Path,
+    _guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    install_native_interrupt_handler()?;
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let result =
+        claude_unix_supervisor::spawn_native(&cmd, claude_unix_supervisor::NativeSetup::None)
+            .map_err(|error| format!("could not run '{}': {error}", display.display()))
+            .and_then(|managed| {
+                claude_unix_supervisor::wait(managed)
+                    .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
+            });
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    result
+}
+
+#[cfg(windows)]
+pub(crate) fn run_managed_native_command_with_guards<G>(
+    mut cmd: Command,
+    display: &Path,
+    _guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    install_native_interrupt_handler()?;
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let result = claude_windows_supervisor::launch_native(&cmd, display);
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    result
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn run_managed_native_command_with_guards<G>(
+    cmd: Command,
+    display: &Path,
+    guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    run_native_command_with_guards(cmd, display, guards)
 }
 
 fn install_native_interrupt_handler() -> Result<(), String> {

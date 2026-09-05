@@ -14,6 +14,14 @@ than on adding more client launchers. Codex App and Claude Desktop entries are
 separate desktop surfaces within those client families, not additional core
 clients.
 
+On Unix, the four protected CLI launchers supervise the native client process
+group. If the shell-facing Pentect process is forcibly killed, a separate
+guardian stops ordinary descendants that remain in that group. Normal exit
+status and terminal job control are preserved. This is a lifecycle boundary,
+not a sandbox: a process that deliberately creates a new session or process
+group is outside the guarantee, and forcibly killing the guardian itself can
+leave the client running. Desktop launchers have separate lifecycle contracts.
+
 | Client | Test | Protected launch |
 | --- | --- | --- |
 | Codex CLI `0.149.0` | Real launch on Linux and all installer platforms | `pentect codex` |
