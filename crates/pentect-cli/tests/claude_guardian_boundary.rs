@@ -262,13 +262,29 @@ os.execve(arguments[0], arguments, os.environ)
     let positive_report = root.join("positive-report.json");
     let positive_settings = root.join("positive-settings.json");
     std::fs::write(&positive_settings, input_bytes).unwrap();
-    let (positive_socket, _positive_peer) = UnixStream::pair().unwrap();
+    let (positive_socket, positive_peer) = UnixStream::pair().unwrap();
     let positive_fd = positive_socket.as_raw_fd();
+    let mut positive_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(
+        unsafe { libc::fstat(positive_fd, &mut positive_stat) },
+        0,
+        "could not inspect positive-control socket"
+    );
     let mut positive = launcher_command(&launcher, &probe, Some(positive_fd));
     positive
         .args(["--settings"])
         .arg(&positive_settings)
         .current_dir(&project)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("TMP", &temporary)
+        .env("TEMP", &temporary)
+        .env("TMPDIR", &temporary)
         .env("REPORT", &positive_report)
         .env("FD_CONTROL", &fd_control)
         .stdin(Stdio::null())
@@ -286,15 +302,28 @@ os.execve(arguments[0], arguments, os.environ)
     );
     let positive_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&positive_report).unwrap()).unwrap();
-    assert!(
-        positive_value["descriptors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|descriptor| descriptor["fd"] == positive_fd && descriptor["socket"] == true),
-        "probe did not detect its explicit socket positive control: {}",
-        positive_value["descriptors"]
+    let positive_descriptor = positive_value["descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|descriptor| descriptor["fd"] == positive_fd)
+        .unwrap_or_else(|| {
+            panic!(
+                "probe did not report its explicit socket positive control: {}",
+                positive_value["descriptors"]
+            )
+        });
+    assert_eq!(positive_descriptor["socket"], true);
+    assert_eq!(
+        positive_descriptor["dev"].as_u64(),
+        Some(positive_stat.st_dev as u64)
     );
+    assert_eq!(
+        positive_descriptor["ino"].as_u64(),
+        Some(positive_stat.st_ino as u64)
+    );
+    drop(positive_socket);
+    drop(positive_peer);
 
     let baseline_report = root.join("baseline-report.json");
     let mut baseline = launcher_command(&launcher, &probe, None);
