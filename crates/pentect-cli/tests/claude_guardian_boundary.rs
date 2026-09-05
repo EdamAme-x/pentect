@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::io::AsRawFd as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +21,34 @@ struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct InheritableFd {
+    fd: i32,
+    flags: i32,
+}
+
+impl InheritableFd {
+    fn new(fd: i32) -> Self {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "could not inspect positive-control descriptor");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0,
+            "could not make positive-control descriptor inheritable"
+        );
+        Self { fd, flags }
+    }
+}
+
+impl Drop for InheritableFd {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe { libc::fcntl(self.fd, libc::F_SETFD, self.flags) },
+            0,
+            "could not restore positive-control descriptor flags"
+        );
     }
 }
 
@@ -64,6 +94,15 @@ fn generated_root(home: &Path, runtime: &Path) -> PathBuf {
     } else {
         runtime.join("pentect/private/claude-settings-v1")
     }
+}
+
+fn launcher_command(launcher: &Path, target: &Path, keep_fd: Option<i32>) -> Command {
+    let mut command = Command::new(launcher);
+    if let Some(fd) = keep_fd {
+        command.args(["--keep-fd", &fd.to_string()]);
+    }
+    command.arg("--").arg(target);
+    command
 }
 
 #[test]
@@ -186,8 +225,79 @@ raise SystemExit(37)
     .unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
 
+    let launcher = root.join("clean-exec.py");
+    std::fs::write(
+        &launcher,
+        r#"#!/usr/bin/env python3
+import errno
+import os
+import sys
+
+arguments = sys.argv[1:]
+keep = set()
+if arguments[:1] == ["--keep-fd"]:
+    keep.add(int(arguments[1]))
+    arguments = arguments[2:]
+if arguments[:1] != ["--"] or len(arguments) < 2:
+    raise SystemExit("invalid clean-exec fixture arguments")
+arguments = arguments[1:]
+fd_root = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+for name in os.listdir(fd_root):
+    if not name.isdigit():
+        continue
+    fd = int(name)
+    if fd < 3 or fd in keep:
+        continue
+    try:
+        os.close(fd)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+os.execve(arguments[0], arguments, os.environ)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let positive_report = root.join("positive-report.json");
+    let positive_settings = root.join("positive-settings.json");
+    std::fs::write(&positive_settings, input_bytes).unwrap();
+    let (positive_socket, _positive_peer) = UnixStream::pair().unwrap();
+    let positive_fd = positive_socket.as_raw_fd();
+    let mut positive = launcher_command(&launcher, &probe, Some(positive_fd));
+    positive
+        .args(["--settings"])
+        .arg(&positive_settings)
+        .current_dir(&project)
+        .env("REPORT", &positive_report)
+        .env("FD_CONTROL", &fd_control)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let inheritable = InheritableFd::new(positive_fd);
+    let positive_child = positive.spawn().unwrap();
+    drop(inheritable);
+    let positive_output = wait_bounded(positive_child, Duration::from_secs(10));
+    assert_eq!(
+        positive_output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&positive_output.stderr)
+    );
+    let positive_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&positive_report).unwrap()).unwrap();
+    assert!(
+        positive_value["descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|descriptor| descriptor["fd"] == positive_fd && descriptor["socket"] == true),
+        "probe did not detect its explicit socket positive control: {}",
+        positive_value["descriptors"]
+    );
+
     let baseline_report = root.join("baseline-report.json");
-    let mut baseline = Command::new(&probe);
+    let mut baseline = launcher_command(&launcher, &probe, None);
     baseline
         .args(["--settings"])
         .arg(&input_settings)
@@ -216,8 +326,17 @@ raise SystemExit(37)
     );
     let baseline_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&baseline_report).unwrap()).unwrap();
+    assert!(
+        baseline_value["descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|descriptor| descriptor["socket"] == false),
+        "clean direct baseline retained a socket: {}",
+        baseline_value["descriptors"]
+    );
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
+    let mut command = launcher_command(&launcher, Path::new(env!("CARGO_BIN_EXE_pentect")), None);
     command
         .args(["claude", "--claude"])
         .arg(&probe)
