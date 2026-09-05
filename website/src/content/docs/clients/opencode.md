@@ -64,6 +64,16 @@ it:
 pentect opencode --api responses --model gpt-5
 ```
 
+## Session sharing and export
+
+Protected launches disable OpenCode's external session sharing. The
+`opencode export` command is forwarded with OpenCode's own `--sanitize` option.
+
+OpenCode's interactive `/export` command still creates a local transcript that
+can contain restored values. Pentect cannot sanitize that client-owned local
+file, so review it as sensitive data and do not publish it without inspecting
+it first.
+
 ## Custom gateways
 
 For Bifrost or another compatible gateway, keep its complete base path:

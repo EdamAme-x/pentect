@@ -395,8 +395,24 @@ fn opencode_command_index(args: &[String]) -> Option<usize> {
                 }
                 index += 2;
             }
-            arg if arg.starts_with("--log-level=") => index += 1,
-            arg if arg.starts_with('-') => return None,
+            "-m" | "--model" | "-s" | "--session" | "--prompt" | "--agent" => {
+                if index + 1 >= args.len() {
+                    return None;
+                }
+                index += 2;
+            }
+            arg if arg.starts_with("--log-level=")
+                || arg.starts_with("--model=")
+                || arg.starts_with("--session=")
+                || arg.starts_with("--prompt=")
+                || arg.starts_with("--agent=") =>
+            {
+                index += 1
+            }
+            // OpenCode currently rejects unknown options. Treating an unknown
+            // option as flag-shaped keeps a following `export` fail-closed if
+            // a future release adds another boolean global option.
+            arg if arg.starts_with('-') => index += 1,
             _ => return Some(index),
         }
     }
@@ -1021,6 +1037,34 @@ mod tests {
                 "session-canary".to_string(),
             ]),
             ["--log-level", "export", "session-canary"]
+        );
+        assert_eq!(
+            protected_opencode_args(&[
+                "-m".to_string(),
+                "openai/gpt-5".to_string(),
+                "export".to_string(),
+                "session-canary".to_string(),
+            ]),
+            [
+                "-m",
+                "openai/gpt-5",
+                "export",
+                "session-canary",
+                "--sanitize=true"
+            ]
+        );
+        assert_eq!(
+            protected_opencode_args(&[
+                "--future-boolean".to_string(),
+                "export".to_string(),
+                "session-canary".to_string(),
+            ]),
+            [
+                "--future-boolean",
+                "export",
+                "session-canary",
+                "--sanitize=true"
+            ]
         );
         assert_eq!(
             protected_opencode_args(&[
