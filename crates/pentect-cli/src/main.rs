@@ -7,6 +7,8 @@ mod claude_http_proxy;
 mod claude_settings_session;
 #[cfg(windows)]
 mod claude_windows_supervisor;
+#[cfg(unix)]
+mod claude_unix_supervisor;
 mod client_descriptor;
 mod cloud_code_http_proxy;
 mod codex_app;
@@ -250,6 +252,10 @@ fn main() {
     #[cfg(windows)]
     if args.get(1).map(String::as_str) == Some("__claude-windows-supervisor") {
         std::process::exit(claude_windows_supervisor::run_helper(&args));
+    }
+    #[cfg(unix)]
+    if let Some(code) = claude_unix_supervisor::hidden_main(&args) {
+        std::process::exit(code);
     }
     if args.get(1).map(String::as_str) == Some("__plugin-setup-supervisor") {
         std::process::exit(plugins_cmd::cmd_setup_supervisor(&args));
