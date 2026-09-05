@@ -33,7 +33,6 @@ with tempfile.TemporaryDirectory(prefix="pentect-interrupt-") as root:
     env["XDG_CACHE_HOME"] = os.path.join(root, "cache")
     env["XDG_STATE_HOME"] = os.path.join(root, "state")
     env["XDG_CONFIG_HOME"] = os.path.join(root, "config")
-    env.pop("USERPROFILE", None)
     env["PENTECT_LOG_DIR"] = os.path.join(root, "log")
     pid, fd = pty.fork()
     if pid == 0:
@@ -127,6 +126,14 @@ with tempfile.TemporaryDirectory(prefix="pentect-claude-job-") as root:
     try: output+=os.read(fd,4096)
     except OSError: break
   return output.count(needle)>=count
+ def wait_reaped(timeout):
+  end=time.monotonic()+timeout
+  while time.monotonic()<end:
+   try: observed,_=os.waitpid(pid,os.WNOHANG)
+   except ChildProcessError: return True
+   if observed!=0: return True
+   time.sleep(.05)
+  return False
  try:
   if not until(b"PENTECT-PROMPT> ",1,5): raise RuntimeError(repr(output))
   shell_group=os.tcgetpgrp(fd)
@@ -146,7 +153,9 @@ with tempfile.TemporaryDirectory(prefix="pentect-claude-job-") as root:
   time.sleep(.2); os.write(fd,b"hello\n")
   if not until(b"GOT=hello",1,5): raise RuntimeError("resume/read failed "+repr(output))
   if not until(b"PENTECT-PROMPT> ",4,5): raise RuntimeError("final prompt missing "+repr(output))
-  os.write(fd,b"exit\n"); os.waitpid(pid,0); reaped=True
+  os.write(fd,b"exit\n")
+  if not wait_reaped(5): raise RuntimeError("shell did not exit "+repr(output))
+  reaped=True
  finally:
   if not reaped:
    if wrapper:
@@ -154,8 +163,7 @@ with tempfile.TemporaryDirectory(prefix="pentect-claude-job-") as root:
     except ProcessLookupError: pass
    try: os.killpg(pid,signal.SIGKILL)
    except ProcessLookupError: pass
-   try: os.waitpid(pid,0)
-   except ChildProcessError: pass
+   wait_reaped(5)
   os.close(fd)
 "##;
 
