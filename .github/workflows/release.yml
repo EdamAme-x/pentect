@@ -47,7 +47,7 @@ jobs:
           }
       - name: Validate POSIX installer
         run: |
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/dispatch_package_site.sh tools/propose_automation_pr.sh tools/wait_for_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/prepare_stable_debs.sh tools/dispatch_package_site.sh tools/propose_automation_pr.sh tools/wait_for_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
           sh tools/test_download_recent_stable_debs.sh
           sh tools/test_install.sh
           bash -n .github/scripts/publish-aur.sh
@@ -62,6 +62,7 @@ jobs:
           python tools/test_npm_release_workflow.py
           sh tools/test_propose_automation_pr.sh
           sh tools/test_dispatch_package_site.sh
+          sh tools/test_prepare_stable_debs.sh
           sh tools/test_wait_for_automation_pr.sh
       - name: Validate PowerShell installer
         shell: pwsh
