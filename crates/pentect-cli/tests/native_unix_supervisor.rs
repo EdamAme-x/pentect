@@ -43,13 +43,14 @@ impl Drop for Fixture {
     }
 }
 
-fn wait_ready(path: &std::path::Path) -> (i32, i32, String) {
+fn wait_ready(path: &std::path::Path) -> (i32, i32, i32, String) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let mut lines = contents.lines();
                 return (
+                    lines.next().unwrap().parse().unwrap(),
                     lines.next().unwrap().parse().unwrap(),
                     lines.next().unwrap().parse().unwrap(),
                     lines.next().unwrap_or_default().to_string(),
@@ -75,7 +76,7 @@ fn wait_dead(pid: i32) -> bool {
 }
 
 #[test]
-fn typed_native_clients_terminate_their_ordinary_process_groups() {
+fn typed_native_clients_terminate_separate_group_descendant_trees() {
     for (client, flag, tail) in [
         ("codex", "--codex", Vec::<&str>::new()),
         ("opencode", "--opencode", vec!["auth"]),
@@ -103,15 +104,24 @@ fn typed_native_clients_terminate_their_ordinary_process_groups() {
         let script = fixture.root.join("client.sh");
         std::fs::write(
             &script,
-            r##"#!/bin/sh
-(sleep 15) &
-child=$!
-settings=no
-for arg in "$@"; do case "$arg" in --settings|--settings=*) settings=yes;; esac; done
-temporary="$READY.tmp.$$"
-printf '%s\n%s\n%s:%s:%s' "$$" "$child" "$PWD" "${PENTECT_MEMORY_STORE_TOKEN-unset}" "$settings" > "$temporary"
-mv "$temporary" "$READY"
-wait "$child"
+            r##"#!/usr/bin/env python3
+import os, sys, time
+
+middle = os.fork()
+if middle == 0:
+    os.setpgid(0, 0)
+    leaf = os.fork()
+    if leaf == 0:
+        time.sleep(15)
+        os._exit(0)
+    temporary = os.environ["READY"] + ".tmp." + str(os.getpid())
+    settings = "yes" if any(arg == "--settings" or arg.startswith("--settings=") for arg in sys.argv[1:]) else "no"
+    state = os.getcwd() + ":" + os.environ.get("PENTECT_MEMORY_STORE_TOKEN", "unset") + ":" + settings
+    with open(temporary, "w", encoding="utf-8") as marker:
+        marker.write(f"{os.getppid()}\n{os.getpid()}\n{leaf}\n{state}")
+    os.replace(temporary, os.environ["READY"])
+    time.sleep(15)
+time.sleep(15)
 "##,
         )
         .unwrap();
@@ -137,13 +147,17 @@ wait "$child"
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         fixture.wrapper = Some(command.spawn().unwrap());
-        let (client_pid, child_pid, state) = wait_ready(&ready);
+        let (client_pid, middle_pid, child_pid, state) = wait_ready(&ready);
         assert_eq!(state, format!("{}:unset:no", project.display()));
 
         fixture.stop_wrapper();
         assert!(
             wait_dead(client_pid),
             "{client} client survived wrapper kill"
+        );
+        assert!(
+            wait_dead(middle_pid),
+            "{client} child survived wrapper kill"
         );
         assert!(
             wait_dead(child_pid),
