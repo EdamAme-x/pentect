@@ -9,6 +9,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 
 const MAX_PAYLOAD: usize = 1024 * 1024;
+const STARTUP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const DESCENDANT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Startup can spend one bounded interval writing the bootstrap frame and a
+// second draining descendants after EOF. Leave scheduling slack for both.
+const GUARDIAN_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const HELLO: u8 = 1;
 const READY: u8 = 2;
 const ACK: u8 = 3;
@@ -21,6 +27,8 @@ const CONTINUE: u8 = 9;
 const CANCEL: u8 = 10;
 const STATUS_ACK: u8 = 11;
 static RELAY_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(target_os = "linux")]
+static LINUX_TREE_DRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn hidden_main(args: &[String]) -> Option<i32> {
     match args.get(1).map(String::as_str) {
@@ -43,7 +51,7 @@ pub(crate) fn spawn_native(
     let payload = encode_payload(command, setup)?;
     let (mut owner, inherited) = UnixStream::pair()
         .map_err(|error| format!("could not create Claude guardian socket: {error}"))?;
-    let timeout = Some(std::time::Duration::from_secs(5));
+    let timeout = Some(STARTUP_IO_TIMEOUT);
     owner.set_read_timeout(timeout).map_err(|e| e.to_string())?;
     owner
         .set_write_timeout(timeout)
@@ -148,7 +156,7 @@ impl Drop for Supervised {
     fn drop(&mut self) {
         drop(self.foreground.take());
         let _ = self.owner.shutdown(std::net::Shutdown::Both);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + GUARDIAN_CLEANUP_TIMEOUT;
         loop {
             match self.guardian.try_wait() {
                 Ok(Some(_)) => break,
@@ -165,7 +173,7 @@ impl Drop for Supervised {
 
 fn cleanup_startup_guardian(child: &mut Child, owner: &UnixStream) {
     let _ = owner.shutdown(std::net::Shutdown::Both);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + GUARDIAN_CLEANUP_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return,
@@ -331,6 +339,12 @@ fn guardian_main(args: &[String]) -> i32 {
 fn guardian_run(args: &[String]) -> Result<i32, String> {
     let fd = parse_socket(args)?;
     let mut owner = unsafe { UnixStream::from_raw_fd(fd) };
+    #[cfg(target_os = "linux")]
+    if let Err(error) = enable_linux_tree_drain() {
+        eprintln!(
+            "[pentect] warning: descendant cleanup is limited to the managed process group: {error}"
+        );
+    }
     owner
         .write_all(&[HELLO])
         .map_err(|error| error.to_string())?;
@@ -464,14 +478,9 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
         session.abort();
         return Err(error.to_string());
     }
-    match rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap_or(None)
-    {
+    match rx.recv_timeout(STARTUP_IO_TIMEOUT).unwrap_or(None) {
         Some(ACK) => {
-            if let Err(error) =
-                barrier_writer.set_write_timeout(Some(std::time::Duration::from_secs(5)))
-            {
+            if let Err(error) = barrier_writer.set_write_timeout(Some(STARTUP_IO_TIMEOUT)) {
                 terminate_managed(&mut client, &mut relay)?;
                 session.abort();
                 return Err(error.to_string());
@@ -503,6 +512,10 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
     let mut first_interrupt = None;
     let mut shutdown = None;
     let mut forced = false;
+    #[cfg(target_os = "linux")]
+    let mut last_orphan_reap = std::time::Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut orphan_reap_cursor = 0;
     loop {
         match rx.try_recv() {
             Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -559,6 +572,21 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
             }
             forced = true;
         }
+        #[cfg(target_os = "linux")]
+        if LINUX_TREE_DRAIN.load(std::sync::atomic::Ordering::Acquire)
+            && last_orphan_reap.elapsed() >= std::time::Duration::from_millis(500)
+        {
+            if let Err(error) = reap_linux_adopted_zombies(
+                client.id() as i32,
+                relay.id() as i32,
+                &mut orphan_reap_cursor,
+            ) {
+                terminate_managed(&mut client, &mut relay)?;
+                session.release();
+                return Err(error);
+            }
+            last_orphan_reap = std::time::Instant::now();
+        }
         let stopped = match stopped_without_reaping(client.id()) {
             Ok(stopped) => stopped,
             Err(error) => {
@@ -602,8 +630,7 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
                 session.release();
                 return Ok(1);
             }
-            client.wait().map_err(|error| error.to_string())?;
-            relay.wait().map_err(|error| error.to_string())?;
+            terminate_managed(&mut client, &mut relay)?;
             session.release();
             return Ok(0);
         }
@@ -943,6 +970,10 @@ fn stopped_without_reaping(pid: u32) -> Result<bool, String> {
 }
 
 fn terminate_anchored(child: &mut Child) -> Result<ExitStatus, String> {
+    #[cfg(target_os = "linux")]
+    if LINUX_TREE_DRAIN.load(std::sync::atomic::Ordering::Acquire) {
+        return terminate_linux_descendants(child.id() as i32);
+    }
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
@@ -952,6 +983,10 @@ fn terminate_anchored(child: &mut Child) -> Result<ExitStatus, String> {
 }
 
 fn terminate_managed(client: &mut Child, relay: &mut Child) -> Result<ExitStatus, String> {
+    #[cfg(target_os = "linux")]
+    if LINUX_TREE_DRAIN.load(std::sync::atomic::Ordering::Acquire) {
+        return terminate_linux_descendants(client.id() as i32);
+    }
     unsafe {
         libc::kill(-(client.id() as i32), libc::SIGKILL);
     }
@@ -964,6 +999,278 @@ fn terminate_managed(client: &mut Child, relay: &mut Child) -> Result<ExitStatus
     match (client_result, relay_result) {
         (Ok(status), Ok(_)) => Ok(status),
         (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enable_linux_tree_drain() -> Result<(), String> {
+    use std::os::fd::FromRawFd as _;
+
+    std::fs::read_to_string("/proc/thread-self/children")
+        .map_err(|error| format!("procfs child discovery unavailable: {error}"))?;
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as i32 };
+    if raw == -1 {
+        return Err(format!(
+            "pidfd unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } == -1
+    {
+        return Err(format!(
+            "pidfd signaling unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd.as_raw_fd() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != -1
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
+    {
+        return Err("pidfd child verification unavailable".to_string());
+    }
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = libc::SIG_DFL;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+    }
+    if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } == -1 {
+        return Err(format!(
+            "could not reset child status handling: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
+        return Err(format!(
+            "subreaper unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    LINUX_TREE_DRAIN.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reap_linux_adopted_zombies(client: i32, relay: i32, cursor: &mut usize) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    let children = match linux_direct_children(deadline) {
+        Ok(children) => children,
+        Err(error) if error.starts_with("timed out discovering") => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if children.is_empty() {
+        *cursor = 0;
+        return Ok(());
+    }
+    let start = *cursor % children.len();
+    let count = children.len().min(256);
+    for offset in 0..count {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let pid = children[(start + offset) % children.len()];
+        if pid == client || pid == relay {
+            continue;
+        }
+        let Some(pidfd) = open_verified_child_pidfd(pid)? else {
+            continue;
+        };
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                continue;
+            }
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if unsafe { info.si_pid() } != 0 {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    pidfd.as_raw_fd() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG,
+                )
+            };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
+            {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+    }
+    *cursor = (start + count) % children.len();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_descendants(leader: i32) -> Result<ExitStatus, String> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    unsafe {
+        libc::kill(-leader, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + DESCENDANT_DRAIN_TIMEOUT;
+    let mut leader_status = None;
+    loop {
+        for pid in linux_direct_children(deadline)? {
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out terminating native client descendants".to_string());
+            }
+            let Some(pidfd) = open_verified_child_pidfd(pid)? else {
+                continue;
+            };
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    pidfd.as_raw_fd() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                    continue;
+                }
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if unsafe { info.si_pid() } == 0
+                && unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                } == -1
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error.to_string());
+                }
+            }
+        }
+
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out terminating native client descendants".to_string());
+            }
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result =
+                unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG) };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    return leader_status
+                        .map(ExitStatus::from_raw)
+                        .ok_or_else(|| "native client status was not observed".to_string());
+                }
+                return Err(error.to_string());
+            }
+            let pid = unsafe { info.si_pid() };
+            if pid == 0 {
+                break;
+            }
+            if pid == leader {
+                leader_status = Some(raw_status_from_siginfo(&info));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out terminating native client descendants".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_direct_children(deadline: std::time::Instant) -> Result<Vec<i32>, String> {
+    let mut children = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir("/proc/self/task").map_err(|error| error.to_string())? {
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out discovering native client descendants".to_string());
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path().join("children");
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for value in contents.split_whitespace() {
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out discovering native client descendants".to_string());
+            }
+            let pid = value
+                .parse::<i32>()
+                .map_err(|_| "procfs returned an invalid child PID".to_string())?;
+            children.insert(pid);
+        }
+    }
+    Ok(children.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_child_pidfd(pid: i32) -> Result<Option<std::os::fd::OwnedFd>, String> {
+    use std::os::fd::FromRawFd as _;
+
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    if raw == -1 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(error.to_string())
+        };
+    }
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd.as_raw_fd() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+        Ok(None)
+    } else if result == -1 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(Some(pidfd))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn raw_status_from_siginfo(info: &libc::siginfo_t) -> i32 {
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => status << 8,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => status,
     }
 }
 
