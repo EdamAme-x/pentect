@@ -8,7 +8,9 @@ cat > "$root/bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
 if [ "$1 $2" = "api --paginate" ]; then
-  printf '%s\n' v1.2.3 v1.2.2 v1.2.1
+  for tag in ${FAKE_TAGS:-v1.2.3 v1.2.2 v1.2.1}; do
+    echo "$tag"
+  done
   exit
 fi
 if [ "$1 $2" = "release view" ]; then
@@ -23,6 +25,7 @@ if [ "$1 $2" = "release view" ]; then
   esac
   assets='[{"name":"pentect_'"${tag#v}"'_amd64.deb"},{"name":"pentect_'"${tag#v}"'_arm64.deb"}]'
   [ "${FAKE_MODE:-ok}" = missing-arm64 ] && assets='[{"name":"pentect_'"${tag#v}"'_amd64.deb"}]'
+  [ "${FAKE_NO_DEB_TAG:-}" = "$tag" ] && assets='[]'
   printf '{"tagName":"%s","isDraft":%s,"isPrerelease":%s,"assets":%s}\n' "$reported_tag" "$draft" "$pre" "$assets"
   exit
 fi
@@ -31,6 +34,7 @@ if [ "$1 $2" = "release download" ]; then
   while [ "$#" -gt 0 ]; do
     case "$1" in --pattern) asset=$2; shift 2 ;; --dir) directory=$2; shift 2 ;; *) shift ;; esac
   done
+  case "${FAKE_MODE:-ok}:$asset" in download-fail-arm64:*_arm64.deb) exit 1 ;; esac
   : > "$directory/$asset"
   exit
 fi
@@ -50,7 +54,26 @@ export PATH="$root/bin:$PATH" GITHUB_REPOSITORY=EdamAme-x/pentect
 sh tools/prepare_stable_debs.sh "$root/out" v1.2.3 3
 test "$(find "$root/out" -name '*.deb' | wc -l)" -eq 6
 
-for case in 'bad-tag:v1.2:ok' 'wrong-tag:v1.2.3:wrong-tag' 'draft:v1.2.3:draft' 'prerelease:v1.2.3:prerelease' 'missing:v1.2.3:missing-arm64' 'wrong-package:v1.2.3:wrong-package' 'wrong-version:v1.2.3:wrong-version' 'wrong-arch:v1.2.3:wrong-arch'; do
+rm -rf "$root/out"; mkdir "$root/out"
+FAKE_TAGS='v1.2.3 v1.2.2 v1.2.1'; export FAKE_TAGS
+sh tools/prepare_stable_debs.sh "$root/out" v1.1.0 3
+test -f "$root/out/pentect_1.1.0_amd64.deb"
+test "$(find "$root/out" -name '*.deb' | wc -l)" -eq 6
+
+rm -rf "$root/out"; mkdir "$root/out"
+FAKE_TAGS='v1.2.3 v1.2.2'; FAKE_NO_DEB_TAG=v1.2.2; export FAKE_TAGS FAKE_NO_DEB_TAG
+sh tools/prepare_stable_debs.sh "$root/out" v1.2.3 3
+test "$(find "$root/out" -name '*.deb' | wc -l)" -eq 2
+unset FAKE_TAGS FAKE_NO_DEB_TAG
+
+printf stale > "$root/out/stale"
+if sh tools/prepare_stable_debs.sh "$root/out" v1.2.3 3 >/dev/null 2>&1; then
+  echo "nonempty output unexpectedly succeeded" >&2
+  exit 1
+fi
+rm -rf "$root/out"; mkdir "$root/out"
+
+for case in 'bad-tag:v1.2:ok' 'wrong-tag:v1.2.3:wrong-tag' 'draft:v1.2.3:draft' 'prerelease:v1.2.3:prerelease' 'missing:v1.2.3:missing-arm64' 'download:v1.2.3:download-fail-arm64' 'wrong-package:v1.2.3:wrong-package' 'wrong-version:v1.2.3:wrong-version' 'wrong-arch:v1.2.3:wrong-arch'; do
   name=${case%%:*}; rest=${case#*:}; tag=${rest%%:*}; FAKE_MODE=${rest#*:}; export FAKE_MODE
   rm -rf "$root/out"; mkdir "$root/out"
   if sh tools/prepare_stable_debs.sh "$root/out" "$tag" 3 >/dev/null 2>&1; then
@@ -62,8 +85,9 @@ done
 workflow=.github/workflows/packages.yml
 grep -Fq 'run-name: Publish packages / sync-${{ inputs.correlation || github.run_id }}' "$workflow"
 grep -Fq 'contents: read' "$workflow"
+grep -Fq 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' "$workflow"
 grep -Fq 'sh tools/prepare_stable_debs.sh debs "$TAG" 3' "$workflow"
-if grep -Eq 'release upload|--clobber|package_deb\.sh' "$workflow"; then
+if grep -Eq 'release upload|--clobber|package_deb\.sh|ref: main' "$workflow"; then
   echo "packages workflow may not rebuild or overwrite stable assets" >&2
   exit 1
 fi
