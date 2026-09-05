@@ -564,7 +564,11 @@ impl ClaudeJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::System::Threading::{OpenProcess, SYNCHRONIZE};
 
     fn payload(location: SettingsLocation, args: &[&str]) -> LaunchPayload {
         LaunchPayload {
@@ -640,8 +644,50 @@ mod tests {
         let path = settings.path.clone();
         let directory = settings.directory.clone();
         assert_eq!(std::fs::read(&path).unwrap(), b"fixture-confidential");
+        for protected in [&directory, &path] {
+            let name: Vec<u16> = protected.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    GetNamedSecurityInfoW(
+                        name.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut dacl,
+                        std::ptr::null_mut(),
+                        &mut descriptor,
+                    )
+                },
+                0
+            );
+            assert!(!dacl.is_null());
+            assert_eq!(unsafe { (*dacl).AceCount }, 1);
+            unsafe { LocalFree(descriptor.cast()) };
+        }
         drop(settings);
         assert!(!path.exists());
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn dropping_startup_guard_terminates_and_reaps_helper() {
+        let job = ClaudeJob::new().unwrap();
+        let child = Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        job.assign_live(&child).unwrap();
+        let process = unsafe { OpenProcess(SYNCHRONIZE, 0, child.id()) };
+        assert!(!process.is_null());
+        let guard = StartupGuard {
+            child: Some(child),
+            job: Some(job),
+        };
+        drop(guard);
+        assert_ne!(unsafe { WaitForSingleObject(process, 1000) }, WAIT_TIMEOUT);
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(process) };
     }
 }
