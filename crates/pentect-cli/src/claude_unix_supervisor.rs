@@ -1362,6 +1362,22 @@ mod tests {
         assert_eq!(payload.args_with_settings_path(None).unwrap(), payload.args);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_verification_accepts_only_owned_live_children() {
+        assert!(open_verified_child_pidfd(std::process::id() as i32)
+            .unwrap()
+            .is_none());
+        assert!(open_verified_child_pidfd(i32::MAX).unwrap().is_none());
+
+        let mut child = Command::new("sh").args(["-c", "sleep 15"]).spawn().unwrap();
+        let pid = child.id() as i32;
+        assert!(open_verified_child_pidfd(pid).unwrap().is_some());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(open_verified_child_pidfd(pid).unwrap().is_none());
+    }
+
     #[test]
     fn settings_location_is_replaced_exactly() {
         let path = std::path::Path::new("/private/generated.json");
