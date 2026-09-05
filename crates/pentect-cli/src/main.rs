@@ -245,6 +245,10 @@ const COMMANDS: &[CommandSpec] = &[
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(windows)]
+    if args.get(1).map(String::as_str) == Some("__claude-windows-supervisor") {
+        std::process::exit(claude_windows_supervisor::run_helper(&args));
+    }
     if args.get(1).map(String::as_str) == Some("__plugin-setup-supervisor") {
         std::process::exit(plugins_cmd::cmd_setup_supervisor(&args));
     }
@@ -1816,9 +1820,18 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let gateway_settings =
         plan.caller_settings
             .with_gateway(&args, http_proxy.base_url(), plan.enable_tool_search)?;
-    let gateway_settings = gateway_settings.materialize()?;
-    cmd.args(gateway_settings.args());
-    run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
+    #[cfg(windows)]
+    {
+        install_native_interrupt_handler()?;
+        NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+        return claude_windows_supervisor::launch(&cmd, gateway_settings, &opts.command);
+    }
+    #[cfg(not(windows))]
+    {
+        let gateway_settings = gateway_settings.materialize()?;
+        cmd.args(gateway_settings.args());
+        run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
+    }
 }
 
 fn run_endpoint_env(
