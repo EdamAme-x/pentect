@@ -1564,6 +1564,240 @@ def wait_for_process_exit(pid: int, timeout: float) -> bool:
     return True
 
 
+def process_identity(pid: int) -> str | None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in (87, 1168):
+                return None
+            raise OSError(error, f"OpenProcess({pid}) failed")
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        try:
+            wait = kernel32.WaitForSingleObject(handle, 0)
+            if wait == 0x00000000:
+                return None
+            if wait != 0x00000102:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return f"{creation.dwHighDateTime}:{creation.dwLowDateTime}"
+        finally:
+            kernel32.CloseHandle(handle)
+    stat = Path(f"/proc/{pid}/stat")
+    if Path("/proc").is_dir():
+        try:
+            value = stat.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        _, separator, suffix = value.rpartition(") ")
+        fields = suffix.split()
+        if not separator or len(fields) <= 19:
+            raise RuntimeError(f"could not parse /proc identity for PID {pid}")
+        if fields[0] == "Z":
+            return None
+        return fields[19]
+    completed = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    value = completed.stdout.strip()
+    return value or None
+
+
+def terminate_process_identity(pid: int, identity: str) -> None:
+    if os.name != "nt":
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return
+            try:
+                if process_identity(pid) == identity:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            finally:
+                os.close(descriptor)
+        elif process_identity(pid) == identity:
+            # macOS has no pidfd; revalidate immediately before this scoped PID kill.
+            os.kill(pid, signal.SIGKILL)
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x00100000 | 0x0001 | 0x1000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in (87, 1168):
+            return
+        raise OSError(error, f"OpenProcess({pid}) for termination failed")
+    try:
+        creation = wintypes.FILETIME()
+        times = [wintypes.FILETIME() for _ in range(3)]
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(times[0]),
+            ctypes.byref(times[1]),
+            ctypes.byref(times[2]),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        handle_identity = f"{creation.dwHighDateTime}:{creation.dwLowDateTime}"
+        wait = kernel32.WaitForSingleObject(handle, 0)
+        if wait == 0xFFFFFFFF:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if (
+            handle_identity == identity
+            and wait == 0x00000102
+            and not kernel32.TerminateProcess(handle, 1)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def wait_for_process_identities_exit(identities: dict[int, str], timeout: float) -> list[int]:
+    deadline = time.monotonic() + timeout
+    remaining = dict(identities)
+    while remaining and time.monotonic() < deadline:
+        remaining = {
+            pid: identity
+            for pid, identity in remaining.items()
+            if process_identity(pid) == identity
+        }
+        if remaining:
+            time.sleep(0.05)
+    return [
+        pid
+        for pid, identity in remaining.items()
+        if process_identity(pid) == identity
+    ]
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    if os.name == "nt":
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            raise RuntimeError("PowerShell is required to inspect the Claude process tree")
+        completed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | "
+                "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+                "ConvertTo-Json -Compress",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=True,
+        )
+        values = json.loads(completed.stdout)
+        if isinstance(values, dict):
+            values = [values]
+        return {
+            int(value["ProcessId"]): (
+                int(value["ParentProcessId"]),
+                str(value.get("CommandLine") or value.get("Name") or ""),
+            )
+            for value in values
+        }
+    if Path("/proc").is_dir():
+        table = {}
+        for directory in Path("/proc").iterdir():
+            if not directory.name.isdigit():
+                continue
+            try:
+                value = (directory / "stat").read_text(encoding="utf-8")
+                command = (directory / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                    errors="replace"
+                )
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            _, separator, suffix = value.rpartition(") ")
+            fields = suffix.split()
+            if separator and len(fields) > 1:
+                table[int(directory.name)] = (int(fields[1]), command)
+        return table
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=True,
+    )
+    table = {}
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) >= 2:
+            table[int(fields[0])] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+    return table
+
+
+def descendant_processes(parent_pid: int) -> dict[int, tuple[int, str]]:
+    table = process_table()
+    descendants: dict[int, tuple[int, str]] = {}
+    frontier = {parent_pid}
+    while frontier:
+        children = {
+            pid: record
+            for pid, record in table.items()
+            if record[0] in frontier and pid not in descendants
+        }
+        descendants.update(children)
+        frontier = set(children)
+    return descendants
+
+
 def tool_response(sequence: int, source: str) -> bytes:
     response_id = f"resp_e2e_{sequence}"
     item_id = f"ct_e2e_{sequence}"
@@ -1766,6 +2000,9 @@ class Handler(BaseHTTPRequestHandler):
         if request_path.endswith("/messages"):
             request = body.decode("utf-8")
             self.server.state.model_requests.append(request)
+            if self.server.state.hold_model:
+                self.server.state.model_request_seen.set()
+                self.server.state.release_model_request.wait(timeout=30)
             sequence = len(self.server.state.model_requests)
             parsed = json.loads(request)
             bash_enabled = any(
@@ -2265,6 +2502,233 @@ def run_cancellation(pentect: str) -> None:
         thread.join()
 
 
+def fixture_settings(roots: tuple[Path, ...], sentinel: str) -> list[Path]:
+    matches: list[Path] = []
+    encoded = sentinel.encode()
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                if encoded in path.read_bytes():
+                    matches.append(path)
+            except FileNotFoundError:
+                continue
+    return matches
+
+
+def claude_descendant_identities(
+    wrapper_pid: int, installed_claude: Path
+) -> tuple[int, dict[int, str]]:
+    descendants = descendant_processes(wrapper_pid)
+    candidates = []
+    named_candidates = []
+    for pid, (_, command) in descendants.items():
+        executable = Path(command.split(" ", 1)[0].strip('"')).name.lower()
+        if "pentect" not in executable:
+            candidates.append(pid)
+            if "claude" in command.lower():
+                named_candidates.append(pid)
+    if not candidates:
+        raise RuntimeError(
+            "could not identify installed Claude below wrapper; descendants="
+            + repr({pid: command for pid, (_, command) in descendants.items()})
+        )
+
+    def depth(pid: int) -> int:
+        value = 0
+        while pid in descendants:
+            value += 1
+            pid = descendants[pid][0]
+        return value
+
+    client_pid = max(named_candidates or candidates, key=depth)
+    client_command = descendants[client_pid][1].lower()
+    expected = {
+        str(installed_claude).lower(),
+        str(installed_claude.resolve()).lower(),
+        installed_claude.name.lower(),
+        "claude-code",
+    }
+    if not any(token and token in client_command for token in expected):
+        raise RuntimeError(
+            "selected client process does not identify the installed Claude command: "
+            + repr(descendants[client_pid][1])
+        )
+    identities = {}
+    for pid in descendants:
+        identity = process_identity(pid)
+        if identity is None:
+            raise RuntimeError(f"Claude descendant PID {pid} exited before identity capture")
+        identities[pid] = identity
+    return client_pid, identities
+
+
+def capture_descendant_identities(wrapper_pid: int, identities: dict[int, str]) -> None:
+    for pid in descendant_processes(wrapper_pid):
+        identity = process_identity(pid)
+        if identity is not None:
+            identities.setdefault(pid, identity)
+
+
+def run_claude_parent_kill(pentect: str) -> None:
+    sentinel = "PENTECT_CLAUDE_LIFETIME_SYNTHETIC_SENTINEL"
+    state = State("unused-valid", "unused-invalid", hold_model=True)
+    server = FixtureServer(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process: subprocess.Popen[str] | None = None
+    recorded_identities: dict[int, str] = {}
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pentect-claude-parent-kill-", ignore_cleanup_errors=True
+        ) as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            project = root / "project"
+            temporary = root / "tmp"
+            runtime = root / "runtime"
+            for directory in (home, project, temporary, runtime):
+                directory.mkdir()
+            environment = isolated_environment(home, root / "logs")
+            environment.update({
+                "ANTHROPIC_API_KEY": "local-fixture",
+                "TMP": str(temporary),
+                "TEMP": str(temporary),
+                "TMPDIR": str(temporary),
+                "XDG_RUNTIME_DIR": str(runtime),
+            })
+            if os.name == "nt":
+                git_bash = shutil.which("bash.exe") or shutil.which("bash")
+                if git_bash is None:
+                    raise RuntimeError("Claude lifetime E2E requires Git Bash on Windows")
+                environment["CLAUDE_CODE_GIT_BASH_PATH"] = git_bash
+            installed_claude_value = shutil.which("claude", path=environment.get("PATH"))
+            if installed_claude_value is None:
+                raise RuntimeError("installed Claude executable is unavailable on PATH")
+            installed_claude = Path(installed_claude_value)
+            input_settings = root / "input-settings.json"
+            input_settings.write_text(
+                json.dumps(
+                    {"env": {"PENTECT_LIFETIME_SENTINEL": sentinel}},
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            input_snapshot = input_settings.read_bytes()
+            command = [
+                pentect,
+                "claude",
+                "--upstream",
+                f"http://127.0.0.1:{server.server_port}",
+                "--bare",
+                "--print",
+                "--output-format",
+                "text",
+                "--no-session-persistence",
+                "--dangerously-skip-permissions",
+                "--tools",
+                "",
+                "--model",
+                "claude-sonnet-4-5",
+                "--settings",
+                str(input_settings),
+                "Reply with DONE.",
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            deadline = time.monotonic() + 20
+            while not state.model_request_seen.is_set() and time.monotonic() < deadline:
+                capture_descendant_identities(process.pid, recorded_identities)
+                if process.poll() is not None:
+                    break
+                state.model_request_seen.wait(timeout=0.05)
+            capture_descendant_identities(process.pid, recorded_identities)
+            if not state.model_request_seen.is_set():
+                raise RuntimeError("installed Claude did not reach the local model fixture")
+            client_pid, ready_identities = claude_descendant_identities(
+                process.pid, installed_claude
+            )
+            recorded_identities.update(ready_identities)
+            generated = fixture_settings((temporary, runtime), sentinel)
+            if len(generated) != 1:
+                raise RuntimeError(
+                    "expected one generated Claude settings file, found "
+                    + repr([str(path) for path in generated])
+                )
+            settings_path = generated[0]
+            if input_settings.read_bytes() != input_snapshot:
+                raise RuntimeError("Claude modified the caller-owned settings input")
+
+            # Popen.kill targets the wrapper process only. The supervisor owns
+            # cleanup of the externally recorded descendant identities.
+            process.kill()
+            process.wait(timeout=10)
+            surviving = wait_for_process_identities_exit(recorded_identities, 10)
+            if surviving:
+                subject = "recorded Claude client" if client_pid in surviving else "Claude descendants"
+                raise RuntimeError(
+                    f"{subject} survived wrapper: "
+                    + ", ".join(map(str, surviving))
+                )
+            if settings_path.exists():
+                raise RuntimeError("generated Claude settings survived guardian cleanup")
+            if input_settings.read_bytes() != input_snapshot:
+                raise RuntimeError("caller-owned Claude settings changed after parent exit")
+
+            state.hold_model = False
+            state.release_model_request.set()
+            completed = subprocess.run(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "follow-up Claude cleanup launch failed:\n"
+                    + completed.stdout.replace(sentinel, "<synthetic-sentinel>")
+                )
+            residue = fixture_settings((temporary, runtime), sentinel)
+            if residue:
+                raise RuntimeError(
+                    "generated Claude settings residue remained after follow-up launch: "
+                    + repr([str(path) for path in residue])
+                )
+            if input_settings.read_bytes() != input_snapshot:
+                raise RuntimeError("caller-owned Claude settings changed after cleanup launch")
+            print(
+                "installed Claude parent-exit E2E passed: exact client exited "
+                "and generated settings were cleaned"
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        for pid, identity in recorded_identities.items():
+            if process_identity(pid) == identity:
+                terminate_process_identity(pid, identity)
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        state.release_model_request.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        if surviving_cleanup:
+            raise RuntimeError(
+                "test cleanup could not reap recorded Claude identities: "
+                + ", ".join(map(str, surviving_cleanup))
+            )
+
+
 def run_image_redaction(pentect: str) -> None:
     state = State("unused-valid", "unused-invalid")
     server = FixtureServer(state)
@@ -2380,6 +2844,7 @@ def main() -> int:
         dest="clients",
     )
     parser.add_argument("--skip-image", action="store_true")
+    parser.add_argument("--claude-parent-kill", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
     args = parser.parse_args()
     candidate = Path(args.pentect)
@@ -2387,6 +2852,9 @@ def main() -> int:
         args.pentect = str(candidate.resolve())
     if args.plugin_lifecycle_only:
         run_plugin_lifecycle(args.pentect)
+        return 0
+    if args.claude_parent_kill:
+        run_claude_parent_kill(args.pentect)
         return 0
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.

@@ -38,6 +38,7 @@ jobs:
               - 'crates/pentect-cli/src/plugins.rs'
               - 'crates/pentect-cli/src/plugins_cmd.rs'
               - 'crates/pentect-cli/src/secure_temp.rs'
+              - 'crates/pentect-cli/src/claude_settings_session.rs'
               - 'crates/pentect-cli/src/*supervisor*.rs'
               - 'crates/pentect-cli/tests/client_store_isolation.rs'
               - 'crates/pentect-cli/tests/native_interrupt.rs'
@@ -170,6 +171,12 @@ jobs:
       - name: Verify installed client handle flows without OCR (Windows PR)
         if: github.event_name == 'pull_request' && runner.os == 'Windows'
         run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}" --skip-image
+      - name: Verify installed Claude cleanup after parent exit (PR)
+        if: github.event_name == 'pull_request'
+        run: >-
+          python tools/installed_agent_e2e.py
+          --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
+          --claude-parent-kill
       - name: Start both protected desktop app contracts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

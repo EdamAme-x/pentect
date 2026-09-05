@@ -49,6 +49,7 @@ def main() -> None:
         "crates/pentect-cli/src/main.rs",
         "crates/pentect-cli/src/openai_clients.rs",
         "crates/pentect-cli/src/secure_temp.rs",
+        "crates/pentect-cli/src/claude_settings_session.rs",
         "crates/pentect-cli/src/*supervisor*.rs",
         "crates/pentect-cli/tests/client_store_isolation.rs",
         "crates/pentect-cli/tests/native_interrupt.rs",
@@ -58,6 +59,7 @@ def main() -> None:
         assert f"- '{boundary}'" in workflow, (
             f"current-client workflow does not watch launch boundary {boundary}"
         )
+    assert "--claude-parent-kill" in workflow
 
 
 if __name__ == "__main__":
