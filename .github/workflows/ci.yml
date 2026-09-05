@@ -510,7 +510,9 @@ jobs:
         run: cargo test -p pentect-runtime --no-default-features activity_log::tests --locked
       - name: Test privacy metrics CLI
         if: needs.changes.outputs.runtime_log == 'true'
-        run: cargo test -p pentect-cli --no-default-features --locked --test metrics
+        run: |
+          cargo test -p pentect-cli --no-default-features --locked --test metrics
+          cargo test -p pentect-cli --all-features --locked --test metrics
       - name: Test general CLI changes
         if: needs.changes.outputs.cli_general == 'true'
         run: cargo test -p pentect-cli --no-default-features --locked

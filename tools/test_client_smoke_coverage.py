@@ -83,6 +83,9 @@ def main() -> None:
         "cargo test -p pentect-cli --no-default-features --locked --test metrics"
         in ci
     )
+    assert (
+        "cargo test -p pentect-cli --all-features --locked --test metrics" in ci
+    )
     assert "claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}" in ci
     supervisor_filter = re.search(
         r"^            claude_supervisor:\n(?P<body>(?:              - .+\n)+)",
