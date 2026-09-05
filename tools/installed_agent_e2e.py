@@ -2590,6 +2590,16 @@ def run_claude_parent_kill(pentect: str) -> None:
             runtime = root / "runtime"
             for directory in (home, project, temporary, runtime):
                 directory.mkdir()
+            generated_roots = (temporary, runtime)
+            if sys.platform == "darwin":
+                generated_roots += (
+                    home
+                    / "Library"
+                    / "Caches"
+                    / "pentect"
+                    / "private"
+                    / "claude-settings-v1",
+                )
             environment = isolated_environment(home, root / "logs")
             environment.update({
                 "ANTHROPIC_API_KEY": "local-fixture",
@@ -2656,7 +2666,7 @@ def run_claude_parent_kill(pentect: str) -> None:
                 process.pid, installed_claude
             )
             recorded_identities.update(ready_identities)
-            generated = fixture_settings((temporary, runtime), sentinel)
+            generated = fixture_settings(generated_roots, sentinel)
             if len(generated) != 1:
                 raise RuntimeError(
                     "expected one generated Claude settings file, found "
@@ -2698,7 +2708,7 @@ def run_claude_parent_kill(pentect: str) -> None:
                     "follow-up Claude cleanup launch failed:\n"
                     + completed.stdout.replace(sentinel, "<synthetic-sentinel>")
                 )
-            residue = fixture_settings((temporary, runtime), sentinel)
+            residue = fixture_settings(generated_roots, sentinel)
             if residue:
                 raise RuntimeError(
                     "generated Claude settings residue remained after follow-up launch: "
