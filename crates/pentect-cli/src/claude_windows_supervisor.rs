@@ -562,6 +562,19 @@ impl ClaudeJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    fn payload(location: SettingsLocation, args: &[&str]) -> LaunchPayload {
+        LaunchPayload {
+            version: PROTOCOL_VERSION,
+            wrapper_pid: 1,
+            program: vec![b'x' as u16],
+            cwd: None,
+            args: args.iter().map(|value| value.to_string()).collect(),
+            settings: br#"{"env":{}}"#.to_vec(),
+            location,
+        }
+    }
 
     #[test]
     fn owner_security_is_non_inheritable() {
@@ -574,5 +587,59 @@ mod tests {
     fn job_handle_is_valid_and_non_inherited_by_construction() {
         let job = ClaudeJob::new().unwrap();
         assert!(!job.0.as_raw_handle().is_null());
+        let mut flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(job.0.as_raw_handle().cast(), &mut flags) },
+            0
+        );
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+    }
+
+    #[test]
+    fn settings_location_validation_is_exact_and_bounded() {
+        assert!(payload_args(
+            &payload(SettingsLocation::Inline(0), &["--settings=old"]),
+            Path::new(r"C:\safe.json")
+        )
+        .is_ok());
+        assert!(payload_args(
+            &payload(SettingsLocation::Separate(1), &["--settings", "old"]),
+            Path::new(r"C:\safe.json")
+        )
+        .is_ok());
+        for invalid in [
+            payload(SettingsLocation::Inline(1), &["--settings=old"]),
+            payload(SettingsLocation::Inline(0), &["--model=old"]),
+            payload(SettingsLocation::Separate(1), &["--model", "old"]),
+            payload(SettingsLocation::Separate(9), &["--settings", "old"]),
+        ] {
+            assert!(payload_args(&invalid, Path::new(r"C:\safe.json")).is_err());
+        }
+    }
+
+    #[test]
+    fn protocol_frame_limit_covers_settings_and_arguments() {
+        let encoded =
+            serde_json::to_vec(&payload(SettingsLocation::InsertFront, &["unicode-☃"])).unwrap();
+        assert!(encoded.len() < MAX_FRAME);
+        let oversized = vec![0_u8; MAX_FRAME + 1];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut sink = tokio::io::sink();
+        assert!(runtime
+            .block_on(write_frame(&mut sink, &oversized))
+            .is_err());
+    }
+
+    #[test]
+    fn private_settings_are_readable_then_delete_on_close() {
+        let settings = PrivateSettings::create(b"fixture-confidential").unwrap();
+        let path = settings.path.clone();
+        let directory = settings.directory.clone();
+        assert_eq!(std::fs::read(&path).unwrap(), b"fixture-confidential");
+        drop(settings);
+        assert!(!path.exists());
+        assert!(!directory.exists());
     }
 }
