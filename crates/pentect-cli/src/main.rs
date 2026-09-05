@@ -2102,6 +2102,7 @@ pub(crate) struct PreparedClaudeGateway {
 }
 
 impl PreparedClaudeGateway {
+    #[cfg(any(not(windows), test))]
     fn args_with_settings_path(&self, settings_path: &str) -> Result<Vec<String>, String> {
         let mut args = self.args.clone();
         match self.settings_arg {
@@ -2131,6 +2132,7 @@ impl PreparedClaudeGateway {
         Ok(args)
     }
 
+    #[cfg(not(windows))]
     fn materialize(self) -> Result<ClaudeGatewaySettings, String> {
         let directory = secure_temp::SecureTempDirectory::create(
             "pentect-claude-settings-",
@@ -2153,12 +2155,14 @@ impl PreparedClaudeGateway {
 }
 
 #[derive(Debug)]
+#[cfg(not(windows))]
 struct ClaudeGatewaySettings {
     args: Vec<String>,
     _file: secure_temp::SecureTempFile,
     _directory: secure_temp::SecureTempDirectory,
 }
 
+#[cfg(not(windows))]
 impl ClaudeGatewaySettings {
     fn args(&self) -> &[String] {
         &self.args
