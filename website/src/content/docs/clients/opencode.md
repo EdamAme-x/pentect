@@ -33,8 +33,11 @@ install Pentect's temporary conversation routing. They exchange credentials,
 not conversation content. Providers not listed as supported below can be
 authenticated there, but protected conversations require a supported provider.
 
-Normal OpenCode arguments pass through. A model flag may appear anywhere before
-the explicit `--` separator:
+Normal local OpenCode arguments pass through. Attaching to another OpenCode
+server bypasses this process's gateway and is rejected. `serve` and `web` stay
+loopback-only; explicit non-loopback or mDNS exposure is rejected and inherited
+server configuration is narrowed to loopback for that launch. A model flag may
+appear anywhere before the explicit `--` separator:
 
 ```sh
 pentect opencode "Review this project" --model openai/gpt-5
@@ -60,6 +63,16 @@ it:
 ```sh
 pentect opencode --api responses --model gpt-5
 ```
+
+## Session sharing and export
+
+Protected launches disable OpenCode's external session sharing. The
+`opencode export` command is forwarded with OpenCode's own `--sanitize` option.
+
+OpenCode's interactive `/export` command still creates a local transcript that
+can contain restored values. Pentect cannot sanitize that client-owned local
+file, so review it as sensitive data and do not publish it without inspecting
+it first.
 
 ## Custom gateways
 

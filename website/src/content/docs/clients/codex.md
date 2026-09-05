@@ -17,6 +17,8 @@ pentect codex app
 
 Pentect protects the Codex session it starts. Normal CLI arguments pass
 through, and `app` opens Codex App without changing the official app.
+Codex Cloud, Remote Control, and `--remote` app-server sessions run outside
+this local gateway, so the protected launcher rejects those modes.
 
 Prerequisites:
 

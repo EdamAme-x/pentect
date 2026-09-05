@@ -17,6 +17,8 @@ pentect claude app
 
 Pentect protects the Claude session it starts. Normal Claude Code arguments
 pass through, and `app` opens Claude Desktop without changing the official app.
+Cloud sessions, self-hosted cloud environments, Remote Control, teleport, and
+cloud-hosted ultrareview run outside this local gateway and are rejected.
 
 Prerequisites:
 

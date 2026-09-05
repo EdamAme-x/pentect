@@ -45,6 +45,13 @@ uses those handles in local tool calls, and reaches the fixture service with
 the exact originals. The provider requests and persistent diagnostics must not
 contain either plaintext value. It does not make a paid provider request.
 
+Pentect commands such as `pentect read`, `pentect exec`, `pentect resolve`,
+`pentect bridge`, and `pentect hook` remain available as standalone commands.
+They are deliberately unavailable when invoked from inside a Pentect-launched
+client: normal shell, file, and MCP tools are restored and remasked at the
+local gateway boundary without giving the client process or its descendants
+the memory-store authority.
+
 Desktop vendor apps are not installed on ephemeral release runners, so their
 full signed-GUI flow is not yet a release gate. Pentect does not claim an App
 version as verified until that automation exists.
