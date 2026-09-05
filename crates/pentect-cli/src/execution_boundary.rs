@@ -206,7 +206,12 @@ fn enabled_boolean_option(args: &[String], option: &str, arity: fn(&str) -> Arit
             .strip_prefix(option)
             .and_then(|rest| rest.strip_prefix('='))
         {
-            return value != "false";
+            // A disabled occurrence does not make a later duplicate safe.
+            // Reject if any occurrence enables the option or has an
+            // unrecognized value, independent of argument order.
+            if value != "false" {
+                return true;
+            }
         }
         if argument.starts_with('-') && !argument.contains('=') {
             match arity(argument) {
@@ -344,6 +349,9 @@ mod tests {
             values(&["serve", "--mdns=unexpected"]),
             values(&["serve", "--mdns=0"]),
             values(&["serve", "--mdns", "false"]),
+            values(&["serve", "--mdns=false", "--mdns=true"]),
+            values(&["serve", "--mdns=false", "--mdns"]),
+            values(&["serve", "--mdns=true", "--mdns=false"]),
             values(&["serve", "--hostname", "127.0.0.1", "--hostname=0.0.0.0"]),
         ] {
             let error = validate(&OPENCODE, &args).unwrap_err();
@@ -355,6 +363,7 @@ mod tests {
             values(&["serve", "--hostname", "127.0.0.1"]),
             values(&["web", "--hostname=::1"]),
             values(&["serve", "--mdns=false"]),
+            values(&["serve", "--mdns=false", "--mdns=false"]),
             values(&["serve", "--prompt", "--mdns", "--hostname=localhost"]),
         ] {
             assert!(validate(&OPENCODE, &args).is_ok(), "{args:?}");
