@@ -9,11 +9,13 @@ pub(crate) struct SecureTempFile {
     path: PathBuf,
 }
 
+#[cfg(any(not(unix), test))]
 #[derive(Debug)]
 pub(crate) struct SecureTempDirectory {
     path: PathBuf,
 }
 
+#[cfg(any(not(unix), test))]
 impl SecureTempDirectory {
     pub(crate) fn create(prefix: &str, purpose: &str) -> Result<Self, String> {
         validate_name_part(prefix)?;
@@ -50,6 +52,7 @@ impl SecureTempDirectory {
     }
 }
 
+#[cfg(any(not(unix), test))]
 impl Drop for SecureTempDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.path);

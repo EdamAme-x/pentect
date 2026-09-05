@@ -61,6 +61,7 @@ jobs:
       claude_app: ${{ steps.filter.outputs.claude_app }}
       openai_proxy: ${{ steps.filter.outputs.openai_proxy }}
       command_shims: ${{ steps.filter.outputs.command_shims }}
+      claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}
       runtime_log: ${{ steps.filter.outputs.runtime_log }}
       cli_general: ${{ steps.filter-general.outputs.cli_general }}
       runtime_general: ${{ steps.filter-general.outputs.runtime_general }}
@@ -179,6 +180,17 @@ jobs:
               - 'crates/pentect-cli/src/upstream.rs'
             command_shims:
               - 'crates/pentect-cli/src/main.rs'
+            claude_supervisor:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/pentect-cli/Cargo.toml'
+              - 'crates/pentect-cli/src/main.rs'
+              - 'crates/pentect-cli/src/claude_settings_session.rs'
+              - 'crates/pentect-cli/src/claude_unix_supervisor.rs'
+              - 'crates/pentect-cli/src/claude_windows_supervisor.rs'
+              - 'crates/pentect-cli/tests/native_interrupt.rs'
+              - 'crates/pentect-cli/tests/*claude*.rs'
             runtime_log:
               - 'crates/pentect-runtime/src/activity_log.rs'
               - 'crates/pentect-runtime/src/delegated_process_host.rs'
@@ -326,14 +338,14 @@ jobs:
         if: needs.changes.result != 'success'
         run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true'
         with:
           submodules: recursive
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true'
       - name: Configure fast Windows test linking
-        if: runner.os == 'Windows' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true')
+        if: runner.os == 'Windows' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true')
         shell: pwsh
         run: |
           $linker = (Get-Command lld-link.exe -ErrorAction Stop).Source
@@ -341,7 +353,7 @@ jobs:
           "CARGO_PROFILE_TEST_DEBUG=0" >> $env:GITHUB_ENV
           "Using linker: $linker"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true'
         with:
           save-if: ${{ github.event_name == 'push' }}
       - name: Test Codex App launcher and recovery
@@ -359,8 +371,15 @@ jobs:
       - name: Test Windows npm command shims
         if: needs.changes.outputs.command_shims == 'true' && runner.os == 'Windows'
         run: cargo test -p pentect-cli --no-default-features windows_npm_cmd_shim --locked
+      - name: Test Windows Claude supervisor
+        if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'Windows'
+        run: cargo test -p pentect-cli --no-default-features --bin pentect claude_windows_supervisor::tests --locked
+      - name: Test macOS Claude supervisor boundaries
+        if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'macOS'
+        timeout-minutes: 5
+        run: cargo test -p pentect-cli --no-default-features --locked --test claude_guardian_boundary --test claude_unix_supervisor --test native_interrupt
       - name: No app changes
-        if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true'
+        if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true' && needs.changes.outputs.claude_supervisor != 'true'
         run: echo "No app changes"
 
   windows-powershell-installer:

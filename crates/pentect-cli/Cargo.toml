@@ -1,6 +1,6 @@
 [package]
 name = "pentect-cli"
-version = "0.0.74"
+version = "0.0.75"
 description = "Pentect CLI"
 edition.workspace = true
 license.workspace = true
@@ -61,6 +61,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 

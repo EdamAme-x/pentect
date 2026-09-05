@@ -3,6 +3,12 @@
 mod app_launcher;
 mod claude_app_proxy;
 mod claude_http_proxy;
+#[cfg(unix)]
+mod claude_settings_session;
+#[cfg(unix)]
+mod claude_unix_supervisor;
+#[cfg(windows)]
+mod claude_windows_supervisor;
 mod client_descriptor;
 mod cloud_code_http_proxy;
 mod codex_app;
@@ -243,6 +249,14 @@ const COMMANDS: &[CommandSpec] = &[
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(windows)]
+    if args.get(1).map(String::as_str) == Some("__claude-windows-supervisor") {
+        std::process::exit(claude_windows_supervisor::run_helper(&args));
+    }
+    #[cfg(unix)]
+    if let Some(code) = claude_unix_supervisor::hidden_main(&args) {
+        std::process::exit(code);
+    }
     if args.get(1).map(String::as_str) == Some("__plugin-setup-supervisor") {
         std::process::exit(plugins_cmd::cmd_setup_supervisor(&args));
     }
@@ -1814,8 +1828,43 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let gateway_settings =
         plan.caller_settings
             .with_gateway(&args, http_proxy.base_url(), plan.enable_tool_search)?;
+    #[cfg(windows)]
+    {
+        install_native_interrupt_handler()?;
+        NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+        return claude_windows_supervisor::launch(&cmd, gateway_settings, &opts.command);
+    }
+    #[cfg(unix)]
+    return run_supervised_claude_with_guards(cmd, &opts.command, gateway_settings, http_proxy);
+    #[cfg(not(any(unix, windows)))]
+    let gateway_settings = gateway_settings.materialize()?;
+    #[cfg(not(any(unix, windows)))]
     cmd.args(gateway_settings.args());
+    #[cfg(not(any(unix, windows)))]
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
+}
+
+#[cfg(unix)]
+fn run_supervised_claude_with_guards<G>(
+    mut command: Command,
+    display: &Path,
+    prepared: PreparedClaudeGateway,
+    _guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    install_native_interrupt_handler()?;
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let result = claude_unix_supervisor::spawn_claude(&command, &prepared)
+        .map_err(|error| format!("could not run '{}': {error}", display.display()))
+        .and_then(|managed| {
+            claude_unix_supervisor::wait(managed)
+                .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
+        });
+    NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
+    result
 }
 
 fn run_endpoint_env(
@@ -2018,7 +2067,7 @@ impl ClaudeCallerSettings {
         args: &[String],
         base_url: &str,
         enable_tool_search: bool,
-    ) -> Result<ClaudeGatewaySettings, String> {
+    ) -> Result<PreparedClaudeGateway, String> {
         let mut settings = self.value.clone();
         let object = settings
             .as_object_mut()
@@ -2039,25 +2088,19 @@ impl ClaudeCallerSettings {
             );
         }
 
-        let directory = secure_temp::SecureTempDirectory::create(
-            "pentect-claude-settings-",
-            "Claude settings",
-        )?;
         let encoded = serde_json::to_vec(&settings)
             .map_err(|error| format!("could not encode protected Claude settings: {error}"))?;
-        let file = secure_temp::SecureTempFile::create(
-            directory.path(),
-            ".pentect-claude-settings-",
-            ".json",
-            &encoded,
-            "Claude settings",
-        )?;
-        let path = file.path().to_string_lossy().into_owned();
-        let out = self.gateway_args(args, &path);
-        Ok(ClaudeGatewaySettings {
-            args: out,
-            _file: file,
-            _directory: directory,
+        let settings_arg = match (self.settings_at, self.inline) {
+            (Some(index), true) => ClaudeSettingsArg::Inline { index },
+            (Some(index), false) => ClaudeSettingsArg::Separate {
+                value_index: index + 1,
+            },
+            (None, _) => ClaudeSettingsArg::InsertFront,
+        };
+        Ok(PreparedClaudeGateway {
+            encoded,
+            args: args.to_vec(),
+            settings_arg,
         })
     }
 
@@ -2077,13 +2120,82 @@ impl ClaudeCallerSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaudeSettingsArg {
+    Inline { index: usize },
+    Separate { value_index: usize },
+    InsertFront,
+}
+
 #[derive(Debug)]
+pub(crate) struct PreparedClaudeGateway {
+    pub(crate) encoded: Vec<u8>,
+    pub(crate) args: Vec<String>,
+    pub(crate) settings_arg: ClaudeSettingsArg,
+}
+
+impl PreparedClaudeGateway {
+    #[cfg(any(not(any(unix, windows)), test))]
+    fn args_with_settings_path(&self, settings_path: &str) -> Result<Vec<String>, String> {
+        let mut args = self.args.clone();
+        match self.settings_arg {
+            ClaudeSettingsArg::Inline { index } => {
+                if !args
+                    .get(index)
+                    .is_some_and(|arg| arg.starts_with("--settings="))
+                {
+                    return Err("prepared Claude inline settings argument is invalid".to_string());
+                }
+                args[index] = format!("--settings={settings_path}");
+            }
+            ClaudeSettingsArg::Separate { value_index } => {
+                if value_index == 0
+                    || args.get(value_index - 1).map(String::as_str) != Some("--settings")
+                    || args.get(value_index).is_none()
+                {
+                    return Err("prepared Claude settings argument is invalid".to_string());
+                }
+                args[value_index] = settings_path.to_string();
+            }
+            ClaudeSettingsArg::InsertFront => {
+                args.insert(0, settings_path.to_string());
+                args.insert(0, "--settings".to_string());
+            }
+        }
+        Ok(args)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn materialize(self) -> Result<ClaudeGatewaySettings, String> {
+        let directory = secure_temp::SecureTempDirectory::create(
+            "pentect-claude-settings-",
+            "Claude settings",
+        )?;
+        let file = secure_temp::SecureTempFile::create(
+            directory.path(),
+            ".pentect-claude-settings-",
+            ".json",
+            &self.encoded,
+            "Claude settings",
+        )?;
+        let path = file.path().to_string_lossy().into_owned();
+        Ok(ClaudeGatewaySettings {
+            args: self.args_with_settings_path(&path)?,
+            _file: file,
+            _directory: directory,
+        })
+    }
+}
+
+#[derive(Debug)]
+#[cfg(not(any(unix, windows)))]
 struct ClaudeGatewaySettings {
     args: Vec<String>,
     _file: secure_temp::SecureTempFile,
     _directory: secure_temp::SecureTempDirectory,
 }
 
+#[cfg(not(any(unix, windows)))]
 impl ClaudeGatewaySettings {
     fn args(&self) -> &[String] {
         &self.args
@@ -4602,7 +4714,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_gateway_settings_use_and_remove_a_private_temp_directory() {
+    fn claude_gateway_settings_are_prepared_without_writing_a_temp_file() {
         let settings = ClaudeCallerSettings {
             value: serde_json::json!({}),
             effective_env: serde_json::Map::new(),
@@ -4612,14 +4724,17 @@ mod tests {
         let gateway = settings
             .with_gateway(&[], "http://127.0.0.1:1234", false)
             .unwrap();
-        let path = PathBuf::from(&gateway.args()[1]);
-        let directory = path.parent().unwrap().to_path_buf();
-        assert!(path.is_file());
-        assert!(directory.starts_with(std::env::temp_dir()));
-
-        drop(gateway);
-        assert!(!path.exists());
-        assert!(!directory.exists());
+        assert_eq!(
+            gateway
+                .args_with_settings_path("<pentect-settings>")
+                .unwrap(),
+            ["--settings", "<pentect-settings>"]
+        );
+        let encoded: serde_json::Value = serde_json::from_slice(&gateway.encoded).unwrap();
+        assert_eq!(
+            encoded["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:1234"
+        );
     }
 
     #[test]
@@ -4694,10 +4809,14 @@ mod tests {
         let gateway = settings
             .with_gateway(&args, "http://127.0.0.1:1234", false)
             .unwrap();
-        let generated = PathBuf::from(&gateway.args()[1]);
-        assert_ne!(generated.parent(), Some(source_directory.as_path()));
+        assert_eq!(
+            gateway
+                .args_with_settings_path("<pentect-settings>")
+                .unwrap()[1],
+            "<pentect-settings>"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"{}");
 
-        drop(gateway);
         std::fs::set_permissions(&source_directory, std::fs::Permissions::from_mode(0o700))
             .unwrap();
         std::fs::remove_file(source).unwrap();
