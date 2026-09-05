@@ -148,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix="pentect-claude-job-") as root:
   if not until(b"PENTECT-PROMPT> ",4,5): raise RuntimeError("final prompt missing "+repr(output))
   os.write(fd,b"exit\n"); os.waitpid(pid,0); reaped=True
  finally:
- if not reaped:
+  if not reaped:
    if wrapper:
     try: os.kill(wrapper,signal.SIGKILL)
     except ProcessLookupError: pass

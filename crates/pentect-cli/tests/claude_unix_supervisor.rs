@@ -83,6 +83,10 @@ fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_ne!(unsafe { libc::kill(client, 0) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while settings.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(!settings.exists());
 
     std::fs::remove_file(&ready).unwrap();

@@ -210,19 +210,22 @@ pub(crate) fn wait(mut managed: Supervised) -> Result<ExitStatus, String> {
                 if received == 5 {
                     match message[0] {
                         STATUS => {
-                            drop(managed.foreground.take());
+                            restore_foreground(&mut managed.foreground)?;
                             managed
                                 .owner
                                 .write_all(&[STATUS_ACK])
                                 .map_err(|e| e.to_string())?;
-                            let _ = managed.guardian.wait();
+                            let guardian_status = managed.guardian.wait().map_err(|error| {
+                                format!("could not reap Claude guardian: {error}")
+                            })?;
+                            validate_guardian_status(guardian_status)?;
                             use std::os::unix::process::ExitStatusExt as _;
                             return Ok(ExitStatus::from_raw(i32::from_ne_bytes(
                                 message[1..].try_into().unwrap(),
                             )));
                         }
                         STOPPED => {
-                            drop(managed.foreground.take());
+                            restore_foreground(&mut managed.foreground)?;
                             unsafe {
                                 libc::kill(libc::getpid(), libc::SIGSTOP);
                             }
@@ -242,6 +245,14 @@ pub(crate) fn wait(mut managed: Supervised) -> Result<ExitStatus, String> {
             Err(error) => return Err(error.to_string()),
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn validate_guardian_status(status: ExitStatus) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Claude guardian exited with status {status}"))
     }
 }
 
@@ -548,7 +559,7 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
             // Keep the direct Claude child unreaped as the PGID anchor until
             // the live wrapper confirms it restored terminal ownership. Owner
             // EOF remains the fail-safe when the wrapper dies while paused.
-            if rx.recv().unwrap_or(None) != Some(STATUS_ACK) {
+            if !await_status_ack(&rx) {
                 terminate_managed(&mut client, &mut relay)?;
                 session.release();
                 return Ok(1);
@@ -559,6 +570,16 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
             return Ok(0);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn await_status_ack(rx: &mpsc::Receiver<Option<u8>>) -> bool {
+    loop {
+        match rx.recv().unwrap_or(None) {
+            Some(STATUS_ACK) => return true,
+            Some(_) => continue,
+            None => return false,
+        }
     }
 }
 
@@ -786,10 +807,10 @@ fn raw_status_without_reaping(pid: u32) -> Result<Option<i32>, String> {
         }
         let code = info.si_code;
         let status = unsafe { info.si_status() };
-        Ok(Some(if code == libc::CLD_EXITED {
-            status << 8
-        } else {
-            status
+        Ok(Some(match code {
+            libc::CLD_EXITED => status << 8,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => status,
         }))
     }
 }
@@ -820,11 +841,19 @@ fn terminate_anchored(child: &mut Child) -> Result<ExitStatus, String> {
 }
 
 fn terminate_managed(client: &mut Child, relay: &mut Child) -> Result<ExitStatus, String> {
-    let status = terminate_anchored(client)?;
-    relay
+    unsafe {
+        libc::kill(-(client.id() as i32), libc::SIGKILL);
+    }
+    let client_result = client
         .wait()
-        .map_err(|error| format!("could not reap Claude signal relay: {error}"))?;
-    Ok(status)
+        .map_err(|error| format!("could not reap Claude: {error}"));
+    let relay_result = relay
+        .wait()
+        .map_err(|error| format!("could not reap Claude signal relay: {error}"));
+    match (client_result, relay_result) {
+        (Ok(status), Ok(_)) => Ok(status),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 
 struct Foreground {
@@ -848,6 +877,19 @@ impl Foreground {
         set_foreground(terminal, group)?;
         Ok(Some(Self { terminal, original }))
     }
+
+    fn restore(self) -> Result<(), String> {
+        set_foreground(self.terminal, self.original)?;
+        std::mem::forget(self);
+        Ok(())
+    }
+}
+
+fn restore_foreground(foreground: &mut Option<Foreground>) -> Result<(), String> {
+    if let Some(foreground) = foreground.take() {
+        foreground.restore()?;
+    }
+    Ok(())
 }
 
 impl Drop for Foreground {
@@ -862,14 +904,18 @@ fn set_foreground(terminal: i32, group: i32) -> Result<(), String> {
     unsafe {
         libc::sigemptyset(&mut block);
         libc::sigaddset(&mut block, libc::SIGTTOU);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+    }
+    let blocked = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old) };
+    if blocked != 0 {
+        return Err(std::io::Error::from_raw_os_error(blocked).to_string());
     }
     let result = unsafe { libc::tcsetpgrp(terminal, group) };
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-    }
+    let terminal_error = (result == -1).then(std::io::Error::last_os_error);
+    let restored = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
     if result == -1 {
-        Err(std::io::Error::last_os_error().to_string())
+        Err(terminal_error.unwrap().to_string())
+    } else if restored != 0 {
+        Err(std::io::Error::from_raw_os_error(restored).to_string())
     } else {
         Ok(())
     }
@@ -914,5 +960,25 @@ mod tests {
                 expected.into_iter().map(OsString::from).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn status_ack_ignores_stale_controls_but_not_owner_eof() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Some(CONTINUE)).unwrap();
+        tx.send(Some(CANCEL)).unwrap();
+        tx.send(Some(STATUS_ACK)).unwrap();
+        assert!(await_status_ack(&rx));
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Some(CONTINUE)).unwrap();
+        drop(tx);
+        assert!(!await_status_ack(&rx));
+    }
+
+    #[test]
+    fn guardian_failure_is_not_reported_as_client_success() {
+        let status = Command::new("sh").args(["-c", "exit 1"]).status().unwrap();
+        assert!(validate_guardian_status(status).is_err());
     }
 }
