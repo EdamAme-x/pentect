@@ -2605,6 +2605,11 @@ def capture_descendant_identities(wrapper_pid: int, identities: dict[int, str]) 
 
 
 def run_claude_parent_kill(pentect: str) -> None:
+    if os.name == "nt" and Path(pentect).suffix.lower() != ".exe":
+        raise RuntimeError(
+            "Claude parent-exit E2E requires a native pentect.exe on Windows; "
+            "command shims cannot provide exact wrapper process identity"
+        )
     sentinel = "PENTECT_CLAUDE_LIFETIME_SYNTHETIC_SENTINEL"
     state = State("unused-valid", "unused-invalid", hold_model=True)
     server = FixtureServer(state)
