@@ -21,13 +21,19 @@ fn root() -> std::path::PathBuf {
 fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
     let root = root();
     let runtime = root.join("runtime");
-    std::fs::create_dir(&runtime).unwrap();
-    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let state = root.join("state");
+    let config = root.join("config");
+    for directory in [&runtime, &home, &cache, &state, &config] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let ready = root.join("ready");
     let script = root.join("client.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\nif [ \"$1\" = exit37 ]; then exit 37; fi\nlast=\nfor arg in \"$@\"; do last=$arg; done\nprintf '%s\\n%s\\n' \"$$\" \"$last\" > \"$READY\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\nsettings=\nnext=0\nfor arg in \"$@\"; do [ \"$arg\" = slow37 ] && { sleep 6; exit 37; }; if [ \"$next\" = 1 ]; then settings=$arg; next=0; elif [ \"$arg\" = --settings ]; then next=1; fi; done\nprintf '%s\\n%s\\n' \"$$\" \"$settings\" > \"$READY\"\nwhile :; do sleep 1; done\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -37,9 +43,14 @@ fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
         .args([
             "__test-claude-unix-wrapper",
             script.to_str().unwrap(),
-            "exit37",
+            "slow37",
         ])
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("READY", &ready)
         .stdin(Stdio::null())
         .status()
@@ -53,6 +64,11 @@ fn noninteractive_guardian_preserves_status_and_cleans_after_wrapper_sigkill() {
             "block",
         ])
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("READY", &ready)
         .stdin(Stdio::null())
         .spawn()

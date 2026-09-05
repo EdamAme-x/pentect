@@ -27,11 +27,13 @@ pub(crate) fn hidden_main(args: &[String]) -> Option<i32> {
 #[cfg(debug_assertions)]
 fn test_wrapper(args: &[String]) -> i32 {
     let Some(program) = args.get(2) else { return 2 };
-    let mut command = Command::new(program);
-    command.args(&args[3..]);
-    match spawn_claude(&command, br#"{"synthetic":"guardian-test"}"#)
-        .and_then(|(child, owner)| wait(child, owner))
-    {
+    let command = Command::new(program);
+    let prepared = crate::PreparedClaudeGateway {
+        encoded: br#"{"synthetic":"guardian-test"}"#.to_vec(),
+        args: args[3..].to_vec(),
+        settings_arg: crate::ClaudeSettingsArg::InsertFront,
+    };
+    match spawn_claude(&command, &prepared).and_then(|(child, owner)| wait(child, owner)) {
         Ok(status) => {
             use std::os::unix::process::ExitStatusExt as _;
             status
@@ -47,8 +49,9 @@ fn test_wrapper(args: &[String]) -> i32 {
 
 pub(crate) fn spawn_claude(
     command: &Command,
-    settings: &[u8],
+    prepared: &crate::PreparedClaudeGateway,
 ) -> Result<(Child, UnixStream), String> {
+    let payload = encode_payload(command, prepared)?;
     let (mut owner, inherited) = UnixStream::pair()
         .map_err(|error| format!("could not create Claude guardian socket: {error}"))?;
     let timeout = Some(std::time::Duration::from_secs(5));
@@ -95,9 +98,9 @@ pub(crate) fn spawn_claude(
         return Err(format!("Claude guardian did not start: {error}"));
     }
     if hello[0] != HELLO {
+        cleanup_startup_guardian(&mut child, owner);
         return Err("Claude guardian returned an invalid hello".to_string());
     }
-    let payload = encode_payload(command, settings)?;
     if let Err(error) = owner
         .write_all(&(payload.len() as u32).to_ne_bytes())
         .and_then(|_| owner.write_all(&payload))
@@ -111,12 +114,19 @@ pub(crate) fn spawn_claude(
         return Err(format!("Claude guardian startup failed: {error}"));
     }
     if ready[0] != READY {
+        cleanup_startup_guardian(&mut child, owner);
         return Err("Claude guardian returned invalid readiness".to_string());
     }
     if let Err(error) = owner.write_all(&[ACK]) {
         cleanup_startup_guardian(&mut child, owner);
         return Err(format!("could not release Claude bootstrap: {error}"));
     }
+    owner
+        .set_read_timeout(None)
+        .map_err(|error| error.to_string())?;
+    owner
+        .set_write_timeout(None)
+        .map_err(|error| error.to_string())?;
     Ok((child, owner))
 }
 
@@ -136,9 +146,10 @@ fn cleanup_startup_guardian(child: &mut Child, owner: UnixStream) {
 
 pub(crate) fn wait(mut guardian: Child, mut owner: UnixStream) -> Result<ExitStatus, String> {
     let mut message = [0_u8; 5];
-    owner
-        .read_exact(&mut message)
-        .map_err(|error| format!("Claude guardian exited without status: {error}"))?;
+    if let Err(error) = owner.read_exact(&mut message) {
+        cleanup_startup_guardian(&mut guardian, owner);
+        return Err(format!("Claude guardian exited without status: {error}"));
+    }
     let _ = guardian.wait();
     if message[0] != STATUS {
         return Err("Claude guardian returned invalid status".to_string());
@@ -149,7 +160,10 @@ pub(crate) fn wait(mut guardian: Child, mut owner: UnixStream) -> Result<ExitSta
     )))
 }
 
-fn encode_payload(command: &Command, settings: &[u8]) -> Result<Vec<u8>, String> {
+fn encode_payload(
+    command: &Command,
+    prepared: &crate::PreparedClaudeGateway,
+) -> Result<Vec<u8>, String> {
     if command.get_program().to_str().is_none()
         || command
             .get_args()
@@ -158,9 +172,20 @@ fn encode_payload(command: &Command, settings: &[u8]) -> Result<Vec<u8>, String>
         return Err("Claude program and arguments must be valid UTF-8 on Unix".to_string());
     }
     let mut out = Vec::new();
-    put(&mut out, settings)?;
+    put(&mut out, &prepared.encoded)?;
+    let (kind, index) = match prepared.settings_arg {
+        crate::ClaudeSettingsArg::Inline { index } => (1_u8, index),
+        crate::ClaudeSettingsArg::Separate { value_index } => (2, value_index),
+        crate::ClaudeSettingsArg::InsertFront => (3, 0),
+    };
+    out.push(kind);
+    out.extend_from_slice(
+        &u32::try_from(index)
+            .map_err(|_| "Claude settings index is too large")?
+            .to_ne_bytes(),
+    );
     put(&mut out, command.get_program().as_bytes())?;
-    let args = command.get_args().collect::<Vec<_>>();
+    let args = &prepared.args;
     out.extend_from_slice(&(args.len() as u32).to_ne_bytes());
     for arg in args {
         put(&mut out, arg.as_bytes())?;
@@ -216,18 +241,35 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
     });
     let session = crate::claude_settings_session::Session::create(&payload.settings)?;
     let path = session.settings_path();
-    let (barrier_reader, barrier_writer) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let client_args = match payload.args_with_settings_path(&path) {
+        Ok(args) => args,
+        Err(error) => {
+            session.abort();
+            return Err(error);
+        }
+    };
+    let (barrier_reader, barrier_writer) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            session.abort();
+            return Err(error.to_string());
+        }
+    };
     let barrier_fd = barrier_reader.as_raw_fd();
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            session.abort();
+            return Err(error.to_string());
+        }
+    };
     let mut client = Command::new(executable);
     client
         .arg("__claude-unix-bootstrap")
         .arg(barrier_fd.to_string())
         .arg(&payload.program)
         .arg("--")
-        .args(&payload.args)
-        .arg("--settings")
-        .arg(path)
+        .args(&client_args)
         .process_group(0)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -300,6 +342,8 @@ fn guardian_run(args: &[String]) -> Result<i32, String> {
 
 struct Payload {
     settings: Vec<u8>,
+    settings_kind: u8,
+    settings_index: usize,
     program: OsString,
     args: Vec<OsString>,
 }
@@ -315,6 +359,11 @@ fn read_payload(owner: &mut UnixStream) -> Result<Payload, String> {
     owner.read_exact(&mut bytes).map_err(|e| e.to_string())?;
     let mut at = 0;
     let settings = take(&bytes, &mut at)?;
+    let settings_kind = *bytes
+        .get(at)
+        .ok_or("Claude guardian payload is truncated")?;
+    at += 1;
+    let settings_index = take_u32(&bytes, &mut at)? as usize;
     let program = OsString::from_vec(take(&bytes, &mut at)?);
     let count = take_u32(&bytes, &mut at)? as usize;
     if count > 4096 {
@@ -329,9 +378,42 @@ fn read_payload(owner: &mut UnixStream) -> Result<Payload, String> {
     }
     Ok(Payload {
         settings,
+        settings_kind,
+        settings_index,
         program,
         args,
     })
+}
+
+impl Payload {
+    fn args_with_settings_path(&self, path: &std::path::Path) -> Result<Vec<OsString>, String> {
+        let path = path.as_os_str().to_owned();
+        let mut args = self.args.clone();
+        match self.settings_kind {
+            1 if args
+                .get(self.settings_index)
+                .and_then(|v| v.to_str())
+                .is_some_and(|v| v.starts_with("--settings=")) =>
+            {
+                let mut value = OsString::from("--settings=");
+                value.push(path);
+                args[self.settings_index] = value;
+            }
+            2 if self.settings_index > 0
+                && args.get(self.settings_index - 1).and_then(|v| v.to_str())
+                    == Some("--settings")
+                && args.get(self.settings_index).is_some() =>
+            {
+                args[self.settings_index] = path
+            }
+            3 => {
+                args.insert(0, path);
+                args.insert(0, OsString::from("--settings"));
+            }
+            _ => return Err("Claude guardian settings location is invalid".to_string()),
+        }
+        Ok(args)
+    }
 }
 
 fn take(bytes: &[u8], at: &mut usize) -> Result<Vec<u8>, String> {
@@ -438,4 +520,46 @@ fn terminate_anchored(child: &mut Child) -> Result<ExitStatus, String> {
 fn raw_status(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     status.into_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_location_is_replaced_exactly() {
+        let path = std::path::Path::new("/private/generated.json");
+        for (kind, index, args, expected) in [
+            (
+                1,
+                1,
+                vec!["x", "--settings=old"],
+                vec!["x", "--settings=/private/generated.json"],
+            ),
+            (
+                2,
+                2,
+                vec!["x", "--settings", "old"],
+                vec!["x", "--settings", "/private/generated.json"],
+            ),
+            (
+                3,
+                0,
+                vec!["x"],
+                vec!["--settings", "/private/generated.json", "x"],
+            ),
+        ] {
+            let payload = Payload {
+                settings: vec![],
+                settings_kind: kind,
+                settings_index: index,
+                program: OsString::from("client"),
+                args: args.into_iter().map(OsString::from).collect(),
+            };
+            assert_eq!(
+                payload.args_with_settings_path(path).unwrap(),
+                expected.into_iter().map(OsString::from).collect::<Vec<_>>()
+            );
+        }
+    }
 }

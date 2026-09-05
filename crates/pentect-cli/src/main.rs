@@ -5,10 +5,10 @@ mod claude_app_proxy;
 mod claude_http_proxy;
 #[cfg(unix)]
 mod claude_settings_session;
-#[cfg(windows)]
-mod claude_windows_supervisor;
 #[cfg(unix)]
 mod claude_unix_supervisor;
+#[cfg(windows)]
+mod claude_windows_supervisor;
 mod client_descriptor;
 mod cloud_code_http_proxy;
 mod codex_app;
@@ -1834,12 +1834,37 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
         NATIVE_COMMAND_INTERRUPTS.store(0, Ordering::SeqCst);
         return claude_windows_supervisor::launch(&cmd, gateway_settings, &opts.command);
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
+        if !std::io::stdin().is_terminal() {
+            return run_noninteractive_claude_with_guards(
+                cmd,
+                &opts.command,
+                gateway_settings,
+                http_proxy,
+            );
+        }
         let gateway_settings = gateway_settings.materialize()?;
         cmd.args(gateway_settings.args());
         run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
     }
+}
+
+#[cfg(unix)]
+fn run_noninteractive_claude_with_guards<G>(
+    mut command: Command,
+    display: &Path,
+    prepared: PreparedClaudeGateway,
+    _guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let (guardian, owner) = claude_unix_supervisor::spawn_claude(&command, &prepared)
+        .map_err(|error| format!("could not run '{}': {error}", display.display()))?;
+    claude_unix_supervisor::wait(guardian, owner)
+        .map_err(|error| format!("could not wait for '{}': {error}", display.display()))
 }
 
 fn run_endpoint_env(
