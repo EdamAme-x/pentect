@@ -1814,6 +1814,7 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let gateway_settings =
         plan.caller_settings
             .with_gateway(&args, http_proxy.base_url(), plan.enable_tool_search)?;
+    let gateway_settings = gateway_settings.materialize()?;
     cmd.args(gateway_settings.args());
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
 }
@@ -2018,7 +2019,7 @@ impl ClaudeCallerSettings {
         args: &[String],
         base_url: &str,
         enable_tool_search: bool,
-    ) -> Result<ClaudeGatewaySettings, String> {
+    ) -> Result<PreparedClaudeGateway, String> {
         let mut settings = self.value.clone();
         let object = settings
             .as_object_mut()
@@ -2039,25 +2040,19 @@ impl ClaudeCallerSettings {
             );
         }
 
-        let directory = secure_temp::SecureTempDirectory::create(
-            "pentect-claude-settings-",
-            "Claude settings",
-        )?;
         let encoded = serde_json::to_vec(&settings)
             .map_err(|error| format!("could not encode protected Claude settings: {error}"))?;
-        let file = secure_temp::SecureTempFile::create(
-            directory.path(),
-            ".pentect-claude-settings-",
-            ".json",
-            &encoded,
-            "Claude settings",
-        )?;
-        let path = file.path().to_string_lossy().into_owned();
-        let out = self.gateway_args(args, &path);
-        Ok(ClaudeGatewaySettings {
-            args: out,
-            _file: file,
-            _directory: directory,
+        let settings_arg = match (self.settings_at, self.inline) {
+            (Some(index), true) => ClaudeSettingsArg::Inline { index },
+            (Some(index), false) => ClaudeSettingsArg::Separate {
+                value_index: index + 1,
+            },
+            (None, _) => ClaudeSettingsArg::InsertFront,
+        };
+        Ok(PreparedClaudeGateway {
+            encoded,
+            args: args.to_vec(),
+            settings_arg,
         })
     }
 
@@ -2074,6 +2069,59 @@ impl ClaudeCallerSettings {
             out.insert(0, "--settings".to_string());
         }
         out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaudeSettingsArg {
+    Inline { index: usize },
+    Separate { value_index: usize },
+    InsertFront,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedClaudeGateway {
+    pub(crate) encoded: Vec<u8>,
+    pub(crate) args: Vec<String>,
+    pub(crate) settings_arg: ClaudeSettingsArg,
+}
+
+impl PreparedClaudeGateway {
+    fn args_with_settings_path(&self, settings_path: &str) -> Vec<String> {
+        let mut args = self.args.clone();
+        match self.settings_arg {
+            ClaudeSettingsArg::Inline { index } => {
+                args[index] = format!("--settings={settings_path}");
+            }
+            ClaudeSettingsArg::Separate { value_index } => {
+                args[value_index] = settings_path.to_string();
+            }
+            ClaudeSettingsArg::InsertFront => {
+                args.insert(0, settings_path.to_string());
+                args.insert(0, "--settings".to_string());
+            }
+        }
+        args
+    }
+
+    fn materialize(self) -> Result<ClaudeGatewaySettings, String> {
+        let directory = secure_temp::SecureTempDirectory::create(
+            "pentect-claude-settings-",
+            "Claude settings",
+        )?;
+        let file = secure_temp::SecureTempFile::create(
+            directory.path(),
+            ".pentect-claude-settings-",
+            ".json",
+            &self.encoded,
+            "Claude settings",
+        )?;
+        let path = file.path().to_string_lossy().into_owned();
+        Ok(ClaudeGatewaySettings {
+            args: self.args_with_settings_path(&path),
+            _file: file,
+            _directory: directory,
+        })
     }
 }
 
