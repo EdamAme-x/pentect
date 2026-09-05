@@ -1,4 +1,5 @@
 name: Publish packages
+run-name: Publish packages / sync-${{ inputs.correlation || github.run_id }}
 
 on:
   push:
@@ -13,9 +14,13 @@ on:
         description: Stable release tag; empty selects the latest release
         required: false
         type: string
+      correlation:
+        description: Optional release-run correlation identifier
+        required: false
+        type: string
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
@@ -34,7 +39,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
           persist-credentials: false
       - name: Resolve stable release
         id: release
@@ -49,32 +53,12 @@ jobs:
           echo "tag=$(jq -r .tagName <<<"$release")" >> "$GITHUB_OUTPUT"
       - name: Install package tools
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
-      - name: Build available Debian packages
-        if: github.event_name == 'workflow_dispatch'
+      - name: Download and verify stable Debian packages
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
-          mkdir -p binaries debs
-          version=${TAG#v}
-          while read -r asset architecture; do
-            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$asset" --dir binaries; then
-              chmod +x "binaries/$asset"
-              bash tools/package_deb.sh "$version" "$architecture" "binaries/$asset" debs
-            fi
-          done <<'EOF'
-          pentect-linux-x86_64 amd64
-          pentect-linux-aarch64 arm64
-          EOF
-          test -n "$(find debs -name 'pentect_*.deb' -print -quit)"
-          gh release upload "$TAG" debs/* --clobber --repo "$GITHUB_REPOSITORY"
-      - name: Download recent stable Debian packages
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          rm -rf debs
-          sh tools/download_recent_stable_debs.sh debs 3
+          sh tools/prepare_stable_debs.sh debs "$TAG" 3
       - name: Sign repository
         id: signing
         env:
