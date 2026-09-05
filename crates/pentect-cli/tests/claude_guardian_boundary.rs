@@ -174,6 +174,17 @@ raise SystemExit(37)
     baseline
         .args(["--settings"])
         .arg(&input_settings)
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("TMP", &temporary)
+        .env("TEMP", &temporary)
+        .env("TMPDIR", &temporary)
         .env("REPORT", &baseline_report)
         .env("FD_CONTROL", &fd_control)
         .stdin(Stdio::null())
@@ -251,23 +262,11 @@ raise SystemExit(37)
         assert_eq!(value["authority"][name], false, "client inherited {name}");
     }
     for descriptor in value["descriptors"].as_array().unwrap() {
-        if descriptor["socket"] == true {
-            let inherited = baseline_value["descriptors"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|baseline| {
-                    baseline["socket"] == true
-                        && baseline["dev"] == descriptor["dev"]
-                        && baseline["ino"] == descriptor["ino"]
-                        && baseline["socket_family"] == descriptor["socket_family"]
-                        && baseline["socket_type"] == descriptor["socket_type"]
-                });
-            assert!(
-                inherited,
-                "protected client gained a socket absent from the direct baseline: {descriptor}"
-            );
-        }
+        assert_eq!(
+            descriptor["socket"], false,
+            "protected client inherited a socket: protected={descriptor}; direct_baseline={}",
+            baseline_value["descriptors"]
+        );
         assert_eq!(
             descriptor["owner_lock"], false,
             "client inherited the settings owner lease"
