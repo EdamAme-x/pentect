@@ -373,6 +373,146 @@ pub(crate) fn run_helper(argv: &[String]) -> i32 {
     })
 }
 
+/// Dispatches the Windows-only supervisor verbs before normal CLI parsing.
+///
+/// The hidden native verb carries only the private pipe name. The client
+/// program and arguments are sent after the helper is assigned to the job.
+pub(crate) fn hidden_main(argv: &[String]) -> Option<i32> {
+    match argv.get(1).map(String::as_str) {
+        Some("__claude-windows-supervisor") => Some(run_helper(argv)),
+        Some("__native-windows-supervisor") => Some(run_native_helper(argv)),
+        _ => None,
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NativeLaunchPayload {
+    version: u8,
+    wrapper_pid: u32,
+    program: Vec<u16>,
+    cwd: Option<Vec<u16>>,
+    args: Vec<Vec<u16>>,
+}
+
+fn native_command(payload: &NativeLaunchPayload) -> Result<Command, String> {
+    if payload.program.is_empty() || payload.program.contains(&0) {
+        return Err("native supervisor program is invalid".to_string());
+    }
+    if payload.args.iter().any(|arg| arg.contains(&0))
+        || payload.cwd.as_ref().is_some_and(|cwd| cwd.contains(&0))
+    {
+        return Err("native supervisor argument is invalid".to_string());
+    }
+    let mut command = Command::new(from_wide(&payload.program));
+    command.args(payload.args.iter().map(|arg| from_wide(arg)));
+    if let Some(cwd) = payload.cwd.as_deref() {
+        command.current_dir(from_wide(cwd));
+    }
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    Ok(command)
+}
+
+fn native_helper_command(client: &Command, executable: &Path, pipe_name: &str) -> Command {
+    let mut helper = Command::new(executable);
+    helper.arg("__native-windows-supervisor").arg(pipe_name);
+    if let Some(cwd) = client.get_current_dir() {
+        helper.current_dir(cwd);
+    }
+    for (name, value) in client.get_envs() {
+        match value {
+            Some(value) => helper.env(name, value),
+            None => helper.env_remove(name),
+        };
+    }
+    helper
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    helper
+}
+
+fn native_exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+fn run_native_helper(argv: &[String]) -> i32 {
+    let Some(pipe_name) = argv.get(2).filter(|_| argv.len() == 3) else {
+        return 2;
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return 2,
+    };
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        let mut pipe = loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name) {
+                Ok(pipe) => break pipe,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(_) => return 2,
+            }
+        };
+        let frame = match tokio::time::timeout(STARTUP_TIMEOUT, read_frame(&mut pipe)).await {
+            Ok(Ok(frame)) => frame,
+            _ => return 2,
+        };
+        let payload = match serde_json::from_slice::<NativeLaunchPayload>(&frame) {
+            Ok(payload) if payload.version == PROTOCOL_VERSION => payload,
+            _ => return 2,
+        };
+        let mut contained = 0;
+        let mut server_pid = 0;
+        if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut contained) } == 0
+            || contained == 0
+            || unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle().cast(), &mut server_pid) }
+                == 0
+            || server_pid != payload.wrapper_pid
+        {
+            return 2;
+        }
+        let mut command = match native_command(&payload) {
+            Ok(command) => command,
+            Err(_) => return 2,
+        };
+        if crate::install_native_interrupt_handler().is_err() {
+            return 2;
+        }
+        crate::NATIVE_COMMAND_INTERRUPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return 2,
+        };
+        if pipe.write_u8(1).await.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return 2;
+        }
+        match crate::wait_for_native_child(
+            &mut child,
+            &crate::NATIVE_COMMAND_INTERRUPTS,
+            std::io::stdin().is_terminal(),
+            crate::NATIVE_REPEAT_INTERRUPT_WINDOW,
+            crate::NATIVE_INTERRUPT_GRACE,
+        ) {
+            Ok(status) => native_exit_code(status),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                2
+            }
+        }
+    })
+}
+
 pub(crate) fn verify_pipe_client(pipe: HANDLE, child: &Child) -> Result<(), String> {
     let mut pid = 0;
     if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 || pid != child.id() {
@@ -535,6 +675,81 @@ pub(crate) fn launch(
     Ok(status)
 }
 
+/// Runs an ordinary native client through the Windows kill-on-close job.
+///
+/// Environment changes are applied to the blocked helper, so its eventual
+/// child inherits the same effective environment without sending environment
+/// values through the protocol. Callers must not use `Command::env_clear`,
+/// which the stable `Command` inspection API cannot distinguish here.
+pub(crate) fn launch_native(client: &Command, display: &Path) -> Result<ExitStatus, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| "could not initialize native supervisor".to_string())?;
+    let (pipe_name, mut pipe) = runtime.block_on(async { create_private_pipe() })?;
+    let job = ClaudeJob::new()?;
+    let executable =
+        std::env::current_exe().map_err(|_| "could not locate native supervisor".to_string())?;
+    let mut helper = native_helper_command(client, &executable, &pipe_name);
+    let child = helper
+        .spawn()
+        .map_err(|_| "could not start native supervisor".to_string())?;
+    let mut guard = StartupGuard {
+        child: Some(child),
+        job: Some(job),
+    };
+    let child = guard.child.as_mut().expect("helper retained");
+    guard
+        .job
+        .as_ref()
+        .expect("job retained")
+        .assign_live(child)?;
+    runtime
+        .block_on(async { tokio::time::timeout(STARTUP_TIMEOUT, pipe.connect()).await })
+        .map_err(|_| "native supervisor startup timed out".to_string())?
+        .map_err(|_| "could not connect native supervisor".to_string())?;
+    verify_pipe_client(pipe.as_raw_handle().cast(), child)?;
+    guard
+        .job
+        .as_ref()
+        .expect("job retained")
+        .assign_live_check(child)?;
+    let payload = NativeLaunchPayload {
+        version: PROTOCOL_VERSION,
+        wrapper_pid: std::process::id(),
+        program: wide(client.get_program()),
+        cwd: client.get_current_dir().map(|path| wide(path.as_os_str())),
+        args: client.get_args().map(wide).collect(),
+    };
+    // Validate before sending anything that could cause a client launch.
+    native_command(&payload)?;
+    let encoded = serde_json::to_vec(&payload)
+        .map_err(|_| "could not encode native supervisor payload".to_string())?;
+    runtime
+        .block_on(async {
+            tokio::time::timeout(STARTUP_TIMEOUT, write_frame(&mut pipe, &encoded)).await
+        })
+        .map_err(|_| "native supervisor payload timed out".to_string())??;
+    let acknowledged =
+        runtime.block_on(async { tokio::time::timeout(STARTUP_TIMEOUT, pipe.read_u8()).await });
+    if !matches!(acknowledged, Ok(Ok(1))) {
+        return Err("native supervisor did not confirm client startup".to_string());
+    }
+    drop(pipe);
+    let status = crate::wait_for_native_child(
+        guard.child.as_mut().expect("helper retained"),
+        &crate::NATIVE_COMMAND_INTERRUPTS,
+        std::io::stdin().is_terminal(),
+        crate::NATIVE_REPEAT_INTERRUPT_WINDOW,
+        crate::NATIVE_INTERRUPT_GRACE,
+    )
+    .map_err(|error| format!("could not wait for '{}': {error}", display.display()))?;
+    drop(guard.child.take());
+    drop(guard.job.take());
+    Ok(status)
+}
+
 struct StartupGuard {
     child: Option<Child>,
     job: Option<ClaudeJob>,
@@ -564,7 +779,9 @@ impl ClaudeJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::ffi::OsStrExt;
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::process::ExitStatusExt;
     use windows_sys::Win32::Foundation::{
         GetHandleInformation, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
     };
@@ -643,6 +860,102 @@ mod tests {
         assert!(runtime
             .block_on(write_frame(&mut sink, &oversized))
             .is_err());
+    }
+
+    #[test]
+    fn native_payload_preserves_windows_arguments_and_cwd_losslessly() {
+        let program = OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
+        let argument = OsString::from_wide(&[
+            b'q' as u16,
+            b'"' as u16,
+            b'\\' as u16,
+            b'\\' as u16,
+            b' ' as u16,
+            0xdfff,
+        ]);
+        let cwd = OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd801]);
+        let payload = NativeLaunchPayload {
+            version: PROTOCOL_VERSION,
+            wrapper_pid: 7,
+            program: wide(&program),
+            cwd: Some(wide(&cwd)),
+            args: vec![wide(&argument)],
+        };
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let decoded: NativeLaunchPayload = serde_json::from_slice(&encoded).unwrap();
+        let command = native_command(&decoded).unwrap();
+        assert_eq!(command.get_program(), program);
+        assert_eq!(command.get_current_dir(), Some(Path::new(&cwd)));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [argument.as_os_str()]
+        );
+    }
+
+    #[test]
+    fn native_payload_rejects_empty_program_and_embedded_nuls() {
+        let valid = NativeLaunchPayload {
+            version: PROTOCOL_VERSION,
+            wrapper_pid: 7,
+            program: wide(OsStr::new("client.exe")),
+            cwd: None,
+            args: vec![wide(OsStr::new("argument"))],
+        };
+        let mut invalid = NativeLaunchPayload {
+            program: vec![],
+            ..valid
+        };
+        assert!(native_command(&invalid).is_err());
+        invalid.program = wide(OsStr::new("client.exe"));
+        invalid.args = vec![vec![b'x' as u16, 0, b'y' as u16]];
+        assert!(native_command(&invalid).is_err());
+        invalid.args = vec![];
+        invalid.cwd = Some(vec![b'C' as u16, b':' as u16, 0]);
+        assert!(native_command(&invalid).is_err());
+    }
+
+    #[test]
+    fn native_helper_receives_only_control_args_and_command_environment_deltas() {
+        let mut client = Command::new("client.exe");
+        client
+            .args(["ordinary", "--literal=secret-looking"])
+            .current_dir(r"C:\fixture")
+            .env("PENTECT_NATIVE_SET", "fixture-value")
+            .env_remove("PENTECT_NATIVE_REMOVE");
+        let helper =
+            native_helper_command(&client, Path::new(r"C:\pentect.exe"), r"\\.\pipe\fixture");
+        assert_eq!(helper.get_program(), r"C:\pentect.exe");
+        assert_eq!(
+            helper.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("__native-windows-supervisor"),
+                OsStr::new(r"\\.\pipe\fixture")
+            ]
+        );
+        assert_eq!(helper.get_current_dir(), Some(Path::new(r"C:\fixture")));
+        let env = helper
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(OsStr::new("PENTECT_NATIVE_SET")),
+            Some(&Some(OsStr::new("fixture-value")))
+        );
+        assert_eq!(env.get(OsStr::new("PENTECT_NATIVE_REMOVE")), Some(&None));
+    }
+
+    #[test]
+    fn native_exit_code_preserves_windows_status_bits() {
+        let raw = 0xc000_013a_u32;
+        assert_eq!(native_exit_code(ExitStatus::from_raw(raw)) as u32, raw);
+        assert_eq!(native_exit_code(ExitStatus::from_raw(37)), 37);
+    }
+
+    #[test]
+    fn hidden_dispatch_ignores_normal_cli_arguments() {
+        assert_eq!(
+            hidden_main(&["pentect".to_string(), "codex".to_string()]),
+            None
+        );
     }
 
     #[test]
