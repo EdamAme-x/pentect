@@ -315,8 +315,8 @@ os.execve(arguments[0], arguments, os.environ)
         });
     assert_eq!(positive_descriptor["socket"], true);
     assert_eq!(
-        positive_descriptor["dev"].as_u64(),
-        Some(positive_stat.st_dev as u64)
+        positive_descriptor["dev"],
+        serde_json::json!(positive_stat.st_dev)
     );
     assert_eq!(
         positive_descriptor["ino"].as_u64(),
