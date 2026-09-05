@@ -79,6 +79,15 @@ def main() -> None:
         assert path in release_workflow
     assert 'git diff --quiet -- "${metadata_paths[@]}"' in release_workflow
     assert 'git add "${metadata_paths[@]}"' in release_workflow
+    assert "needs: package-metadata" in release_workflow
+    assert "main_sha: ${{ steps.metadata.outputs.main_sha }}" in release_workflow
+    assert "needs.package-metadata.outputs.main_sha" in release_workflow
+    assert "sh tools/dispatch_package_site.sh" in release_workflow
+    assert (
+        '"$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$MAIN_SHA"'
+        in release_workflow
+    )
+    assert "actions/deploy-pages@" not in release_workflow
     assert (
         "run: |\n"
         "          sh tools/download_recent_stable_debs.sh debs 2\n"
