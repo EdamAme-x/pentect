@@ -660,7 +660,27 @@ command = ["python", "{plugin}/setup.py"]
         process.kill()
         output, _ = process.communicate(timeout=5)
         raise RuntimeError("plugin setup did not reach its forced-termination fixture:\n" + output)
-    setup_processes = json.loads(marker.read_text(encoding="utf-8"))
+    setup_processes = None
+    parse_error = None
+    publication_deadline = time.monotonic() + 2
+    while process.poll() is None and time.monotonic() < publication_deadline:
+        try:
+            text = marker.read_text(encoding="utf-8")
+            if text:
+                setup_processes = json.loads(text)
+                break
+        except (FileNotFoundError, json.JSONDecodeError) as error:
+            parse_error = error
+        time.sleep(0.05)
+    if setup_processes is None:
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        raise RuntimeError(
+            "plugin setup marker was not published as valid JSON"
+            + (f": {parse_error}" if parse_error else "")
+            + "\n"
+            + output
+        )
     setup_pid = int(setup_processes["setup"])
     supervisor_pid = int(setup_processes["supervisor"])
     if supervisor_pid == process.pid:
@@ -2517,6 +2537,19 @@ def fixture_settings(roots: tuple[Path, ...], sentinel: str) -> list[Path]:
     return matches
 
 
+def generated_claude_settings(roots: tuple[Path, ...], sentinel: str) -> list[Path]:
+    if os.name != "nt":
+        return fixture_settings(roots, sentinel)
+    # The supervisor intentionally holds settings DELETE_ON_CLOSE. Python's
+    # Windows file open does not share DELETE, so discover the isolated,
+    # uniquely named generated path without weakening the production handle.
+    return [
+        path
+        for root in roots
+        for path in root.glob("pentect-claude-settings-*/settings.json")
+    ]
+
+
 def claude_descendant_identities(
     wrapper_pid: int, installed_claude: Path
 ) -> tuple[int, dict[int, str]]:
@@ -2666,7 +2699,7 @@ def run_claude_parent_kill(pentect: str) -> None:
                 process.pid, installed_claude
             )
             recorded_identities.update(ready_identities)
-            generated = fixture_settings(generated_roots, sentinel)
+            generated = generated_claude_settings(generated_roots, sentinel)
             if len(generated) != 1:
                 raise RuntimeError(
                     "expected one generated Claude settings file, found "
@@ -2708,7 +2741,7 @@ def run_claude_parent_kill(pentect: str) -> None:
                     "follow-up Claude cleanup launch failed:\n"
                     + completed.stdout.replace(sentinel, "<synthetic-sentinel>")
                 )
-            residue = fixture_settings(generated_roots, sentinel)
+            residue = generated_claude_settings(generated_roots, sentinel)
             if residue:
                 raise RuntimeError(
                     "generated Claude settings residue remained after follow-up launch: "
@@ -2724,9 +2757,9 @@ def run_claude_parent_kill(pentect: str) -> None:
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
-        for pid, identity in recorded_identities.items():
-            if process_identity(pid) == identity:
-                terminate_process_identity(pid, identity)
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        for pid in surviving_cleanup:
+            terminate_process_identity(pid, recorded_identities[pid])
         surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
         state.release_model_request.set()
         server.shutdown()
