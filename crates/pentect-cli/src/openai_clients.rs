@@ -27,7 +27,7 @@ pub(crate) fn run(
         .or_else(|| configured_upstream(tool))
         .or_else(|| tool.default_upstream.map(str::to_string))
         .ok_or_else(|| format!("{} has no configured upstream", tool.name))?;
-    let args = opts.tool_args.clone();
+    let args = protected_client_args(injection, &opts.tool_args)?;
     let model = selected_model(opts.model.as_deref())?;
     let api = ClientApi::parse(opts.api.as_deref())?;
     if opts.dry_run {
@@ -164,6 +164,21 @@ fn provider_key_env_names(
     }
 }
 
+fn protected_client_args(
+    injection: crate::client_descriptor::OpenAiInjection,
+    args: &[String],
+) -> Result<Vec<String>, String> {
+    if injection == crate::client_descriptor::OpenAiInjection::TempExtension
+        && args.iter().any(|arg| arg == "--export")
+    {
+        return Err(
+            "Pi session export is unavailable in a protected launch because stored sessions may contain restored values"
+                .to_string(),
+        );
+    }
+    Ok(args.to_vec())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OpenCodeProtocol {
     OpenAi,
@@ -270,6 +285,7 @@ fn run_opencode(
     opts: &crate::AgentToolOpts,
     pentect: &Path,
 ) -> Result<std::process::ExitStatus, String> {
+    let tool_args = protected_opencode_args(&opts.tool_args);
     // Authentication does not carry conversation content. Let OpenCode own this
     // flow so its complete native provider catalog remains available and the
     // credential is stored under the real provider ID. Injecting the protected
@@ -277,12 +293,12 @@ fn run_opencode(
     // routed provider.
     if is_opencode_auth_command(&opts.tool_args) {
         if opts.dry_run {
-            crate::print_dry_run(&opts.command, &opts.tool_args);
+            crate::print_dry_run(&opts.command, &tool_args);
             return Ok(crate::success_status());
         }
         let mut command = Command::new(&opts.command);
         crate::clear_pentect_control_env(&mut command);
-        command.args(&opts.tool_args);
+        command.args(&tool_args);
         return crate::run_native_command_with_guards(command, &opts.command, ());
     }
 
@@ -290,7 +306,7 @@ fn run_opencode(
     let route = OpenCodeRoute::resolve(opts)?;
     validate_opencode_route(&route, &opts.upstream_header_env)?;
     if opts.dry_run {
-        crate::print_dry_run(&opts.command, &opts.tool_args);
+        crate::print_dry_run(&opts.command, &tool_args);
         println!(
             "[pentect] route provider={} model={} upstream=<pentect-upstream>",
             route.provider,
@@ -319,9 +335,70 @@ fn run_opencode(
     if let Some(name) = child_key_env {
         command.env(name, "pentect-local");
     }
-    command.env("OPENCODE_CONFIG_CONTENT", config);
-    command.args(&opts.tool_args);
+    apply_opencode_protection(&mut command, config, &opts.tool_args);
     crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+}
+
+fn apply_opencode_protection(command: &mut Command, config: String, args: &[String]) {
+    command.env("OPENCODE_CONFIG_CONTENT", config);
+    command.args(protected_opencode_args(args));
+}
+
+fn protected_opencode_args(args: &[String]) -> Vec<String> {
+    let Some(command_index) = opencode_command_index(args) else {
+        return args.to_vec();
+    };
+    if args[command_index] != "export" {
+        return args.to_vec();
+    }
+    let option_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut protected = Vec::with_capacity(args.len() + 1);
+    let mut index = 0;
+    while index < option_end {
+        let arg = &args[index];
+        if arg == "--sanitize" {
+            index += 1;
+            if index < option_end && matches!(args[index].as_str(), "true" | "false") {
+                index += 1;
+            }
+            continue;
+        }
+        if arg == "--no-sanitize"
+            || arg.starts_with("--sanitize=")
+            || arg.starts_with("--no-sanitize=")
+        {
+            index += 1;
+            continue;
+        }
+        protected.push(arg.clone());
+        index += 1;
+    }
+    protected.push("--sanitize=true".to_string());
+    protected.extend_from_slice(&args[option_end..]);
+    protected
+}
+
+fn opencode_command_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => return None,
+            "-h" | "--help" | "-v" | "--version" | "--print-logs" | "--pure" => index += 1,
+            "--log-level" => {
+                if index + 1 >= args.len() {
+                    return None;
+                }
+                index += 2;
+            }
+            arg if arg.starts_with("--log-level=") => index += 1,
+            arg if arg.starts_with('-') => return None,
+            _ => return Some(index),
+        }
+    }
+    None
 }
 
 fn validate_opencode_route(
@@ -513,8 +590,7 @@ fn run_opencode_picker(
     for name in child_key_env {
         command.env(name, "pentect-local");
     }
-    command.env("OPENCODE_CONFIG_CONTENT", config);
-    command.args(&opts.tool_args);
+    apply_opencode_protection(&mut command, config, &opts.tool_args);
     crate::run_native_command_with_guards(command, &opts.command, (proxies, memory_store))
 }
 
@@ -677,6 +753,8 @@ fn opencode_picker_config(provider_urls: &[(&str, String)]) -> Result<String, St
         ),
     );
     root_object.insert("disabled_providers".to_string(), json!([]));
+    root_object.insert("share".to_string(), Value::String("disabled".to_string()));
+    root_object.insert("autoshare".to_string(), Value::Bool(false));
     serde_json::to_string(&root)
         .map_err(|error| format!("could not encode temporary OpenCode config: {error}"))
 }
@@ -743,6 +821,8 @@ fn opencode_config(
     // provider so those requests cannot bypass the local gateway.
     root_object.insert("enabled_providers".to_string(), json!([provider]));
     root_object.insert("disabled_providers".to_string(), json!([]));
+    root_object.insert("share".to_string(), Value::String("disabled".to_string()));
+    root_object.insert("autoshare".to_string(), Value::Bool(false));
     serde_json::to_string(&root)
         .map_err(|error| format!("could not encode temporary OpenCode config: {error}"))
 }
@@ -891,12 +971,148 @@ mod tests {
     }
 
     #[test]
+    fn opencode_exports_are_canonicalized_to_the_upstream_sanitizer() {
+        assert_eq!(
+            protected_opencode_args(&[
+                "--print-logs".to_string(),
+                "--log-level".to_string(),
+                "DEBUG".to_string(),
+                "export".to_string(),
+                "session-canary".to_string(),
+                "--no-sanitize".to_string(),
+                "--sanitize=false".to_string(),
+                "--sanitize".to_string(),
+                "false".to_string(),
+                "--no-sanitize=false".to_string(),
+            ]),
+            [
+                "--print-logs",
+                "--log-level",
+                "DEBUG",
+                "export",
+                "session-canary",
+                "--sanitize=true"
+            ]
+        );
+        assert_eq!(
+            protected_opencode_args(&["run".to_string(), "--share".to_string()]),
+            ["run", "--share"]
+        );
+        assert_eq!(
+            protected_opencode_args(&[
+                "--log-level".to_string(),
+                "export".to_string(),
+                "session-canary".to_string(),
+            ]),
+            ["--log-level", "export", "session-canary"]
+        );
+        assert_eq!(
+            protected_opencode_args(&[
+                "export".to_string(),
+                "--sanitize=false".to_string(),
+                "--".to_string(),
+                "--sanitize=false".to_string(),
+            ]),
+            ["export", "--sanitize=true", "--", "--sanitize=false"]
+        );
+    }
+
+    #[test]
+    fn opencode_fixed_and_picker_commands_capture_protected_export_and_share_config() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
+        std::env::set_var(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"share":"auto","autoshare":true}"#,
+        );
+        let args = [
+            "--log-level".to_string(),
+            "DEBUG".to_string(),
+            "export".to_string(),
+            "session-capture-canary".to_string(),
+            "--no-sanitize".to_string(),
+        ];
+        let mut fixed = Command::new("fake-opencode-capture-canary");
+        apply_opencode_protection(
+            &mut fixed,
+            opencode_config(
+                "http://127.0.0.1/fixed",
+                "openrouter",
+                Some("openrouter/canary"),
+                None,
+            )
+            .unwrap(),
+            &args,
+        );
+        let mut picker = Command::new("fake-opencode-capture-canary");
+        apply_opencode_protection(
+            &mut picker,
+            opencode_picker_config(&[("opencode", "http://127.0.0.1/picker".to_string())]).unwrap(),
+            &args,
+        );
+        match old {
+            Some(value) => std::env::set_var("OPENCODE_CONFIG_CONTENT", value),
+            None => std::env::remove_var("OPENCODE_CONFIG_CONTENT"),
+        }
+
+        for command in [&fixed, &picker] {
+            let captured_args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                captured_args,
+                [
+                    "--log-level",
+                    "DEBUG",
+                    "export",
+                    "session-capture-canary",
+                    "--sanitize=true"
+                ]
+            );
+            let config = command
+                .get_envs()
+                .find_map(|(name, value)| {
+                    (name == "OPENCODE_CONFIG_CONTENT")
+                        .then(|| value.unwrap().to_string_lossy().into_owned())
+                })
+                .unwrap();
+            let config: Value = serde_json::from_str(&config).unwrap();
+            assert_eq!(config["share"], "disabled");
+            assert_eq!(config["autoshare"], false);
+        }
+    }
+
+    #[test]
+    fn pi_cli_export_is_rejected_before_launch() {
+        let error = protected_client_args(
+            crate::client_descriptor::OpenAiInjection::TempExtension,
+            &[
+                "--export".to_string(),
+                "raw-session-canary.jsonl".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("session export is unavailable"), "{error}");
+        assert!(protected_client_args(
+            crate::client_descriptor::OpenAiInjection::TempExtension,
+            &["--print".to_string(), "hello".to_string()],
+        )
+        .is_ok());
+        assert!(protected_client_args(
+            crate::client_descriptor::OpenAiInjection::TempExtension,
+            &["--export=not-a-pi-option".to_string()],
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn opencode_config_preserves_settings_and_native_provider_without_credentials() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
         std::env::set_var(
             "OPENCODE_CONFIG_CONTENT",
-            r#"{"theme":"dark","provider":{"other":{"options":{"apiKey":"other-secret"}},"openrouter":{"models":{"team-alias":{"name":"Team alias"}},"options":{"timeout":30000,"apiKey":"must-not-survive"}}}}"#,
+            r#"{"theme":"dark","share":"auto","autoshare":true,"provider":{"other":{"options":{"apiKey":"other-secret"}},"openrouter":{"models":{"team-alias":{"name":"Team alias"}},"options":{"timeout":30000,"apiKey":"must-not-survive"}}}}"#,
         );
         let value: Value = serde_json::from_str(
             &opencode_config(
@@ -915,6 +1131,8 @@ mod tests {
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["model"], "openrouter/anthropic/claude-sonnet");
         assert_eq!(value["small_model"], "openrouter/anthropic/claude-sonnet");
+        assert_eq!(value["share"], "disabled");
+        assert_eq!(value["autoshare"], false);
         assert_eq!(
             value["enabled_providers"],
             serde_json::json!(["openrouter"])
@@ -954,6 +1172,8 @@ mod tests {
         assert!(value.get("model").is_none());
         assert!(value.get("small_model").is_none());
         assert_eq!(value["enabled_providers"], serde_json::json!(["opencode"]));
+        assert_eq!(value["share"], "disabled");
+        assert_eq!(value["autoshare"], false);
     }
 
     #[test]
@@ -962,7 +1182,7 @@ mod tests {
         let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
         std::env::set_var(
             "OPENCODE_CONFIG_CONTENT",
-            r#"{"model":"old/model","provider":{"openrouter":{"models":{"team":{"name":"Team"}},"options":{"apiKey":"secret","timeout":30000}},"unprotected":{"options":{"baseURL":"https://bypass.invalid"}}}}"#,
+            r#"{"model":"old/model","share":"manual","autoshare":true,"provider":{"openrouter":{"models":{"team":{"name":"Team"}},"options":{"apiKey":"secret","timeout":30000}},"unprotected":{"options":{"baseURL":"https://bypass.invalid"}}}}"#,
         );
         let urls = [
             ("opencode", "http://127.0.0.1:1/opencode".to_string()),
@@ -978,6 +1198,8 @@ mod tests {
         }
         assert!(value.get("model").is_none());
         assert!(value.get("small_model").is_none());
+        assert_eq!(value["share"], "disabled");
+        assert_eq!(value["autoshare"], false);
         assert_eq!(
             value["enabled_providers"],
             serde_json::json!(["opencode", "openai", "openrouter", "anthropic", "google"])
