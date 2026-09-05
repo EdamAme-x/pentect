@@ -174,6 +174,9 @@ logging and rotation continue independently so crashes remain diagnosable.
 The summary includes masked and restored occurrence counts, blocked restoration
 attempts, blocked operations, plugin failures and timeouts, and warnings grouped
 by a bounded reason code.
+The human-readable summary explains those fixed codes in plain language. The
+`--json` form keeps the stable reason, surface, and detector code values for
+scripts and local analysis.
 Plugin names, error text, values, handles, paths, URLs, and account identifiers
 are not metric dimensions. Plugin timeout counts are a subset of plugin failure
 counts, not an additional failure total.
