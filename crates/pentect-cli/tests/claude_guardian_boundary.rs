@@ -87,6 +87,8 @@ fn actual_noninteractive_claude_keeps_guardian_authority_out_of_client() {
     let input_bytes = br#"{"env":{"PENTECT_BOUNDARY_SENTINEL":"synthetic-only"}}"#;
     std::fs::write(&input_settings, input_bytes).unwrap();
     let report = root.join("client-report.json");
+    let fd_control = root.join("fd-control");
+    std::fs::write(&fd_control, b"descriptor-enumeration-control").unwrap();
     let probe = root.join("claude-probe.py");
     std::fs::write(
         &probe,
@@ -104,19 +106,20 @@ for index, argument in enumerate(sys.argv[1:]):
         settings = argument.split("=", 1)[1]
 
 fd_root = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+positive = open(os.environ["FD_CONTROL"], "rb")
+owner = os.stat(os.path.join(os.path.dirname(settings), "owner.lock"))
 descriptors = []
 for name in os.listdir(fd_root):
     if not name.isdigit() or int(name) < 3:
         continue
     try:
         info = os.fstat(int(name))
-        target = os.readlink(os.path.join(fd_root, name))
     except OSError:
         continue
     descriptors.append({
         "fd": int(name),
         "socket": stat.S_ISSOCK(info.st_mode),
-        "owner_lock": target.endswith("/owner.lock"),
+        "owner_lock": (info.st_dev, info.st_ino) == (owner.st_dev, owner.st_ino),
     })
 
 authority = {}
@@ -134,6 +137,7 @@ payload = {
     "settings": settings,
     "settings_exists": bool(settings and os.path.isfile(settings)),
     "descriptors": descriptors,
+    "positive_fd": positive.fileno(),
     "authority": authority,
     "untrusted": os.environ.get("PENTECT_UNTRUSTED_CLIENT"),
 }
@@ -167,6 +171,7 @@ raise SystemExit(37)
         .env("TEMP", &temporary)
         .env("TMPDIR", &temporary)
         .env("REPORT", &report)
+        .env("FD_CONTROL", &fd_control)
         .env("PENTECT_DISABLE_UPDATE_CHECK", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -190,6 +195,15 @@ raise SystemExit(37)
     assert!(!generated.exists());
     assert_eq!(std::fs::read(&input_settings).unwrap(), input_bytes);
     assert_eq!(value["untrusted"], "1");
+    assert!(value["descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|descriptor| {
+            descriptor["fd"] == value["positive_fd"]
+                && descriptor["socket"] == false
+                && descriptor["owner_lock"] == false
+        }));
     for name in AUTHORITY_ENV {
         assert_eq!(value["authority"][name], false, "client inherited {name}");
     }
