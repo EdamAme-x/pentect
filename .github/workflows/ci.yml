@@ -202,6 +202,7 @@ jobs:
               - 'crates/pentect-runtime/src/activity_log.rs'
               - 'crates/pentect-runtime/src/delegated_process_host.rs'
               - 'crates/pentect-runtime/src/memory_store.rs'
+              - 'crates/pentect-cli/tests/metrics.rs'
             runtime_main:
               - 'crates/pentect-runtime/src/main.rs'
       # Negated globs require AND semantics. With paths-filter's default OR
@@ -507,6 +508,9 @@ jobs:
       - name: Test runtime activity log
         if: needs.changes.outputs.runtime_log == 'true'
         run: cargo test -p pentect-runtime --no-default-features activity_log::tests --locked
+      - name: Test privacy metrics CLI
+        if: needs.changes.outputs.runtime_log == 'true'
+        run: cargo test -p pentect-cli --no-default-features --locked --test metrics
       - name: Test general CLI changes
         if: needs.changes.outputs.cli_general == 'true'
         run: cargo test -p pentect-cli --no-default-features --locked

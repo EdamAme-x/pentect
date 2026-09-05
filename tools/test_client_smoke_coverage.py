@@ -78,6 +78,11 @@ def main() -> None:
     )
 
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "- 'crates/pentect-cli/tests/metrics.rs'" in ci
+    assert (
+        "cargo test -p pentect-cli --no-default-features --locked --test metrics"
+        in ci
+    )
     assert "claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}" in ci
     supervisor_filter = re.search(
         r"^            claude_supervisor:\n(?P<body>(?:              - .+\n)+)",

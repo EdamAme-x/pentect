@@ -4,6 +4,7 @@ use pentect_core::{model::labels, MaskResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -390,45 +391,111 @@ pub(crate) fn print_metrics(json: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("Pentect privacy metrics (retained local logs)");
-    println!("Masked occurrences: {}", metrics.masked_text_occurrences);
-    println!("Redacted images: {}", metrics.redacted_image_occurrences);
-    println!("Blocked images: {}", metrics.blocked_image_occurrences);
-    println!(
-        "Local restoration operations: {}",
-        metrics.restoration_operations
-    );
-    println!(
-        "Blocked restoration attempts: {}",
-        metrics.blocked_restoration_occurrences
-    );
-    println!("Blocked operations: {}", metrics.blocked_occurrences);
-    println!("Warnings: {}", metrics.warning_occurrences);
-    println!(
-        "Plugin failures (including timeouts): {}",
-        metrics.plugin_failure_occurrences
-    );
-    println!("Plugin timeouts: {}", metrics.plugin_timeout_occurrences);
-    print_metric_group(
-        "Secret types (text masks and image redactions)",
-        &metrics.by_secret_type,
-    );
-    print_metric_group("Protection surfaces", &metrics.by_surface);
-    print_metric_group("Warning reasons", &metrics.by_warning_reason);
-    if metrics.records_skipped > 0 {
-        println!(
-            "Skipped unreadable records: {} (counts may be incomplete)",
-            metrics.records_skipped
-        );
-    }
-    println!("No secret values, handles, paths, URLs, or account identifiers are included.");
+    print!("{}", format_metrics_human(&metrics));
     Ok(())
 }
 
-fn print_metric_group(title: &str, values: &BTreeMap<String, u64>) {
-    println!("{title}:");
+fn format_metrics_human(metrics: &PrivacyMetrics) -> String {
+    let mut output = String::new();
+    writeln!(output, "Pentect privacy metrics (retained local logs)").unwrap();
+    writeln!(
+        output,
+        "Masked occurrences: {}",
+        metrics.masked_text_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Redacted images: {}",
+        metrics.redacted_image_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Blocked images: {}",
+        metrics.blocked_image_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Local restoration operations: {}",
+        metrics.restoration_operations
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Blocked restoration attempts: {}",
+        metrics.blocked_restoration_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Blocked operations: {}",
+        metrics.blocked_occurrences
+    )
+    .unwrap();
+    writeln!(output, "Warnings: {}", metrics.warning_occurrences).unwrap();
+    writeln!(
+        output,
+        "Plugin failures (including timeouts): {}",
+        metrics.plugin_failure_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Plugin timeouts: {}",
+        metrics.plugin_timeout_occurrences
+    )
+    .unwrap();
+    format_metric_group(
+        &mut output,
+        "Secret types (text masks and image redactions)",
+        &metrics.by_secret_type,
+        |name| {
+            (safe_metric_secret_type(name) == name).then(|| {
+                labels::description(name)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| readable_metric_name(name))
+            })
+        },
+    );
+    format_metric_group(
+        &mut output,
+        "Protection surfaces",
+        &metrics.by_surface,
+        metric_surface_description,
+    );
+    format_metric_group(
+        &mut output,
+        "Warning reasons",
+        &metrics.by_warning_reason,
+        warning_reason_description,
+    );
+    if metrics.records_skipped > 0 {
+        writeln!(
+            output,
+            "Skipped unreadable records: {} (counts may be incomplete)",
+            metrics.records_skipped
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "No secret values, handles, paths, URLs, or account identifiers are included."
+    )
+    .unwrap();
+    output
+}
+
+fn format_metric_group(
+    output: &mut String,
+    title: &str,
+    values: &BTreeMap<String, u64>,
+    description: fn(&str) -> Option<String>,
+) {
+    writeln!(output, "{title}:").unwrap();
     if values.is_empty() {
-        println!("  (none)");
+        writeln!(output, "  (none)").unwrap();
         return;
     }
     let mut values = values.iter().collect::<Vec<_>>();
@@ -438,15 +505,26 @@ fn print_metric_group(title: &str, values: &BTreeMap<String, u64>) {
             .then_with(|| left_name.cmp(right_name))
     });
     for (name, count) in values {
-        let readable = labels::description(name)
-            .map(str::to_string)
-            .unwrap_or_else(|| readable_metric_name(name));
-        if readable == *name {
-            println!("  {name}: {count}");
-        } else {
-            println!("  {name} ({readable}): {count}");
-        }
+        let (safe_name, readable) = description(name)
+            .map(|readable| (name.as_str(), readable))
+            .unwrap_or_else(|| ("unknown", "Unknown or unclassified value".to_string()));
+        writeln!(output, "  {safe_name} ({readable}): {count}").unwrap();
     }
+}
+
+fn metric_surface_description(name: &str) -> Option<String> {
+    Some(
+        match name {
+            "prompt" => "Text sent to a model",
+            "output" => "Masked tool or command output",
+            "tool" => "Local tool input or output",
+            "read" => "Content read from a local file",
+            "image" => "Image or OCR content",
+            "OTHER" => "Other protected surface",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 fn readable_metric_name(name: &str) -> String {
@@ -1510,48 +1588,150 @@ fn diagnostic_surface(value: &str) -> String {
     )
 }
 
+const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "cmd-binding-skipped",
+        "Shell command binding could not be inspected",
+    ),
+    (
+        "connection-failed",
+        "A protected connection could not be established",
+    ),
+    (
+        "candidate-limit",
+        "Inspection reached the configured candidate limit",
+    ),
+    (
+        "decoded-byte-limit",
+        "Inspection reached the decoded-data limit",
+    ),
+    (
+        "diagnostic-queue-overflow",
+        "Some diagnostic records could not be queued",
+    ),
+    ("elapsed-limit", "Inspection reached the time limit"),
+    (
+        "expansion-limit",
+        "Inspection reached the decoded-expansion limit",
+    ),
+    (
+        "file-attestation-unavailable",
+        "Local file identity could not be verified",
+    ),
+    (
+        "file-registry-unavailable",
+        "Protected local file tracking was unavailable",
+    ),
+    (
+        "gateway-busy",
+        "The local protection gateway was at capacity",
+    ),
+    ("gateway-stopped", "The local protection gateway stopped"),
+    (
+        "no-protected-connection",
+        "No protected client connection was observed",
+    ),
+    (
+        "provider-mcp-credential-forwarded",
+        "A configured provider MCP credential was forwarded",
+    ),
+    (
+        "request-content-encoding-skipped",
+        "Request content encoding could not be inspected",
+    ),
+    (
+        "request-encode-skipped",
+        "A protected request could not be encoded",
+    ),
+    ("request-failed", "A protected provider request failed"),
+    ("request-invalid-json", "Request content was not valid JSON"),
+    (
+        "request-protection-skipped",
+        "Request content protection was skipped",
+    ),
+    (
+        "request-rejected",
+        "A request was rejected to preserve protection",
+    ),
+    (
+        "response-protection-skipped",
+        "Response content protection was skipped",
+    ),
+    (
+        "response-restore-skipped",
+        "Local response-handle restoration was skipped",
+    ),
+    ("scan-complete", "Image inspection completed"),
+    ("scan-failed", "Image inspection failed"),
+    (
+        "scan-failure-allowed",
+        "Policy allowed image content after OCR inspection failed",
+    ),
+    (
+        "scan-failure-blocked",
+        "Affected image content was blocked after OCR inspection failed",
+    ),
+    (
+        "scan-unavailable-allowed",
+        "Policy allowed image content without OCR inspection",
+    ),
+    (
+        "scan-unavailable-blocked",
+        "Affected image content was blocked because OCR inspection was unavailable",
+    ),
+    (
+        "shell-secret-unresolved",
+        "A protected value could not be restored for a local shell",
+    ),
+    (
+        "sse-event-limit",
+        "A stream event exceeded the inspection size limit",
+    ),
+    (
+        "sse-restore-skipped",
+        "Local stream-handle restoration was skipped",
+    ),
+    (
+        "sse-tool-limit",
+        "Stream tool input exceeded the inspection size limit",
+    ),
+    (
+        "stream-event-protection-skipped",
+        "Stream event content protection was skipped",
+    ),
+    (
+        "tool-input-restore-skipped",
+        "Local tool-input handle restoration was skipped",
+    ),
+    (
+        "unknown-content-block",
+        "Unrecognized content was blocked because it could not be inspected",
+    ),
+    ("unknown-endpoint", "A provider endpoint was not recognized"),
+    (
+        "upstream-response",
+        "A provider response status was observed",
+    ),
+];
+
 fn diagnostic_event(value: &str) -> String {
-    allowed_diagnostic_identifier(
-        value,
-        &[
-            "cmd-binding-skipped",
-            "connection-failed",
-            "candidate-limit",
-            "decoded-byte-limit",
-            "diagnostic-queue-overflow",
-            "elapsed-limit",
-            "expansion-limit",
-            "file-attestation-unavailable",
-            "file-registry-unavailable",
-            "gateway-busy",
-            "gateway-stopped",
-            "no-protected-connection",
-            "provider-mcp-credential-forwarded",
-            "request-content-encoding-skipped",
-            "request-encode-skipped",
-            "request-failed",
-            "request-invalid-json",
-            "request-protection-skipped",
-            "request-rejected",
-            "response-protection-skipped",
-            "response-restore-skipped",
-            "scan-complete",
-            "scan-failed",
-            "scan-failure-allowed",
-            "scan-failure-blocked",
-            "scan-unavailable-allowed",
-            "scan-unavailable-blocked",
-            "shell-secret-unresolved",
-            "sse-event-limit",
-            "sse-restore-skipped",
-            "sse-tool-limit",
-            "stream-event-protection-skipped",
-            "tool-input-restore-skipped",
-            "unknown-content-block",
-            "unknown-endpoint",
-            "upstream-response",
-        ],
-    )
+    if WARNING_REASON_DESCRIPTIONS
+        .iter()
+        .any(|(code, _)| *code == value)
+    {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn warning_reason_description(name: &str) -> Option<String> {
+    if name == "unknown" {
+        return Some("Unknown or unclassified warning".to_string());
+    }
+    WARNING_REASON_DESCRIPTIONS
+        .iter()
+        .find_map(|(code, description)| (*code == name).then(|| (*description).to_string()))
 }
 
 fn diagnostic_kind(value: &str) -> String {
@@ -1888,6 +2068,9 @@ mod tests {
         assert!(!output.contains("private-plugin"));
         assert!(!output.contains("private-restoration"));
         assert!(!output.contains(".env"));
+        assert!(output.contains("\"by_surface\":{\"image\":1,\"prompt\":3}"));
+        assert!(output.contains("\"by_warning_reason\":{\"request-failed\":1,\"unknown\":1}"));
+        assert!(!output.contains("A protected provider request failed"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1904,6 +2087,62 @@ mod tests {
         assert_eq!(readable_metric_name("request-failed"), "Request failed");
         assert_eq!(readable_metric_name("PII"), "PII");
         assert_eq!(readable_metric_name(""), "Unknown");
+    }
+
+    #[test]
+    fn human_metrics_explain_bounded_codes_without_exposing_untrusted_dimensions() {
+        let private = "https://private.example/account/alice";
+        let metrics = PrivacyMetrics {
+            masked_text_occurrences: 2,
+            by_secret_type: BTreeMap::from([("AWS_AKID".to_string(), 1), (private.to_string(), 1)]),
+            by_surface: BTreeMap::from([("tool".to_string(), 1), (private.to_string(), 1)]),
+            by_warning_reason: BTreeMap::from([
+                ("scan-unavailable-allowed".to_string(), 1),
+                ("request-rejected".to_string(), 2),
+                (private.to_string(), 1),
+            ]),
+            ..PrivacyMetrics::default()
+        };
+
+        let output = format_metrics_human(&metrics);
+        assert!(output.contains("AWS_AKID (AWS akid): 1"), "{output}");
+        assert!(
+            output.contains("tool (Local tool input or output): 1"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "scan-unavailable-allowed (Policy allowed image content without OCR inspection): 1"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("request-rejected (A request was rejected to preserve protection): 2"),
+            "{output}"
+        );
+        assert!(!output.contains(private), "{output}");
+        assert_eq!(
+            output.matches("unknown (Unknown or unclassified").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn warning_reason_allowlist_and_descriptions_share_one_complete_source() {
+        for (code, description) in WARNING_REASON_DESCRIPTIONS {
+            assert_eq!(diagnostic_event(code), *code);
+            assert_eq!(
+                warning_reason_description(code).as_deref(),
+                Some(*description)
+            );
+            assert!(!description.is_empty());
+        }
+        assert_eq!(diagnostic_event("private-error-/home/alice"), "unknown");
+        assert_eq!(
+            warning_reason_description("unknown").as_deref(),
+            Some("Unknown or unclassified warning")
+        );
+        assert!(warning_reason_description("private-error-/home/alice").is_none());
     }
 
     #[test]
