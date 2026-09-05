@@ -1372,16 +1372,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_verification_accepts_only_owned_live_children() {
-        assert!(open_verified_child_pidfd(std::process::id() as i32)
-            .unwrap()
-            .is_none());
+        let self_result = open_verified_child_pidfd(std::process::id() as i32);
+        if self_result.is_err() {
+            // Runtime fallback intentionally supports kernels and sandboxes
+            // without pidfds.
+            return;
+        }
+        assert!(self_result.unwrap().is_none());
         assert!(open_verified_child_pidfd(i32::MAX).unwrap().is_none());
 
-        let mut child = Command::new("sh").args(["-c", "sleep 15"]).spawn().unwrap();
+        let mut child = Command::new("sleep").arg("15").spawn().unwrap();
         let pid = child.id() as i32;
-        assert!(open_verified_child_pidfd(pid).unwrap().is_some());
+        let verified = open_verified_child_pidfd(pid);
         child.kill().unwrap();
         child.wait().unwrap();
+        assert!(verified.unwrap().is_some());
         assert!(open_verified_child_pidfd(pid).unwrap().is_none());
     }
 
