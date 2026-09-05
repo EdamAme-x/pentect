@@ -161,4 +161,5 @@ fn metrics_human_describes_stable_codes_without_echoing_untrusted_values() {
     assert!(!String::from_utf8(encoded.stdout)
         .unwrap()
         .contains(sentinel));
+    assert!(!fixture.0.join("state/pentect/update-check.json").exists());
 }
