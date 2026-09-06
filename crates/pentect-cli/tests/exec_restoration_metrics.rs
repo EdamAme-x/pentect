@@ -1,7 +1,8 @@
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SECRET: &str = "sk-proj-pentect-synthetic-exec-restoration-1234567890";
 
@@ -9,6 +10,7 @@ struct Fixture {
     root: PathBuf,
     home: PathBuf,
     project: PathBuf,
+    source: PathBuf,
     handle: String,
 }
 
@@ -38,9 +40,13 @@ impl Fixture {
             root,
             home,
             project,
+            source,
             handle: String::new(),
         };
-        let output = fixture.run("seed", ["read".into(), source.into_os_string()]);
+        let output = fixture.run(
+            "seed",
+            ["read".into(), fixture.source.clone().into_os_string()],
+        );
         assert_success(&output, "seed handle");
         let masked = String::from_utf8(output.stdout).unwrap();
         fixture.handle = first_handle(&masked);
@@ -62,6 +68,7 @@ impl Fixture {
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
         command
+            .env_clear()
             .args(args)
             .current_dir(&self.project)
             .env("HOME", &self.home)
@@ -76,16 +83,12 @@ impl Fixture {
             .env("TEMP", &temp)
             .env("PENTECT_LOG_DIR", &log_dir)
             .env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-        for name in [
-            "PENTECT_MEMORY_STORE_ADDR",
-            "PENTECT_MEMORY_STORE_TOKEN",
-            "PENTECT_PROCESS_HOST_READ_TOKEN",
-            "PENTECT_PROCESS_HOST_WRITE_TOKEN",
-            "PENTECT_AGENT_LAUNCHED",
-        ] {
-            command.env_remove(name);
+        for name in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
         }
-        command.output().unwrap()
+        bounded_output(command, label)
     }
 
     fn resolve_events(&self, label: &str) -> Vec<Value> {
@@ -97,14 +100,34 @@ impl Fixture {
         );
         raw.lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|event| event["action"] == "resolve" && event["surface"] == "exec")
+            .filter(|event| event["action"] == "resolve")
             .collect()
     }
 
     fn assert_resolve_count(&self, label: &str, expected: usize) {
         let events = self.resolve_events(label);
         assert_eq!(events.len(), expected, "{label}: {events:?}");
-        assert!(events.iter().all(|event| event["count"] == 1));
+        let env_name = env_name_for_handle(&self.handle);
+        for event in events {
+            assert_eq!(event["surface"], "exec", "{label}: {event:?}");
+            assert_eq!(event["count"], 1, "{label}: {event:?}");
+            assert!(
+                event
+                    .get("labels")
+                    .is_none_or(|labels| labels == &Value::Array(Vec::new())),
+                "{label}: {event:?}"
+            );
+            assert!(event.get("target").is_none(), "{label}: {event:?}");
+            let encoded = serde_json::to_string(&event).unwrap();
+            for private in [
+                SECRET,
+                self.handle.as_str(),
+                self.source.to_str().unwrap(),
+                env_name.as_str(),
+            ] {
+                assert!(!encoded.contains(private), "{label}: {event:?}");
+            }
+        }
     }
 }
 
@@ -119,38 +142,49 @@ fn actual_exec_records_completed_input_restoration_once() {
     let fixture = Fixture::new();
 
     for (label, live) in [("shell-buffered", false), ("shell-live", true)] {
-        let output = fixture.run(label, shell_args(&fixture.handle, live));
+        let output = fixture.run(label, shell_args(&fixture.handle, &fixture.source, live));
         assert_success(&output, label);
         fixture.assert_resolve_count(label, 1);
     }
 
     for (label, live) in [("stdin-buffered", false), ("stdin-live", true)] {
-        let output = fixture.run(label, secret_stdin_args(&fixture.handle, live));
+        let output = fixture.run(
+            label,
+            secret_stdin_args(&fixture.handle, &fixture.source, live),
+        );
         assert_success(&output, label);
         fixture.assert_resolve_count(label, 1);
     }
 
-    let output = fixture.run("referenced-env", referenced_env_args(&fixture.handle));
+    let output = fixture.run(
+        "referenced-env",
+        referenced_env_args(&fixture.handle, &fixture.source),
+    );
     assert_success(&output, "referenced-env");
     fixture.assert_resolve_count("referenced-env", 1);
 
-    let output = fixture.run("argv-nonzero", argv_args(&fixture.handle, 37));
-    assert_eq!(output.status.code(), Some(37), "{output:?}");
-    fixture.assert_resolve_count("argv-nonzero", 1);
+    for (label, live) in [("argv-nonzero", false), ("argv-nonzero-live", true)] {
+        let output = fixture.run(label, argv_args(&fixture.handle, &fixture.source, 37, live));
+        assert_eq!(output.status.code(), Some(37), "{output:?}");
+        fixture.assert_resolve_count(label, 1);
+    }
 
-    let missing = fixture.root.join("program-that-does-not-exist");
-    let output = fixture.run(
-        "spawn-failure",
-        [
-            "exec".into(),
+    for (label, live) in [("spawn-failure", false), ("spawn-failure-live", true)] {
+        let missing = fixture.root.join("program-that-does-not-exist");
+        let mut args = vec!["exec".into()];
+        if live {
+            args.push("--live".into());
+        }
+        args.extend([
             "--allow-secret-argv".into(),
             "--".into(),
             missing.into_os_string(),
             fixture.handle.clone().into(),
-        ],
-    );
-    assert!(!output.status.success(), "{output:?}");
-    fixture.assert_resolve_count("spawn-failure", 1);
+        ]);
+        let output = fixture.run(label, args);
+        assert!(!output.status.success(), "{output:?}");
+        fixture.assert_resolve_count(label, 1);
+    }
 }
 
 #[test]
@@ -161,14 +195,22 @@ fn actual_exec_does_not_count_noop_or_failed_input_preparation() {
     assert_success(&output, "noop");
     fixture.assert_resolve_count("noop", 0);
 
-    let output = fixture.run("argv-denied", argv_args_without_opt_in(&fixture.handle));
+    let output = fixture.run(
+        "argv-denied",
+        argv_args_without_opt_in(&fixture.handle, &fixture.source),
+    );
     assert!(!output.status.success(), "{output:?}");
     fixture.assert_resolve_count("argv-denied", 0);
 
     let unknown = unknown_handle(&fixture.handle);
-    let output = fixture.run("unknown", secret_stdin_args(&unknown, false));
-    assert!(!output.status.success(), "{output:?}");
-    fixture.assert_resolve_count("unknown", 0);
+    for (label, live) in [("late-unknown", false), ("late-unknown-live", true)] {
+        let output = fixture.run(
+            label,
+            argv_with_late_unknown(&fixture.handle, &unknown, live),
+        );
+        assert!(!output.status.success(), "{output:?}");
+        fixture.assert_resolve_count(label, 0);
+    }
 }
 
 fn first_handle(masked: &str) -> String {
@@ -190,11 +232,8 @@ fn unknown_handle(handle: &str) -> String {
         .position(|window| window == prefix)
         .map(|index| index + prefix.len())
         .unwrap();
-    let index = unknown[hash_start..]
-        .iter()
-        .position(|byte| byte.is_ascii_hexdigit() && byte.is_ascii_lowercase())
-        .map(|index| hash_start + index)
-        .unwrap();
+    let index = hash_start;
+    assert!(unknown[index].is_ascii_hexdigit());
     unknown[index] = if unknown[index] == b'a' { b'b' } else { b'a' };
     String::from_utf8(unknown).unwrap()
 }
@@ -221,46 +260,86 @@ fn assert_success(output: &Output, context: &str) {
     );
 }
 
+fn bounded_output(mut command: Command, context: &str) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{context}: pentect command did not exit within 15 seconds");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(unix)]
-fn shell_args(handle: &str, live: bool) -> Vec<std::ffi::OsString> {
+fn shell_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
     }
-    args.push(format!(": '{handle}'").into());
+    args.push(
+        format!(
+            "expected=$(cut -d= -f2- '{}'); test '{handle}' = \"$expected\"; test '{handle}' = \"$expected\"",
+            source.display()
+        )
+        .into(),
+    );
     args
 }
 
 #[cfg(unix)]
-fn referenced_env_args(handle: &str) -> Vec<std::ffi::OsString> {
+fn referenced_env_args(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString> {
     let name = env_name_for_handle(handle);
     vec![
         "exec".into(),
-        format!(": '{handle}'; test -n \"${name}\"").into(),
+        format!(
+            "expected=$(cut -d= -f2- '{}'); : '{handle}'; test \"${name}\" = \"$expected\"",
+            source.display()
+        )
+        .into(),
     ]
 }
 
 #[cfg(windows)]
-fn shell_args(handle: &str, live: bool) -> Vec<std::ffi::OsString> {
+fn shell_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
     }
-    args.push(format!("'{handle}' | Out-Null").into());
+    args.push(
+        format!(
+            "$expected=(Get-Content -LiteralPath '{}') -replace '^OPENAI_API_KEY=', ''; if ('{handle}' -ne $expected -or '{handle}' -ne $expected) {{ exit 1 }}",
+            source.display()
+        )
+        .into(),
+    );
     args
 }
 
 #[cfg(windows)]
-fn referenced_env_args(handle: &str) -> Vec<std::ffi::OsString> {
+fn referenced_env_args(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString> {
     let name = env_name_for_handle(handle);
     vec![
         "exec".into(),
-        format!("'{handle}' | Out-Null; if (-not $env:{name}) {{ exit 1 }}").into(),
+        format!(
+            "$expected=(Get-Content -LiteralPath '{}') -replace '^OPENAI_API_KEY=', ''; '{handle}' | Out-Null; if ($env:{name} -ne $expected) {{ exit 1 }}",
+            source.display()
+        )
+        .into(),
     ]
 }
 
 #[cfg(unix)]
-fn secret_stdin_args(handle: &str, live: bool) -> Vec<std::ffi::OsString> {
+fn secret_stdin_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -271,13 +350,17 @@ fn secret_stdin_args(handle: &str, live: bool) -> Vec<std::ffi::OsString> {
         "--".into(),
         "sh".into(),
         "-c".into(),
-        "IFS= read -r value; test -n \"$value\"".into(),
+        format!(
+            "IFS= read -r value; expected=$(cut -d= -f2- '{}'); test \"$value\" = \"$expected\"",
+            source.display()
+        )
+        .into(),
     ]);
     args
 }
 
 #[cfg(windows)]
-fn secret_stdin_args(handle: &str, live: bool) -> Vec<std::ffi::OsString> {
+fn secret_stdin_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -291,29 +374,44 @@ fn secret_stdin_args(handle: &str, live: bool) -> Vec<std::ffi::OsString> {
         "-NoProfile".into(),
         "-NonInteractive".into(),
         "-Command".into(),
-        "$value=[Console]::In.ReadToEnd(); if ($value.Length -eq 0) { exit 1 }".into(),
+        format!(
+            "$value=[Console]::In.ReadToEnd(); $expected=(Get-Content -LiteralPath '{}') -replace '^OPENAI_API_KEY=', ''; if ($value -ne $expected) {{ exit 1 }}",
+            source.display()
+        )
+        .into(),
     ]);
     args
 }
 
 #[cfg(unix)]
-fn argv_args(handle: &str, exit: i32) -> Vec<std::ffi::OsString> {
-    vec![
-        "exec".into(),
+fn argv_args(handle: &str, source: &PathBuf, exit: i32, live: bool) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["exec".into()];
+    if live {
+        args.push("--live".into());
+    }
+    args.extend([
         "--allow-secret-argv".into(),
         "--".into(),
         "sh".into(),
         "-c".into(),
-        format!("exit {exit}").into(),
+        format!(
+            "expected=$(cut -d= -f2- \"$2\"); test \"$1\" = \"$expected\" || exit 1; exit {exit}"
+        )
+        .into(),
         "pentect-test".into(),
         handle.into(),
-    ]
+        source.clone().into_os_string(),
+    ]);
+    args
 }
 
 #[cfg(windows)]
-fn argv_args(handle: &str, exit: i32) -> Vec<std::ffi::OsString> {
-    vec![
-        "exec".into(),
+fn argv_args(handle: &str, source: &PathBuf, exit: i32, live: bool) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["exec".into()];
+    if live {
+        args.push("--live".into());
+    }
+    args.extend([
         "--allow-secret-argv".into(),
         "--".into(),
         "powershell.exe".into(),
@@ -321,14 +419,31 @@ fn argv_args(handle: &str, exit: i32) -> Vec<std::ffi::OsString> {
         "-NoProfile".into(),
         "-NonInteractive".into(),
         "-Command".into(),
-        format!("exit {exit}").into(),
+        format!("param($value,$path); $expected=(Get-Content -LiteralPath $path) -replace '^OPENAI_API_KEY=', ''; if ($value -ne $expected) {{ exit 1 }}; exit {exit}").into(),
         handle.into(),
-    ]
+        source.clone().into_os_string(),
+    ]);
+    args
 }
 
-fn argv_args_without_opt_in(handle: &str) -> Vec<std::ffi::OsString> {
-    let mut args = argv_args(handle, 0);
+fn argv_args_without_opt_in(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString> {
+    let mut args = argv_args(handle, source, 0, false);
     args.remove(1);
+    args
+}
+
+fn argv_with_late_unknown(known: &str, unknown: &str, live: bool) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["exec".into()];
+    if live {
+        args.push("--live".into());
+    }
+    args.extend([
+        "--allow-secret-argv".into(),
+        "--".into(),
+        "program-is-never-spawned".into(),
+        known.into(),
+        unknown.into(),
+    ]);
     args
 }
 
