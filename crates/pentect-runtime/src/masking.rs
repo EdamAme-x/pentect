@@ -203,9 +203,6 @@ impl OutputMasker {
                 },
             )
         });
-        if let Some(env_result) = &env_result {
-            self.track_mask_result("prompt", env_result);
-        }
         let no_plugins = PluginMiddleware::default();
         let plugins = if run_plugins {
             &self.plugin_middleware
@@ -225,6 +222,7 @@ impl OutputMasker {
             },
         )?;
         if let Some(env_result) = env_result {
+            result.items.extend(env_result.items);
             result.recovery.extend_same_key(env_result.recovery);
             result.summary.masked_count = result
                 .summary
@@ -576,6 +574,16 @@ impl OutputMasker {
             let count = summary.labels.entry(item.label.clone()).or_default();
             *count = count.saturating_add(1);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_activity_for(
+        &self,
+        surface: &str,
+    ) -> Option<(u64, BTreeMap<String, u64>)> {
+        self.activity
+            .get(surface)
+            .map(|summary| (summary.count, summary.labels.clone()))
     }
 
     pub(crate) fn flush_activity(&mut self) {

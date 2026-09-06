@@ -1180,6 +1180,43 @@ for line in sys.stdin:
 }
 
 #[test]
+fn prompt_dotenv_activity_counts_each_finding_once() {
+    let root = temp_root("prompt-dotenv-activity-count");
+    std::fs::create_dir_all(&root).unwrap();
+
+    for (session_name, prompt, expected_count, expected_labels) in [
+        (
+            "dotenv-only",
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            1,
+            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 0)],
+        ),
+        (
+            "dotenv-and-text",
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nContact alice@example.com",
+            2,
+            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 1)],
+        ),
+    ] {
+        let session = Session::open_capability_at(&root, session_name).unwrap();
+        let store = MemoryStore::for_session(&session);
+        let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+        let masked = masker.mask_prompt_text_without_plugins(prompt).unwrap();
+        assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(!masked.contains("alice@example.com"));
+
+        let (count, labels) = masker.pending_activity_for("prompt").unwrap();
+        assert_eq!(count, expected_count);
+        for (label, expected) in expected_labels {
+            assert_eq!(labels.get(label).copied().unwrap_or_default(), expected);
+        }
+        assert_eq!(labels.values().sum::<u64>(), count);
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn active_prompt_masker_reuses_bounded_cached_result() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-cache");
