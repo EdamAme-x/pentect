@@ -1542,19 +1542,22 @@ fn run_resolved_command(
     store: &MemoryStore,
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
-    match &opts.mode {
-        ExecMode::Program(args) => {
-            if args.is_empty() {
-                return Err("exec requires a program after `--`".to_string());
-            }
-            let env = requested_env_bindings(store, &opts.mode)?;
-            let resolved_args = resolve_command_args(store, args, opts.allow_secret_argv)?;
+    let resolved = resolve_exec_inputs(store, opts)?;
+    if resolved.restored() {
+        activity_log::record_resolve("exec", None);
+    }
+    match resolved {
+        ResolvedExecInputs::Program {
+            args: resolved_args,
+            env,
+            secret_stdin,
+            ..
+        } => {
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
             let mut command = Command::new(program);
             command.args(command_args);
             apply_child_env_overlays(&mut command, &env, &opts.session);
-            let secret_stdin = resolve_secret_stdin(store, opts)?;
             if let Some(secret) = secret_stdin.as_deref() {
                 run_command_with_stdin(command, secret)
             } else {
@@ -1563,17 +1566,64 @@ fn run_resolved_command(
                     .map_err(|error| command_start_error(&error))
             }
         }
-        ExecMode::Shell(command) => {
-            let command = resolve_command_text(store, command)?;
-            register_local_file_inputs(store, &command)?;
-            let env = requested_env_bindings(store, &opts.mode)?;
-            run_shell_script(&command, &env, &opts.session, opts.script_shell)
-        }
-        ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
+        ResolvedExecInputs::Shell {
+            command, script, ..
+        } => run_shell_command(command, &script),
     }
 }
 
 fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
+    let resolved = resolve_exec_inputs(store, opts)?;
+    if resolved.restored() {
+        activity_log::record_resolve("exec", None);
+    }
+    match resolved {
+        ResolvedExecInputs::Program {
+            args: resolved_args,
+            env,
+            secret_stdin,
+            ..
+        } => {
+            let program = &resolved_args[0];
+            let command_args = &resolved_args[1..];
+            let mut command = Command::new(program);
+            command.args(command_args);
+            apply_child_env_overlays(&mut command, &env, &opts.session);
+            run_live_command(
+                command,
+                secret_stdin.as_ref().map(|value| value.as_str()),
+                store.clone(),
+            )
+        }
+        ResolvedExecInputs::Shell {
+            command, script, ..
+        } => run_live_command(command, Some(&script), store.clone()),
+    }
+}
+
+enum ResolvedExecInputs {
+    Program {
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        secret_stdin: Option<Zeroizing<String>>,
+        restored: bool,
+    },
+    Shell {
+        command: Command,
+        script: String,
+        restored: bool,
+    },
+}
+
+impl ResolvedExecInputs {
+    fn restored(&self) -> bool {
+        match self {
+            Self::Program { restored, .. } | Self::Shell { restored, .. } => *restored,
+        }
+    }
+}
+
+fn resolve_exec_inputs(store: &MemoryStore, opts: &ExecOpts) -> Result<ResolvedExecInputs, String> {
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
@@ -1581,26 +1631,27 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
             }
             let env = requested_env_bindings(store, &opts.mode)?;
             let resolved_args = resolve_command_args(store, args, opts.allow_secret_argv)?;
-            let program = &resolved_args[0];
-            let command_args = &resolved_args[1..];
-            let mut command = Command::new(program);
-            command.args(command_args);
-            apply_child_env_overlays(&mut command, &env, &opts.session);
             let secret_stdin = resolve_secret_stdin(store, opts)?;
-            run_live_command(
-                command,
-                secret_stdin.as_ref().map(|value| value.as_str()),
-                store.clone(),
-            )
+            let restored = !env.is_empty() || resolved_args != *args || secret_stdin.is_some();
+            Ok(ResolvedExecInputs::Program {
+                args: resolved_args,
+                env,
+                secret_stdin,
+                restored,
+            })
         }
         ExecMode::Shell(command) => {
-            let command = resolve_command_text(store, command)?;
-            register_local_file_inputs(store, &command)?;
+            let resolved = resolve_command_text(store, command)?;
+            register_local_file_inputs(store, &resolved)?;
             let env = requested_env_bindings(store, &opts.mode)?;
+            let restored = resolved != *command || !env.is_empty();
             let mut shell = shell_script_command(opts.script_shell)?;
             apply_child_env_overlays(&mut shell, &env, &opts.session);
-            let command = prepare_shell_script(&command, opts.script_shell);
-            run_live_command(shell, Some(&command), store.clone())
+            Ok(ResolvedExecInputs::Shell {
+                command: shell,
+                script: prepare_shell_script(&resolved, opts.script_shell),
+                restored,
+            })
         }
         ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
@@ -2017,15 +2068,7 @@ fn command_shell_start_error(error: &std::io::Error) -> String {
     format!("could not start command shell: {reason}")
 }
 
-fn run_shell_script(
-    script: &str,
-    env: &[(String, String)],
-    session: &str,
-    script_shell: ScriptShell,
-) -> Result<std::process::Output, String> {
-    let mut command = shell_script_command(script_shell)?;
-    apply_child_env_overlays(&mut command, env, session);
-    let script = prepare_shell_script(script, script_shell);
+fn run_shell_command(mut command: Command, script: &str) -> Result<std::process::Output, String> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

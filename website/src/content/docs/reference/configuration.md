@@ -174,9 +174,12 @@ logging and rotation continue independently so crashes remain diagnosable.
 The summary includes masked occurrence counts, completed local restoration
 operation counts, blocked restoration attempts, blocked operations, plugin
 failures and timeouts, and warnings grouped by a bounded reason code. Restoration
-operations currently cover changed `pentect resolve` inputs/files and completed
-HTTP tool-call inputs; multiple restored values in one completed tool call count
-as one operation. OpenAI streaming events without a bounded stable call identity,
+operations currently cover changed `pentect resolve` inputs/files, completed
+HTTP tool-call inputs, and successfully prepared `pentect exec` inputs. Multiple
+restored values in one completed tool call or one `pentect exec` invocation count
+as one operation. An exec restoration is counted after all command inputs are
+prepared; it does not assert that the process subsequently started or exited
+successfully. OpenAI streaming events without a bounded stable call identity,
 or after the bounded identity tracker is exhausted, are conservatively omitted
 from metrics without affecting restoration. Other automatic restoration paths
 are not yet included.

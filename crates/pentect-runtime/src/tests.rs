@@ -1604,6 +1604,260 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
 }
 
 #[test]
+fn exec_input_preparation_tracks_selected_recovery_env_without_a_handle_in_command() {
+    let root = temp_root("exec-restored-env-input");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
+    let env_name =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "KAGGLE_API_TOKEN"));
+    let command = if cfg!(windows) {
+        format!("Write-Output $env:{env_name}")
+    } else {
+        format!("printf '%s' \"${env_name}\"")
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: false,
+        secret_stdin: None,
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Shell(command.clone()),
+    };
+
+    let prepared = resolve_exec_inputs(&MemoryStore::for_session(&session), &opts).unwrap();
+    assert!(prepared.restored());
+    match prepared {
+        ResolvedExecInputs::Shell {
+            command: shell,
+            script,
+            ..
+        } => {
+            assert_eq!(script, prepare_shell_script(&command, ScriptShell::Native));
+            assert!(shell.get_envs().any(|(name, configured)| {
+                name == env_name.as_str()
+                    && configured.is_some_and(|configured| configured == value)
+            }));
+        }
+        ResolvedExecInputs::Program { .. } => panic!("expected shell inputs"),
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_aggregates_multiple_restoration_channels() {
+    let root = temp_root("exec-restored-mixed-inputs");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: true,
+        secret_stdin: Some(handle.clone()),
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["program".to_string(), handle]),
+    };
+
+    let prepared = resolve_exec_inputs(&MemoryStore::for_session(&session), &opts).unwrap();
+    assert!(prepared.restored());
+    match prepared {
+        ResolvedExecInputs::Program {
+            args, secret_stdin, ..
+        } => {
+            assert_eq!(args, ["program", raw]);
+            assert_eq!(secret_stdin.as_deref().map(String::as_str), Some(raw));
+        }
+        ResolvedExecInputs::Shell { .. } => panic!("expected program inputs"),
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_does_not_commit_partial_restoration() {
+    let root = temp_root("exec-restored-late-failure");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: true,
+        secret_stdin: Some("<<UNKNOWN_0123456789abcdef>>".to_string()),
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["program".to_string(), handle]),
+    };
+
+    let error = match resolve_exec_inputs(&MemoryStore::for_session(&session), &opts) {
+        Ok(_) => panic!("unknown late secret-stdin handle should fail preparation"),
+        Err(error) => error,
+    };
+    assert!(error.contains("unknown masked handle"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_leaves_plain_inputs_untracked() {
+    let root = temp_root("exec-unrestored-inputs");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: false,
+        secret_stdin: None,
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["program".to_string(), "ordinary".to_string()]),
+    };
+
+    let prepared = resolve_exec_inputs(&MemoryStore::for_session(&session), &opts).unwrap();
+    assert!(!prepared.restored());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_emits_only_after_the_whole_operation_is_ready() {
+    const CHILD_CASE_ENV: &str = "PENTECT_TEST_EXEC_METRIC_CASE";
+    const CHILD_ROOT_ENV: &str = "PENTECT_TEST_EXEC_METRIC_ROOT";
+
+    if let (Ok(case), Some(root)) = (
+        std::env::var(CHILD_CASE_ENV),
+        std::env::var_os(CHILD_ROOT_ENV).map(PathBuf::from),
+    ) {
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+        let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+        let env_name = pentect_env_name_for_handle(&handle);
+        let store = MemoryStore::for_session(&session);
+        let opts = match case.trim_end_matches("-live") {
+            "env-only" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: case.ends_with("-live"),
+                allow_secret_argv: false,
+                secret_stdin: None,
+                script_shell: ScriptShell::Native,
+                mode: ExecMode::Shell(if cfg!(windows) {
+                    format!("Write-Output $env:{env_name}")
+                } else {
+                    format!("printf '%s' \"${env_name}\"")
+                }),
+            },
+            "unreferenced" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: false,
+                allow_secret_argv: false,
+                secret_stdin: None,
+                script_shell: ScriptShell::Native,
+                mode: ExecMode::Program(vec!["pentect-test-missing-program".to_string()]),
+            },
+            "shell-failure" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: case.ends_with("-live"),
+                allow_secret_argv: false,
+                secret_stdin: None,
+                script_shell: ScriptShell::Bash,
+                mode: ExecMode::Shell(handle),
+            },
+            "late-failure" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: false,
+                allow_secret_argv: true,
+                secret_stdin: Some("<<UNKNOWN_0123456789abcdef>>".to_string()),
+                script_shell: ScriptShell::Native,
+                mode: ExecMode::Program(vec!["program".to_string(), handle]),
+            },
+            _ => panic!("unknown child case"),
+        };
+        let result = if opts.live {
+            run_resolved_command_live(&store, &opts).map(|_| ())
+        } else {
+            run_resolved_command(&store, &opts).map(|_| ())
+        };
+        assert_eq!(
+            result.is_ok(),
+            case.starts_with("env-only"),
+            "{case}: {result:?}"
+        );
+        activity_log::flush_persistent();
+        return;
+    }
+
+    let root = temp_root("exec-restoration-emission");
+    std::fs::create_dir_all(&root).unwrap();
+    for (case, expected) in [
+        ("env-only", 1),
+        ("env-only-live", 1),
+        ("unreferenced", 0),
+        ("shell-failure", 0),
+        ("shell-failure-live", 0),
+        ("late-failure", 0),
+    ] {
+        let child_root = root.join(case);
+        let home = child_root.join("home");
+        let work = child_root.join("work");
+        let log = child_root.join("logs");
+        std::fs::create_dir_all(work.join(".pentect")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            work.join(".pentect/config.toml"),
+            "[activity]\nshare = false\n[update]\ncheck = false\n",
+        )
+        .unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("tests::exec_input_preparation_emits_only_after_the_whole_operation_is_ready")
+            .arg("--nocapture")
+            .env_clear()
+            .env(CHILD_CASE_ENV, case)
+            .env(CHILD_ROOT_ENV, &child_root)
+            .env("PENTECT_LOG_DIR", &log)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("LOCALAPPDATA", child_root.join("local-app-data"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", child_root.join("data"))
+            .env("XDG_CACHE_HOME", child_root.join("cache"))
+            .env("XDG_STATE_HOME", child_root.join("state"))
+            .env("XDG_RUNTIME_DIR", child_root.join("runtime"))
+            .env("TMPDIR", child_root.join("tmp"))
+            .env("TMP", child_root.join("tmp"))
+            .env("TEMP", child_root.join("tmp"))
+            .current_dir(&work);
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{case} child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload = std::fs::read_to_string(log.join("pentect.log")).unwrap_or_default();
+        assert!(
+            !payload.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            "{payload}"
+        );
+        let events = payload
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["action"] == "resolve" && event["surface"] == "exec")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), expected, "{case}: {payload}");
+        if let Some(event) = events.first() {
+            assert_eq!(event["count"], 1);
+            assert!(event.get("labels").is_none(), "{event}");
+            assert!(event.get("target").is_none(), "{event}");
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn handle_core_is_also_a_valid_environment_binding() {
     let root = temp_root("capability-short-env-binding");
     let session = Session::open_capability_at(&root, "t").unwrap();
