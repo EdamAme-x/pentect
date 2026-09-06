@@ -4241,6 +4241,69 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    struct OwnedTestRoot(std::path::PathBuf);
+
+    impl Drop for OwnedTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PluginRuntimeTest {
+        root: std::path::PathBuf,
+        _env: crate::EnvVarGuard,
+        _root: OwnedTestRoot,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PluginRuntimeTest {
+        fn new(prefix: &str) -> Self {
+            let env_lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let root_guard = OwnedTestRoot(root.clone());
+            let home = root.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let env = crate::EnvVarGuard::set_optional([
+                ("HOME", Some(home.clone().into_os_string())),
+                ("USERPROFILE", Some(home.into_os_string())),
+                (
+                    "LOCALAPPDATA",
+                    Some(root.join("local-app-data").into_os_string()),
+                ),
+                ("XDG_DATA_HOME", Some(root.join("data").into_os_string())),
+                ("XDG_CACHE_HOME", Some(root.join("cache").into_os_string())),
+                ("XDG_STATE_HOME", Some(root.join("state").into_os_string())),
+                (
+                    "XDG_RUNTIME_DIR",
+                    Some(root.join("runtime").into_os_string()),
+                ),
+            ]);
+            Self {
+                root: root.clone(),
+                _env: env,
+                _root: root_guard,
+                _env_lock: env_lock,
+            }
+        }
+
+        fn project(&self) -> std::path::PathBuf {
+            let project = self.root.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            project
+        }
+
+        fn assert_owned(&self, path: &Path) {
+            assert!(path.starts_with(&self.root), "{}", path.display());
+        }
+    }
+
     #[test]
     fn windows_command_plugins_accept_batch_shims_only() {
         for extension in [".EXE", "com", ".CMD", "bat"] {
@@ -4710,6 +4773,7 @@ mod tests {
 
     #[test]
     fn approved_command_setup_runs_selected_profile_and_is_locked() {
+        let fixture = PluginRuntimeTest::new("pentect-command-setup");
         let Some(python) = python_test_executable() else {
             return;
         };
@@ -4718,8 +4782,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("command-setup-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture.project();
         std::fs::write(root.join("server.py"), "print('unused')\n").unwrap();
         std::fs::write(
             root.join("setup.py"),
@@ -4735,6 +4798,7 @@ mod tests {
         .unwrap();
         let source = plugins::plugin_source(&root.to_string_lossy()).unwrap();
         let runtime = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        fixture.assert_owned(&runtime.data_dir);
 
         setup_plugin_source(source, true, Some("cpu"), false).unwrap();
 
@@ -4745,8 +4809,6 @@ mod tests {
         let lock =
             std::fs::read_to_string(runtime.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
         assert!(lock.contains("path = \"setup.py\""), "{lock}");
-        let _ = std::fs::remove_dir_all(runtime.data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4779,6 +4841,7 @@ mod tests {
 
     #[test]
     fn local_command_files_are_hashed_into_the_runtime_lock() {
+        let fixture = PluginRuntimeTest::new("pentect-command-lock");
         let Some(python) = python_test_executable() else {
             return;
         };
@@ -4787,8 +4850,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("command-lock-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture.project();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(
             &manifest_path,
@@ -4808,8 +4870,9 @@ mod tests {
             runtime_id: name.clone(),
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
-        write_command_lock(&name, &source, &manifest).unwrap();
         let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        fixture.assert_owned(&dirs.data_dir);
+        write_command_lock(&name, &source, &manifest).unwrap();
         let first = std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
         assert!(first.contains("path = \"server.py\""));
 
@@ -4817,12 +4880,11 @@ mod tests {
         write_command_lock(&name, &source, &manifest).unwrap();
         let second = std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
         assert_ne!(first, second);
-        let _ = std::fs::remove_dir_all(dirs.data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn command_runtime_snapshot_restores_only_managed_state() {
+        let fixture = PluginRuntimeTest::new("pentect-command-rollback");
         let Some(python) = python_test_executable() else {
             return;
         };
@@ -4831,8 +4893,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("command-rollback-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture.project();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(
             &manifest_path,
@@ -4850,6 +4911,7 @@ mod tests {
             runtime_id: name.clone(),
         };
         let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        fixture.assert_owned(&dirs.data_dir);
         std::fs::create_dir_all(dirs.data_dir.join("command")).unwrap();
         std::fs::write(dirs.data_dir.join("command/server.py"), "old").unwrap();
         std::fs::write(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE), "old-lock").unwrap();
@@ -4873,8 +4935,6 @@ mod tests {
             std::fs::read_to_string(dirs.data_dir.join(PLUGIN_APPROVAL_FILE)).unwrap(),
             "old-approval"
         );
-        let _ = std::fs::remove_dir_all(dirs.data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4916,9 +4976,8 @@ mod tests {
 
     #[test]
     fn release_binary_is_portable_wasm_with_optional_override() {
-        let root =
-            std::env::temp_dir().join(format!("pentect-plugin-destination-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = PluginRuntimeTest::new("pentect-plugin-destination");
+        let root = fixture.project();
         let manifest = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(&manifest, "schema = \"pentect.plugin.v1\"\n").unwrap();
         let source = plugins::PluginSource {
@@ -4942,12 +5001,10 @@ mod tests {
             binary_destination("test", "../outside.wasm", PluginRuntime::Wasm, &source).is_err()
         );
         assert!(binary_destination("test", "helper", PluginRuntime::Wasm, &source).is_err());
-        assert!(
-            binary_destination("test", "helper.wasm", PluginRuntime::Wasm, &source)
-                .unwrap()
-                .is_absolute()
-        );
-        let _ = std::fs::remove_dir_all(root);
+        let destination =
+            binary_destination("test", "helper.wasm", PluginRuntime::Wasm, &source).unwrap();
+        assert!(destination.is_absolute());
+        fixture.assert_owned(&destination);
     }
 
     #[test]
@@ -5102,41 +5159,13 @@ pattern = "token-[0-9]+"
 
     #[test]
     fn plugin_update_requires_the_exact_approved_manifest() {
-        let _env_lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("update-approval-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        struct OwnedRoot(std::path::PathBuf);
-        impl Drop for OwnedRoot {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        std::fs::create_dir_all(&root).unwrap();
-        let root = std::fs::canonicalize(root).unwrap();
-        let _root = OwnedRoot(root.clone());
-        let project = root.join("project");
-        let home = root.join("home");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        let _env = crate::EnvVarGuard::set_optional([
-            ("HOME", Some(home.clone().into_os_string())),
-            ("USERPROFILE", Some(home.into_os_string())),
-            (
-                "LOCALAPPDATA",
-                Some(root.join("local-app-data").into_os_string()),
-            ),
-            ("XDG_DATA_HOME", Some(root.join("data").into_os_string())),
-            ("XDG_CACHE_HOME", Some(root.join("cache").into_os_string())),
-            ("XDG_STATE_HOME", Some(root.join("state").into_os_string())),
-            (
-                "XDG_RUNTIME_DIR",
-                Some(root.join("runtime").into_os_string()),
-            ),
-        ]);
+        let fixture = PluginRuntimeTest::new("pentect-update-approval");
+        let project = fixture.project();
         let manifest_path = project.join(plugins::PLUGIN_MANIFEST_FILE);
         let manifest_source = format!(
             "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper.wasm\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n"
@@ -5155,7 +5184,7 @@ pattern = "token-[0-9]+"
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()
             .data_dir;
-        assert!(data_dir.starts_with(&root));
+        fixture.assert_owned(&data_dir);
         std::fs::create_dir_all(data_dir.join("bin")).unwrap();
         let wasm = wat::parse_str(
             r#"(module
@@ -5326,8 +5355,8 @@ pattern = "token-[0-9]+"
             .unwrap()
             .as_nanos();
         let name = format!("downgrade-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = PluginRuntimeTest::new("pentect-plugin-downgrade");
+        let root = fixture.project();
         let manifest = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(&manifest, "schema = \"pentect.plugin.v1\"\n").unwrap();
         let source = plugins::PluginSource {
@@ -5341,6 +5370,7 @@ pattern = "token-[0-9]+"
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()
             .data_dir;
+        fixture.assert_owned(&data_dir);
         std::fs::write(
             data_dir.join(PLUGIN_BINARY_LOCK_FILE),
             "schema = \"pentect.plugin-lock.v1\"\nversion = \"2.0.0\"\n",
@@ -5350,9 +5380,6 @@ pattern = "token-[0-9]+"
         assert!(reject_plugin_downgrade(&name, &source, &semver::Version::new(1, 9, 9)).is_err());
         assert!(reject_plugin_downgrade(&name, &source, &semver::Version::new(2, 0, 0)).is_ok());
         assert!(reject_plugin_downgrade(&name, &source, &semver::Version::new(2, 1, 0)).is_ok());
-
-        let _ = std::fs::remove_dir_all(data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
