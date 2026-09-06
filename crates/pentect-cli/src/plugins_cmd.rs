@@ -5102,14 +5102,40 @@ pattern = "token-[0-9]+"
 
     #[test]
     fn plugin_update_requires_the_exact_approved_manifest() {
+        let _env_lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("update-approval-{nonce}");
         let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
-        let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _root = OwnedRoot(root.clone());
+        let project = root.join("project");
+        let home = root.join("home");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = crate::EnvVarGuard::set_optional([
+            ("HOME", Some(home.clone().into_os_string())),
+            ("USERPROFILE", Some(home.into_os_string())),
+            (
+                "LOCALAPPDATA",
+                Some(root.join("local-app-data").into_os_string()),
+            ),
+            ("XDG_DATA_HOME", Some(root.join("data").into_os_string())),
+            ("XDG_CACHE_HOME", Some(root.join("cache").into_os_string())),
+            ("XDG_STATE_HOME", Some(root.join("state").into_os_string())),
+            (
+                "XDG_RUNTIME_DIR",
+                Some(root.join("runtime").into_os_string()),
+            ),
+        ]);
+        let manifest_path = project.join(plugins::PLUGIN_MANIFEST_FILE);
         let manifest_source = format!(
             "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper.wasm\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n"
         );
@@ -5127,6 +5153,7 @@ pattern = "token-[0-9]+"
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()
             .data_dir;
+        assert!(data_dir.starts_with(&root));
         std::fs::create_dir_all(data_dir.join("bin")).unwrap();
         let wasm = wat::parse_str(
             r#"(module
@@ -5147,12 +5174,6 @@ pattern = "token-[0-9]+"
         .unwrap();
         let changed = load_plugin_manifest(&source).unwrap().unwrap();
         assert!(verify_plugin_update_approval(&name, &source, &changed).is_err());
-
-        let data_dir = plugin_runtime_dirs_for_source(&name, &source)
-            .unwrap()
-            .data_dir;
-        let _ = std::fs::remove_dir_all(data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
