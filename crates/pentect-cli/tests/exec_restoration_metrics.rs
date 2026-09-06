@@ -31,7 +31,7 @@ impl Fixture {
         std::fs::create_dir_all(project.join(".git")).unwrap();
         std::fs::write(
             home.join(".pentect/config.toml"),
-            "[activity]\nshare = false\n[update]\ncheck = false\n",
+            "[activity]\nshare = false\n[files]\nremember = true\n[update]\ncheck = false\n",
         )
         .unwrap();
 
