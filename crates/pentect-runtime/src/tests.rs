@@ -1256,7 +1256,8 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
         "[activity]\nshare = false\n[update]\ncheck = false\n",
     )
     .unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .arg("--exact")
         .arg("tests::prompt_dotenv_activity_counts_each_finding_once")
         .arg("--nocapture")
@@ -1270,12 +1271,16 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
         .env("TMPDIR", child_root.join("tmp"))
         .env("TMP", child_root.join("tmp"))
         .env("TEMP", child_root.join("tmp"))
-        .current_dir(&child_work)
-        .output()
-        .unwrap();
+        .current_dir(&child_work);
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "child failed: {}",
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
