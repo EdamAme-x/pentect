@@ -5115,6 +5115,8 @@ pattern = "token-[0-9]+"
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         let _root = OwnedRoot(root.clone());
         let project = root.join("project");
         let home = root.join("home");
