@@ -3240,7 +3240,11 @@ mod tests {
             "content": [{
                 "type": "tool_use",
                 "name": "shell",
-                "input": {"first": handle, "second": handle}
+                "input": {
+                    "first": handle,
+                    "second": handle,
+                    "unknown": "<<SECRET_ffeeddccbbaa0099>>"
+                }
             }]
         }))
         .unwrap();
@@ -3250,6 +3254,27 @@ mod tests {
 
         let mut fail = |_text: &str| Err("synthetic resolver failure".to_string());
         assert!(rewrite_anthropic_json_response(&body, false, &mut fail).is_err());
+        assert!(take_test_completed_tool_restorations().is_empty());
+
+        let late_failure_body = serde_json::to_vec(&serde_json::json!({
+            "content": [
+                {"type": "tool_use", "name": "first", "input": {"value": handle}},
+                {"type": "tool_use", "name": "second", "input": {"value": handle}}
+            ]
+        }))
+        .unwrap();
+        let mut calls = 0usize;
+        let mut late_fail = |text: &str| {
+            calls += 1;
+            if calls == 2 {
+                Err("synthetic late resolver failure".to_string())
+            } else {
+                Ok(text.replace(handle, "local-value"))
+            }
+        };
+        assert!(
+            rewrite_anthropic_json_response(&late_failure_body, false, &mut late_fail).is_err()
+        );
         assert!(take_test_completed_tool_restorations().is_empty());
     }
 

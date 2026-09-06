@@ -2646,8 +2646,13 @@ fn function_call_identities(object: &serde_json::Map<String, Value>) -> Vec<Stri
     let mut identities = Vec::new();
     for key in ["item_id", "id", "call_id"] {
         if let Some(identity) = object.get(key).and_then(Value::as_str) {
-            if identity.len() <= 256 && !identities.iter().any(|known| known == identity) {
-                identities.push(identity.to_string());
+            if identity.is_empty() || identity.len() > 256 {
+                continue;
+            }
+            let namespace = if key == "call_id" { "call" } else { "item" };
+            let identity = format!("{namespace}:{identity}");
+            if !identities.contains(&identity) {
+                identities.push(identity);
             }
         }
     }
@@ -2729,20 +2734,31 @@ impl ToolRestorationDedup {
                     hasher.finish()
                 })
                 .collect::<Vec<_>>();
-            if identities
+            let already_known = identities
                 .iter()
-                .any(|identity| self.identities.contains(identity))
-            {
+                .any(|identity| self.identities.contains(identity));
+            let new_identities = identities
+                .into_iter()
+                .filter(|identity| !self.identities.contains(identity))
+                .collect::<Vec<_>>();
+            if already_known {
+                if self.identities.len().saturating_add(new_identities.len())
+                    > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+                {
+                    self.full = true;
+                    break;
+                }
+                self.identities.extend(new_identities);
                 continue;
             }
             if self.calls >= MAX_CHAT_TOOL_CALLS
-                || self.identities.len().saturating_add(identities.len())
+                || self.identities.len().saturating_add(new_identities.len())
                     > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
             {
                 self.full = true;
                 break;
             }
-            self.identities.extend(identities);
+            self.identities.extend(new_identities);
             self.calls = self.calls.saturating_add(1);
             count = count.saturating_add(1);
         }
@@ -5501,6 +5517,53 @@ mod tests {
         assert_eq!(
             dedup.commit(rewrite_function_calls(&mut nested_alias, &mut resolve).unwrap()),
             0
+        );
+        let mut item_only_replay = serde_json::json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "item_alias",
+            "name": "exec",
+            "input": handle,
+        });
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut item_only_replay, &mut resolve).unwrap()),
+            0,
+            "aliases learned from duplicate envelopes must remain deduplicated"
+        );
+
+        let mut separate_namespaces = ToolRestorationDedup::default();
+        let mut call_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "shared",
+            "input": handle,
+        });
+        let mut item_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "item_id": "shared",
+            "input": handle,
+        });
+        assert_eq!(
+            separate_namespaces
+                .commit(rewrite_function_calls(&mut call_identity, &mut resolve).unwrap()),
+            1
+        );
+        assert_eq!(
+            separate_namespaces
+                .commit(rewrite_function_calls(&mut item_identity, &mut resolve).unwrap()),
+            1,
+            "call and item identifier namespaces must not collide"
+        );
+
+        let mut empty_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "item_id": "",
+            "call_id": "",
+            "input": handle,
+        });
+        assert_eq!(
+            ToolRestorationDedup::default()
+                .commit(rewrite_function_calls(&mut empty_identity, &mut resolve).unwrap()),
+            0,
+            "empty identifiers are not stable streaming identities"
         );
 
         let mut distinct = serde_json::json!({
