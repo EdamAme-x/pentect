@@ -937,16 +937,19 @@ fn rewrite_response_body(
     let mut value: Value = serde_json::from_slice(body).map_err(|error| {
         format!("unknown format blocked: Google Cloud Code response is not valid JSON ({error})")
     })?;
-    rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Google Cloud Code response: {error}"))
+    let restored_tools = rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
+    let encoded = serde_json::to_vec(&value).map_err(|error| {
+        format!("could not encode restored Google Cloud Code response: {error}")
+    })?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn rewrite_response_value(
     value: &mut Value,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     block_unknown_formats: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     validate_response_value(value, block_unknown_formats)?;
     let mut run = plugins
         .lock()
@@ -976,9 +979,9 @@ fn rewrite_response_value(
     run_tool_plugins(&mut payload, &plugins)?;
     drop(plugins);
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    resolve_function_calls(&mut payload, &mut resolve)?;
+    let restored_tools = resolve_function_calls(&mut payload, &mut resolve)?;
     *value = payload;
-    Ok(())
+    Ok(restored_tools)
 }
 
 fn validate_response_value(value: &Value, block_unknown_formats: bool) -> Result<(), String> {
@@ -1094,14 +1097,16 @@ fn run_tool_plugins(
     Ok(())
 }
 
-pub(crate) fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+pub(crate) fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<u64, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     match value {
         Value::Array(values) => {
             for value in values {
-                resolve_function_calls(value, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_function_calls(value, resolve)?);
             }
         }
         Value::Object(object) => {
@@ -1111,23 +1116,26 @@ where
                     let encoded = serde_json::to_string(args).map_err(|error| {
                         format!("could not encode Google tool arguments: {error}")
                     })?;
-                    let restored = crate::claude_http_proxy::resolve_tool_input_json(
-                        &encoded,
-                        name.as_deref(),
-                        resolve,
-                    )?;
+                    let (restored, changed) =
+                        crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                            &encoded,
+                            name.as_deref(),
+                            resolve,
+                        )?;
                     *args = serde_json::from_str(&restored).map_err(|error| {
                         format!("restored Google tool arguments are invalid: {error}")
                     })?;
+                    restored_tools = restored_tools.saturating_add(u64::from(changed));
                 }
             }
             for child in object.values_mut() {
-                resolve_function_calls(child, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_function_calls(child, resolve)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
 struct StreamState {
@@ -1253,7 +1261,7 @@ fn rewrite_sse_block(
             return Ok(Bytes::copy_from_slice(block));
         }
     };
-    rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
+    let restored_tools = rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
     let encoded = serde_json::to_string(&value)
         .map_err(|error| format!("could not encode Google Cloud Code SSE event: {error}"))?;
     let ending = if text.ends_with("\r\n\r\n") {
@@ -1275,6 +1283,7 @@ fn rewrite_sse_block(
     output.push_str("data: ");
     output.push_str(&encoded);
     output.push_str(ending);
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
     Ok(Bytes::from(output))
 }
 
@@ -1756,7 +1765,7 @@ mod tests {
             ]}}]}
         });
         let mut resolve = |text: &str| Ok(text.replace(handle, "C:/private.txt"));
-        resolve_function_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(resolve_function_calls(&mut value, &mut resolve).unwrap(), 1);
         assert_eq!(
             value["response"]["candidates"][0]["content"]["parts"][0]["text"],
             handle

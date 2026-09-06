@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2394,12 +2395,15 @@ fn rewrite_openai_json_response(body: &[u8], restore_output: bool) -> Result<Vec
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    rewrite_function_calls(&mut value, &mut resolve)?;
+    let restored_tools = ToolRestorationDedup::default()
+        .commit_nonstream(rewrite_function_calls(&mut value, &mut resolve)?);
     if restore_output {
         restore_openai_output_text(&mut value, &mut resolve)?;
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored OpenAI response: {error}"))
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored OpenAI response: {error}"))?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn rewrite_chat_completions_json_response(
@@ -2409,12 +2413,14 @@ fn rewrite_chat_completions_json_response(
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI Chat Completions response was not valid JSON: {error}"))?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    rewrite_chat_tool_calls(&mut value, &mut resolve)?;
+    let restored_tools = rewrite_chat_tool_calls(&mut value, &mut resolve)?;
     if restore_output {
         restore_chat_output_text(&mut value, &mut resolve)?;
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Chat Completions response: {error}"))
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Chat Completions response: {error}"))?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn rewrite_completions_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
@@ -2509,12 +2515,13 @@ where
     Ok(())
 }
 
-fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<u64, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
-        return Ok(());
+        return Ok(0);
     };
     for choice in choices {
         let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
@@ -2538,25 +2545,28 @@ where
             else {
                 continue;
             };
-            let restored = crate::claude_http_proxy::resolve_tool_input_json(
-                &arguments,
-                tool_name.as_deref(),
-                resolve,
-            )?;
+            let (restored, changed) =
+                crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                    &arguments,
+                    tool_name.as_deref(),
+                    resolve,
+                )?;
             call["function"]["arguments"] = Value::String(restored);
+            restored_tools = restored_tools.saturating_add(u64::from(changed));
         }
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
-fn rewrite_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+fn rewrite_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<Vec<Vec<String>>, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut restored_tools = Vec::new();
     match value {
         Value::Array(values) => {
             for value in values {
-                rewrite_function_calls(value, resolve)?;
+                restored_tools.extend(rewrite_function_calls(value, resolve)?);
             }
         }
         Value::Object(object) => {
@@ -2573,6 +2583,8 @@ where
                     )
                 });
             if is_function_call {
+                let mut call_changed = false;
+                let call_identities = function_call_identities(object);
                 let is_custom_call =
                     object
                         .get("type")
@@ -2596,31 +2608,62 @@ where
                     });
                 for key in ["arguments", "input"] {
                     if let Some(Value::String(arguments)) = object.get_mut(key) {
-                        *arguments = if is_custom_call && key == "input" {
-                            resolve(arguments)?
+                        let (resolved, changed) = if is_custom_call && key == "input" {
+                            let resolved = resolve(arguments)?;
+                            let changed = resolved != *arguments;
+                            (resolved, changed)
                         } else {
-                            crate::claude_http_proxy::resolve_tool_input_json(
+                            crate::claude_http_proxy::resolve_tool_input_json_with_change(
                                 arguments,
                                 tool_name.as_deref(),
                                 resolve,
                             )?
                         };
+                        *arguments = resolved;
+                        call_changed |= changed;
                     }
+                }
+                if call_changed {
+                    restored_tools.push(call_identities);
                 }
             }
             if let Some(item) = object.get_mut("item") {
-                rewrite_function_calls(item, resolve)?;
+                restored_tools.extend(rewrite_function_calls(item, resolve)?);
             }
             if let Some(response) = object.get_mut("response") {
-                rewrite_function_calls(response, resolve)?;
+                restored_tools.extend(rewrite_function_calls(response, resolve)?);
             }
             if let Some(output) = object.get_mut("output") {
-                rewrite_function_calls(output, resolve)?;
+                restored_tools.extend(rewrite_function_calls(output, resolve)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(restored_tools)
+}
+
+fn function_call_identities(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut identities = Vec::new();
+    for key in ["item_id", "id", "call_id"] {
+        if let Some(identity) = object.get(key).and_then(Value::as_str) {
+            if identity.is_empty() || identity.len() > 256 {
+                continue;
+            }
+            let namespace = if key == "call_id" { "call" } else { "item" };
+            let identity = format!("{namespace}:{identity}");
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+    }
+    if let Some(item) = object.get("item").and_then(Value::as_object) {
+        for identity in function_call_identities(item) {
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+    }
+    identities
 }
 
 async fn read_response_capped(response: reqwest::Response) -> Result<Option<Bytes>, String> {
@@ -2650,6 +2693,77 @@ struct StreamState {
     block_unknown_formats: bool,
     output_text: HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     output_resolve: HandleResolver,
+    restored_tools: ToolRestorationDedup,
+}
+
+#[derive(Default)]
+struct ToolRestorationDedup {
+    identities: HashSet<u64>,
+    calls: usize,
+    full: bool,
+}
+
+impl ToolRestorationDedup {
+    fn commit_nonstream(&mut self, restored: Vec<Vec<String>>) -> u64 {
+        let mut count = 0u64;
+        let mut identified = Vec::new();
+        for identities in restored {
+            if identities.is_empty() {
+                count = count.saturating_add(1);
+            } else {
+                identified.push(identities);
+            }
+        }
+        count.saturating_add(self.commit(identified))
+    }
+
+    fn commit(&mut self, restored: Vec<Vec<String>>) -> u64 {
+        let mut count = 0u64;
+        for identities in restored {
+            if self.full {
+                break;
+            }
+            if identities.is_empty() {
+                continue;
+            }
+            let identities = identities
+                .iter()
+                .map(|identity| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    identity.hash(&mut hasher);
+                    hasher.finish()
+                })
+                .collect::<Vec<_>>();
+            let already_known = identities
+                .iter()
+                .any(|identity| self.identities.contains(identity));
+            let new_identities = identities
+                .into_iter()
+                .filter(|identity| !self.identities.contains(identity))
+                .collect::<Vec<_>>();
+            if already_known {
+                if self.identities.len().saturating_add(new_identities.len())
+                    > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+                {
+                    self.full = true;
+                    break;
+                }
+                self.identities.extend(new_identities);
+                continue;
+            }
+            if self.calls >= MAX_CHAT_TOOL_CALLS
+                || self.identities.len().saturating_add(new_identities.len())
+                    > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+            {
+                self.full = true;
+                break;
+            }
+            self.identities.extend(new_identities);
+            self.calls = self.calls.saturating_add(1);
+            count = count.saturating_add(1);
+        }
+        count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2663,12 +2777,13 @@ enum StreamTransform {
 fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), String> {
     let block = run_sse_response_plugins(&block, &state.plugins, state.block_unknown_formats)?;
     let rewritten = match state.transform {
-        StreamTransform::Responses => rewrite_openai_sse_block(
+        StreamTransform::Responses => rewrite_openai_sse_block_tracked(
             &block,
             &state.plugins,
             state.restore_output,
             &mut state.output_text,
             &mut state.output_resolve,
+            &mut state.restored_tools,
         ),
         StreamTransform::ChatCompletions => state.chat.rewrite_block(
             &block,
@@ -2719,6 +2834,7 @@ fn streaming_response_body(
         block_unknown_formats,
         output_text: HashMap::new(),
         output_resolve: Box::new(crate::claude_http_proxy::request_scoped_resolver()),
+        restored_tools: ToolRestorationDedup::default(),
     };
     let stream = stream::unfold(state, |mut state| async move {
         loop {
@@ -3110,6 +3226,7 @@ impl ChatStreamState {
             .lock()
             .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
         let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+        let mut restored_tools = 0u64;
         for index in indexes {
             let call = self
                 .calls
@@ -3130,11 +3247,13 @@ impl ChatStreamState {
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let arguments = crate::claude_http_proxy::resolve_tool_input_json(
-                arguments,
-                Some(name),
-                &mut resolve,
-            )?;
+            let (arguments, changed) =
+                crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                    arguments,
+                    Some(name),
+                    &mut resolve,
+                )?;
+            restored_tools = restored_tools.saturating_add(u64::from(changed));
             calls.push(serde_json::json!({
                 "index": index,
                 "id": call.id,
@@ -3148,7 +3267,9 @@ impl ChatStreamState {
             "delta": {"tool_calls": calls},
             "finish_reason": null
         }]);
-        encode_sse_value(template, &completed)
+        let encoded = encode_sse_value(template, &completed)?;
+        crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+        Ok(encoded)
     }
 }
 
@@ -3250,12 +3371,31 @@ fn encode_sse_value_for_event(
     Ok(Bytes::from(output))
 }
 
+#[cfg(test)]
 fn rewrite_openai_sse_block(
     block: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     restore_output: bool,
     output_text: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     resolve: &mut HandleResolver,
+) -> Result<Vec<Bytes>, String> {
+    rewrite_openai_sse_block_tracked(
+        block,
+        plugins,
+        restore_output,
+        output_text,
+        resolve,
+        &mut ToolRestorationDedup::default(),
+    )
+}
+
+fn rewrite_openai_sse_block_tracked(
+    block: &[u8],
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    restore_output: bool,
+    output_text: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
+    resolve: &mut HandleResolver,
+    restored_tool_ids: &mut ToolRestorationDedup,
 ) -> Result<Vec<Bytes>, String> {
     let Ok(text) = std::str::from_utf8(block) else {
         return Ok(vec![Bytes::copy_from_slice(block)]);
@@ -3286,11 +3426,13 @@ fn rewrite_openai_sse_block(
             .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
         run_openai_tool_plugins(&mut value, &plugins)?;
     }
-    if let Err(error) = rewrite_function_calls(&mut value, resolve) {
-        let _ = error;
-        proxy_diagnostic("sse-restore-skipped");
-        return Ok(vec![Bytes::copy_from_slice(block)]);
-    }
+    let restored_tools = match rewrite_function_calls(&mut value, resolve) {
+        Ok(restored_tools) => restored_tools,
+        Err(_error) => {
+            proxy_diagnostic("sse-restore-skipped");
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        }
+    };
     let mut output = Vec::new();
     if let Some(delta) = completed_openai_call_delta(&value) {
         let event = delta.get("type").and_then(Value::as_str);
@@ -3303,6 +3445,8 @@ fn rewrite_openai_sse_block(
         }
     }
     output.push(encode_sse_value(text, &value)?);
+    let count = restored_tool_ids.commit(restored_tools);
+    crate::claude_http_proxy::record_completed_tool_restorations(count);
     Ok(output)
 }
 
@@ -5204,6 +5348,7 @@ mod tests {
             block_unknown_formats: true,
             output_text: HashMap::new(),
             output_resolve: Box::new(|text| Ok(text.to_string())),
+            restored_tools: ToolRestorationDedup::default(),
         };
 
         process_pending_stream_block(&mut state).unwrap();
@@ -5312,6 +5457,209 @@ mod tests {
         rewrite_function_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["item"]["input"], "python hash.py safe-secret-token");
         assert_eq!(value["visible_text"], "keep <<SECRET_0123456789abcdef>>");
+    }
+
+    #[test]
+    fn streaming_tool_metrics_deduplicate_mirrored_completion_envelopes() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let item = serde_json::json!({
+            "id": "item_1",
+            "type": "custom_tool_call",
+            "call_id": "call_1",
+            "name": "exec",
+            "input": handle,
+        });
+        let mut events = [
+            serde_json::json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": "item_1",
+                "name": "exec",
+                "input": handle,
+            }),
+            serde_json::json!({"type": "response.output_item.done", "item": item.clone()}),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"output": [item]},
+            }),
+        ];
+        let stream_events = events.clone();
+        let mut dedup = ToolRestorationDedup::default();
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let counts = events
+            .iter_mut()
+            .map(|event| {
+                let restored = rewrite_function_calls(event, &mut resolve).unwrap();
+                dedup.commit(restored)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [1, 0, 0]);
+
+        let mut call_only = serde_json::json!({
+            "type": "response.custom_tool_call_input.done",
+            "call_id": "call_alias",
+            "name": "exec",
+            "input": handle,
+        });
+        let mut nested_alias = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "item_alias",
+                "call_id": "call_alias",
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": handle,
+            }
+        });
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut call_only, &mut resolve).unwrap()),
+            1
+        );
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut nested_alias, &mut resolve).unwrap()),
+            0
+        );
+        let mut item_only_replay = serde_json::json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "item_alias",
+            "name": "exec",
+            "input": handle,
+        });
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut item_only_replay, &mut resolve).unwrap()),
+            0,
+            "aliases learned from duplicate envelopes must remain deduplicated"
+        );
+
+        let mut separate_namespaces = ToolRestorationDedup::default();
+        let mut call_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "shared",
+            "input": handle,
+        });
+        let mut item_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "item_id": "shared",
+            "input": handle,
+        });
+        assert_eq!(
+            separate_namespaces
+                .commit(rewrite_function_calls(&mut call_identity, &mut resolve).unwrap()),
+            1
+        );
+        assert_eq!(
+            separate_namespaces
+                .commit(rewrite_function_calls(&mut item_identity, &mut resolve).unwrap()),
+            1,
+            "call and item identifier namespaces must not collide"
+        );
+
+        let mut empty_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "item_id": "",
+            "call_id": "",
+            "input": handle,
+        });
+        assert_eq!(
+            ToolRestorationDedup::default()
+                .commit(rewrite_function_calls(&mut empty_identity, &mut resolve).unwrap()),
+            0,
+            "empty identifiers are not stable streaming identities"
+        );
+
+        let mut distinct = serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "call_2",
+            "name": "exec",
+            "input": handle,
+        });
+        let restored = rewrite_function_calls(&mut distinct, &mut resolve).unwrap();
+        assert_eq!(dedup.commit(restored), 1);
+
+        let mirrored_item = serde_json::json!({
+            "id": "item_nonstream_1",
+            "type": "custom_tool_call",
+            "input": handle,
+        });
+        let mut mirrored = serde_json::json!({
+            "item": mirrored_item.clone(),
+            "response": {"output": [mirrored_item]},
+        });
+        let restored = rewrite_function_calls(&mut mirrored, &mut resolve).unwrap();
+        assert_eq!(
+            ToolRestorationDedup::default().commit_nonstream(restored),
+            1
+        );
+
+        let mut distinct = serde_json::json!({
+            "output": [
+                {"id": "item_nonstream_2", "type": "custom_tool_call", "input": handle},
+                {"id": "item_nonstream_3", "type": "custom_tool_call", "input": handle}
+            ]
+        });
+        let restored = rewrite_function_calls(&mut distinct, &mut resolve).unwrap();
+        assert_eq!(
+            ToolRestorationDedup::default().commit_nonstream(restored),
+            2
+        );
+
+        let mut identityless = serde_json::json!({
+            "type": "custom_tool_call",
+            "input": handle,
+        });
+        let restored = rewrite_function_calls(&mut identityless, &mut resolve).unwrap();
+        assert_eq!(
+            ToolRestorationDedup::default().commit_nonstream(restored),
+            1
+        );
+
+        crate::claude_http_proxy::take_test_completed_tool_restorations();
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut output_text = HashMap::new();
+        let mut resolve: HandleResolver =
+            Box::new(move |text: &str| Ok(text.replace(handle, "local-value")));
+        let mut dedup = ToolRestorationDedup::default();
+        let delta = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": "item_1",
+                "delta": handle,
+            })
+        );
+        assert!(rewrite_openai_sse_block_tracked(
+            delta.as_bytes(),
+            &plugins,
+            false,
+            &mut output_text,
+            &mut resolve,
+            &mut dedup,
+        )
+        .unwrap()
+        .is_empty());
+        assert!(crate::claude_http_proxy::take_test_completed_tool_restorations().is_empty());
+        for event in stream_events {
+            let block = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+            rewrite_openai_sse_block_tracked(
+                block.as_bytes(),
+                &plugins,
+                false,
+                &mut output_text,
+                &mut resolve,
+                &mut dedup,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            crate::claude_http_proxy::take_test_completed_tool_restorations(),
+            [1]
+        );
+
+        let mut bounded = ToolRestorationDedup::default();
+        for index in 0..MAX_CHAT_TOOL_CALLS {
+            assert_eq!(bounded.commit(vec![vec![format!("call_{index}")]]), 1);
+        }
+        assert_eq!(bounded.commit(vec![vec!["overflow".to_string()]]), 0);
+        assert!(bounded.full);
     }
 
     #[test]

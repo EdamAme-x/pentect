@@ -80,6 +80,26 @@ def shell_command(arguments: list[str]) -> str:
     return shlex.join(arguments)
 
 
+def has_completed_tool_restoration(logs: str) -> bool:
+    for line in logs.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        count = event.get("count")
+        if (
+            event.get("action") == "resolve"
+            and event.get("surface") == "tool"
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        ):
+            return True
+    return False
+
+
 def pentect_command(pentect: str, arguments: list[str]) -> list[str]:
     command = [pentect, *arguments]
     if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
@@ -2425,6 +2445,10 @@ else:
             logs = log_path.read_text(encoding="utf-8")
             if valid in logs or invalid in logs or PLUGIN_PLAINTEXT in logs:
                 raise RuntimeError("a synthetic plaintext key reached persistent diagnostics")
+            if not has_completed_tool_restoration(logs):
+                raise RuntimeError(
+                    f"{client} did not record a completed HTTP tool-input restoration"
+                )
             remove_detector_plugin(pentect, project, environment)
             print(
                 f"installed {client} E2E passed: project plugin "
