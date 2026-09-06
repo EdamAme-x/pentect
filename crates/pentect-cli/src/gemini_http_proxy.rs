@@ -778,10 +778,13 @@ fn rewrite_response_body(
     validate_response(&value, block_unknown_formats)?;
     run_tool_plugins(&mut value, &plugins)?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve)?;
-    serde_json::to_vec(&value)
+    let restored_tools =
+        crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve)?;
+    let encoded = serde_json::to_vec(&value)
         .map(Bytes::from)
-        .map_err(|error| format!("could not encode restored Gemini response: {error}"))
+        .map_err(|error| format!("could not encode restored Gemini response: {error}"))?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn run_tool_plugins(
@@ -1517,7 +1520,10 @@ mod tests {
             ]}}]
         });
         let mut resolve = |text: &str| Ok(text.replace(handle, "sk_test_synthetic"));
-        crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(
+            crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve).unwrap(),
+            1
+        );
         assert_eq!(
             value["candidates"][0]["content"]["parts"][0]["text"],
             handle

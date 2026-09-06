@@ -171,9 +171,15 @@ enabled = true
 `true`. Metrics are calculated on demand from retained diagnostic logs and are
 never sent externally. Setting it to `false` disables the summary; diagnostic
 logging and rotation continue independently so crashes remain diagnosable.
-The summary includes masked and restored occurrence counts, blocked restoration
-attempts, blocked operations, plugin failures and timeouts, and warnings grouped
-by a bounded reason code.
+The summary includes masked occurrence counts, completed local restoration
+operation counts, blocked restoration attempts, blocked operations, plugin
+failures and timeouts, and warnings grouped by a bounded reason code. Restoration
+operations currently cover changed `pentect resolve` inputs/files and completed
+HTTP tool-call inputs; multiple restored values in one completed tool call count
+as one operation. OpenAI streaming events without a bounded stable call identity,
+or after the bounded identity tracker is exhausted, are conservatively omitted
+from metrics without affecting restoration. Other automatic restoration paths
+are not yet included.
 The human-readable summary explains those fixed codes in plain language. The
 `--json` form keeps the stable reason, surface, and detector code values for
 scripts and local analysis.

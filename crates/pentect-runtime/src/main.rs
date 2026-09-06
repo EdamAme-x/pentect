@@ -247,6 +247,14 @@ pub fn flush_activity_log() {
     activity_log::flush_persistent();
 }
 
+/// Record completed local restoration of model-authored tool-call objects.
+///
+/// Callers stage this count while rewriting a response and invoke this only
+/// after the rewritten object has been encoded successfully.
+pub fn record_completed_tool_restorations(count: u64) {
+    activity_log::record_summary("resolve", "tool", count, BTreeMap::new(), None);
+}
+
 fn mask_input_into_memory_store_client(
     client: &MemoryStoreClient,
     input: Input,

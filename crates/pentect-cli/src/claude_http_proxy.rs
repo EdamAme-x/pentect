@@ -1589,10 +1589,10 @@ where
             tools.bytes.extend_from_slice(&block);
             if tools.active.is_empty() {
                 let tools = self.tool_buffer.take().expect("tool buffer exists");
-                let rewritten = std::str::from_utf8(&tools.bytes)
+                let (rewritten, restored_tools) = std::str::from_utf8(&tools.bytes)
                     .map_err(|error| format!("Claude tool SSE was not UTF-8: {error}"))
                     .and_then(|text| {
-                        rewrite_anthropic_sse_with_tool_context(
+                        rewrite_anthropic_sse_with_tool_context_tracked(
                             text,
                             None,
                             &mut self.resolve,
@@ -1601,6 +1601,7 @@ where
                         )
                     })?;
                 output.push(Bytes::from(rewritten));
+                record_completed_tool_restorations(restored_tools);
             }
             return Ok(());
         }
@@ -2528,25 +2529,30 @@ where
 {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
-    restore_anthropic_json_value(&mut value, restore_output, resolve)?;
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+    let restored_tools = restore_anthropic_json_value(&mut value, restore_output, resolve)?;
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Claude response: {error}"))?;
+    record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 pub(crate) fn restore_anthropic_json_value<R>(
     value: &mut Value,
     restore_output: bool,
     resolve: &mut R,
-) -> Result<(), String>
+) -> Result<u64, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 let tool_name = block.get("name").and_then(Value::as_str).map(str::to_owned);
                 if let Some(input) = block.get_mut("input") {
-                    resolve_tool_input_value(input, tool_name.as_deref(), resolve)?;
+                    let changed =
+                        resolve_tool_input_value_with_change(input, tool_name.as_deref(), resolve)?;
+                    restored_tools = restored_tools.saturating_add(u64::from(changed));
                 }
             } else if restore_output {
                 let field = match block.get("type").and_then(Value::as_str) {
@@ -2560,7 +2566,7 @@ where
             }
         }
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
 #[derive(Default)]
@@ -2608,6 +2614,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn rewrite_anthropic_sse_with_tool_context<R>(
     input: &str,
     forced_tool_name: Option<&str>,
@@ -2618,9 +2625,30 @@ fn rewrite_anthropic_sse_with_tool_context<R>(
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    rewrite_anthropic_sse_with_tool_context_tracked(
+        input,
+        forced_tool_name,
+        resolve,
+        plugins,
+        plugin_context,
+    )
+    .map(|(rewritten, _)| rewritten)
+}
+
+fn rewrite_anthropic_sse_with_tool_context_tracked<R>(
+    input: &str,
+    forced_tool_name: Option<&str>,
+    resolve: &mut R,
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+    plugin_context: PluginContext,
+) -> Result<(String, u64), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     let mut blocks = parse_sse(input);
     let mut tool_indices = HashSet::new();
     let mut pending: HashMap<u64, PendingToolInput> = HashMap::new();
+    let mut restored_tools = 0u64;
 
     for block_index in 0..blocks.len() {
         let Some(data) = blocks[block_index].data.as_ref() else {
@@ -2717,7 +2745,8 @@ where
                 joined = serde_json::to_string(input)
                     .map_err(|error| format!("plugin middleware: encode failed: {error}"))?;
             }
-            let resolved = resolve_tool_input_json(&joined, tool.name.as_deref(), resolve)?;
+            let (resolved, changed) =
+                resolve_tool_input_json_with_change(&joined, tool.name.as_deref(), resolve)?;
             for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
                 if let Some(partial_json) = blocks[*chunk_index]
                     .data
@@ -2732,9 +2761,10 @@ where
                     });
                 }
             }
+            restored_tools = restored_tools.saturating_add(u64::from(changed));
         }
     }
-    Ok(render_sse(&blocks))
+    Ok((render_sse(&blocks), restored_tools))
 }
 
 fn parse_sse(input: &str) -> Vec<SseBlock> {
@@ -2828,6 +2858,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_tool_input_json<R>(
     input: &str,
     tool_name: Option<&str>,
@@ -2836,14 +2867,66 @@ pub(crate) fn resolve_tool_input_json<R>(
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    resolve_tool_input_json_with_change(input, tool_name, resolve).map(|(resolved, _)| resolved)
+}
+
+pub(crate) fn resolve_tool_input_json_with_change<R>(
+    input: &str,
+    tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<(String, bool), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     let Ok(mut value) = serde_json::from_str::<Value>(input) else {
         // Fine-grained tool streaming can end with invalid JSON. Keep handles
         // inert rather than resolving into a malformed or injectable payload.
-        return Ok(input.to_string());
+        return Ok((input.to_string(), false));
     };
-    resolve_tool_input_value(&mut value, tool_name, resolve)?;
-    serde_json::to_string(&value)
-        .map_err(|error| format!("could not encode restored Claude tool input: {error}"))
+    let changed = resolve_tool_input_value_with_change(&mut value, tool_name, resolve)?;
+    let encoded = serde_json::to_string(&value)
+        .map_err(|error| format!("could not encode restored Claude tool input: {error}"))?;
+    Ok((encoded, changed))
+}
+
+fn resolve_tool_input_value_with_change<R>(
+    value: &mut Value,
+    tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<bool, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let mut changed = false;
+    let mut tracked_resolve = |text: &str| {
+        let resolved = resolve(text)?;
+        changed |= resolved != text;
+        Ok(resolved)
+    };
+    resolve_tool_input_value(value, tool_name, &mut tracked_resolve)?;
+    Ok(changed)
+}
+
+pub(crate) fn record_completed_tool_restorations(count: u64) {
+    if count == 0 {
+        return;
+    }
+    #[cfg(not(test))]
+    pentect_agent::record_completed_tool_restorations(count);
+    #[cfg(test)]
+    TEST_COMPLETED_TOOL_RESTORATIONS.with(|counts| counts.borrow_mut().push(count));
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMPLETED_TOOL_RESTORATIONS: std::cell::RefCell<Vec<u64>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_completed_tool_restorations() -> Vec<u64> {
+    TEST_COMPLETED_TOOL_RESTORATIONS.with(|counts| std::mem::take(&mut *counts.borrow_mut()))
 }
 
 fn resolve_tool_input_value<R>(
@@ -3139,11 +3222,35 @@ mod tests {
             ]
         });
         let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
-        restore_anthropic_json_value(&mut value, false, &mut resolve).unwrap();
+        assert_eq!(
+            restore_anthropic_json_value(&mut value, false, &mut resolve).unwrap(),
+            1
+        );
 
         assert_eq!(value["content"][0]["text"], handle);
         assert_eq!(value["content"][1]["thinking"], handle);
         assert_eq!(value["content"][2]["input"]["token"], "local-value");
+    }
+
+    #[test]
+    fn completed_anthropic_response_emits_only_after_successful_tool_restore() {
+        take_test_completed_tool_restorations();
+        let handle = "<<SECRET_0011223344556677>>";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": [{
+                "type": "tool_use",
+                "name": "shell",
+                "input": {"first": handle, "second": handle}
+            }]
+        }))
+        .unwrap();
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        rewrite_anthropic_json_response(&body, false, &mut resolve).unwrap();
+        assert_eq!(take_test_completed_tool_restorations(), [1]);
+
+        let mut fail = |_text: &str| Err("synthetic resolver failure".to_string());
+        assert!(rewrite_anthropic_json_response(&body, false, &mut fail).is_err());
+        assert!(take_test_completed_tool_restorations().is_empty());
     }
 
     #[test]
@@ -4834,6 +4941,30 @@ mod tests {
     }
 
     #[test]
+    fn tracked_tool_input_counts_changed_scalars_as_one_operation() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let input =
+            format!("{{ \"first\": \"{handle}\", \"nested\": {{\"second\": \"{handle}\"}} }}");
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let (restored, changed) =
+            resolve_tool_input_json_with_change(&input, None, &mut resolve).unwrap();
+        assert!(changed);
+        assert_eq!(restored.matches("local-value").count(), 2);
+
+        let mut unchanged = |text: &str| Ok(text.to_string());
+        let (normalized, changed) =
+            resolve_tool_input_json_with_change("{ \"ordinary\": 1 }", None, &mut unchanged)
+                .unwrap();
+        assert_eq!(normalized, r#"{"ordinary":1}"#);
+        assert!(!changed, "JSON normalization is not restoration");
+
+        let (invalid, changed) =
+            resolve_tool_input_json_with_change("{invalid", None, &mut unchanged).unwrap();
+        assert_eq!(invalid, "{invalid");
+        assert!(!changed);
+    }
+
+    #[test]
     fn sse_tool_input_is_reassembled_and_resolved_without_touching_text() {
         let input = concat!(
             "event: content_block_start\n",
@@ -4849,9 +4980,31 @@ mod tests {
         );
         let mut resolve =
             |text: &str| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret"));
-        let output = rewrite_anthropic_sse_with(input, &mut resolve).unwrap();
+        let (output, restored_tools) = rewrite_anthropic_sse_with_tool_context_tracked(
+            input,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+        )
+        .unwrap();
+        assert_eq!(restored_tools, 1);
         assert!(output.contains("actual-secret"));
         assert!(output.contains("keep <<SECRET_deadbeefdeadbeef>>"));
+
+        let incomplete = input.replace(
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "",
+        );
+        let (_, restored_tools) = rewrite_anthropic_sse_with_tool_context_tracked(
+            &incomplete,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+        )
+        .unwrap();
+        assert_eq!(restored_tools, 0);
     }
 
     #[test]

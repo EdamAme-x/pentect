@@ -3091,11 +3091,18 @@ where
             .clone();
         run_chat_tool_plugins(&mut value, &plugins)?;
     }
-    resolve_chat_tool_calls(&mut value, resolve)?;
-    crate::claude_http_proxy::restore_anthropic_json_value(&mut value, restore_output, resolve)?;
-    serde_json::to_vec(&value)
+    let mut restored_tools = resolve_chat_tool_calls(&mut value, resolve)?;
+    restored_tools =
+        restored_tools.saturating_add(crate::claude_http_proxy::restore_anthropic_json_value(
+            &mut value,
+            restore_output,
+            resolve,
+        )?);
+    let encoded = serde_json::to_vec(&value)
         .map(Bytes::from)
-        .map_err(|error| format!("could not encode Claude App Chat response: {error}"))
+        .map_err(|error| format!("could not encode Claude App Chat response: {error}"))?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn chat_sse_body<S>(
@@ -3280,14 +3287,16 @@ fn run_chat_tool_plugins(
     Ok(())
 }
 
-fn resolve_chat_tool_calls<R>(value: &mut serde_json::Value, resolve: &mut R) -> Result<(), String>
+fn resolve_chat_tool_calls<R>(value: &mut serde_json::Value, resolve: &mut R) -> Result<u64, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     match value {
         serde_json::Value::Array(values) => {
             for value in values {
-                resolve_chat_tool_calls(value, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_chat_tool_calls(value, resolve)?);
             }
         }
         serde_json::Value::Object(object) => {
@@ -3300,6 +3309,7 @@ where
                 || kind.contains("tool_call")
                 || kind.contains("function_call");
             if tool_call {
+                let mut call_changed = false;
                 let name = object
                     .get("name")
                     .and_then(serde_json::Value::as_str)
@@ -3315,11 +3325,12 @@ where
                                 false,
                             ),
                         };
-                        let resolved = crate::claude_http_proxy::resolve_tool_input_json(
-                            &encoded,
-                            name.as_deref(),
-                            resolve,
-                        )?;
+                        let (resolved, changed) =
+                            crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                                &encoded,
+                                name.as_deref(),
+                                resolve,
+                            )?;
                         *arguments = if was_string {
                             serde_json::Value::String(resolved)
                         } else {
@@ -3327,16 +3338,19 @@ where
                                 format!("could not decode Claude App tool input: {error}")
                             })?
                         };
+                        call_changed |= changed;
                     }
                 }
+                restored_tools = restored_tools.saturating_add(u64::from(call_changed));
             }
             for nested in object.values_mut() {
-                resolve_chat_tool_calls(nested, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_chat_tool_calls(nested, resolve)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
 fn metadata_path(path: &str) -> String {
