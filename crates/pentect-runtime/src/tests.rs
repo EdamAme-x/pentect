@@ -3173,10 +3173,43 @@ fn canonical_claude_hook_applies_otp_detection_to_browser_rows() {
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
+    let store = MemoryStore::for_session(&session);
+    let without_known_handles = without_known_opaque_handles(&rendered, &store);
     for secret in ["837291", "1234", "7QK4P", "729004", "483920", "7391"] {
-        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(
+            !without_known_handles.contains(secret),
+            "raw OTP remained outside a known opaque handle: {rendered}"
+        );
+        assert!(store.resolve_all(&rendered).unwrap().contains(secret));
     }
     assert!(rendered.contains("<<OTP_"), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn otp_assertion_ignores_only_well_formed_known_handles() {
+    let (root, session) = empty_session("otp-known-handle-assertion");
+    let store = MemoryStore::for_session(&session);
+    let handle = "<<OTP_3a78a312691234b3>>";
+    store
+        .add_recovery(pentect_core::Recovery::seal(
+            std::collections::HashMap::from([(handle.to_string(), "1234".to_string())]),
+            &session.key,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        without_known_opaque_handles(&format!("masked={handle}"), &store),
+        "masked=<KNOWN_OPAQUE_HANDLE>"
+    );
+    for visible in [
+        "raw=1234",
+        "unknown=<<OTP_1234deadbeef5678>>",
+        "broken=<<OTP_1234",
+    ] {
+        assert!(without_known_opaque_handles(visible, &store).contains("1234"));
+    }
+    assert_eq!(store.resolve_all(handle).unwrap(), "1234");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4680,6 +4713,32 @@ fn first_masked_handle(masked: &str) -> String {
         .map(|offset| start + offset + 2)
         .unwrap_or_else(|| panic!("unterminated handle in {masked}"));
     masked[start..end].to_string()
+}
+
+fn without_known_opaque_handles(text: &str, store: &MemoryStore) -> String {
+    let mut remaining = text;
+    let mut visible = String::with_capacity(text.len());
+    while let Some(start) = remaining.find("<<") {
+        visible.push_str(&remaining[..start]);
+        let candidate_start = &remaining[start..];
+        let Some(end) = candidate_start.find(">>").map(|offset| offset + 2) else {
+            visible.push_str(candidate_start);
+            return visible;
+        };
+        let candidate = &candidate_start[..end];
+        let known = parse_placeholder(candidate).is_ok()
+            && store
+                .resolve_all(candidate)
+                .is_ok_and(|resolved| resolved != candidate);
+        if known {
+            visible.push_str("<KNOWN_OPAQUE_HANDLE>");
+        } else {
+            visible.push_str(candidate);
+        }
+        remaining = &candidate_start[end..];
+    }
+    visible.push_str(remaining);
+    visible
 }
 
 fn pentect_env_name_for_handle(handle: &str) -> String {
