@@ -1202,8 +1202,15 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
         let store = MemoryStore::for_session(&session);
         let mut masker = masking::OutputMasker::new_shared(store).unwrap();
         let masked = masker.mask_prompt_text_without_plugins(prompt).unwrap();
+        assert_ne!(masked, prompt);
         assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
         assert!(!masked.contains("alice@example.com"));
+        assert_eq!(
+            MemoryStore::for_session(&session)
+                .resolve_all(&masked)
+                .unwrap(),
+            prompt
+        );
 
         let (count, labels) = masker.pending_activity_for("prompt").unwrap();
         assert_eq!(count, expected_count);
