@@ -29,11 +29,11 @@ impl Fixture {
         let project = root.join("project");
         std::fs::create_dir_all(home.join(".pentect")).unwrap();
         std::fs::create_dir_all(project.join(".git")).unwrap();
-        std::fs::write(
-            home.join(".pentect/config.toml"),
-            "[activity]\nshare = false\n[files]\nremember = true\n[update]\ncheck = false\n",
-        )
-        .unwrap();
+        std::fs::create_dir_all(project.join(".pentect")).unwrap();
+        let config =
+            "[activity]\nshare = false\n[files]\nremember = true\n[update]\ncheck = false\n";
+        std::fs::write(home.join(".pentect/config.toml"), config).unwrap();
+        std::fs::write(project.join(".pentect/config.toml"), config).unwrap();
 
         let source = project.join("source.env");
         std::fs::write(&source, format!("OPENAI_API_KEY={SECRET}\n")).unwrap();
@@ -57,11 +57,21 @@ impl Fixture {
             verifier,
             handle: String::new(),
         };
-        let output = fixture.run(
-            "seed",
-            ["read".into(), fixture.source.clone().into_os_string()],
-        );
+        // Use the runtime's test setup route. Public standalone `read`
+        // intentionally creates transient handles when no store is active.
+        let output = fixture.run("seed", seed_args(&fixture.source));
         assert_success(&output, "seed handle");
+        for name in ["key.bin", "index.bin"] {
+            let path = fixture
+                .project
+                .join(".pentect/file-pointer-manager")
+                .join(name);
+            assert!(
+                std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0),
+                "runtime read did not register {}",
+                path.display()
+            );
+        }
         let masked = String::from_utf8(output.stdout).unwrap();
         fixture.handle = first_handle(&masked);
         assert!(!fixture.handle.contains(SECRET));
@@ -281,6 +291,14 @@ fn assert_success(output: &Output, context: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn seed_args(source: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "agent".into(),
+        "read".into(),
+        source.to_path_buf().into_os_string(),
+    ]
 }
 
 fn bounded_output(mut command: Command, context: &str) -> Output {
