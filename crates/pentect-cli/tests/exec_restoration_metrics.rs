@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,6 +11,7 @@ struct Fixture {
     home: PathBuf,
     project: PathBuf,
     source: PathBuf,
+    verifier: PathBuf,
     handle: String,
 }
 
@@ -36,11 +37,24 @@ impl Fixture {
 
         let source = project.join("source.env");
         std::fs::write(&source, format!("OPENAI_API_KEY={SECRET}\n")).unwrap();
+        let verifier = project.join("verify.ps1");
+        std::fs::write(
+            &verifier,
+            concat!(
+                "param([string]$Mode,[string]$ExpectedPath,[string]$Value,[int]$ExitCode=0)\n",
+                "$expected=(Get-Content -Raw -LiteralPath $ExpectedPath).TrimEnd(\"`r\",\"`n\") -replace '^OPENAI_API_KEY=', ''\n",
+                "if ($Mode -eq 'stdin') { $Value=[Console]::In.ReadToEnd() }\n",
+                "if ($Value -cne $expected) { exit 1 }\n",
+                "exit $ExitCode\n",
+            ),
+        )
+        .unwrap();
         let mut fixture = Self {
             root,
             home,
             project,
             source,
+            verifier,
             handle: String::new(),
         };
         let output = fixture.run(
@@ -150,7 +164,7 @@ fn actual_exec_records_completed_input_restoration_once() {
     for (label, live) in [("stdin-buffered", false), ("stdin-live", true)] {
         let output = fixture.run(
             label,
-            secret_stdin_args(&fixture.handle, &fixture.source, live),
+            secret_stdin_args(&fixture.handle, &fixture.source, &fixture.verifier, live),
         );
         assert_success(&output, label);
         fixture.assert_resolve_count(label, 1);
@@ -164,7 +178,16 @@ fn actual_exec_records_completed_input_restoration_once() {
     fixture.assert_resolve_count("referenced-env", 1);
 
     for (label, live) in [("argv-nonzero", false), ("argv-nonzero-live", true)] {
-        let output = fixture.run(label, argv_args(&fixture.handle, &fixture.source, 37, live));
+        let output = fixture.run(
+            label,
+            argv_args(
+                &fixture.handle,
+                &fixture.source,
+                &fixture.verifier,
+                37,
+                live,
+            ),
+        );
         assert_eq!(output.status.code(), Some(37), "{output:?}");
         fixture.assert_resolve_count(label, 1);
     }
@@ -197,7 +220,7 @@ fn actual_exec_does_not_count_noop_or_failed_input_preparation() {
 
     let output = fixture.run(
         "argv-denied",
-        argv_args_without_opt_in(&fixture.handle, &fixture.source),
+        argv_args_without_opt_in(&fixture.handle, &fixture.source, &fixture.verifier),
     );
     assert!(!output.status.success(), "{output:?}");
     fixture.assert_resolve_count("argv-denied", 0);
@@ -281,7 +304,7 @@ fn bounded_output(mut command: Command, context: &str) -> Output {
 }
 
 #[cfg(unix)]
-fn shell_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
+fn shell_args(handle: &str, source: &Path, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -297,7 +320,7 @@ fn shell_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsStr
 }
 
 #[cfg(unix)]
-fn referenced_env_args(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString> {
+fn referenced_env_args(handle: &str, source: &Path) -> Vec<std::ffi::OsString> {
     let name = env_name_for_handle(handle);
     vec![
         "exec".into(),
@@ -310,7 +333,7 @@ fn referenced_env_args(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString
 }
 
 #[cfg(windows)]
-fn shell_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
+fn shell_args(handle: &str, source: &Path, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -326,7 +349,7 @@ fn shell_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsStr
 }
 
 #[cfg(windows)]
-fn referenced_env_args(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString> {
+fn referenced_env_args(handle: &str, source: &Path) -> Vec<std::ffi::OsString> {
     let name = env_name_for_handle(handle);
     vec![
         "exec".into(),
@@ -339,7 +362,12 @@ fn referenced_env_args(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString
 }
 
 #[cfg(unix)]
-fn secret_stdin_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
+fn secret_stdin_args(
+    handle: &str,
+    source: &Path,
+    _verifier: &Path,
+    live: bool,
+) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -360,7 +388,12 @@ fn secret_stdin_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi
 }
 
 #[cfg(windows)]
-fn secret_stdin_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi::OsString> {
+fn secret_stdin_args(
+    handle: &str,
+    source: &Path,
+    verifier: &Path,
+    live: bool,
+) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -373,18 +406,22 @@ fn secret_stdin_args(handle: &str, source: &PathBuf, live: bool) -> Vec<std::ffi
         "-NoLogo".into(),
         "-NoProfile".into(),
         "-NonInteractive".into(),
-        "-Command".into(),
-        format!(
-            "$value=[Console]::In.ReadToEnd(); $expected=(Get-Content -LiteralPath '{}') -replace '^OPENAI_API_KEY=', ''; if ($value -ne $expected) {{ exit 1 }}",
-            source.display()
-        )
-        .into(),
+        "-File".into(),
+        verifier.to_path_buf().into_os_string(),
+        "stdin".into(),
+        source.to_path_buf().into_os_string(),
     ]);
     args
 }
 
 #[cfg(unix)]
-fn argv_args(handle: &str, source: &PathBuf, exit: i32, live: bool) -> Vec<std::ffi::OsString> {
+fn argv_args(
+    handle: &str,
+    source: &Path,
+    _verifier: &Path,
+    exit: i32,
+    live: bool,
+) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -400,13 +437,19 @@ fn argv_args(handle: &str, source: &PathBuf, exit: i32, live: bool) -> Vec<std::
         .into(),
         "pentect-test".into(),
         handle.into(),
-        source.clone().into_os_string(),
+        source.to_path_buf().into_os_string(),
     ]);
     args
 }
 
 #[cfg(windows)]
-fn argv_args(handle: &str, source: &PathBuf, exit: i32, live: bool) -> Vec<std::ffi::OsString> {
+fn argv_args(
+    handle: &str,
+    source: &Path,
+    verifier: &Path,
+    exit: i32,
+    live: bool,
+) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
     if live {
         args.push("--live".into());
@@ -418,16 +461,22 @@ fn argv_args(handle: &str, source: &PathBuf, exit: i32, live: bool) -> Vec<std::
         "-NoLogo".into(),
         "-NoProfile".into(),
         "-NonInteractive".into(),
-        "-Command".into(),
-        format!("param($value,$path); $expected=(Get-Content -LiteralPath $path) -replace '^OPENAI_API_KEY=', ''; if ($value -ne $expected) {{ exit 1 }}; exit {exit}").into(),
+        "-File".into(),
+        verifier.to_path_buf().into_os_string(),
+        "argv".into(),
+        source.to_path_buf().into_os_string(),
         handle.into(),
-        source.clone().into_os_string(),
+        exit.to_string().into(),
     ]);
     args
 }
 
-fn argv_args_without_opt_in(handle: &str, source: &PathBuf) -> Vec<std::ffi::OsString> {
-    let mut args = argv_args(handle, source, 0, false);
+fn argv_args_without_opt_in(
+    handle: &str,
+    source: &Path,
+    verifier: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args = argv_args(handle, source, verifier, 0, false);
     args.remove(1);
     args
 }
