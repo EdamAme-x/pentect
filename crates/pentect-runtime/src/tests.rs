@@ -1180,6 +1180,139 @@ for line in sys.stdin:
 }
 
 #[test]
+fn prompt_dotenv_activity_counts_each_finding_once() {
+    const CHILD_ROOT_ENV: &str = "PENTECT_TEST_DOTENV_ACTIVITY_CHILD_ROOT";
+    const MIXED_PROMPT: &str =
+        "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nContact alice@example.com";
+
+    if let Some(child_root) = std::env::var_os(CHILD_ROOT_ENV) {
+        let child_root = PathBuf::from(child_root);
+        let session = Session::open_capability_at(&child_root, "emitted-activity").unwrap();
+        let store = MemoryStore::for_session(&session);
+        let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+        let masked = masker
+            .mask_prompt_text_without_plugins(MIXED_PROMPT)
+            .unwrap();
+        assert_eq!(
+            MemoryStore::for_session(&session)
+                .resolve_all(&masked)
+                .unwrap(),
+            MIXED_PROMPT
+        );
+        masker.flush_activity();
+        activity_log::flush_persistent();
+        return;
+    }
+
+    let root = temp_root("prompt-dotenv-activity-count");
+    std::fs::create_dir_all(&root).unwrap();
+
+    for (session_name, prompt, expected_count, expected_labels) in [
+        (
+            "dotenv-only",
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            1,
+            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 0)],
+        ),
+        (
+            "dotenv-and-text",
+            MIXED_PROMPT,
+            2,
+            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 1)],
+        ),
+    ] {
+        let session = Session::open_capability_at(&root, session_name).unwrap();
+        let store = MemoryStore::for_session(&session);
+        let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+        let masked = masker.mask_prompt_text_without_plugins(prompt).unwrap();
+        assert_ne!(masked, prompt);
+        assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(!masked.contains("alice@example.com"));
+        assert_eq!(
+            MemoryStore::for_session(&session)
+                .resolve_all(&masked)
+                .unwrap(),
+            prompt
+        );
+
+        let (count, labels) = masker.pending_activity_for("prompt").unwrap();
+        assert_eq!(count, expected_count);
+        for (label, expected) in expected_labels {
+            assert_eq!(labels.get(label).copied().unwrap_or_default(), expected);
+        }
+        assert_eq!(labels.values().sum::<u64>(), count);
+    }
+
+    let child_root = root.join("activity-child");
+    let child_home = child_root.join("home");
+    let child_work = child_root.join("work");
+    let child_log = child_root.join("logs");
+    std::fs::create_dir_all(&child_home).unwrap();
+    std::fs::create_dir_all(child_root.join("runtime")).unwrap();
+    std::fs::create_dir_all(child_root.join("tmp")).unwrap();
+    std::fs::create_dir_all(child_work.join(".pentect")).unwrap();
+    std::fs::write(
+        child_work.join(".pentect/config.toml"),
+        "[activity]\nshare = false\n[update]\ncheck = false\n",
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("tests::prompt_dotenv_activity_counts_each_finding_once")
+        .arg("--nocapture")
+        .env_clear()
+        .env(CHILD_ROOT_ENV, &child_root)
+        .env("PENTECT_LOG_DIR", &child_log)
+        .env("HOME", &child_home)
+        .env("USERPROFILE", &child_home)
+        .env("XDG_CONFIG_HOME", child_home.join(".config"))
+        .env("XDG_RUNTIME_DIR", child_root.join("runtime"))
+        .env("TMPDIR", child_root.join("tmp"))
+        .env("TMP", child_root.join("tmp"))
+        .env("TEMP", child_root.join("tmp"))
+        .current_dir(&child_work);
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload = std::fs::read_to_string(child_log.join("pentect.log")).unwrap();
+    let events = payload
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "{payload}");
+    assert_eq!(events[0]["action"], "mask");
+    assert_eq!(events[0]["surface"], "prompt");
+    assert_eq!(events[0]["count"], 2);
+    assert_eq!(
+        events[0]["labels"],
+        json!([
+            { "name": "EMAIL_ADDRESS", "count": 1 },
+            { "name": "OPENAI_API_KEY", "count": 1 }
+        ])
+    );
+    for private_value in [
+        MIXED_PROMPT,
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+        "alice@example.com",
+        "Contact alice",
+    ] {
+        assert!(!payload.contains(private_value), "{payload}");
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn active_prompt_masker_reuses_bounded_cached_result() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-cache");
