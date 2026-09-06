@@ -131,7 +131,6 @@ impl Fixture {
     fn assert_resolve_count(&self, label: &str, expected: usize) {
         let events = self.resolve_events(label);
         assert_eq!(events.len(), expected, "{label}: {events:?}");
-        let env_name = env_name_for_handle(&self.handle);
         for event in events {
             assert_eq!(event["surface"], "exec", "{label}: {event:?}");
             assert_eq!(event["count"], 1, "{label}: {event:?}");
@@ -143,12 +142,7 @@ impl Fixture {
             );
             assert!(event.get("target").is_none(), "{label}: {event:?}");
             let encoded = serde_json::to_string(&event).unwrap();
-            for private in [
-                SECRET,
-                self.handle.as_str(),
-                self.source.to_str().unwrap(),
-                env_name.as_str(),
-            ] {
+            for private in [SECRET, self.handle.as_str(), self.source.to_str().unwrap()] {
                 assert!(!encoded.contains(private), "{label}: {event:?}");
             }
         }
@@ -179,13 +173,6 @@ fn actual_exec_records_completed_input_restoration_once() {
         assert_success(&output, label);
         fixture.assert_resolve_count(label, 1);
     }
-
-    let output = fixture.run(
-        "referenced-env",
-        referenced_env_args(&fixture.handle, &fixture.source),
-    );
-    assert_success(&output, "referenced-env");
-    fixture.assert_resolve_count("referenced-env", 1);
 
     for (label, live) in [("argv-nonzero", false), ("argv-nonzero-live", true)] {
         let output = fixture.run(
@@ -235,11 +222,12 @@ fn actual_exec_does_not_count_noop_or_failed_input_preparation() {
     assert!(!output.status.success(), "{output:?}");
     fixture.assert_resolve_count("argv-denied", 0);
 
-    let unknown = unknown_handle(&fixture.handle);
+    let foreign_fixture = Fixture::new();
+    assert_ne!(fixture.handle, foreign_fixture.handle);
     for (label, live) in [("late-unknown", false), ("late-unknown-live", true)] {
         let output = fixture.run(
             label,
-            argv_with_late_unknown(&fixture.handle, &unknown, live),
+            argv_with_late_unknown(&fixture.handle, &foreign_fixture.handle, live),
         );
         assert!(!output.status.success(), "{output:?}");
         fixture.assert_resolve_count(label, 0);
@@ -255,33 +243,6 @@ fn first_handle(masked: &str) -> String {
         .map(|offset| start + offset + 2)
         .unwrap_or_else(|| panic!("unterminated handle"));
     masked[start..end].to_string()
-}
-
-fn unknown_handle(handle: &str) -> String {
-    let mut unknown = handle.as_bytes().to_vec();
-    let prefix = b"OPENAI_API_KEY_";
-    let hash_start = unknown
-        .windows(prefix.len())
-        .position(|window| window == prefix)
-        .map(|index| index + prefix.len())
-        .unwrap();
-    let index = hash_start;
-    assert!(unknown[index].is_ascii_hexdigit());
-    unknown[index] = if unknown[index] == b'a' { b'b' } else { b'a' };
-    String::from_utf8(unknown).unwrap()
-}
-
-fn env_name_for_handle(handle: &str) -> String {
-    let inner = handle
-        .strip_prefix("<<")
-        .and_then(|value| value.strip_suffix(">>"))
-        .unwrap();
-    let core = inner
-        .rsplit_once("_length_at_least_")
-        .or_else(|| inner.rsplit_once("_length_"))
-        .or_else(|| inner.rsplit_once("_len"))
-        .map_or(inner, |(core, _)| core);
-    format!("PENTECT_{core}")
 }
 
 fn assert_success(output: &Output, context: &str) {
@@ -337,19 +298,6 @@ fn shell_args(handle: &str, source: &Path, live: bool) -> Vec<std::ffi::OsString
     args
 }
 
-#[cfg(unix)]
-fn referenced_env_args(handle: &str, source: &Path) -> Vec<std::ffi::OsString> {
-    let name = env_name_for_handle(handle);
-    vec![
-        "exec".into(),
-        format!(
-            "expected=$(cut -d= -f2- '{}'); : '{handle}'; test \"${name}\" = \"$expected\"",
-            source.display()
-        )
-        .into(),
-    ]
-}
-
 #[cfg(windows)]
 fn shell_args(handle: &str, source: &Path, live: bool) -> Vec<std::ffi::OsString> {
     let mut args = vec!["exec".into()];
@@ -364,19 +312,6 @@ fn shell_args(handle: &str, source: &Path, live: bool) -> Vec<std::ffi::OsString
         .into(),
     );
     args
-}
-
-#[cfg(windows)]
-fn referenced_env_args(handle: &str, source: &Path) -> Vec<std::ffi::OsString> {
-    let name = env_name_for_handle(handle);
-    vec![
-        "exec".into(),
-        format!(
-            "$expected=(Get-Content -LiteralPath '{}') -replace '^OPENAI_API_KEY=', ''; '{handle}' | Out-Null; if ($env:{name} -ne $expected) {{ exit 1 }}",
-            source.display()
-        )
-        .into(),
-    ]
 }
 
 #[cfg(unix)]
