@@ -20,7 +20,7 @@ index 1cedfcf..e339c82 100644
 @@ -25,3 +14,35 @@ __all__ = [
  ]
  
- __version__ = "1.17.4"
+ __version__ = "1.18.1"
 +
 +
 +def __getattr__(name):

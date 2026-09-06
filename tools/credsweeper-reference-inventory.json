@@ -1,5 +1,5 @@
 {
-  "credsweeper_version": "1.17.4",
+  "credsweeper_version": "1.18.1",
   "filter_classes": [
     "LineGitBinaryCheck",
     "LineSpecificKeyCheck",
@@ -6391,6 +6391,7 @@
       "CMD Password",
       "CMD Secret",
       "CMD Token",
+      "CURL Options",
       "CURL User Password",
       "Credential",
       "DOC_CREDENTIALS",
@@ -6432,7 +6433,7 @@
       "entropy"
     ]
   },
-  "rule_count": 134,
+  "rule_count": 146,
   "rule_types": {
     "keyword": [
       "API",
@@ -6478,9 +6479,12 @@
       "CMD Password",
       "CMD Secret",
       "CMD Token",
+      "CURL Options",
       "CURL User Password",
+      "CircleCI Personal API Token",
       "Clojars Deploy Token",
       "CloudFlare API Token",
+      "Contentful Credentials",
       "DOC_CREDENTIALS",
       "DOC_GET",
       "Databricks Access Token",
@@ -6536,8 +6540,11 @@
       "NewRelic Credentials",
       "Notion Integration Token",
       "NuGet API key",
+      "Nylas API Key",
       "OTP / 2FA Secret",
       "OpenAI Token",
+      "PASERK Keys",
+      "PASETO Token",
       "PASSWD_PAIR",
       "PayPal Braintree Access Token",
       "Perplexity API Key",
@@ -6545,7 +6552,9 @@
       "PlanetScale Credentials",
       "PostHog Credentials",
       "Postman Credentials",
+      "Pulumi Personal Access Token",
       "PyPi API Token",
+      "Riot Games API Key",
       "RubyGems API Key",
       "SECRET_PAIR",
       "SQL Password",
@@ -6557,18 +6566,22 @@
       "Slack Token",
       "Slack Webhook",
       "SonarQube Credentials",
+      "SourceGraph Credentials",
       "Square Access Token",
       "Square Credentials",
       "Stripe Credentials",
       "Supabase Credentials",
+      "Tailscale Credentials",
       "Tavily API Key",
       "Telegram Bot API Token",
       "Tencent WeChat API App ID",
       "Together AI API Key",
       "Twilio Credentials",
+      "Typeform API Personal Token",
       "URL Credentials",
       "UUID",
       "Vercel Token",
+      "WakaTime API Key",
       "WunderGraph API Key",
       "X AI API Key",
       "X App-Only Authentication Bearer Token"
@@ -8133,6 +8146,104 @@
         "type": "pattern",
         "values": [
           "(?P<value>IGQVJ[=0-9A-Za-z_-]{100,8000})(?![=0-9A-Za-z_-])"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "PASETO Token",
+      "runtime": {
+        "confidence": "moderate",
+        "min_line_len": 64,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>v[1-4]\\.(public|local)\\.[0-9A-Za-z_-]{15,8000}(\\.[0-9A-Za-z_-]{0,8000})?)"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          ".local.",
+          ".public."
+        ],
+        "severity": "medium",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "moderate",
+        "filter_type": [
+          "ValuePatternCheck"
+        ],
+        "min_line_len": 64,
+        "name": "PASETO Token",
+        "required_substrings": [
+          ".public.",
+          ".local."
+        ],
+        "severity": "medium",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>v[1-4]\\.(public|local)\\.[0-9A-Za-z_-]{15,8000}(\\.[0-9A-Za-z_-]{0,8000})?)"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "PASERK Keys",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 64,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>k[1-4]\\.(local|secret)(-pw)?\\.[0-9A-Za-z_-]{15,8000})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "local",
+          "secret"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": [
+          "ValuePatternCheck"
+        ],
+        "min_line_len": 64,
+        "name": "PASERK Keys",
+        "required_substrings": [
+          "local",
+          "secret"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>k[1-4]\\.(local|secret)(-pw)?\\.[0-9A-Za-z_-]{15,8000})"
         ]
       },
       "type": "pattern"
@@ -9940,6 +10051,54 @@
         "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
         "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
       ],
+      "name": "CircleCI Personal API Token",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 70,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>CCIPAT_[0-9A-Za-z]{22}_[0-9a-f]{40})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "ccipat_"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": "TokenPattern",
+        "min_line_len": 70,
+        "name": "CircleCI Personal API Token",
+        "required_substrings": [
+          "CCIPAT_"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>CCIPAT_[0-9A-Za-z]{22}_[0-9a-f]{40})"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "d1d95e9b2554cfe993d62d95e317f310cedb3b4ce0eaf347273da06572557d4b",
+        "5cabcbb31f39853e721fd8409ef421127a4e733cb9f312e4e831356751d2407f",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
       "name": "Digital Ocean Token",
       "runtime": {
         "confidence": "strong",
@@ -11322,12 +11481,12 @@
         "patterns": [
           {
             "flags": 32,
-            "regex": "(?P<value>sk-ant-api03-[0-9A-Za-z_-]{64,128})(?![0-9A-Za-z_-])"
+            "regex": "(?P<value>sk-ant-(api|admin)0[1-4]-[0-9A-Za-z_-]{64,128})(?![0-9A-Za-z_-])"
           }
         ],
         "required_regex": null,
         "required_substrings": [
-          "sk-ant-api03-"
+          "sk-ant-"
         ],
         "severity": "high",
         "target": [
@@ -11344,7 +11503,7 @@
         "min_line_len": 77,
         "name": "Anthropic API Key",
         "required_substrings": [
-          "sk-ant-api03-"
+          "sk-ant-"
         ],
         "severity": "high",
         "target": [
@@ -11353,7 +11512,7 @@
         ],
         "type": "pattern",
         "values": [
-          "(?P<value>sk-ant-api03-[0-9A-Za-z_-]{64,128})(?![0-9A-Za-z_-])"
+          "(?P<value>sk-ant-(api|admin)0[1-4]-[0-9A-Za-z_-]{64,128})(?![0-9A-Za-z_-])"
         ]
       },
       "type": "pattern"
@@ -11401,6 +11560,147 @@
         "type": "pattern",
         "values": [
           "(?P<value>pplx-[0-9A-Za-z_-]{40,64})(?![0-9A-Za-z_-])"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "Tailscale Credentials",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 61,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>tskey-(api|auth|client|scim|webhook)-[0-9A-Za-z]{12,24}-[0-9A-Za-z]{32})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "tskey-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": [
+          "ValuePatternCheck"
+        ],
+        "min_line_len": 61,
+        "name": "Tailscale Credentials",
+        "required_substrings": [
+          "tskey-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>tskey-(api|auth|client|scim|webhook)-[0-9A-Za-z]{12,24}-[0-9A-Za-z]{32})"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "Contentful Credentials",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 49,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>CFPAT-[0-9A-Za-z_-]{43})(?![0-9A-Za-z_-])"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "cfpat-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": [
+          "ValuePatternCheck"
+        ],
+        "min_line_len": 49,
+        "name": "Contentful Credentials",
+        "required_substrings": [
+          "CFPAT-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>CFPAT-[0-9A-Za-z_-]{43})(?![0-9A-Za-z_-])"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "Pulumi Personal Access Token",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 44,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>pul-[0-9a-f]{40})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "pul-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": [
+          "ValuePatternCheck"
+        ],
+        "min_line_len": 44,
+        "name": "Pulumi Personal Access Token",
+        "required_substrings": [
+          "pul-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>pul-[0-9a-f]{40})"
         ]
       },
       "type": "pattern"
@@ -11994,6 +12294,246 @@
         "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
         "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
       ],
+      "name": "Nylas API Key",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 71,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>nyk_v0_[0-9A-Za-z_-]{64})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "nyk_v0_"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": "TokenPattern",
+        "min_line_len": 71,
+        "name": "Nylas API Key",
+        "required_substrings": [
+          "nyk_v0_"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>nyk_v0_[0-9A-Za-z_-]{64})"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "d1d95e9b2554cfe993d62d95e317f310cedb3b4ce0eaf347273da06572557d4b",
+        "5cabcbb31f39853e721fd8409ef421127a4e733cb9f312e4e831356751d2407f",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "WakaTime API Key",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 40,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>waka_[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "waka_"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": "TokenPattern",
+        "min_line_len": 40,
+        "name": "WakaTime API Key",
+        "required_substrings": [
+          "waka_"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>waka_[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "d1d95e9b2554cfe993d62d95e317f310cedb3b4ce0eaf347273da06572557d4b",
+        "5cabcbb31f39853e721fd8409ef421127a4e733cb9f312e4e831356751d2407f",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "Riot Games API Key",
+      "runtime": {
+        "confidence": "strong",
+        "min_line_len": 41,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>RGAPI-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "rgapi-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "strong",
+        "filter_type": "TokenPattern",
+        "min_line_len": 41,
+        "name": "Riot Games API Key",
+        "required_substrings": [
+          "RGAPI-"
+        ],
+        "severity": "high",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>RGAPI-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "d1d95e9b2554cfe993d62d95e317f310cedb3b4ce0eaf347273da06572557d4b",
+        "5cabcbb31f39853e721fd8409ef421127a4e733cb9f312e4e831356751d2407f",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "SourceGraph Credentials",
+      "runtime": {
+        "confidence": "moderate",
+        "min_line_len": 44,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<value>sgp_(local_|[0-9a-f]{16}_)?[0-9a-f]{40})"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "sgp_"
+        ],
+        "severity": "medium",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "moderate",
+        "filter_type": "TokenPattern",
+        "min_line_len": 44,
+        "name": "SourceGraph Credentials",
+        "required_substrings": [
+          "sgp_"
+        ],
+        "severity": "medium",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?P<value>sgp_(local_|[0-9a-f]{16}_)?[0-9a-f]{40})"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "d1d95e9b2554cfe993d62d95e317f310cedb3b4ce0eaf347273da06572557d4b",
+        "5cabcbb31f39853e721fd8409ef421127a4e733cb9f312e4e831356751d2407f",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
+      "name": "Typeform API Personal Token",
+      "runtime": {
+        "confidence": "weak",
+        "min_line_len": 60,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?:^|/|[^\\\\0-9A-Za-z+_-]|\\\\[0abfnrtv]|(?:%|\\\\x)[0-9A-Fa-f]{2}|\\\\[0-7]{3}|\\\\[Uu][0-9A-Fa-f]{4}|\\x1B\\[[0-9;]{0,80}m)(?P<value>tfp_[0-9A-Za-z_-]{56,60})(?![0-9A-Za-z_-])"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "tfp_"
+        ],
+        "severity": "medium",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "use_ml": false
+      },
+      "source": {
+        "confidence": "weak",
+        "filter_type": "TokenPattern",
+        "min_line_len": 60,
+        "name": "Typeform API Personal Token",
+        "required_substrings": [
+          "tfp_"
+        ],
+        "severity": "medium",
+        "target": [
+          "code",
+          "doc"
+        ],
+        "type": "pattern",
+        "values": [
+          "(?:^|/|[^\\\\0-9A-Za-z+_-]|\\\\[0abfnrtv]|(?:%|\\\\x)[0-9A-Fa-f]{2}|\\\\[0-7]{3}|\\\\[Uu][0-9A-Fa-f]{4}|\\x1B\\[[0-9;]{0,80}m)(?P<value>tfp_[0-9A-Za-z_-]{56,60})(?![0-9A-Za-z_-])"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "d1d95e9b2554cfe993d62d95e317f310cedb3b4ce0eaf347273da06572557d4b",
+        "5cabcbb31f39853e721fd8409ef421127a4e733cb9f312e4e831356751d2407f",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462"
+      ],
       "name": "Vercel Token",
       "runtime": {
         "confidence": "weak",
@@ -12489,16 +13029,16 @@
       "name": "NTLM Token",
       "runtime": {
         "confidence": "strong",
-        "min_line_len": 160,
+        "min_line_len": 44,
         "patterns": [
           {
             "flags": 32,
-            "regex": "(?P<value>TlRMTVNTUAADAAAA[=0-9A-Za-z_/+-]{8,8000})(?![0-9A-Za-z_/+-])"
+            "regex": "(?P<value>TlRMTVNTUAA[BCD]AAAA[=0-9A-Za-z_/+-]{28,8000})(?![0-9A-Za-z_/+-])"
           }
         ],
         "required_regex": null,
         "required_substrings": [
-          "tlrmtvntuaadaaaa"
+          "tlrmtvntuaa"
         ],
         "severity": "medium",
         "target": [
@@ -12513,10 +13053,10 @@
           "ValueMorphemesCheck(2)",
           "ValuePatternCheck"
         ],
-        "min_line_len": 160,
+        "min_line_len": 44,
         "name": "NTLM Token",
         "required_substrings": [
-          "TlRMTVNTUAADAAAA"
+          "TlRMTVNTUAA"
         ],
         "severity": "medium",
         "target": [
@@ -12525,7 +13065,7 @@
         ],
         "type": "pattern",
         "values": [
-          "(?P<value>TlRMTVNTUAADAAAA[=0-9A-Za-z_/+-]{8,8000})(?![0-9A-Za-z_/+-])"
+          "(?P<value>TlRMTVNTUAA[BCD]AAAA[=0-9A-Za-z_/+-]{28,8000})(?![0-9A-Za-z_/+-])"
         ]
       },
       "type": "pattern"
@@ -12686,6 +13226,76 @@
         "use_ml": true,
         "values": [
           "(\\\\[nrt]|\\b)(?i:(?P<variable>(CREATE|ALTER|SET\\s{1,8}PASSWORD|INSERT(\\s{1,8}IGNORE)?|UPDATE\\s{1,8}[^\\s;]{1,80})\\s{1,8}(LOGIN|USER|ROLE|FOR|INTO|SET)\\s{1,8}((?!IDENTIFIED|PASSWORD)[^\\s;]{1,80}\\s{1,8}|VALUES\\s{0,8}\\(){1,8}(IDENTIFIED((\\s{1,8}WITH\\s{1,8}\\S{1,80})?\\s{1,8}(BY|AS))|(=|WITH)?\\s{0,8}PASSWORD\\b(\\s{0,8}=)?)))\\s{0,8}(?P<wrap>[(]\\s{0,8})?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4})?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|[^\\s\\\"'`,;\\\\])){3,80})(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote))|(?(wrap)[)]|[\\s\\\"'`,;]))"
+        ]
+      },
+      "type": "pattern"
+    },
+    {
+      "filters": [
+        "b85d5e06126b69912a17366f73a9449df73380733941cceae6835fe3c979b285",
+        "0301e5c43eac4b8f1e17aefec9d959bddddf688911be5b1007e0a0d24aeaabfb",
+        "38bf214df4fbe8a0e67b7f99be8af5678e37d3ac230f1cc486ad151879c43a20",
+        "ec3fcbf9808c16a50b10e3f188b97e914e38daa798ef00a2d198a3f7c60896fc",
+        "450a06fc337c21b5c9e358304039716d24f2d3b0be1439d9e5f93527d3bdaf9d",
+        "d79325171910104ff78bba622b3bfef3e8fc09b1863395d105f9e1f8f146c71f",
+        "69bf6c78773debc5248d7d6d0716fcb8f7b0e53888a3cf2052a586c53019b54b",
+        "7b5cee4822fd6022f0e4280aff80765498b879279828c6c93e078c94a31f421b",
+        "834aa4212c1b2163f49e64e670b37d709621878e144e19b65b02f39de2ae7863",
+        "b857000585d8ebff0cf9784fc43d545c92ab31e8b207a7a5a373d64a88ace71d",
+        "04a905e8f114a72ccc291aa0f2c235bd8e15118716a76fd41c68453a1bc108f2",
+        "51203034b5ad491182cd3dced2882f9dd35f175add9364dd1709ab786b501462",
+        "23be6d335ddff5b829c60ad4a3bc2d78763006222fbaf48a038c929b8a3e9b4a",
+        "4853545a8b268d9d7b3f316d28eb132e1dc47ed34ab6b57b76b175e48421854a",
+        "5b9ea725802b9f80ee9d2655d8a3c49da1f605540c00bc13b267c6042fb71cbe"
+      ],
+      "name": "CURL Options",
+      "runtime": {
+        "confidence": "weak",
+        "min_line_len": 32,
+        "patterns": [
+          {
+            "flags": 32,
+            "regex": "(?P<variable>CURLOPT_(XOAUTH2_BEARER|(?:PROXY)?PASSWORD|(?:PROXY)?USERPWD)|KEYPASSWD)\\s*,\\s*(?P<value_leftquote>\")(?P<value>[^\"]{4,8000})(?P<value_rightquote>\")?"
+          }
+        ],
+        "required_regex": null,
+        "required_substrings": [
+          "curlopt_keypasswd",
+          "curlopt_password",
+          "curlopt_proxypassword",
+          "curlopt_proxyuserpwd",
+          "curlopt_userpwd",
+          "curlopt_xoauth2_bearer"
+        ],
+        "severity": "high",
+        "target": [
+          "doc",
+          "code"
+        ],
+        "use_ml": true
+      },
+      "source": {
+        "confidence": "weak",
+        "filter_type": "GeneralKeyword",
+        "min_line_len": 32,
+        "name": "CURL Options",
+        "required_substrings": [
+          "CURLOPT_XOAUTH2_BEARER",
+          "CURLOPT_PASSWORD",
+          "CURLOPT_USERPWD",
+          "CURLOPT_PROXYPASSWORD",
+          "CURLOPT_PROXYUSERPWD",
+          "CURLOPT_KEYPASSWD"
+        ],
+        "severity": "high",
+        "target": [
+          "doc",
+          "code"
+        ],
+        "type": "pattern",
+        "use_ml": true,
+        "values": [
+          "(?P<variable>CURLOPT_(XOAUTH2_BEARER|(?:PROXY)?PASSWORD|(?:PROXY)?USERPWD)|KEYPASSWD)\\s*,\\s*(?P<value_leftquote>\")(?P<value>[^\"]{4,8000})(?P<value_rightquote>\")?"
         ]
       },
       "type": "pattern"
@@ -13074,7 +13684,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>api(?!tal))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>api(?!tal))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13132,7 +13742,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>auth(?!ors?(?!i[tz])))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>auth(?!ors?(?!i[tz])))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13190,7 +13800,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>credential)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>credential)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13248,7 +13858,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>key(?!word|board|pad|name))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>key(?!word|board|pad|name))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13306,7 +13916,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>(?<!\\\\)nonce)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>(?<!\\\\)nonce)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13367,7 +13977,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>(?<!by)pass(?!e[dns]|ing|ion|age|\\s+[a-z]{3,80})|(?<!pro|sto)p(s|ss|as)?w(o?r)?d(?!ump)|pswr?\\b|(\\b|_)pw(_|\\b))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>(?<!by)pass(?!e[dns]|ing|ion|age|\\s+[a-z]{3,80})|(?<!pro|sto)p(s|ss|as)?w(o?r)?d(?!ump)|pswr?\\b|(\\b|_)pw(_|\\b))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13433,7 +14043,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>salt)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>salt)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13491,7 +14101,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>secret)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>secret)[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
@@ -13549,7 +14159,7 @@
         "patterns": [
           {
             "flags": 50,
-            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>token(?!ize))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
+            "regex": "(?P<directive>(?:(?:[#%]define|define(?=(\\s|\\\\{1,8}[tnr])*\\()|%global)(?:\\s?\\(|\\s|\\\\{1,8}[tnr]){1,8}|\\bset(?=\\b|\\w*(\\s|\\\\{1,8}[tnr])*\\()))?(?:\\\\[nrt]|(\\\\\\\\*u00|%)[0-9a-f]{2}|\\s)*(?P<variable>(([\\\"'`]{1,8}[^:=\\\"'`}<>\\\\/&?]*|[^:=\\\"'`}<>\\s()\\\\/&?;,%]*)(?P<keyword>token(?!ize))[^%:=\\\"'`<>({?!&;\\n]{0,80})(&(quot|apos|#3[49]);|(\\\\\\\\*u00|%)[0-9a-f]{2}|[\\\"'`])*)(?(directive)|(\\s|\\\\{1,8}[tnr])*\\]?(\\s|\\\\{1,8}[tnr])*)(?P<separator>:(\\s[a-z]{3,9}[?]?\\s)?=|:(?!:)|=(>|&gt;|(\\\\\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|<<<|(?(directive)(,|\\\\t|\\s|\\((?!\\))){1,80}|%3d))(\\s|\\\\{1,8}[tnr])*(?P<wrap>(((\\s|\\\\{1,8}[tnr]|new|byte|char|string|\\[\\]){1,8})?(?P<get>([_a-z][0-9a-z_.\\[\\]]*\\.)get|(os\\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\\s*(\\[(?!\\])|\\((?!\\))|\\{(?!\\}))(\\s|\\\\{1,8}[tnr])*(?(get)('[^']{1,31}'|\\\"[^\\\"]{1,31}\\\")\\s*(,|\\)\\s*or)\\s*|)([0-9a-z_]{1,32}\\s*[:=]\\s*)?){1,8})?(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\\\*[\\\"'`])))?(?P<value_leftquote>((?P<esq>\\\\{1,8})?([\\\"'`]|&(quot|apos|#3[49]);)){1,4}))?(\\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\\s)?(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)([\\\"'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\\\{1,8}([ tnr]|[^\\s\\\"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\\s\\\"'`,;\\\\&]|[^\\s\\\"'`,;\\\\]))){4,8000}|(<[^>]{4,8000}>)|(\\$?\\({1,3}[^)]{4,8000}\\){1,3})|(\\$?\\{{1,3}[^}]{4,8000}\\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\\\(?P=value_leftquote))|[^\\]\\)\\}]){16,8000}))(?(value_leftquote)(?P<value_rightquote>(?<!\\\\)(?P=value_leftquote)|\\\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\\]|\\)|\\}|;|\\\\|$)))"
           }
         ],
         "required_regex": null,
