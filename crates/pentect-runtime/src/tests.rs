@@ -1497,6 +1497,70 @@ fn exec_capability_env_does_not_shadow_parent_environment() {
 }
 
 #[test]
+fn diagnostic_recovered_handles_have_exact_raw_bytes_across_output_shapes() {
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let cases = [
+        ("plain", format!("LIVE_KEY={raw}\n")),
+        (
+            "json-envelope",
+            serde_json::json!({"stdout": format!("LIVE_KEY={raw}\n")}).to_string(),
+        ),
+        (
+            "json-stringified-output",
+            serde_json::to_string(&format!("LIVE_KEY={raw}\n")).unwrap(),
+        ),
+        (
+            "codex-function-output",
+            serde_json::json!({
+                "type": "function_call_output",
+                "output": format!("LIVE_KEY={raw}\n")
+            })
+            .to_string(),
+        ),
+        (
+            "codex-response-output",
+            serde_json::json!({
+                "output": [{
+                    "type": "function_call_output",
+                    "output": format!("LIVE_KEY={raw}\n")
+                }]
+            })
+            .to_string(),
+        ),
+        (
+            "codex-exec-header",
+            format!(
+                "Chunk ID: synthetic\nWall time: 0.1 seconds\nProcess exited with code 0\nFinal output:\nLIVE_KEY={raw}\n"
+            ),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, output) in cases {
+        let root = temp_root(&format!("diagnostic-recovered-{name}"));
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let store = MemoryStore::for_session(&session);
+        let masked = mask_tool_output(&session, &output).unwrap();
+        let handle = first_masked_handle(&masked);
+        let recovered = store.resolve_all(&handle).unwrap();
+        let shape = format!(
+            "len={},actual_lf={},actual_cr={},literal_backslash_n_suffix={}",
+            recovered.len(),
+            recovered.contains('\n'),
+            recovered.contains('\r'),
+            recovered.ends_with(r"\n"),
+        );
+        let exact = recovered == raw;
+        eprintln!("diagnostic {name}: {shape},exact={exact}");
+        if !exact {
+            failures.push(name);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+    assert!(failures.is_empty(), "non-exact recovered cases: {failures:?}");
+}
+
+#[test]
 fn exec_resolves_masked_handle_in_command_text() {
     let root = temp_root("exec-command-handle");
     let session = Session::open_capability_at(&root, "t").unwrap();
