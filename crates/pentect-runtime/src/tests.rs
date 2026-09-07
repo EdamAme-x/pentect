@@ -4289,6 +4289,25 @@ fn masked_read_copy_paths_do_not_collide_for_project_punctuation() {
 }
 
 #[test]
+fn masked_read_copy_paths_remain_distinct_for_unicode_names() {
+    let first = safe_masked_read_component("café.env");
+    let second = safe_masked_read_component("café.env");
+    assert_ne!(first, second);
+    assert!(first.starts_with("caf"));
+    assert!(second.starts_with("caf"));
+}
+
+#[test]
+fn masked_read_copy_paths_remain_distinct_after_component_truncation() {
+    let first = format!("{}A.env", "x".repeat(80));
+    let second = format!("{}B.env", "x".repeat(80));
+    assert_ne!(
+        safe_masked_read_component(&first),
+        safe_masked_read_component(&second)
+    );
+}
+
+#[test]
 fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let fixture = TestDirectory::new("masked-read-external-collision");

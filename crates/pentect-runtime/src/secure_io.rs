@@ -87,4 +87,21 @@ mod tests {
         assert!(error.contains("exceeds 4 bytes"), "{error}");
         std::fs::remove_file(path).unwrap();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "pentect-bounded-fifo-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let error = read_bounded_bytes(&path, 32, "test fifo").unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
 }
