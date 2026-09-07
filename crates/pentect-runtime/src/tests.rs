@@ -1497,7 +1497,7 @@ fn exec_capability_env_does_not_shadow_parent_environment() {
 }
 
 #[test]
-fn diagnostic_recovered_handles_have_exact_raw_bytes_across_output_shapes() {
+fn json_tool_output_recovers_exact_secret_across_output_shapes() {
     let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
     let cases = [
         ("plain", format!("LIVE_KEY={raw}\n")),
@@ -1535,7 +1535,6 @@ fn diagnostic_recovered_handles_have_exact_raw_bytes_across_output_shapes() {
         ),
     ];
 
-    let mut failures = Vec::new();
     for (name, output) in cases {
         let root = temp_root(&format!("diagnostic-recovered-{name}"));
         let session = Session::open_capability_at(&root, "t").unwrap();
@@ -1550,21 +1549,13 @@ fn diagnostic_recovered_handles_have_exact_raw_bytes_across_output_shapes() {
             recovered.contains('\r'),
             recovered.ends_with(r"\n"),
         );
-        let exact = recovered == raw;
-        eprintln!("diagnostic {name}: {shape},exact={exact}");
-        if !exact {
-            failures.push(name);
-        }
+        assert!(recovered == raw, "{name}: recovered shape {shape}");
         let _ = std::fs::remove_dir_all(root);
     }
-    assert!(
-        failures.is_empty(),
-        "non-exact recovered cases: {failures:?}"
-    );
 }
 
 #[test]
-fn diagnostic_json_masking_preserves_literal_backslash_and_metadata() {
+fn json_tool_output_preserves_literal_backslash_and_metadata() {
     let root = temp_root("diagnostic-json-literal-backslash");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = MemoryStore::for_session(&session);
@@ -1584,7 +1575,7 @@ fn diagnostic_json_masking_preserves_literal_backslash_and_metadata() {
 }
 
 #[test]
-fn diagnostic_malformed_json_keeps_text_fallback() {
+fn malformed_json_uses_text_masking_fallback() {
     let root = temp_root("diagnostic-json-malformed");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
@@ -1596,7 +1587,7 @@ fn diagnostic_malformed_json_keeps_text_fallback() {
 }
 
 #[test]
-fn diagnostic_json_masking_without_plugins_still_decodes_recovery() {
+fn json_tool_output_without_plugins_still_decodes_recovery() {
     let root = temp_root("diagnostic-json-no-plugins");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = MemoryStore::for_session(&session);
@@ -1610,6 +1601,25 @@ fn diagnostic_json_masking_without_plugins_still_decodes_recovery() {
         serde_json::from_str::<Value>(&masked).unwrap()["stdout"],
         format!("LIVE_KEY={handle}\n")
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn json_tool_output_with_image_payload_uses_text_policy_path() {
+    let root = temp_root("json-tool-image-policy");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = serde_json::json!({
+        "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+        "stdout": format!("LIVE_KEY={raw}")
+    })
+    .to_string();
+    let masked = mask_tool_output(&session, &output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    assert!(masked.contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+    assert!(serde_json::from_str::<Value>(&masked).is_ok());
     let _ = std::fs::remove_dir_all(root);
 }
 

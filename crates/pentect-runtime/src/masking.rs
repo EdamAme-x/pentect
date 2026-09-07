@@ -143,12 +143,17 @@ impl OutputMasker {
         // masking keeps the tool result valid JSON. Malformed JSON follows
         // the existing text path unchanged.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-            let (updated, changed) = crate::mask_tool_json(&value, self, run_plugins)?;
-            if changed {
-                return serde_json::to_string(&updated)
-                    .map_err(|error| format!("could not encode masked tool output: {error}"));
+            // Image payloads use a separate OCR/policy path. Keep those on
+            // the original text path so decoding this envelope cannot skip
+            // image inspection or alter its policy.
+            if !crate::image_ocr::contains_image_result(&value) {
+                let (updated, changed) = crate::mask_tool_json(&value, self, run_plugins)?;
+                if changed {
+                    return serde_json::to_string(&updated)
+                        .map_err(|error| format!("could not encode masked tool output: {error}"));
+                }
+                return Ok(text.to_string());
             }
-            return Ok(text.to_string());
         }
         let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
             Kind::Env
