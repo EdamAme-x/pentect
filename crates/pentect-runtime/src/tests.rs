@@ -4279,16 +4279,12 @@ fn masked_read_copy_paths_do_not_collide_for_project_punctuation() {
     };
 
     assert_ne!(first_masked, second_masked);
-    assert!(
-        std::fs::read_to_string(&first_masked)
-            .unwrap()
-            .contains("<<RUNPOD_API_KEY_")
-    );
-    assert!(
-        std::fs::read_to_string(&second_masked)
-            .unwrap()
-            .contains("<<OPENAI_API_KEY_")
-    );
+    assert!(std::fs::read_to_string(&first_masked)
+        .unwrap()
+        .contains("<<RUNPOD_API_KEY_"));
+    assert!(std::fs::read_to_string(&second_masked)
+        .unwrap()
+        .contains("<<OPENAI_API_KEY_"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4336,6 +4332,59 @@ fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     assert!(first_text.contains("<<RUNPOD_API_KEY_"), "{first_text}");
     assert!(second_text.contains("<<OPENAI_API_KEY_"), "{second_text}");
     assert_directory_empty(&root.join(".pentect"));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_bytes_rejects_a_fifo_without_bypassing_the_input_limit() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = temp_root("read-bytes-fifo-limit");
+    let fifo = root.join("input.pipe");
+    std::fs::create_dir_all(&root).unwrap();
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let writer_path = std::ffi::CString::new(writer_path.as_os_str().as_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let writer = loop {
+            let fd = unsafe { libc::open(writer_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, 0) }, 0);
+                break Some(unsafe { std::fs::File::from_raw_fd(fd) });
+            }
+            if std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            } else {
+                break None;
+            }
+        };
+        if let Some(mut writer) = writer {
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..=(MAX_INPUT_BYTES / chunk.len()) {
+                if std::io::Write::write_all(&mut writer, &chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    assert!(
+        read_bytes(&fifo).is_err(),
+        "FIFO input bypassed the byte limit"
+    );
+    writer.join().unwrap();
+
+    let regular = root.join("large.txt");
+    let file = std::fs::File::create(&regular).unwrap();
+    file.set_len(MAX_INPUT_BYTES as u64 + 1).unwrap();
+    assert!(read_bytes(&regular).is_err());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
