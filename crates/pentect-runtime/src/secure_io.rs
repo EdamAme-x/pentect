@@ -5,8 +5,7 @@ use std::path::Path;
 /// Reads a regular file without allowing metadata races or chunked sources to
 /// exceed the caller's hard byte limit.
 pub fn read_bounded_bytes(path: &Path, max_bytes: u64, kind: &str) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))?;
+    let file = open_regular_candidate(path, kind)?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("could not inspect {kind} '{}': {error}", path.display()))?;
@@ -30,6 +29,25 @@ pub fn read_bounded_bytes(path: &Path, max_bytes: u64, kind: &str) -> Result<Vec
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_regular_candidate(path: &Path, kind: &str) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        // A FIFO can block in open(2) until a writer arrives. Open it
+        // nonblocking, then reject it from the descriptor metadata below.
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_regular_candidate(path: &Path, kind: &str) -> Result<std::fs::File, String> {
+    std::fs::File::open(path)
+        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))
 }
 
 /// Reads a bounded regular file and rejects non-UTF-8 data.

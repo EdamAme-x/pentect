@@ -3271,7 +3271,7 @@ fn safe_masked_read_component(value: &str) -> String {
     // Sanitizing punctuation can otherwise collapse distinct source names
     // (`a b.env` and `a_b.env`) onto one writable masked copy. Keep the
     // readable form for ordinary names, but make every transformed component
-    // injective by carrying a digest of its original spelling.
+    // collision-resistant by carrying a digest of its original spelling.
     if out != value {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
