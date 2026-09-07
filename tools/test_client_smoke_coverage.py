@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import fnmatch
 from pathlib import Path
 import re
 
@@ -45,9 +46,30 @@ def main() -> None:
     workflow = (ROOT / ".github/workflows/current-clients.yml").read_text(
         encoding="utf-8"
     )
+    watched = [
+        line.strip().strip("- '")
+        for line in workflow.splitlines()
+        if line.strip().startswith("- '")
+    ]
+    samples = {
+        "crates/pentect-cli/src/openai_http_proxy.rs": True,
+        "crates/pentect-runtime/src/masking.rs": True,
+        "crates/pentect-core/src/lib.rs": True,
+        "docs/compatibility.md": False,
+    }
+    for path, expected in samples.items():
+        matched = any(fnmatch.fnmatchcase(path, pattern) for pattern in watched)
+        assert matched is expected, f"unexpected current-client path match for {path}: {matched}"
     for boundary in (
         "crates/pentect-cli/src/main.rs",
         "crates/pentect-cli/src/openai_clients.rs",
+        "crates/pentect-cli/**",
+        "crates/pentect-runtime/**",
+        "crates/pentect-core/**",
+        "crates/pentect-cli/src/*_http_proxy.rs",
+        "crates/pentect-cli/src/*_app_proxy.rs",
+        "Cargo.toml",
+        "Cargo.lock",
         "crates/pentect-cli/src/secure_temp.rs",
         "crates/pentect-cli/src/claude_settings_session.rs",
         "crates/pentect-cli/src/*supervisor*.rs",
@@ -58,6 +80,7 @@ def main() -> None:
         "crates/pentect-cli/tests/native_windows_supervisor.rs",
         "crates/pentect-cli/tests/*claude*.rs",
         "tools/installed_agent_e2e.py",
+        "tools/test_installed_agent_environment.py",
     ):
         assert f"- '{boundary}'" in workflow, (
             f"current-client workflow does not watch launch boundary {boundary}"

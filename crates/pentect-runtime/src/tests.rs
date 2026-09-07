@@ -4255,6 +4255,105 @@ fn masked_read_copy_path_mirrors_relative_paths() {
 }
 
 #[test]
+fn masked_read_copy_paths_do_not_collide_for_project_punctuation() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-project-collision");
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let first = project.join("a b.env");
+    let second = project.join("a_b.env");
+    std::fs::write(
+        &first,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    std::fs::write(&second, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let (first_masked, second_masked) = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        (
+            masked_read_copy(&session, "a b.env").unwrap().unwrap(),
+            masked_read_copy(&session, "a_b.env").unwrap().unwrap(),
+        )
+    };
+
+    assert_ne!(first_masked, second_masked);
+    assert!(std::fs::read_to_string(&first_masked)
+        .unwrap()
+        .contains("<<RUNPOD_API_KEY_"));
+    assert!(std::fs::read_to_string(&second_masked)
+        .unwrap()
+        .contains("<<OPENAI_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn masked_read_copy_paths_remain_distinct_for_unicode_names() {
+    let first = safe_masked_read_component("café.env");
+    let second = safe_masked_read_component("café.env");
+    assert_ne!(first, second);
+    assert!(first.starts_with("caf"));
+    assert!(second.starts_with("caf"));
+}
+
+#[test]
+fn masked_read_copy_paths_remain_distinct_after_component_truncation() {
+    let first = format!("{}A.env", "x".repeat(80));
+    let second = format!("{}B.env", "x".repeat(80));
+    assert_ne!(
+        safe_masked_read_component(&first),
+        safe_masked_read_component(&second)
+    );
+}
+
+#[test]
+fn project_external_component_cannot_alias_external_source_namespace() {
+    let project_path = safe_masked_read_path(Path::new("_external/abc/file.env"));
+    let external_path = PathBuf::from("_external").join("abc").join("file.env");
+    assert_ne!(project_path, external_path);
+}
+
+#[test]
+fn batched_read_paths_get_distinct_masked_copies() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-batched-paths");
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let first = project.join("a b.env");
+    let second = project.join("a_b.env");
+    std::fs::write(
+        &first,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    std::fs::write(&second, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let updated = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        let input = json!({
+            "paths": ["a b.env", "a_b.env"]
+        });
+        apply_masked_read_before_tool(&session, &input)
+            .unwrap()
+            .expect("secret files should be rewritten")
+    };
+    let paths = updated["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 2);
+    let first_masked = Path::new(paths[0].as_str().unwrap());
+    let second_masked = Path::new(paths[1].as_str().unwrap());
+    assert_ne!(first_masked, second_masked);
+    assert!(std::fs::read_to_string(first_masked)
+        .unwrap()
+        .contains("<<RUNPOD_API_KEY_"));
+    assert!(std::fs::read_to_string(second_masked)
+        .unwrap()
+        .contains("<<OPENAI_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let fixture = TestDirectory::new("masked-read-external-collision");
@@ -4298,6 +4397,62 @@ fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     assert!(first_text.contains("<<RUNPOD_API_KEY_"), "{first_text}");
     assert!(second_text.contains("<<OPENAI_API_KEY_"), "{second_text}");
     assert_directory_empty(&root.join(".pentect"));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_bytes_rejects_a_fifo_without_bypassing_the_input_limit() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = temp_root("read-bytes-fifo-limit");
+    let regular = root.join("large.txt");
+    let fifo = root.join("input.pipe");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = std::fs::File::create(&regular).unwrap();
+    file.set_len(MAX_INPUT_BYTES as u64 + 1).unwrap();
+    assert!(read_bytes(&regular).is_err());
+
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let writer_path = std::ffi::CString::new(writer_path.as_os_str().as_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let writer = loop {
+            let fd = unsafe { libc::open(writer_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, 0) }, 0);
+                break Some(unsafe { std::fs::File::from_raw_fd(fd) });
+            }
+            if std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            } else {
+                break None;
+            }
+        };
+        if let Some(mut writer) = writer {
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..=(MAX_INPUT_BYTES / chunk.len()) {
+                if std::io::Write::write_all(&mut writer, &chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = read_bytes(&fifo);
+    writer.join().unwrap();
+    if let Ok(bytes) = result {
+        panic!(
+            "FIFO input returned {} bytes despite the {MAX_INPUT_BYTES}-byte limit",
+            bytes.len()
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

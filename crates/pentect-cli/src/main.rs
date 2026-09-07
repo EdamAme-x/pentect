@@ -30,6 +30,7 @@ mod plugins;
 mod plugins_cmd;
 mod remote_content;
 mod secure_temp;
+mod sse;
 mod uninstall;
 mod update;
 mod upstream;
@@ -3588,15 +3589,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         }
         return Ok(buf);
     }
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("could not stat '{}': {e}", path.display()))?;
-    if metadata.len() > MAX_INPUT_BYTES as u64 {
-        return Err(format!(
-            "input '{}' exceeds {MAX_INPUT_BYTES} bytes",
-            path.display()
-        ));
-    }
-    std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
+    pentect_agent::read_bounded_bytes(path, MAX_INPUT_BYTES as u64, "input")
 }
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get

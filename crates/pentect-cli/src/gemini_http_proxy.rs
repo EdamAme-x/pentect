@@ -1011,8 +1011,7 @@ fn rewrite_sse_block(
         }
         Err(_) => return Ok(Bytes::copy_from_slice(block)),
     };
-    let data = text
-        .lines()
+    let data = crate::sse::lines(text)
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
         .collect::<Vec<_>>();
     if data.is_empty() || data == ["[DONE]"] {
@@ -1020,16 +1019,23 @@ fn rewrite_sse_block(
     }
     let joined = data.join("\n");
     let rewritten = rewrite_response_body(joined.as_bytes(), plugins, block_unknown_formats)?;
-    let ending = if text.ends_with("\r\n\r\n") {
+    let ending = if text.ends_with("\r\r") {
+        "\r\r"
+    } else if text.ends_with("\r\n\r\n") {
         "\r\n\r\n"
     } else {
         "\n\n"
     };
-    let line_ending = if ending == "\r\n\r\n" { "\r\n" } else { "\n" };
+    let line_ending = if ending == "\r\n\r\n" {
+        "\r\n"
+    } else if ending == "\r\r" {
+        "\r"
+    } else {
+        "\n"
+    };
     let mut out = Vec::with_capacity(block.len() + 32);
-    for line in text
-        .lines()
-        .filter(|line| !line.starts_with("data:") && !line.is_empty())
+    for line in
+        crate::sse::lines(text).filter(|line| !line.starts_with("data:") && !line.is_empty())
     {
         out.extend_from_slice(line.as_bytes());
         out.extend_from_slice(line_ending.as_bytes());
@@ -1064,19 +1070,7 @@ async fn read_response_capped(response: reqwest::Response) -> Result<Option<Byte
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| index + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {

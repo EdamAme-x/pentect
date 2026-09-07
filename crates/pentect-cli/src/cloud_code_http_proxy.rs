@@ -1242,8 +1242,7 @@ fn rewrite_sse_block(
             return Ok(Bytes::copy_from_slice(block));
         }
     };
-    let data = text
-        .lines()
+    let data = crate::sse::lines(text)
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
         .collect::<Vec<_>>();
     if data.is_empty() || data == ["[DONE]"] {
@@ -1264,14 +1263,21 @@ fn rewrite_sse_block(
     let restored_tools = rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
     let encoded = serde_json::to_string(&value)
         .map_err(|error| format!("could not encode Google Cloud Code SSE event: {error}"))?;
-    let ending = if text.ends_with("\r\n\r\n") {
+    let ending = if text.ends_with("\r\r") {
+        "\r\r"
+    } else if text.ends_with("\r\n\r\n") {
         "\r\n\r\n"
     } else {
         "\n\n"
     };
-    let line_ending = if ending == "\r\n\r\n" { "\r\n" } else { "\n" };
-    let metadata = text
-        .lines()
+    let line_ending = if ending == "\r\n\r\n" {
+        "\r\n"
+    } else if ending == "\r\r" {
+        "\r"
+    } else {
+        "\n"
+    };
+    let metadata = crate::sse::lines(text)
         .filter(|line| !line.starts_with("data:"))
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
@@ -1312,19 +1318,7 @@ async fn read_response_capped(response: reqwest::Response) -> Result<Option<Byte
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {

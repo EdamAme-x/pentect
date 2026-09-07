@@ -3268,6 +3268,20 @@ fn safe_masked_read_component(value: &str) -> String {
             out.push('_');
         }
     }
+    // Sanitizing punctuation can otherwise collapse distinct source names
+    // (`a b.env` and `a_b.env`) onto one writable masked copy. Keep the
+    // readable form for ordinary names, but make every transformed component
+    // collision-resistant by carrying a digest of its original spelling.
+    // `_external` is a reserved first-level directory for sources outside
+    // the project root. Escape a project component with that spelling so a
+    // project file cannot alias the external-source namespace.
+    if out != value || value == "_external" {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        let digest = hasher.finalize();
+        out.push('~');
+        out.push_str(&data_encoding::HEXLOWER.encode(&digest[..6]));
+    }
     out
 }
 
@@ -4342,15 +4356,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         }
         return Ok(buf);
     }
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("could not stat '{}': {e}", path.display()))?;
-    if metadata.len() > MAX_INPUT_BYTES as u64 {
-        return Err(format!(
-            "input '{}' exceeds {MAX_INPUT_BYTES} bytes",
-            path.display()
-        ));
-    }
-    std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
+    secure_io::read_bounded_bytes(path, MAX_INPUT_BYTES as u64, "input")
 }
 
 fn read_stdin_text() -> Result<String, String> {
