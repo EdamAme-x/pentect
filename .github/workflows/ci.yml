@@ -138,6 +138,7 @@ jobs:
               - 'tools/install_portable_client_smoke.py'
               - 'tools/installed_agent_e2e.py'
               - 'tools/test_client_smoke_coverage.py'
+              - 'tools/test_installed_agent_environment.py'
               - 'tools/verify_client_smoke_log.py'
               - 'tools/codex-app-smoke-fixture.c'
               - 'tools/codex-app-smoke-fixture.cs'
