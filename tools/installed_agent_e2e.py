@@ -2415,6 +2415,36 @@ def request_tool_result_summary(requests: list[str]) -> list[str]:
     return summaries[-4:]
 
 
+def tool_output_for_call(requests: list[str], call_id: str) -> object | None:
+    def walk(value: object) -> object | None:
+        if isinstance(value, dict):
+            if (
+                value.get("type") in {"custom_tool_call_output", "function_call_output"}
+                and value.get("call_id") == call_id
+            ):
+                return value.get("output", value.get("content"))
+            for child in value.values():
+                found = walk(child)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found is not None:
+                    return found
+        return None
+
+    for request in requests:
+        try:
+            parsed = json.loads(request)
+        except json.JSONDecodeError:
+            continue
+        found = walk(parsed)
+        if found is not None:
+            return found
+    return None
+
+
 def anthropic_env_handles(request: dict[str, object]) -> list[str]:
     messages = request.get("messages", [])
     if not isinstance(messages, list):
@@ -2744,13 +2774,37 @@ else:
                     raise RuntimeError("native apply_patch JSON content or final newline was incorrect")
                 if HANDLE.search(written_bytes.decode("utf-8")):
                     raise RuntimeError("native apply_patch left an opaque handle on disk")
-                if not any(
-                    state.native_patch_read_call_id in request
-                    and HANDLE.search(request)
-                    for request in state.model_requests[4:]
+                readback_output = tool_output_for_call(
+                    state.model_requests, state.native_patch_read_call_id
+                )
+                readback_text = (
+                    readback_output
+                    if isinstance(readback_output, str)
+                    else json.dumps(readback_output, ensure_ascii=True)
+                )
+                if (
+                    readback_output is None
+                    or "api_key" not in readback_text
+                    or not HANDLE.search(readback_text)
                 ):
+                    output_records = []
+                    for request in state.model_requests:
+                        try:
+                            parsed_request = json.loads(request)
+                        except json.JSONDecodeError:
+                            continue
+                        output_records.extend(
+                            (value.get("type"), value.get("call_id"))
+                            for value in parsed_request.get("input", [])
+                            if isinstance(value, dict)
+                            and value.get("type") in {
+                                "custom_tool_call_output",
+                                "function_call_output",
+                            }
+                        )
                     raise RuntimeError(
-                        "native apply_patch readback was not returned protected to the model"
+                        "native apply_patch readback was not returned protected to the model: "
+                        + repr({"expected": state.native_patch_read_call_id, "outputs": output_records})
                     )
             if not unicode_path.is_file() or unicode_path.read_text(encoding="utf-8") != UNICODE_ROUNDTRIP:
                 raise RuntimeError(f"{client} did not complete the Unicode file write/read roundtrip")
