@@ -1,8 +1,8 @@
 //! Small, byte-preserving helpers for Server-Sent Events.
 
 /// Return the end of the first SSE event, whose blank line may use CR, LF,
-/// CRLF, or a mixture. A terminal CR is held because the next transport
-/// chunk may complete it as CRLF.
+/// CRLF, or a mixture. A single terminal CR without a following line ending
+/// is held because the next transport chunk may complete it as CRLF.
 pub(crate) fn first_block_end(bytes: &[u8]) -> Option<usize> {
     let mut index = 0;
     while index < bytes.len() {
@@ -22,8 +22,6 @@ pub(crate) fn first_block_end(bytes: &[u8]) -> Option<usize> {
             b'\n' => first_end + 1,
             b'\r' if bytes.get(first_end + 1) == Some(&b'\n') => first_end + 2,
             // A second bare CR is itself a complete blank-line delimiter.
-            // A lone terminal CR (handled below before this match) remains
-            // buffered by the caller until the next transport chunk.
             b'\r' => first_end + 1,
             _ => {
                 index = first_end;

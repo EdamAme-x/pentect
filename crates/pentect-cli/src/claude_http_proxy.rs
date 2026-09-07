@@ -1489,16 +1489,10 @@ where
             diagnostic("sse-event-limit", "limit", "messages", false);
             return Err("Anthropic SSE event exceeded inspection limit".to_string());
         }
-        if self.pending.as_slice() == b"\n" {
-            self.pending.clear();
-        }
         self.pending.extend_from_slice(chunk);
         let mut output = Vec::new();
         while let Some(end) = first_sse_block_end(&self.pending) {
             let block = self.pending.drain(..end).collect::<Vec<_>>();
-            if self.pending.first() == Some(&b'\n') {
-                self.pending.drain(..1);
-            }
             self.process_block(block, &mut output)?;
             if self.terminated {
                 self.pending.clear();

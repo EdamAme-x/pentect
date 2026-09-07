@@ -2807,10 +2807,6 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
 }
 
 fn process_pending_stream_block(state: &mut StreamState) -> Result<(), String> {
-    if state.pending.as_slice() == b"\n" {
-        state.pending.clear();
-        return Ok(());
-    }
     if state.pending.is_empty() {
         return Ok(());
     }
@@ -2862,15 +2858,9 @@ fn streaming_response_body(
                         ))));
                         continue;
                     }
-                    if state.pending.as_slice() == b"\n" {
-                        state.pending.clear();
-                    }
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        if state.pending.first() == Some(&b'\n') {
-                            state.pending.drain(..1);
-                        }
                         if let Err(error) = process_stream_block(&mut state, block) {
                             state.finished = true;
                             state.ready.push_back(Err(Box::new(io::Error::new(
@@ -3995,9 +3985,6 @@ mod tests {
             .unwrap();
 
         assert!(child.join().unwrap().success());
-        if pending.as_slice() == b"\n" {
-            pending.clear();
-        }
         assert!(
             request.contains(&format!("Authorization: Bearer {secret}")),
             "{request}"
@@ -6385,12 +6372,9 @@ mod tests {
                 );
             }
         }
-        if pending.as_slice() == b"\n" {
-            pending.clear();
-        }
         assert!(
-            pending.is_empty(),
-            "unconsumed SSE tail at EOF: {pending:?}"
+            pending.as_slice() == b"\n",
+            "unexpected SSE tail at EOF: {pending:?}"
         );
         let text = String::from_utf8(
             output

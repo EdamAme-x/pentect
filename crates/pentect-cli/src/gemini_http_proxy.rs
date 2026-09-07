@@ -940,15 +940,9 @@ fn streaming_response_body(
                         ))));
                         continue;
                     }
-                    if state.pending.as_slice() == b"\n" {
-                        state.pending.clear();
-                    }
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        if state.pending.first() == Some(&b'\n') {
-                            state.pending.drain(..1);
-                        }
                         match rewrite_sse_block(&block, &state.plugins, state.block_unknown_formats)
                         {
                             Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
