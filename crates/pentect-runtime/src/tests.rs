@@ -4340,8 +4340,13 @@ fn read_bytes_rejects_a_fifo_without_bypassing_the_input_limit() {
     use std::os::unix::ffi::OsStrExt as _;
 
     let root = temp_root("read-bytes-fifo-limit");
+    let regular = root.join("large.txt");
     let fifo = root.join("input.pipe");
     std::fs::create_dir_all(&root).unwrap();
+    let file = std::fs::File::create(&regular).unwrap();
+    file.set_len(MAX_INPUT_BYTES as u64 + 1).unwrap();
+    assert!(read_bytes(&regular).is_err());
+
     let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
 
@@ -4374,16 +4379,14 @@ fn read_bytes_rejects_a_fifo_without_bypassing_the_input_limit() {
         }
     });
 
-    assert!(
-        read_bytes(&fifo).is_err(),
-        "FIFO input bypassed the byte limit"
-    );
+    let result = read_bytes(&fifo);
     writer.join().unwrap();
-
-    let regular = root.join("large.txt");
-    let file = std::fs::File::create(&regular).unwrap();
-    file.set_len(MAX_INPUT_BYTES as u64 + 1).unwrap();
-    assert!(read_bytes(&regular).is_err());
+    if let Ok(bytes) = result {
+        panic!(
+            "FIFO input returned {} bytes despite the {MAX_INPUT_BYTES}-byte limit",
+            bytes.len()
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
