@@ -2288,6 +2288,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = tool_response(sequence, source)
             else:
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
+                env_handles = codex_env_handles(request)
+                if len(env_handles) == 2:
+                    handles = env_handles
                 if handles:
                     self.server.state.last_handles = handles
                 elif self.server.state.native_patch:
@@ -2468,6 +2471,16 @@ def anthropic_env_handles(request: dict[str, object]) -> list[str]:
                 continue
             return list(dict.fromkeys(HANDLE.findall(rendered)))[:2]
     return []
+
+
+def codex_env_handles(request: str) -> list[str]:
+    match = re.search(
+        r"FIRST_KEY=(<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>).*?"
+        r"SECOND_KEY=(<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>)",
+        request,
+        re.DOTALL,
+    )
+    return list(match.groups()) if match else []
 
 
 def client_command(
