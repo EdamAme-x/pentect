@@ -4255,6 +4255,44 @@ fn masked_read_copy_path_mirrors_relative_paths() {
 }
 
 #[test]
+fn masked_read_copy_paths_do_not_collide_for_project_punctuation() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-project-collision");
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let first = project.join("a b.env");
+    let second = project.join("a_b.env");
+    std::fs::write(
+        &first,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    std::fs::write(&second, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let (first_masked, second_masked) = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        (
+            masked_read_copy(&session, "a b.env").unwrap().unwrap(),
+            masked_read_copy(&session, "a_b.env").unwrap().unwrap(),
+        )
+    };
+
+    assert_ne!(first_masked, second_masked);
+    assert!(
+        std::fs::read_to_string(&first_masked)
+            .unwrap()
+            .contains("<<RUNPOD_API_KEY_")
+    );
+    assert!(
+        std::fs::read_to_string(&second_masked)
+            .unwrap()
+            .contains("<<OPENAI_API_KEY_")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let fixture = TestDirectory::new("masked-read-external-collision");
