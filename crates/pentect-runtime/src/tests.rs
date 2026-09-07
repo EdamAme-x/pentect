@@ -4308,6 +4308,13 @@ fn masked_read_copy_paths_remain_distinct_after_component_truncation() {
 }
 
 #[test]
+fn project_external_component_cannot_alias_external_source_namespace() {
+    let project_path = safe_masked_read_path(Path::new("_external/abc/file.env"));
+    let external_path = PathBuf::from("_external").join("abc").join("file.env");
+    assert_ne!(project_path, external_path);
+}
+
+#[test]
 fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let fixture = TestDirectory::new("masked-read-external-collision");

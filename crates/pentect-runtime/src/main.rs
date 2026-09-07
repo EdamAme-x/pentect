@@ -3272,7 +3272,10 @@ fn safe_masked_read_component(value: &str) -> String {
     // (`a b.env` and `a_b.env`) onto one writable masked copy. Keep the
     // readable form for ordinary names, but make every transformed component
     // collision-resistant by carrying a digest of its original spelling.
-    if out != value {
+    // `_external` is a reserved first-level directory for sources outside
+    // the project root. Escape a project component with that spelling so a
+    // project file cannot alias the external-source namespace.
+    if out != value || value == "_external" {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
         let digest = hasher.finalize();
