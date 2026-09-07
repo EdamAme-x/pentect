@@ -1489,10 +1489,16 @@ where
             diagnostic("sse-event-limit", "limit", "messages", false);
             return Err("Anthropic SSE event exceeded inspection limit".to_string());
         }
+        if self.pending.as_slice() == b"\n" {
+            self.pending.clear();
+        }
         self.pending.extend_from_slice(chunk);
         let mut output = Vec::new();
         while let Some(end) = first_sse_block_end(&self.pending) {
             let block = self.pending.drain(..end).collect::<Vec<_>>();
+            if self.pending.first() == Some(&b'\n') {
+                self.pending.drain(..1);
+            }
             self.process_block(block, &mut output)?;
             if self.terminated {
                 self.pending.clear();
@@ -1682,21 +1688,17 @@ fn encode_anthropic_sse_value(template: &str, value: &Value) -> Result<Vec<u8>, 
         .map_err(|error| format!("could not encode Anthropic SSE event: {error}"))?;
     let mut replaced = false;
     let mut output = String::with_capacity(template.len() + encoded.len());
-    for line in template.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+    for (trimmed, ending) in crate::sse::lines_with_endings(template) {
         if trimmed.starts_with("data:") {
             if !replaced {
                 output.push_str("data: ");
                 output.push_str(&encoded);
-                if line.ends_with("\r\n") {
-                    output.push_str("\r\n");
-                } else if line.ends_with('\n') {
-                    output.push('\n');
-                }
+                output.push_str(ending);
                 replaced = true;
             }
         } else {
-            output.push_str(line);
+            output.push_str(trimmed);
+            output.push_str(ending);
         }
     }
     replaced
@@ -1809,7 +1811,7 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
     let Ok(text) = std::str::from_utf8(block) else {
         return SseControlEvent::Other;
     };
-    let event = text.lines().find_map(|line| {
+    let event = crate::sse::lines(text).find_map(|line| {
         line.trim_end_matches('\r')
             .strip_prefix("event:")
             .map(str::trim)
@@ -1824,19 +1826,7 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
@@ -2768,8 +2758,11 @@ where
 }
 
 fn parse_sse(input: &str) -> Vec<SseBlock> {
+    // Normalize CRLF before bare CR so one physical line ending never turns
+    // into two separators. This parser already re-renders rewritten events.
     input
         .replace("\r\n", "\n")
+        .replace('\r', "\n")
         .split("\n\n")
         .filter(|block| !block.is_empty())
         .map(|block| {
@@ -2798,8 +2791,7 @@ fn parse_sse(input: &str) -> Vec<SseBlock> {
 }
 
 fn sse_json_data(input: &str) -> Option<Value> {
-    let data = input
-        .lines()
+    let data = crate::sse::lines(input)
         .filter_map(|line| {
             line.trim_end_matches('\r')
                 .strip_prefix("data:")
@@ -5047,6 +5039,25 @@ mod tests {
             .is_empty());
         let output = transformer.push(&event.as_bytes()[split..]).unwrap();
         assert_eq!(output, vec![Bytes::from(event)]);
+    }
+
+    #[test]
+    fn streaming_text_accepts_bare_cr_event_boundaries() {
+        let events = concat!("event: content_block_start\r", "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\r", "event: content_block_delta\r", "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<<CHARGE_0123456789abcdef>>\"}}\r\r", "event: content_block_stop\r", "data: {\"type\":\"content_block_stop\",\"index\":0}\r\r");
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            None,
+            true,
+        );
+        let input = format!("{events}event:");
+        let mut chunks = Vec::new();
+        for byte in input.as_bytes() {
+            chunks.extend(transformer.push(std::slice::from_ref(byte)).unwrap());
+        }
+        chunks.extend(transformer.finish().unwrap());
+        let output = join_bytes(chunks);
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
     }
 
     #[test]

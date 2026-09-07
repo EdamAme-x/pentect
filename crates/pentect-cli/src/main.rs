@@ -30,6 +30,7 @@ mod plugins;
 mod plugins_cmd;
 mod remote_content;
 mod secure_temp;
+mod sse;
 mod uninstall;
 mod update;
 mod upstream;

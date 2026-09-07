@@ -2807,6 +2807,10 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
 }
 
 fn process_pending_stream_block(state: &mut StreamState) -> Result<(), String> {
+    if state.pending.as_slice() == b"\n" {
+        state.pending.clear();
+        return Ok(());
+    }
     if state.pending.is_empty() {
         return Ok(());
     }
@@ -2858,9 +2862,15 @@ fn streaming_response_body(
                         ))));
                         continue;
                     }
+                    if state.pending.as_slice() == b"\n" {
+                        state.pending.clear();
+                    }
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
+                        if state.pending.first() == Some(&b'\n') {
+                            state.pending.drain(..1);
+                        }
                         if let Err(error) = process_stream_block(&mut state, block) {
                             state.finished = true;
                             state.ready.push_back(Err(Box::new(io::Error::new(
@@ -3291,9 +3301,8 @@ fn chat_chunk_has_visible_delta(value: &Value) -> bool {
 }
 
 fn sse_data(text: &str) -> Option<Cow<'_, str>> {
-    let mut lines = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start));
+    let mut lines =
+        crate::sse::lines(text).filter_map(|line| line.strip_prefix("data:").map(str::trim_start));
     let first = lines.next()?;
     let Some(second) = lines.next() else {
         return Some(Cow::Borrowed(first));
@@ -3343,29 +3352,21 @@ fn encode_sse_value_for_event(
         .map_err(|error| format!("could not encode OpenAI SSE event: {error}"))?;
     let mut replaced = false;
     let mut output = String::with_capacity(template.len() + encoded.len());
-    for line in template.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+    for (trimmed, ending) in crate::sse::lines_with_endings(template) {
         if let Some(event) = event.filter(|_| trimmed.starts_with("event:")) {
             output.push_str("event: ");
             output.push_str(event);
-            if line.ends_with("\r\n") {
-                output.push_str("\r\n");
-            } else if line.ends_with('\n') {
-                output.push('\n');
-            }
+            output.push_str(ending);
         } else if trimmed.starts_with("data:") {
             if !replaced {
                 output.push_str("data: ");
                 output.push_str(&encoded);
-                if line.ends_with("\r\n") {
-                    output.push_str("\r\n");
-                } else if line.ends_with('\n') {
-                    output.push('\n');
-                }
+                output.push_str(ending);
                 replaced = true;
             }
         } else {
-            output.push_str(line);
+            output.push_str(trimmed);
+            output.push_str(ending);
         }
     }
     Ok(Bytes::from(output))
@@ -3586,19 +3587,7 @@ fn contains_completed_function_call(value: &Value) -> bool {
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4006,6 +3995,9 @@ mod tests {
             .unwrap();
 
         assert!(child.join().unwrap().success());
+        if pending.as_slice() == b"\n" {
+            pending.clear();
+        }
         assert!(
             request.contains(&format!("Authorization: Bearer {secret}")),
             "{request}"
@@ -5411,6 +5403,18 @@ mod tests {
     }
 
     #[test]
+    fn sse_parser_accepts_bare_cr_event_boundaries() {
+        let event = "data: {\"type\":\"response.completed\"}\r\r";
+        let chunk = format!("{event}event:");
+        let end = first_sse_block_end(chunk.as_bytes()).expect("complete SSE event");
+        assert_eq!(end, event.len());
+        assert_eq!(
+            sse_data(&chunk[..end]).as_deref(),
+            Some("{\"type\":\"response.completed\"}")
+        );
+    }
+
+    #[test]
     fn chat_messages_receive_the_handle_contract_without_replacing_user_text() {
         let mut value = serde_json::json!({
             "model": "gpt-5",
@@ -6318,6 +6322,85 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("local-value"), "{output}");
         assert!(!output.contains("<<CHARGE_"), "{output}");
+    }
+
+    #[test]
+    fn live_openai_stream_restores_handle_with_bare_cr_and_byte_chunks() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver =
+            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let input = concat!(
+            "event: response.output_text.delta\r",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"before <<CHAR\"}\r\r",
+            "event: response.output_text.delta\r",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"GE_0123456789abcdef>> after\"}\r\r",
+            "event: response.output_text.done\r",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m\",\"content_index\":0,\"text\":\"before <<CHARGE_0123456789abcdef>> after\"}\r\r"
+        );
+        let mut pending = Vec::new();
+        let mut output = Vec::new();
+        for byte in input.as_bytes() {
+            pending.push(*byte);
+            while let Some(end) = first_sse_block_end(&pending) {
+                let block = pending.drain(..end).collect::<Vec<_>>();
+                output.extend(
+                    rewrite_openai_sse_block(&block, &plugins, true, &mut streams, &mut resolve)
+                        .unwrap(),
+                );
+            }
+        }
+        let text = output
+            .into_iter()
+            .flat_map(|block| block.to_vec())
+            .collect::<Vec<_>>();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("local-value"), "{text}");
+        assert!(!text.contains("<<CHARGE_"), "{text}");
+    }
+
+    #[test]
+    fn live_openai_stream_handles_crlf_split_at_every_byte_boundary() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver =
+            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let input = concat!(
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"<<CHAR\"}\r\n\r\n",
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"GE_0123456789abcdef>>\"}\r\n\r\n",
+            "event: response.output_text.done\r\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m\",\"content_index\":0,\"text\":\"<<CHARGE_0123456789abcdef>>\"}\r\n\r\n"
+        );
+        let mut pending = Vec::new();
+        let mut output = Vec::new();
+        for byte in input.as_bytes() {
+            pending.push(*byte);
+            while let Some(end) = first_sse_block_end(&pending) {
+                let block = pending.drain(..end).collect::<Vec<_>>();
+                output.extend(
+                    rewrite_openai_sse_block(&block, &plugins, true, &mut streams, &mut resolve)
+                        .unwrap(),
+                );
+            }
+        }
+        if pending.as_slice() == b"\n" {
+            pending.clear();
+        }
+        assert!(
+            pending.is_empty(),
+            "unconsumed SSE tail at EOF: {pending:?}"
+        );
+        let text = String::from_utf8(
+            output
+                .into_iter()
+                .flat_map(|block| block.to_vec())
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(text.matches("local-value").count(), 2, "{text}");
+        assert!(!text.contains("<<CHARGE_"), "{text}");
     }
 
     #[test]
