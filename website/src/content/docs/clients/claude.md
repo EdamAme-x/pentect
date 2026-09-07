@@ -41,12 +41,18 @@ remote session passes through Pentect's local gateway.
 | `pentect claude app` | One supported Claude Desktop launch |
 | `pentect claude --plugins NAME` | One launch with the selected plugin set |
 
-On Unix, if the shell-facing Pentect process is forcibly killed, its guardian
-stops the Claude process group before releasing generated settings. This covers
-ordinary descendants that remain in that group. It does not promise cleanup
-for deliberately detached processes. If the guardian itself is also forcibly
-killed, Pentect preserves the unreleased private settings session rather than
-risking deletion while its Claude process might still be active.
+For the `pentect claude` CLI launch on Linux, if the shell-facing Pentect
+process is forcibly killed, its guardian uses subreaper support, pidfds, and
+`/proc` child discovery, when available, to stop ordinary descendants across
+process groups before releasing generated settings. If those facilities are
+unavailable, Pentect warns and falls back to the original process group. On
+macOS, CLI supervision is process-group based; an ordinary child such as an MCP
+server can create another group outside that boundary. See
+[Compatibility](/reference/compatibility/) for the current lifecycle limits.
+If the CLI guardian itself is also forcibly killed, Pentect preserves the
+unreleased private settings session rather than risking deletion while its
+Claude process might still be active. Claude Desktop has the separate lifecycle
+contract described below.
 
 On Windows, a protected launch ties the helper and Claude process tree to a
 kill-on-close job owned by the shell-facing Pentect process. Generated settings
