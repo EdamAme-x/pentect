@@ -2143,8 +2143,11 @@ class State:
         self.native_target_path = ""
         self.native_read_sent = False
         self.native_read_back_sent = False
+        self.native_read_back_id: str | None = None
         self.native_write_sent = False
         self.native_patch_sent = False
+        self.native_patch_read_sent = False
+        self.native_patch_read_call_id: str | None = None
         self.native_write_inputs: list[dict[str, str]] = []
         self.native_patch_inputs: list[str] = []
         self.last_handles: list[str] = []
@@ -2234,6 +2237,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif self.server.state.native_write and not self.server.state.native_read_back_sent:
                 self.server.state.native_read_back_sent = True
+                self.server.state.native_read_back_id = f"toolu_e2e_{sequence}"
                 action = "tool:Read:back"
                 payload = anthropic_read_response(
                     sequence, self.server.state.native_target_path
@@ -2299,6 +2303,18 @@ class Handler(BaseHTTPRequestHandler):
                     source = (
                         f"const r = await tools.apply_patch({json.dumps(patch)}); "
                         "text(r);"
+                    )
+                    payload = tool_response(sequence, source)
+                elif self.server.state.native_patch and not self.server.state.native_patch_read_sent:
+                    self.server.state.native_patch_read_sent = True
+                    self.server.state.native_patch_read_call_id = f"call_e2e_{sequence}"
+                    code = (
+                        "from pathlib import Path; "
+                        f"print(Path({json.dumps(self.server.state.native_target_path)}).read_text(), end='')"
+                    )
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(shell_command(['python', '-c', code]))}}}); "
+                        "text(r.output);"
                     )
                     payload = tool_response(sequence, source)
                 else:
@@ -2535,8 +2551,8 @@ def run_client(
             project.mkdir()
             (project / ".env").write_text(f"FIRST_KEY={invalid}\nSECOND_KEY={valid}\n", encoding="utf-8")
             if native_write or native_patch:
-                (project / "verified-config.json").write_text(
-                    '{"api_key":"PLACEHOLDER"}\n', encoding="utf-8"
+                (project / "verified-config.json").write_bytes(
+                    b'{"api_key":"PLACEHOLDER"}\n'
                 )
             (project / "plugin-input.txt").write_text(
                 PLUGIN_PLAINTEXT + "\n", encoding="utf-8"
@@ -2659,50 +2675,83 @@ else:
                     raise RuntimeError("native Edit fixture did not use the absolute target path")
                 if not HANDLE.search(state.native_write_inputs[0]["new_string"]):
                     raise RuntimeError("native Edit fixture did not carry an opaque handle")
-                written_text = (
-                    written.read_text(encoding="utf-8") if written.is_file() else "<missing>"
-                )
-                if written_text != expected_content:
-                    safe_text = written_text.replace(valid, "<synthetic-key>").replace(
-                        invalid, "<synthetic-key>"
+                written_bytes = written.read_bytes() if written.is_file() else b"<missing>"
+                expected_bytes = expected_content.encode("utf-8")
+                if written_bytes != expected_bytes:
+                    safe_bytes = written_bytes.replace(valid.encode(), b"<synthetic-key>").replace(
+                        invalid.encode(), b"<synthetic-key>"
                     )
                     raise RuntimeError(
                         "native Edit did not produce exact verified-config.json content: "
-                        + repr(safe_text)
+                        + repr(safe_bytes)
                         + "\nagent output:\n"
                         + completed.stdout.replace(valid, "<synthetic-key>")
                         .replace(invalid, "<synthetic-key>")[-4000:]
                         + f"\nfixture actions={state.anthropic_actions!r}"
                         + f"\nmodel requests={len(state.model_requests)}"
                     )
-                if not written_text.endswith("\n") or json.loads(written_text) != {"api_key": valid}:
+                if not written_bytes.endswith(b"\n") or json.loads(written_bytes) != {"api_key": valid}:
                     raise RuntimeError("native Edit JSON content or final newline was incorrect")
-                if HANDLE.search(written_text):
+                if HANDLE.search(written_bytes.decode("utf-8")):
                     raise RuntimeError("native Edit left an opaque handle on disk")
+                readback = None
+                for request in state.model_requests:
+                    try:
+                        parsed_request = json.loads(request)
+                    except json.JSONDecodeError:
+                        continue
+                    for message in parsed_request.get("messages", []):
+                        for block in message.get("content", []) if isinstance(message, dict) else []:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_result"
+                                and block.get("tool_use_id") == state.native_read_back_id
+                            ):
+                                readback = block
+                readback_content = readback.get("content") if readback else ""
+                readback_text = (
+                    readback_content if isinstance(readback_content, str) else ""
+                )
+                if not state.native_read_back_sent or not readback or readback.get("is_error"):
+                    raise RuntimeError("native Edit readback was not returned successfully")
+                if '"api_key"' not in readback_text or not HANDLE.search(readback_text):
+                    raise RuntimeError(
+                        "native Edit readback was not protected before model delivery: "
+                        + repr(readback_text)
+                    )
             elif native_patch:
                 expected_content = json.dumps(
                     {"api_key": valid}, separators=(",", ":")
                 ) + "\n"
                 written = project / "verified-config.json"
-                written_text = (
-                    written.read_text(encoding="utf-8") if written.is_file() else "<missing>"
-                )
+                written_bytes = written.read_bytes() if written.is_file() else b"<missing>"
+                expected_bytes = expected_content.encode("utf-8")
                 if len(state.native_patch_inputs) != 1:
                     raise RuntimeError("native apply_patch fixture did not emit exactly one patch")
+                if not state.native_patch_read_sent or not state.native_patch_read_call_id:
+                    raise RuntimeError("native apply_patch fixture did not perform readback")
                 if not HANDLE.search(state.native_patch_inputs[0]):
                     raise RuntimeError("fixture patch did not carry an opaque handle")
-                if written_text != expected_content:
-                    safe_text = written_text.replace(valid, "<synthetic-key>").replace(
-                        invalid, "<synthetic-key>"
+                if written_bytes != expected_bytes:
+                    safe_bytes = written_bytes.replace(valid.encode(), b"<synthetic-key>").replace(
+                        invalid.encode(), b"<synthetic-key>"
                     )
                     raise RuntimeError(
                         "native apply_patch did not produce exact file content: "
-                        + repr(safe_text)
+                        + repr(safe_bytes)
                     )
-                if not written_text.endswith("\n") or json.loads(written_text) != {"api_key": valid}:
+                if not written_bytes.endswith(b"\n") or json.loads(written_bytes) != {"api_key": valid}:
                     raise RuntimeError("native apply_patch JSON content or final newline was incorrect")
-                if HANDLE.search(written_text):
+                if HANDLE.search(written_bytes.decode("utf-8")):
                     raise RuntimeError("native apply_patch left an opaque handle on disk")
+                if not any(
+                    state.native_patch_read_call_id in request
+                    and HANDLE.search(request)
+                    for request in state.model_requests[4:]
+                ):
+                    raise RuntimeError(
+                        "native apply_patch readback was not returned protected to the model"
+                    )
             if not unicode_path.is_file() or unicode_path.read_text(encoding="utf-8") != UNICODE_ROUNDTRIP:
                 raise RuntimeError(f"{client} did not complete the Unicode file write/read roundtrip")
             remove_detector_plugin(pentect, project, environment)
@@ -3514,12 +3563,13 @@ def main() -> int:
     parser.add_argument("--claude-parent-kill", action="store_true")
     parser.add_argument("--tmux-cancellation", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
-    parser.add_argument(
+    native_mode = parser.add_mutually_exclusive_group()
+    native_mode.add_argument(
         "--native-handle-write",
         action="store_true",
         help="run the deterministic Claude native Edit handle roundtrip only",
     )
-    parser.add_argument(
+    native_mode.add_argument(
         "--native-handle-patch",
         action="store_true",
         help="run the deterministic Codex native apply_patch handle roundtrip only",
