@@ -2142,6 +2142,7 @@ class State:
         self.native_patch = native_patch
         self.native_target_path = ""
         self.native_read_sent = False
+        self.native_read_back_sent = False
         self.native_write_sent = False
         self.native_patch_sent = False
         self.native_write_inputs: list[dict[str, str]] = []
@@ -2230,6 +2231,12 @@ class Handler(BaseHTTPRequestHandler):
                 action = "tool:Edit"
                 payload = anthropic_write_response(
                     sequence, handle, self.server.state.native_target_path
+                )
+            elif self.server.state.native_write and not self.server.state.native_read_back_sent:
+                self.server.state.native_read_back_sent = True
+                action = "tool:Read:back"
+                payload = anthropic_read_response(
+                    sequence, self.server.state.native_target_path
                 )
             else:
                 action = "text:done"
@@ -2646,6 +2653,8 @@ else:
                 written = project / "verified-config.json"
                 if len(state.native_write_inputs) != 1 or state.native_write_inputs[0]["name"] != "Edit":
                     raise RuntimeError("native Edit fixture did not emit exactly one Edit call")
+                if not state.native_read_back_sent:
+                    raise RuntimeError("native Edit fixture did not perform the requested readback")
                 if state.native_write_inputs[0]["file_path"] != str(written):
                     raise RuntimeError("native Edit fixture did not use the absolute target path")
                 if not HANDLE.search(state.native_write_inputs[0]["new_string"]):
@@ -2661,9 +2670,8 @@ else:
                         "native Edit did not produce exact verified-config.json content: "
                         + repr(safe_text)
                         + "\nagent output:\n"
-                        + completed.stdout.replace(valid, "<synthetic-key>").replace(
-                            invalid, "<synthetic-key>"
-                        )
+                        + completed.stdout.replace(valid, "<synthetic-key>")
+                        .replace(invalid, "<synthetic-key>")[-4000:]
                         + f"\nfixture actions={state.anthropic_actions!r}"
                         + f"\nmodel requests={len(state.model_requests)}"
                     )
@@ -2702,6 +2710,13 @@ else:
                 f"installed {client} E2E passed: project plugin "
                 "inspect/test/add/setup/update/reinstall/mask/remove, two key handles, "
                 "no model/log plaintext"
+                + (
+                    "; native Read/Edit handle roundtrip with exact disk JSON"
+                    if native_write
+                    else "; native apply_patch handle roundtrip with exact disk JSON"
+                    if native_patch
+                    else ""
+                )
             )
     finally:
         server.shutdown()
@@ -3539,6 +3554,9 @@ def main() -> int:
     # transport. A regression should fail before the slower Codex startup.
     for client in args.clients or ("claude", "codex", "opencode", "pi"):
         run_client(args.pentect, client)
+    if args.clients is None:
+        run_client(args.pentect, "claude", native_write=True)
+        run_client(args.pentect, "codex", native_patch=True)
     if args.clients is None or "codex" in args.clients:
         run_cancellation(args.pentect)
         if not args.skip_image:

@@ -3567,6 +3567,32 @@ fn env_like_tool_output_masks_all_env_values() {
 }
 
 #[test]
+fn tool_output_masking_roundtrips_plain_envelopes_and_json_escaped_newlines() {
+    let (root, session) = empty_session("tool-output-envelope-roundtrip");
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let cases = [
+        format!("LIVE_KEY={raw}\n"),
+        serde_json::json!({
+            "stdout": format!("LIVE_KEY={raw}\n"),
+            "exit_code": 0,
+            "status": "completed"
+        })
+        .to_string(),
+        serde_json::to_string(&format!("LIVE_KEY={raw}\n")).unwrap(),
+    ];
+
+    for output in cases {
+        let masked = mask_tool_output(&session, &output).unwrap();
+        assert!(!masked.contains(raw), "protected output leaked: {masked}");
+        let restored = MemoryStore::for_session(&session)
+            .resolve_all(&masked)
+            .unwrap();
+        assert_eq!(restored, output);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn codex_posttool_does_not_block_already_masked_exec_output() {
     let (root, session) = empty_session("hook-post-codex-already-masked");
     let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
