@@ -2031,6 +2031,77 @@ def anthropic_tool_response(sequence: int, command: str) -> bytes:
     ])
 
 
+def anthropic_write_response(sequence: int, handle: str, file_path: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Edit",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(
+                    {
+                        "file_path": file_path,
+                        "old_string": "PLACEHOLDER",
+                        "new_string": handle,
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
+def anthropic_read_response(sequence: int, file_path: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Read",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(
+                    {"file_path": file_path}, separators=(",", ":")
+                ),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
 def anthropic_text_response(sequence: int, text: str) -> bytes:
     return anthropic_sse([
         {"type": "message_start", "message": anthropic_message(sequence)},
@@ -2055,10 +2126,27 @@ def anthropic_text_response(sequence: int, text: str) -> bytes:
 
 
 class State:
-    def __init__(self, valid: str, invalid: str, *, hold_model: bool = False) -> None:
+    def __init__(
+        self,
+        valid: str,
+        invalid: str,
+        *,
+        hold_model: bool = False,
+        native_write: bool = False,
+        native_patch: bool = False,
+    ) -> None:
         self.valid = valid
         self.invalid = invalid
         self.hold_model = hold_model
+        self.native_write = native_write
+        self.native_patch = native_patch
+        self.native_target_path = ""
+        self.native_read_sent = False
+        self.native_write_sent = False
+        self.native_patch_sent = False
+        self.native_write_inputs: list[dict[str, str]] = []
+        self.native_patch_inputs: list[str] = []
+        self.last_handles: list[str] = []
         self.model_request_seen = threading.Event()
         self.release_model_request = threading.Event()
         self.model_requests: list[str] = []
@@ -2102,6 +2190,10 @@ class Handler(BaseHTTPRequestHandler):
                 for tool in parsed.get("tools", [])
             )
             handles = anthropic_env_handles(parsed)
+            if handles:
+                self.server.state.last_handles = handles
+            elif self.server.state.native_write:
+                handles = self.server.state.last_handles
             attempts = len(self.server.state.service_attempts)
             if not bash_enabled:
                 action = "text:no-bash"
@@ -2119,6 +2211,25 @@ class Handler(BaseHTTPRequestHandler):
                 action = f"tool:probe:{attempts}"
                 payload = anthropic_tool_response(
                     sequence, self._probe_command(handles[attempts], posix_shell=True)
+                )
+            elif self.server.state.native_write and not self.server.state.native_read_sent:
+                self.server.state.native_read_sent = True
+                action = "tool:Read"
+                payload = anthropic_read_response(
+                    sequence, self.server.state.native_target_path
+                )
+            elif self.server.state.native_write and not self.server.state.native_write_sent:
+                handle = handles[1]
+                self.server.state.native_write_sent = True
+                self.server.state.native_write_inputs.append({
+                    "name": "Edit",
+                    "file_path": self.server.state.native_target_path,
+                    "old_string": "PLACEHOLDER",
+                    "new_string": handle,
+                })
+                action = "tool:Edit"
+                payload = anthropic_write_response(
+                    sequence, handle, self.server.state.native_target_path
                 )
             else:
                 action = "text:done"
@@ -2159,10 +2270,30 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
+                if handles:
+                    self.server.state.last_handles = handles
+                elif self.server.state.native_patch:
+                    handles = self.server.state.last_handles
                 if sequence == 2 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[0]))
                 elif sequence == 3 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[1]))
+                elif self.server.state.native_patch and not self.server.state.native_patch_sent and len(handles) >= 2:
+                    self.server.state.native_patch_sent = True
+                    patch = (
+                        "*** Begin Patch\n"
+                        f"*** Update File: {self.server.state.native_target_path}\n"
+                        "@@\n"
+                        '-{"api_key":"PLACEHOLDER"}\n'
+                        f'+{{"api_key":"{handles[1]}"}}\n'
+                        "*** End Patch\n"
+                    )
+                    self.server.state.native_patch_inputs.append(patch)
+                    source = (
+                        f"const r = await tools.apply_patch({json.dumps(patch)}); "
+                        "text(r);"
+                    )
+                    payload = tool_response(sequence, source)
                 else:
                     payload = text_response(sequence, "DONE")
             self.send_response(200)
@@ -2280,9 +2411,32 @@ def anthropic_env_handles(request: dict[str, object]) -> list[str]:
 
 
 def client_command(
-    pentect: str, client: str, project: Path, upstream: str
+    pentect: str,
+    client: str,
+    project: Path,
+    upstream: str,
+    *,
+    native_write: bool = False,
+    native_patch: bool = False,
 ) -> list[str]:
-    prompt = "Read .env, write/read a Unicode path roundtrip, try each key against the local service, and finish after one succeeds."
+    prompt = (
+        "Read .env, write/read a Unicode path roundtrip, try each key against the local "
+        "service, and finish after one succeeds."
+    )
+    tools = "Read,Bash,Edit" if native_write else "Bash"
+    if native_write:
+        prompt = (
+            "Read .env, try each key against the local service, then use the native Edit "
+            "tool exactly once to update verified-config.json with the successful key in an "
+            "api_key JSON field, including a final newline. Read that file back and finish. "
+            "Do not use Bash, cp, shell redirection, or a helper script for the file edit."
+        )
+    if native_patch:
+        prompt = (
+            "Read .env, try each key against the local service, then use the native apply_patch "
+            "tool exactly once to update verified-config.json with the successful key. Read "
+            "that file back and finish. Do not use shell redirection, cp, or a helper script."
+        )
     if client == "codex":
         return [
             pentect,
@@ -2326,7 +2480,7 @@ def client_command(
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--tools",
-            "Bash",
+            tools,
             "--model",
             "claude-sonnet-4-5",
             prompt,
@@ -2350,10 +2504,16 @@ def client_command(
     ]
 
 
-def run_client(pentect: str, client: str) -> None:
+def run_client(
+    pentect: str,
+    client: str,
+    *,
+    native_write: bool = False,
+    native_patch: bool = False,
+) -> None:
     valid = "".join(("rpa_", "PENTECT_VALID_", "0123456789abcdef"))
     invalid = "".join(("rpa_", "PENTECT_INVALID_", "fedcba9876543210"))
-    state = State(valid, invalid)
+    state = State(valid, invalid, native_write=native_write, native_patch=native_patch)
     server = FixtureServer(state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2367,6 +2527,10 @@ def run_client(pentect: str, client: str) -> None:
             home.mkdir()
             project.mkdir()
             (project / ".env").write_text(f"FIRST_KEY={invalid}\nSECOND_KEY={valid}\n", encoding="utf-8")
+            if native_write or native_patch:
+                (project / "verified-config.json").write_text(
+                    '{"api_key":"PLACEHOLDER"}\n', encoding="utf-8"
+                )
             (project / "plugin-input.txt").write_text(
                 PLUGIN_PLAINTEXT + "\n", encoding="utf-8"
             )
@@ -2396,6 +2560,7 @@ else:
                 encoding="utf-8",
             )
             environment = isolated_environment(home, root / "logs")
+            state.native_target_path = str(project / "verified-config.json")
             environment.update({
                 "OPENAI_API_KEY": "local-fixture",
                 "ANTHROPIC_API_KEY": "local-fixture",
@@ -2414,6 +2579,8 @@ else:
                 client,
                 project,
                 f"http://127.0.0.1:{server.server_port}/v1",
+                native_write=native_write,
+                native_patch=native_patch,
             )
             if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *command]
@@ -2472,6 +2639,62 @@ else:
                 raise RuntimeError(
                     f"{client} did not record a completed HTTP tool-input restoration"
                 )
+            if native_write:
+                expected_content = json.dumps(
+                    {"api_key": valid}, separators=(",", ":")
+                ) + "\n"
+                written = project / "verified-config.json"
+                if len(state.native_write_inputs) != 1 or state.native_write_inputs[0]["name"] != "Edit":
+                    raise RuntimeError("native Edit fixture did not emit exactly one Edit call")
+                if state.native_write_inputs[0]["file_path"] != str(written):
+                    raise RuntimeError("native Edit fixture did not use the absolute target path")
+                if not HANDLE.search(state.native_write_inputs[0]["new_string"]):
+                    raise RuntimeError("native Edit fixture did not carry an opaque handle")
+                written_text = (
+                    written.read_text(encoding="utf-8") if written.is_file() else "<missing>"
+                )
+                if written_text != expected_content:
+                    safe_text = written_text.replace(valid, "<synthetic-key>").replace(
+                        invalid, "<synthetic-key>"
+                    )
+                    raise RuntimeError(
+                        "native Edit did not produce exact verified-config.json content: "
+                        + repr(safe_text)
+                        + "\nagent output:\n"
+                        + completed.stdout.replace(valid, "<synthetic-key>").replace(
+                            invalid, "<synthetic-key>"
+                        )
+                        + f"\nfixture actions={state.anthropic_actions!r}"
+                        + f"\nmodel requests={len(state.model_requests)}"
+                    )
+                if not written_text.endswith("\n") or json.loads(written_text) != {"api_key": valid}:
+                    raise RuntimeError("native Edit JSON content or final newline was incorrect")
+                if HANDLE.search(written_text):
+                    raise RuntimeError("native Edit left an opaque handle on disk")
+            elif native_patch:
+                expected_content = json.dumps(
+                    {"api_key": valid}, separators=(",", ":")
+                ) + "\n"
+                written = project / "verified-config.json"
+                written_text = (
+                    written.read_text(encoding="utf-8") if written.is_file() else "<missing>"
+                )
+                if len(state.native_patch_inputs) != 1:
+                    raise RuntimeError("native apply_patch fixture did not emit exactly one patch")
+                if not HANDLE.search(state.native_patch_inputs[0]):
+                    raise RuntimeError("fixture patch did not carry an opaque handle")
+                if written_text != expected_content:
+                    safe_text = written_text.replace(valid, "<synthetic-key>").replace(
+                        invalid, "<synthetic-key>"
+                    )
+                    raise RuntimeError(
+                        "native apply_patch did not produce exact file content: "
+                        + repr(safe_text)
+                    )
+                if not written_text.endswith("\n") or json.loads(written_text) != {"api_key": valid}:
+                    raise RuntimeError("native apply_patch JSON content or final newline was incorrect")
+                if HANDLE.search(written_text):
+                    raise RuntimeError("native apply_patch left an opaque handle on disk")
             if not unicode_path.is_file() or unicode_path.read_text(encoding="utf-8") != UNICODE_ROUNDTRIP:
                 raise RuntimeError(f"{client} did not complete the Unicode file write/read roundtrip")
             remove_detector_plugin(pentect, project, environment)
@@ -3276,6 +3499,16 @@ def main() -> int:
     parser.add_argument("--claude-parent-kill", action="store_true")
     parser.add_argument("--tmux-cancellation", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
+    parser.add_argument(
+        "--native-handle-write",
+        action="store_true",
+        help="run the deterministic Claude native Edit handle roundtrip only",
+    )
+    parser.add_argument(
+        "--native-handle-patch",
+        action="store_true",
+        help="run the deterministic Codex native apply_patch handle roundtrip only",
+    )
     args = parser.parse_args()
     candidate = Path(args.pentect)
     if candidate.is_file():
@@ -3291,6 +3524,16 @@ def main() -> int:
         return 0
     if args.tmux_cancellation:
         run_cancellation(args.pentect, tmux_pty=True)
+        return 0
+    if args.native_handle_write:
+        if args.clients and args.clients != ["claude"]:
+            parser.error("--native-handle-write only supports --client claude")
+        run_client(args.pentect, "claude", native_write=True)
+        return 0
+    if args.native_handle_patch:
+        if args.clients and args.clients != ["codex"]:
+            parser.error("--native-handle-patch only supports --client codex")
+        run_client(args.pentect, "codex", native_patch=True)
         return 0
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.
