@@ -52,6 +52,7 @@ jobs:
           sh tools/test_install.sh
           bash -n .github/scripts/publish-aur.sh
           python tools/test_client_smoke_coverage.py
+          python tools/test_installed_agent_environment.py
           python tools/test_release_package_metadata.py
           python -m unittest tools/test_creddata_shards.py tools/test_verify_credsweeper_evidence.py
           python -m py_compile tools/client_smoke.py tools/creddata_shards.py tools/install_portable_client_smoke.py tools/installed_agent_e2e.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/test_verify_credsweeper_evidence.py tools/verify_client_smoke_log.py tools/verify_credsweeper_evidence.py

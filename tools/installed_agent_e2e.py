@@ -25,6 +25,7 @@ from pathlib import Path
 HANDLE = re.compile(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>")
 PLUGIN_HANDLE = re.compile(r"<<PLUGIN_E2E_[0-9a-f]{16}>>")
 PLUGIN_PLAINTEXT = "PENTECT-PLUGIN-E2E-VALUE"
+UNICODE_ROUNDTRIP = "write/read ✓ 東京 — multiline\nsecond line\n"
 IMAGE_SECRET = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
 IMAGE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/d"
@@ -270,7 +271,22 @@ def remove_detector_plugin(
 
 
 def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
-    environment = os.environ.copy()
+    # Client launchers honor provider-specific config and process injection
+    # before they consult HOME/XDG. Start with only the OS/toolchain variables
+    # needed to run a client and the local plugin fixtures; never inherit an
+    # arbitrary caller variable (credentials, proxies, startup hooks, etc.).
+    allowed = {
+        "PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
+        "TEMP", "TMP", "TMPDIR", "LANG", "TERM", "TERMINFO", "CI",
+        "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR",
+        "CARGO_NET_OFFLINE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    }
+    allowed_upper = {name.upper() for name in allowed}
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in allowed_upper or key.upper().startswith("LC_")
+    }
     original_home_value = os.environ.get("HOME") or os.environ.get("USERPROFILE")
     original_home = Path(original_home_value) if original_home_value else None
     environment.update({
@@ -2091,9 +2107,9 @@ class Handler(BaseHTTPRequestHandler):
                 action = "text:no-bash"
                 payload = anthropic_text_response(sequence, "DONE")
             elif len(handles) < 2:
-                action = "tool:read"
+                action = "tool:roundtrip"
                 payload = anthropic_tool_response(
-                    sequence, shell_command(["python", "e2e_helper.py", "read"])
+                    sequence, shell_command(["python", "e2e_helper.py", "roundtrip"])
                 )
             elif (
                 attempts < 2
@@ -2136,7 +2152,7 @@ class Handler(BaseHTTPRequestHandler):
             if '"type":"input_image"' in request:
                 payload = text_response(sequence, "DONE")
             elif sequence == 1:
-                command = shell_command(["python", "e2e_helper.py", "read"])
+                command = shell_command(["python", "e2e_helper.py", "roundtrip"])
                 payload = tool_response(
                     sequence,
                     f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
@@ -2170,7 +2186,7 @@ class Handler(BaseHTTPRequestHandler):
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if sequence == 1:
                     payload = chat_tool_response(
-                        sequence, shell_command(["python", "e2e_helper.py", "read"])
+                        sequence, shell_command(["python", "e2e_helper.py", "roundtrip"])
                     )
                 elif sequence == 2 and len(handles) >= 2:
                     payload = chat_tool_response(
@@ -2266,7 +2282,7 @@ def anthropic_env_handles(request: dict[str, object]) -> list[str]:
 def client_command(
     pentect: str, client: str, project: Path, upstream: str
 ) -> list[str]:
-    prompt = "Read .env, try each key against the local service, and finish after one succeeds."
+    prompt = "Read .env, write/read a Unicode path roundtrip, try each key against the local service, and finish after one succeeds."
     if client == "codex":
         return [
             pentect,
@@ -2354,6 +2370,7 @@ def run_client(pentect: str, client: str) -> None:
             (project / "plugin-input.txt").write_text(
                 PLUGIN_PLAINTEXT + "\n", encoding="utf-8"
             )
+            unicode_path = project / "unicode 東京 path.txt"
             (project / "e2e_helper.py").write_text(
                 """from pathlib import Path
 import sys
@@ -2362,6 +2379,12 @@ import urllib.request
 if sys.argv[1] == "read":
     print(Path(".env").read_text(encoding="utf-8"))
     print(Path("plugin-input.txt").read_text(encoding="utf-8"))
+elif sys.argv[1] == "roundtrip":
+    path = Path("unicode 東京 path.txt")
+    path.write_text("write/read ✓ 東京 — multiline\\nsecond line\\n", encoding="utf-8")
+    print(Path(".env").read_text(encoding="utf-8"))
+    print(Path("plugin-input.txt").read_text(encoding="utf-8"))
+    print(path.read_text(encoding="utf-8"))
 elif sys.argv[1] == "probe":
     request = urllib.request.Request(
         sys.argv[2], data=b"", headers={"Authorization": f"Bearer {sys.argv[3]}"}
@@ -2449,6 +2472,8 @@ else:
                 raise RuntimeError(
                     f"{client} did not record a completed HTTP tool-input restoration"
                 )
+            if not unicode_path.is_file() or unicode_path.read_text(encoding="utf-8") != UNICODE_ROUNDTRIP:
+                raise RuntimeError(f"{client} did not complete the Unicode file write/read roundtrip")
             remove_detector_plugin(pentect, project, environment)
             print(
                 f"installed {client} E2E passed: project plugin "
@@ -2461,7 +2486,7 @@ else:
         thread.join()
 
 
-def run_cancellation(pentect: str) -> None:
+def run_cancellation(pentect: str, *, tmux_pty: bool = False) -> None:
     valid = "rpa_PENTECT_CANCEL_VALID_0123456789abcdef"
     invalid = "rpa_PENTECT_CANCEL_INVALID_fedcba9876543210"
     state = State(valid, invalid, hold_model=True)
@@ -2469,6 +2494,18 @@ def run_cancellation(pentect: str) -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     process: subprocess.Popen[str] | None = None
+    tmux_socket: Path | None = None
+    tmux_session: str | None = None
+
+    def cleanup_tmux() -> None:
+        nonlocal tmux_socket, tmux_session
+        if tmux_socket is not None and tmux_session is not None:
+            subprocess.run(
+                ["tmux", "-S", str(tmux_socket), "kill-session", "-t", tmux_session],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            tmux_socket = None
+            tmux_session = None
     try:
         with tempfile.TemporaryDirectory(
             prefix="pentect-cancel-e2e-", ignore_cleanup_errors=True
@@ -2490,7 +2527,7 @@ def run_cancellation(pentect: str) -> None:
                 "# cancellation E2E sentinel\n"
             )
             config.write_text(sentinel, encoding="utf-8")
-            environment = os.environ.copy()
+            environment = isolated_environment(home, root / "logs")
             environment.update({
                 "HOME": str(home),
                 "USERPROFILE": str(home),
@@ -2515,36 +2552,92 @@ def run_cancellation(pentect: str) -> None:
                     "/c",
                     *command,
                 ]
-            popen_options: dict[str, object] = {}
-            if os.name == "nt":
-                popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            if tmux_pty:
+                if os.name == "nt":
+                    raise RuntimeError("tmux PTY cancellation is only supported on POSIX")
+                tmux_socket = root / "tmux-cancellation.sock"
+                tmux_session = f"pentect-cancel-{os.getpid()}"
+                output_path = root / "tmux-cancellation.output"
+                shell = (
+                    f"{shlex.join(command)}; "
+                    f"printf '%s' $? >{shlex.quote(str(root / 'tmux-cancellation.status'))}"
+                )
+                subprocess.run(
+                    ["tmux", "-S", str(tmux_socket), "new-session", "-d", "-s", tmux_session,
+                     "sh", "-lc", shell],
+                    cwd=project, env=environment, check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                # Keep stdout/stderr attached to the foreground PTY. Capture
+                # the pane stream after the session starts instead of redirecting
+                # the child to files, so C-c exercises the real terminal path.
+                try:
+                    subprocess.run(
+                        ["tmux", "-S", str(tmux_socket), "pipe-pane", "-o", "-t", tmux_session,
+                         f"cat >{shlex.quote(str(output_path))}"],
+                        env=environment, check=True, stdout=subprocess.DEVNULL,
+                    )
+                except BaseException:
+                    # The temporary root is still alive here; reap the owned
+                    # server before propagating a setup failure.
+                    cleanup_tmux()
+                    raise
             else:
-                popen_options["start_new_session"] = True
-            process = subprocess.Popen(
-                command,
-                cwd=project,
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                **popen_options,
-            )
+                popen_options: dict[str, object] = {}
+                if os.name == "nt":
+                    popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    popen_options["start_new_session"] = True
+                process = subprocess.Popen(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    **popen_options,
+                )
             if not state.model_request_seen.wait(timeout=20):
+                cleanup_tmux()
                 raise RuntimeError("cancellation E2E never reached the model fixture")
-            if os.name == "nt":
-                process.send_signal(signal.CTRL_BREAK_EVENT)
+            if tmux_pty:
+                try:
+                    probe = subprocess.run(
+                        ["tmux", "-S", str(tmux_socket), "send-keys", "-t", tmux_session, "C-c"],
+                        env=environment, check=True, stdout=subprocess.DEVNULL,
+                    )
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        probe = subprocess.run(
+                            ["tmux", "-S", str(tmux_socket), "has-session", "-t", tmux_session],
+                            env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                        if probe.returncode != 0:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise RuntimeError("tmux foreground client did not exit within 8 seconds")
+                    time.sleep(0.2)
+                    output = output_path.read_text(encoding="utf-8", errors="replace")
+                    returncode = int((root / "tmux-cancellation.status").read_text())
+                finally:
+                    cleanup_tmux()
             else:
-                os.killpg(process.pid, signal.SIGINT)
-            try:
-                output, _ = process.communicate(timeout=8)
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError(
-                    "Pentect did not finish client cleanup within 8 seconds after interrupt"
-                ) from error
+                if os.name == "nt":
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(process.pid, signal.SIGINT)
+                try:
+                    output, _ = process.communicate(timeout=8)
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError(
+                        "Pentect did not finish client cleanup within 8 seconds after interrupt"
+                    ) from error
+                returncode = process.returncode
             sanitized = output.replace(valid, "<synthetic-key>").replace(
                 invalid, "<synthetic-key>"
             )
-            if process.returncode == 0:
+            if returncode == 0:
                 raise RuntimeError(
                     "interrupted Pentect unexpectedly returned success:\n" + sanitized
                 )
@@ -2576,6 +2669,7 @@ def run_cancellation(pentect: str) -> None:
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
+        cleanup_tmux()
         state.release_model_request.set()
         server.shutdown()
         server.server_close()
@@ -3079,7 +3173,7 @@ def run_image_redaction(pentect: str) -> None:
             project.mkdir()
             image = project / "secret.png"
             image.write_bytes(base64.b64decode(IMAGE_PNG_BASE64))
-            environment = os.environ.copy()
+            environment = isolated_environment(home, root / "logs")
             environment.update({
                 "HOME": str(home),
                 "USERPROFILE": str(home),
@@ -3180,6 +3274,7 @@ def main() -> int:
     parser.add_argument("--skip-image", action="store_true")
     parser.add_argument("--codex-parent-kill", action="store_true")
     parser.add_argument("--claude-parent-kill", action="store_true")
+    parser.add_argument("--tmux-cancellation", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
     args = parser.parse_args()
     candidate = Path(args.pentect)
@@ -3193,6 +3288,9 @@ def main() -> int:
         return 0
     if args.claude_parent_kill:
         run_claude_parent_kill(args.pentect)
+        return 0
+    if args.tmux_cancellation:
+        run_cancellation(args.pentect, tmux_pty=True)
         return 0
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.
