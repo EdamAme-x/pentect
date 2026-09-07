@@ -2318,12 +2318,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.server.state.native_patch and not self.server.state.native_patch_read_sent:
                     self.server.state.native_patch_read_sent = True
                     self.server.state.native_patch_read_call_id = f"call_e2e_{sequence}"
-                    code = (
-                        "from pathlib import Path; "
-                        f"print(Path({json.dumps(self.server.state.native_target_path)}).read_text(), end='')"
-                    )
                     source = (
-                        f"const r = await tools.exec_command({{cmd:{json.dumps(shell_command(['python', '-c', code]))}}}); "
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(shell_command(['python', 'e2e_helper.py', 'read_file', 'verified-config.json']))}}}); "
                         "text(r.output);"
                     )
                     payload = tool_response(sequence, source)
@@ -2616,6 +2612,8 @@ import urllib.request
 if sys.argv[1] == "read":
     print(Path(".env").read_text(encoding="utf-8"))
     print(Path("plugin-input.txt").read_text(encoding="utf-8"))
+elif sys.argv[1] == "read_file":
+    sys.stdout.write(Path(sys.argv[2]).read_text(encoding="utf-8"))
 elif sys.argv[1] == "roundtrip":
     path = Path("unicode 東京 path.txt")
     path.write_text("write/read ✓ 東京 — multiline\\nsecond line\\n", encoding="utf-8")
