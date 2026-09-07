@@ -2275,10 +2275,17 @@ class Handler(BaseHTTPRequestHandler):
                 payload = text_response(sequence, "DONE")
             elif sequence == 1:
                 command = shell_command(["python", "e2e_helper.py", "roundtrip"])
-                payload = tool_response(
-                    sequence,
-                    f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
-                )
+                if self.server.state.native_patch:
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); "
+                        "text(r);"
+                    )
+                else:
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); "
+                        "text(r.output);"
+                    )
+                payload = tool_response(sequence, source)
             else:
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if handles:
