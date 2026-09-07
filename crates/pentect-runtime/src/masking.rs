@@ -137,6 +137,19 @@ impl OutputMasker {
         text: &str,
         run_plugins: bool,
     ) -> Result<String, String> {
+        // Tool adapters commonly wrap command output in JSON. Decode that
+        // envelope before detection so JSON escapes (notably `\\n`) do not
+        // become part of the recovered secret value. Re-encoding after
+        // masking keeps the tool result valid JSON. Malformed JSON follows
+        // the existing text path unchanged.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            let (updated, changed) = crate::mask_tool_json(&value, self, run_plugins)?;
+            if changed {
+                return serde_json::to_string(&updated)
+                    .map_err(|error| format!("could not encode masked tool output: {error}"));
+            }
+            return Ok(text.to_string());
+        }
         let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
             Kind::Env
         } else {
@@ -377,28 +390,34 @@ impl OutputMasker {
             .ok_or_else(|| "text plugin payload requires text".to_string())
     }
 
-    pub(crate) fn mask_tool_result_scalar(
+    fn mask_tool_result_scalar_with_plugins(
         &mut self,
         text: &str,
         region_kind: RegionKind,
         key: Option<&str>,
         path: Option<&str>,
         hints: &[String],
+        run_plugins: bool,
     ) -> Result<String, String> {
         if scalar_is_env_assignment(text) {
-            let protected = self.mask_text(text, Kind::Env)?;
+            let protected = self.mask_text_with_plugins(text, Kind::Env, run_plugins)?;
             if protected != text {
                 return Ok(protected);
             }
         }
-        let protected_assignments = self.mask_embedded_env_assignments(text)?;
+        let protected_assignments =
+            self.mask_embedded_env_assignments_with_plugins(text, run_plugins)?;
         let redacted = redact_env_derivative_lines(&protected_assignments);
         let remasked = self.remask_all(&redacted)?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Prepare,
-            remasked,
-            &Kind::ToolResult,
-        )?;
+        let remasked = if run_plugins {
+            self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Prepare,
+                remasked,
+                &Kind::ToolResult,
+            )?
+        } else {
+            remasked
+        };
         let context = Context {
             path: path.map(str::to_string),
             key: key.map(str::to_string),
@@ -406,7 +425,11 @@ impl OutputMasker {
             kind: region_kind,
             format: Kind::ToolResult,
         };
-        let remasked = self.mask_plugin_input(remasked, Kind::ToolResult, Some(context.clone()))?;
+        let remasked = if run_plugins {
+            self.mask_plugin_input(remasked, Kind::ToolResult, Some(context.clone()))?
+        } else {
+            remasked
+        };
         let cfg = Config {
             disclose_length: false,
             ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
@@ -415,11 +438,15 @@ impl OutputMasker {
         let mut result = self.engine.mask_context(remasked, context.clone(), &cfg);
         if !masks_only_endpoint_metadata(&result) {
             let initially_masked = std::mem::take(&mut result.masked);
-            let masked = self.run_text_plugins(
-                crate::plugin_middleware::MiddlewareStage::Finalize,
-                initially_masked,
-                &Kind::ToolResult,
-            )?;
+            let masked = if run_plugins {
+                self.run_text_plugins(
+                    crate::plugin_middleware::MiddlewareStage::Finalize,
+                    initially_masked,
+                    &Kind::ToolResult,
+                )?
+            } else {
+                initially_masked
+            };
             let final_result = self.engine.mask_context(masked, context, &cfg);
             merge_final_mask_result(&mut result, final_result);
         }
@@ -430,22 +457,38 @@ impl OutputMasker {
         &mut self,
         scalars: &[ToolScalarInput],
     ) -> Result<Vec<String>, String> {
+        self.mask_tool_result_scalars_with_plugins(scalars, true)
+    }
+
+    pub(crate) fn mask_tool_result_scalars_without_plugins(
+        &mut self,
+        scalars: &[ToolScalarInput],
+    ) -> Result<Vec<String>, String> {
+        self.mask_tool_result_scalars_with_plugins(scalars, false)
+    }
+
+    fn mask_tool_result_scalars_with_plugins(
+        &mut self,
+        scalars: &[ToolScalarInput],
+        run_plugins: bool,
+    ) -> Result<Vec<String>, String> {
         if scalars.is_empty() {
             return Ok(Vec::new());
         }
-        if !self.plugin_middleware.is_empty()
+        if (run_plugins && !self.plugin_middleware.is_empty())
             || scalars
                 .iter()
                 .any(|scalar| contains_sensitive_env_assignment(&scalar.text))
         {
             let mut out = Vec::with_capacity(scalars.len());
             for scalar in scalars {
-                out.push(self.mask_tool_result_scalar(
+                out.push(self.mask_tool_result_scalar_with_plugins(
                     &scalar.text,
                     scalar.region_kind,
                     scalar.key.as_deref(),
                     scalar.path.as_deref(),
                     &scalar.hints,
+                    run_plugins,
                 )?);
             }
             return Ok(out);
@@ -459,12 +502,13 @@ impl OutputMasker {
             return scalars
                 .iter()
                 .map(|scalar| {
-                    self.mask_tool_result_scalar(
+                    self.mask_tool_result_scalar_with_plugins(
                         &scalar.text,
                         scalar.region_kind,
                         scalar.key.as_deref(),
                         scalar.path.as_deref(),
                         &scalar.hints,
+                        run_plugins,
                     )
                 })
                 .collect();
@@ -521,7 +565,16 @@ impl OutputMasker {
         Ok(masked)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn mask_embedded_env_assignments(&mut self, text: &str) -> Result<String, String> {
+        self.mask_embedded_env_assignments_with_plugins(text, true)
+    }
+
+    fn mask_embedded_env_assignments_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<String, String> {
         let mut out = String::with_capacity(text.len());
         let mut changed = false;
         for segment in text.split_inclusive('\n') {
@@ -533,7 +586,8 @@ impl OutputMasker {
                 .map_or((line, false), |line| (line, true));
             if let Some(start) = embedded_sensitive_env_assignment_start(line) {
                 out.push_str(&line[..start]);
-                let protected = self.mask_text(&line[start..], Kind::Env)?;
+                let protected =
+                    self.mask_text_with_plugins(&line[start..], Kind::Env, run_plugins)?;
                 changed |= protected != line[start..];
                 out.push_str(&protected);
             } else {

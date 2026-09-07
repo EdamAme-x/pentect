@@ -1557,7 +1557,60 @@ fn diagnostic_recovered_handles_have_exact_raw_bytes_across_output_shapes() {
         }
         let _ = std::fs::remove_dir_all(root);
     }
-    assert!(failures.is_empty(), "non-exact recovered cases: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "non-exact recovered cases: {failures:?}"
+    );
+}
+
+#[test]
+fn diagnostic_json_masking_preserves_literal_backslash_and_metadata() {
+    let root = temp_root("diagnostic-json-literal-backslash");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\\n";
+    let output = serde_json::json!({
+        "label": "東京 \"quoted\"",
+        "stdout": format!("LIVE_KEY={raw}")
+    })
+    .to_string();
+    let masked = mask_tool_output(&session, &output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    let parsed: Value = serde_json::from_str(&masked).unwrap();
+    assert_eq!(parsed["label"], "東京 \"quoted\"");
+    assert!(!masked.contains(raw));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn diagnostic_malformed_json_keeps_text_fallback() {
+    let root = temp_root("diagnostic-json-malformed");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = format!(r#"{{"stdout":"LIVE_KEY={raw}\\n"}} trailing"#);
+    let masked = mask_tool_output(&session, &output).unwrap();
+    assert!(masked.contains("<<"));
+    assert!(!masked.contains(raw));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn diagnostic_json_masking_without_plugins_still_decodes_recovery() {
+    let root = temp_root("diagnostic-json-no-plugins");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = serde_json::json!({"stdout": format!("LIVE_KEY={raw}\n")}).to_string();
+    let mut masker = masking::OutputMasker::new_shared(store.clone()).unwrap();
+    let masked = masker.mask_tool_output_without_plugins(&output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    assert_eq!(
+        serde_json::from_str::<Value>(&masked).unwrap()["stdout"],
+        format!("LIVE_KEY={handle}\n")
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

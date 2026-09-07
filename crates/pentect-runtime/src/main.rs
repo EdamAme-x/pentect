@@ -3903,7 +3903,7 @@ fn mask_tool_text_output(
     }
     let store = MemoryStore::for_session(session);
     let mut masker = OutputMasker::new_deferred(store)?;
-    let (updated, changed) = mask_tool_json(&output, &mut masker)?;
+    let (updated, changed) = mask_tool_json(&output, &mut masker, true)?;
     masker.flush()?;
     if changed || image_changed {
         Ok(ToolTextOutput::Updated(updated))
@@ -4164,10 +4164,18 @@ fn empty_json_value(value: &Value) -> bool {
     }
 }
 
-fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
+fn mask_tool_json(
+    value: &Value,
+    masker: &mut OutputMasker,
+    run_plugins: bool,
+) -> Result<(Value, bool), String> {
     let mut scalars = Vec::new();
     collect_tool_json_scalars(value, None, None, &[], &mut scalars);
-    let masked = masker.mask_tool_result_scalars(&scalars)?;
+    let masked = if run_plugins {
+        masker.mask_tool_result_scalars(&scalars)?
+    } else {
+        masker.mask_tool_result_scalars_without_plugins(&scalars)?
+    };
     let mut cursor = 0usize;
     let out = rebuild_masked_tool_json(value, &masked, &mut cursor)?;
     if cursor != masked.len() {
