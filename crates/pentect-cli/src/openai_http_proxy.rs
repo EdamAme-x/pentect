@@ -72,9 +72,10 @@ fn request_scoped_bounded_resolver(limit: usize) -> HandleResolver {
     let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
     let mut resolved_bytes = 0usize;
     Box::new(move |text, kind| {
-        let resolved = resolve(text, kind)?;
+        let mut resolved = resolve(text, kind)?;
         resolved_bytes = resolved_bytes.saturating_add(resolved.len());
         if resolved_bytes > limit {
+            resolved.zeroize();
             return Err("OpenAI restored response exceeded inspection limit".to_string());
         }
         Ok(resolved)
@@ -2838,6 +2839,19 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
         );
         if state.responses_tool_started.len() > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
             || state.responses_tool_completed.len() > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+            || state
+                .responses_tool_started
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(
+                    state
+                        .responses_tool_completed
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>(),
+                )
+                > MAX_PENDING_SSE_BYTES
         {
             return Err("OpenAI Responses produced too many tool call identities".to_string());
         }
@@ -2980,7 +2994,16 @@ fn record_responses_tool_progress(
                 if call {
                     for identity in function_call_identities(object) {
                         started.insert(identity.clone());
-                        if completion_envelope {
+                        let has_payload = match object.get("type").and_then(Value::as_str) {
+                            Some("function_call") => {
+                                object.get("arguments").is_some_and(Value::is_string)
+                            }
+                            Some("custom_tool_call") => {
+                                object.get("input").is_some_and(Value::is_string)
+                            }
+                            _ => false,
+                        };
+                        if completion_envelope && has_payload {
                             completed.insert(identity);
                         }
                     }
@@ -5587,6 +5610,29 @@ mod tests {
         let error = process_stream_block(
             &mut state,
             b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".to_vec(),
+        )
+        .unwrap_err();
+        assert!(error.contains("incomplete tool call"), "{error}");
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn responses_stream_late_missing_known_payload_releases_no_prior_call() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}}\n\n".to_vec(),
+        )
+        .unwrap();
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_2\",\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":null}}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert!(state.ready.is_empty());
+        let error = process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"},{\"id\":\"item_2\",\"type\":\"custom_tool_call\",\"name\":\"exec\"}]}}\n\n".to_vec(),
         )
         .unwrap_err();
         assert!(error.contains("incomplete tool call"), "{error}");
