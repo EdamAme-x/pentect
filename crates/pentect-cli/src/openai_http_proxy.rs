@@ -33,6 +33,8 @@ use crate::handle_contract::HANDLE_CONTRACT;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAT_TOOL_CALLS: usize = 1024;
+const CHAT_TOOL_INPUT_REJECTED: &str = "openai-chat-tool-input-rejected";
+const CHAT_TOOL_INPUT_ERROR_SSE: &[u8] = b"data: {\"error\":{\"message\":\"Pentect rejected a protected tool input\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"pentect_tool_input_rejected\"}}\n\n";
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
 fn proxy_diagnostic(reason: &str) {
@@ -3134,6 +3136,9 @@ fn streaming_response_body(
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
                         if let Err(error) = process_stream_block(&mut state, block) {
+                            if handle_chat_tool_input_rejection(&mut state, &error) {
+                                break;
+                            }
                             state.finished = true;
                             state.ready.push_back(Err(Box::new(io::Error::new(
                                 io::ErrorKind::PermissionDenied,
@@ -3210,6 +3215,20 @@ fn streaming_response_body(
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+fn handle_chat_tool_input_rejection(state: &mut StreamState, error: &str) -> bool {
+    if state.transform != StreamTransform::ChatCompletions || error != CHAT_TOOL_INPUT_REJECTED {
+        return false;
+    }
+    state.finished = true;
+    state.pending.clear();
+    state.chat.calls.clear();
+    state.chat.buffered_bytes = 0;
+    state.ready.push_back(Ok(Frame::data(Bytes::from_static(
+        CHAT_TOOL_INPUT_ERROR_SSE,
+    ))));
+    true
 }
 
 #[derive(Default)]
@@ -3553,7 +3572,8 @@ impl ChatStreamState {
                     arguments,
                     Some(name),
                     resolve,
-                )?;
+                )
+                .map_err(|_| CHAT_TOOL_INPUT_REJECTED.to_string())?;
             restored_tools = restored_tools.saturating_add(u64::from(changed));
             calls.push(serde_json::json!({
                 "index": index,
@@ -5820,6 +5840,49 @@ mod tests {
         assert_eq!(finished[1], Bytes::from_static(b"data: [DONE]\n\n"));
         assert!(state.calls.is_empty());
         assert_eq!(state.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn chat_validation_rejection_emits_one_native_error_and_no_tool_bytes() {
+        let mut state = StreamState {
+            upstream: Box::pin(stream::empty::<Result<Bytes, reqwest::Error>>()),
+            pending: Vec::new(),
+            ready: VecDeque::new(),
+            transform: StreamTransform::ChatCompletions,
+            chat: ChatStreamState::default(),
+            completions: CompletionStreamState::default(),
+            finished: false,
+            plugins: Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            restore_output: false,
+            block_unknown_formats: true,
+            output_text: HashMap::new(),
+            output_resolve: Box::new(|_text, _kind| Err("synthetic secret detail".to_string())),
+            restored_tools: ToolRestorationDedup::default(),
+            responses_tool_pending: VecDeque::new(),
+            responses_tool_pending_bytes: 0,
+            responses_tool_started: HashSet::new(),
+            responses_tool_completed: HashSet::new(),
+        };
+        process_stream_block(
+            &mut state,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"<<SECRET_0123456789abcdef>>\\\"}\"}}]},\"finish_reason\":null}]}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert!(state.ready.is_empty(), "tool deltas must remain buffered");
+
+        let error = process_stream_block(&mut state, b"data: [DONE]\n\n".to_vec()).unwrap_err();
+        assert_eq!(error, CHAT_TOOL_INPUT_REJECTED);
+        assert!(handle_chat_tool_input_rejection(&mut state, &error));
+        assert!(state.finished);
+        assert!(state.chat.calls.is_empty());
+        assert_eq!(state.ready.len(), 1);
+        let frame = state.ready.pop_front().unwrap().unwrap();
+        let bytes = frame.into_data().unwrap();
+        assert_eq!(bytes.as_ref(), CHAT_TOOL_INPUT_ERROR_SSE);
+        assert!(!bytes.windows(6).any(|window| window == b"call_1"));
+        assert!(!bytes.windows(6).any(|window| window == b"secret"));
+        assert!(!bytes.windows(9).any(|window| window == b"<<SECRET_"));
+        assert!(!bytes.windows(6).any(|window| window == b"[DONE]"));
     }
 
     #[test]
