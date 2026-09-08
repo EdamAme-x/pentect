@@ -3872,12 +3872,14 @@ mod tests {
     async fn streaming_chat_reassembles_tool_input_and_multiline_data() {
         let input = concat!(
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"http\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\n",
-            "data: \"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"token\\\":\\\"<<KEYED_SECRET_0123456789abcdef>>\\\"}\"}}\n\n",
+            "data: \"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<KEYED_SECRET_0123456789abcdef>>\\\"}\"}}\n\n",
             "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
         );
         let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
             Bytes::from_static(input.as_bytes()),
@@ -4719,25 +4721,22 @@ mod tests {
     }
 
     #[test]
-    fn completed_tool_calls_restore_nested_inputs_but_normal_text_stays_opaque() {
+    fn completed_tool_calls_restore_declared_inputs_but_normal_text_stays_opaque() {
         let handle = "<<SECRET_0011223344556677>>";
         let mut value = serde_json::json!({
             "content": [
                 {"type": "text", "text": format!("show {handle}")},
-                {"type": "tool_use", "name": "http", "input": {
-                    "headers": {"x-token": handle},
-                    "body": [handle]
+                {"type": "tool_use", "name": "Write", "input": {
+                    "content": handle,
+                    "metadata": {"x-token": handle}
                 }}
             ]
         });
         let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
         resolve_chat_tool_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["content"][0]["text"], format!("show {handle}"));
-        assert_eq!(
-            value["content"][1]["input"]["headers"]["x-token"],
-            "local-value"
-        );
-        assert_eq!(value["content"][1]["input"]["body"][0], "local-value");
+        assert_eq!(value["content"][1]["input"]["content"], "local-value");
+        assert_eq!(value["content"][1]["input"]["metadata"]["x-token"], handle);
     }
 
     #[test]
@@ -4811,8 +4810,8 @@ mod tests {
                     {"type": "thinking", "thinking": format!("consider {handle}"),
                         "signature": format!("signed-{handle}")},
                     {"type": "redacted_thinking", "data": format!("opaque-{handle}")},
-                    {"type": "tool_use", "name": "http", "input": {
-                        "headers": {"x-token": handle}
+                    {"type": "tool_use", "name": "Write", "input": {
+                        "content": handle
                     }}
                 ]
             }))
@@ -4827,10 +4826,7 @@ mod tests {
         assert_eq!(value["content"][1]["thinking"], "consider local-value");
         assert_eq!(value["content"][1]["signature"], format!("signed-{handle}"));
         assert_eq!(value["content"][2]["data"], format!("opaque-{handle}"));
-        assert_eq!(
-            value["content"][3]["input"]["headers"]["x-token"],
-            "local-value"
-        );
+        assert_eq!(value["content"][3]["input"]["content"], "local-value");
     }
 
     #[test]
