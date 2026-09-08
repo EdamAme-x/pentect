@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
+const MAX_VIEW_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_VIEW_TOKENS: usize = 4096;
+
 /// The data contract of the operation receiving a tool input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolInputKind {
@@ -195,6 +198,10 @@ pub fn process_recovery_tool_input(
 ) -> Result<ValidatedToolInput, ToolInputError> {
     let spans = scan_views(input)?;
     validate_surface(kind, &spans)?;
+    let known: std::collections::HashSet<_> = recovery.placeholders().into_iter().collect();
+    if spans.iter().any(|span| !known.contains(&span.handle)) {
+        return Err(ToolInputError::UnknownHandle);
+    }
     let text = recovery
         .resolve_with_views(input)
         .map_err(|error| match error {
@@ -217,10 +224,14 @@ struct ViewSpan {
 }
 
 fn scan_views(input: &str) -> Result<Vec<ViewSpan>, ToolInputError> {
+    if input.len() > MAX_VIEW_INPUT_BYTES {
+        return Err(ToolInputError::MalformedView);
+    }
     let mut spans = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative_start) = input[cursor..].find("<<") {
-        let start = cursor + relative_start;
+    for (start, _) in input.match_indices("<<") {
+        if spans.len() >= MAX_VIEW_TOKENS {
+            return Err(ToolInputError::MalformedView);
+        }
         let Some(relative_end) = input[start + 2..].find(">>") else {
             if is_placeholder(&input[start + 2..]) {
                 return Err(ToolInputError::MalformedView);
@@ -233,7 +244,6 @@ fn scan_views(input: &str) -> Result<Vec<ViewSpan>, ToolInputError> {
             .split_once('|')
             .map_or((body, None), |(handle, name)| (handle, Some(name)));
         let Ok(parts) = parse_placeholder(handle) else {
-            cursor = start + 2;
             continue;
         };
         let view = match name {
@@ -248,7 +258,6 @@ fn scan_views(input: &str) -> Result<Vec<ViewSpan>, ToolInputError> {
             handle: parts.handle,
             view,
         });
-        cursor = end;
     }
     Ok(spans)
 }
@@ -278,6 +287,7 @@ fn is_placeholder(body: &str) -> bool {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::collections::HashMap;
 
     fn resolver(handle: &str, view: HandleView) -> Result<String, ToolInputError> {
         match (handle, view) {
@@ -408,6 +418,76 @@ mod tests {
         assert_eq!(
             tracker.record(&OperationContext::new("session", "x".repeat(257))),
             Err(ToolInputError::InvalidOperationContext)
+        );
+    }
+
+    #[test]
+    fn recovery_adapter_rejects_unknown_raw_and_handles_full_placeholder_grammar() {
+        let mut values = HashMap::new();
+        let long_handle =
+            "<<KEY_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef>>";
+        values.insert(long_handle.to_string(), "synthetic-64".to_string());
+        let hinted = "<<KEY_abcdef0123456789_length_12_chars>>";
+        values.insert(hinted.to_string(), "synthetic-hint".to_string());
+        let recovery = Recovery::seal(values, &[9u8; 32]);
+
+        assert_eq!(
+            process_recovery_tool_input(
+                "x <<KEY_deadbeefdeadbeef>>",
+                ToolInputKind::Data,
+                &recovery,
+            ),
+            Err(ToolInputError::UnknownHandle)
+        );
+        assert_eq!(
+            process_recovery_tool_input(
+                "<<KEY_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|base64>>",
+                ToolInputKind::Code,
+                &recovery,
+            )
+            .unwrap()
+            .text,
+            data_encoding::BASE64.encode(b"synthetic-64")
+        );
+        assert_eq!(
+            process_recovery_tool_input(
+                "<<KEY_abcdef0123456789_length_12_chars|json>>",
+                ToolInputKind::JsonTemplate,
+                &recovery,
+            )
+            .unwrap()
+            .text,
+            "\"synthetic-hint\""
+        );
+    }
+
+    #[test]
+    fn ordinary_syntax_and_incomplete_view_are_distinguished() {
+        let recovery = Recovery::empty_for_key(&[8u8; 32]);
+        let heredoc = "cat <<EOF | sed 's/x/y/'\nEOF";
+        assert_eq!(
+            process_recovery_tool_input(heredoc, ToolInputKind::Data, &recovery)
+                .unwrap()
+                .text,
+            heredoc
+        );
+        assert_eq!(
+            process_recovery_tool_input(
+                "<<KEY_abcdef0123456789|base64",
+                ToolInputKind::Code,
+                &recovery,
+            ),
+            Err(ToolInputError::MalformedView)
+        );
+        assert_eq!(
+            process_recovery_tool_input(
+                "unicode 東京 <<not-a-handle>>",
+                ToolInputKind::Data,
+                &recovery
+            )
+            .unwrap()
+            .text,
+            "unicode 東京 <<not-a-handle>>"
         );
     }
 }
