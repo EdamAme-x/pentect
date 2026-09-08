@@ -253,6 +253,7 @@ struct StreamPattern {
     value: Vec<u8>,
     placeholder: Vec<u8>,
     token_boundaries: bool,
+    derived: bool,
 }
 
 impl Recovery {
@@ -261,31 +262,67 @@ impl Recovery {
         remasker.merge_recovery(self);
         remasker
     }
+
+    /// Opt-in stream remasker for raw and encoded recovery views.
+    pub fn stream_remasker_with_views(&self) -> RecoveryStreamRemasker {
+        let mut remasker = RecoveryStreamRemasker::default();
+        remasker.merge_recovery_with_views(self);
+        remasker
+    }
 }
 
 impl RecoveryStreamRemasker {
     pub fn merge_recovery(&mut self, recovery: &Recovery) {
+        self.merge_recovery_inner(recovery, false);
+    }
+
+    /// Add raw and experimental derived-view patterns to this stream.
+    pub fn merge_recovery_with_views(&mut self, recovery: &Recovery) {
+        self.merge_recovery_inner(recovery, true);
+    }
+
+    fn merge_recovery_inner(&mut self, recovery: &Recovery, include_views: bool) {
         let mut incoming = recovery
             .map
             .keys()
             .filter_map(|placeholder| {
-                recovery
-                    .reveal(placeholder)
-                    .filter(|value| is_remaskable_echo(value, placeholder))
-                    .map(|value| {
-                        let token_boundaries = requires_token_boundaries(&value);
-                        StreamPattern {
-                            value: value.into_bytes(),
+                recovery.reveal(placeholder).map(|mut value| {
+                    let mut patterns = Vec::new();
+                    if is_remaskable_echo(&value, placeholder) {
+                        patterns.push(StreamPattern {
+                            value: value.clone().into_bytes(),
                             placeholder: placeholder.as_bytes().to_vec(),
-                            token_boundaries,
+                            token_boundaries: requires_token_boundaries(&value),
+                            derived: false,
+                        });
+                    }
+                    if include_views {
+                        if let Some(base) = placeholder.strip_suffix(">>") {
+                            for view in ["base64", "json"] {
+                                if let Some(rendered) = view_rendered(&value, view) {
+                                    if !rendered.is_empty() {
+                                        patterns.push(StreamPattern {
+                                            value: rendered.into_bytes(),
+                                            placeholder: format!("{base}|{view}>>").into_bytes(),
+                                            token_boundaries: false,
+                                            derived: true,
+                                        });
+                                    }
+                                }
+                            }
                         }
-                    })
+                    }
+                    value.zeroize();
+                    patterns
+                })
             })
+            .flatten()
             .collect::<Vec<_>>();
         self.patterns.append(&mut incoming);
         self.patterns.sort_by(|left, right| {
             left.value
                 .cmp(&right.value)
+                .then_with(|| right.derived.cmp(&left.derived))
                 .then_with(|| {
                     remask_placeholder_priority_bytes(&right.placeholder)
                         .cmp(&remask_placeholder_priority_bytes(&left.placeholder))
@@ -1030,6 +1067,38 @@ mod tests {
                 .unwrap(),
             "YzJGdFpRPT0="
         );
+    }
+
+    #[test]
+    fn experimental_stream_remask_matches_whole_for_every_byte_split() {
+        let ph = "<<KEY_0123456789abcdef>>";
+        let value = "line\n雪 \"quoted\"";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[4u8; 32]);
+        let base = rec
+            .resolve_with_views("<<KEY_0123456789abcdef|base64>>")
+            .unwrap();
+        let json = rec
+            .resolve_with_views("<<KEY_0123456789abcdef|json>>")
+            .unwrap();
+        let input = format!("prefix {base} middle {json} suffix");
+        let expected = rec.remask_views(&input);
+        for split in 0..=input.len() {
+            let (left, right) = input.as_bytes().split_at(split);
+            let mut stream = rec.stream_remasker_with_views();
+            let mut output = stream.push_text(left);
+            output.extend(stream.push_text(right));
+            output.extend(stream.finish());
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                expected,
+                "split={split}"
+            );
+        }
+        let mut merged = rec.stream_remasker_with_views();
+        merged.merge_recovery_with_views(&rec);
+        let mut output = merged.push_text(input.as_bytes());
+        output.extend(merged.finish());
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
     }
 
     #[test]
