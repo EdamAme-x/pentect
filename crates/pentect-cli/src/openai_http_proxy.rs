@@ -2635,6 +2635,32 @@ where
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     });
+                let event_kind = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let required_payload = if matches!(
+                    event_kind,
+                    "function_call" | "response.function_call_arguments.done"
+                ) {
+                    Some("arguments")
+                } else if matches!(
+                    event_kind,
+                    "custom_tool_call" | "response.custom_tool_call_input.done"
+                ) && tool_name.as_deref().is_some_and(|name| {
+                    classify_openai_custom_tool_input(name) != pentect_agent::ToolInputKind::Unknown
+                }) {
+                    Some("input")
+                } else {
+                    None
+                };
+                if required_payload
+                    .is_some_and(|key| !object.get(key).is_some_and(Value::is_string))
+                {
+                    return Err(
+                        "OpenAI completed tool call is missing its input payload".to_string()
+                    );
+                }
                 for key in ["arguments", "input"] {
                     if let Some(Value::String(arguments)) = object.get_mut(key) {
                         let (resolved, changed) = if is_custom_call && key == "input" {
@@ -3030,15 +3056,18 @@ fn record_responses_tool_progress(
                 | "response.custom_tool_call_input.done"
         )
     ) {
+        let payload_is_complete = match event_type {
+            Some("response.function_call_arguments.done") => {
+                value.get("arguments").is_some_and(Value::is_string)
+            }
+            Some("response.custom_tool_call_input.done") => {
+                value.get("input").is_some_and(Value::is_string)
+            }
+            _ => false,
+        };
         for identity in function_call_identities(value.as_object().unwrap()) {
             started.insert(identity.clone());
-            if matches!(
-                event_type,
-                Some(
-                    "response.function_call_arguments.done"
-                        | "response.custom_tool_call_input.done"
-                )
-            ) {
+            if payload_is_complete {
                 completed.insert(identity);
             }
         }
@@ -3697,7 +3726,11 @@ fn rewrite_openai_sse_block_tracked(
     ) {
         return Ok(Vec::new());
     }
-    let completed_function_call = contains_completed_function_call(&value);
+    let completed_function_call = contains_completed_function_call(&value)
+        || (matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("response.output_item.done" | "response.completed")
+        ) && contains_any_function_call(&value));
     let output_event = restore_output && contains_openai_output_text(&value);
     if !completed_function_call && !output_event {
         return Ok(vec![Bytes::copy_from_slice(block)]);
@@ -5624,19 +5657,47 @@ mod tests {
             b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}}\n\n".to_vec(),
         )
         .unwrap();
-        process_stream_block(
+        let error = process_stream_block(
             &mut state,
             b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_2\",\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":null}}\n\n".to_vec(),
         )
-        .unwrap();
-        assert!(state.ready.is_empty());
-        let error = process_stream_block(
-            &mut state,
-            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"},{\"id\":\"item_2\",\"type\":\"custom_tool_call\",\"name\":\"exec\"}]}}\n\n".to_vec(),
-        )
         .unwrap_err();
-        assert!(error.contains("incomplete tool call"), "{error}");
+        assert!(error.contains("missing its input payload"), "{error}");
         assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn every_completed_known_openai_call_shape_requires_a_string_payload() {
+        let cases = [
+            serde_json::json!({"type": "function_call", "name": "exec_command"}),
+            serde_json::json!({"type": "function_call", "name": "exec_command", "arguments": null}),
+            serde_json::json!({"type": "response.function_call_arguments.done", "name": "exec_command"}),
+            serde_json::json!({"type": "response.function_call_arguments.done", "name": "exec_command", "arguments": null}),
+            serde_json::json!({"type": "custom_tool_call", "name": "exec"}),
+            serde_json::json!({"type": "custom_tool_call", "name": "exec", "input": null}),
+            serde_json::json!({"type": "response.custom_tool_call_input.done", "name": "exec"}),
+            serde_json::json!({"type": "response.custom_tool_call_input.done", "name": "exec", "input": null}),
+        ];
+        for mut case in cases {
+            let mut resolve = |_text: &str, _kind| Ok("must-not-run".to_string());
+            let error = rewrite_function_calls(&mut case, &mut resolve).unwrap_err();
+            assert!(
+                error.contains("missing its input payload"),
+                "{case}: {error}"
+            );
+        }
+
+        let mut unknown = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "future_tool",
+            "input": null
+        });
+        let mut resolve = |_text: &str, _kind| -> Result<String, String> {
+            panic!("unknown custom tool must remain inert")
+        };
+        assert!(rewrite_function_calls(&mut unknown, &mut resolve)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
