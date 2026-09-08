@@ -188,9 +188,9 @@ pub fn process_tool_input<R: ViewResolver>(
     })
 }
 
-/// Runtime adapter for the core recovery implementation.  This is the
-/// production entry point: callers still declare the operation surface here,
-/// while core owns the authenticated handle/view mapping and encoding.
+/// Runtime adapter for the core recovery implementation. This opt-in adapter
+/// lets a future integration declare the operation surface while core owns
+/// the authenticated handle/view mapping and encoding.
 pub fn process_recovery_tool_input(
     input: &str,
     kind: ToolInputKind,
