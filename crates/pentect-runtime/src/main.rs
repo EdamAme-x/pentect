@@ -21,8 +21,8 @@ mod output_remask;
 mod plugin_middleware;
 mod secure_io;
 pub use handle_views::{
-    process_tool_input, HandleView, OperationContext, RetryTracker, ToolInputError, ToolInputKind,
-    ValidatedToolInput, ViewResolver, MAX_OPERATION_RETRIES,
+    process_recovery_tool_input, process_tool_input, HandleView, OperationContext, RetryTracker,
+    ToolInputError, ToolInputKind, ValidatedToolInput, ViewResolver, MAX_OPERATION_RETRIES,
 };
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
@@ -42,9 +42,9 @@ pub fn experimental_handle_view_contract() -> &'static str {
     concat!(
         "Experimental encoded-view operation rules:\n",
         "- Use a raw handle only where the requested operation consumes data or a raw file.\n",
-        "- For code, use an explicit `|base64` view in an ordinary quoted string, then decode it with the local language runtime and pass the result through a data API such as argv, stdin, or a JSON serializer.\n",
+        "- For code, use an explicit `|base64` view in an ordinary quoted string, then let the local program decode that data and pass the result through a data API such as argv, stdin, or a JSON serializer; the model must not infer or print the plaintext.\n",
         "- Use `|json` only as a complete JSON string value in a JSON-template operation; do not place it in arbitrary code or shell syntax.\n",
-        "- Do not invoke Pentect, decode a handle yourself, print a secret, reread the source, or request an extra user action.\n",
+        "- Do not invoke Pentect, decode a raw handle yourself, print a secret, reread the source, or request an extra user action.\n",
         "- Preserve the view marker byte-for-byte until the local tool input is complete.\n",
     )
 }

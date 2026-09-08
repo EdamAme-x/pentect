@@ -6,8 +6,10 @@
 //! complete input before the resolver is called, so a late failure cannot
 //! publish a partially resolved tool input.
 
+use pentect_core::{parse_placeholder, Recovery};
 use std::collections::HashMap;
 use std::fmt;
+use zeroize::{Zeroize, Zeroizing};
 
 /// The data contract of the operation receiving a tool input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +57,7 @@ pub enum ToolInputError {
     UnsupportedView,
     UnknownHandle,
     RetryLimit,
+    InvalidOperationContext,
 }
 
 impl fmt::Display for ToolInputError {
@@ -65,6 +68,7 @@ impl fmt::Display for ToolInputError {
             Self::UnsupportedView => "protected handle view is unsupported for this operation",
             Self::UnknownHandle => "protected handle is unavailable in this session",
             Self::RetryLimit => "the same protected operation exceeded its retry limit",
+            Self::InvalidOperationContext => "protected operation identity is invalid",
         })
     }
 }
@@ -77,15 +81,24 @@ impl ToolInputError {
     }
 
     pub const fn retryable(self) -> bool {
-        true
+        matches!(self, Self::MalformedView | Self::UnsupportedView)
     }
 }
 
 /// A validated input ready for the caller's local execution path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ValidatedToolInput {
     pub text: String,
     pub executed: bool,
+}
+
+impl fmt::Debug for ValidatedToolInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedToolInput")
+            .field("text", &"<redacted>")
+            .field("executed", &self.executed)
+            .finish()
+    }
 }
 
 /// Maximum retries for one explicitly identified operation.
@@ -101,6 +114,13 @@ impl RetryTracker {
     /// Records one execution attempt.  Different operation IDs never consume
     /// each other's budget, even when their payloads happen to match.
     pub fn record(&mut self, context: &OperationContext) -> Result<(), ToolInputError> {
+        if context.session_id.is_empty()
+            || context.operation_id.is_empty()
+            || context.session_id.len() > 256
+            || context.operation_id.len() > 256
+        {
+            return Err(ToolInputError::InvalidOperationContext);
+        }
         if !self.attempts.contains_key(context) && self.attempts.len() >= MAX_TRACKED_OPERATIONS {
             return Err(ToolInputError::RetryLimit);
         }
@@ -114,6 +134,10 @@ impl RetryTracker {
 
     pub fn attempts(&self, context: &OperationContext) -> u8 {
         self.attempts.get(context).copied().unwrap_or(0)
+    }
+
+    pub fn finish(&mut self, context: &OperationContext) {
+        self.attempts.remove(context);
     }
 }
 
@@ -141,18 +165,45 @@ pub fn process_tool_input<R: ViewResolver>(
     let spans = scan_views(input)?;
     validate_surface(kind, &spans)?;
 
-    // No output is allocated or published until every view has passed the
-    // surface policy and every resolver lookup succeeds.
-    let mut output = String::with_capacity(input.len());
+    // No output is published until every view has passed the surface policy
+    // and every resolver lookup succeeds. The temporary is zeroized if a
+    // later resolver fails.
+    let mut output = Zeroizing::new(String::with_capacity(input.len()));
     let mut cursor = 0;
     for span in spans {
         output.push_str(&input[cursor..span.start]);
-        output.push_str(&resolver.resolve_view(&span.handle, span.view)?);
+        let rendered = Zeroizing::new(resolver.resolve_view(&span.handle, span.view)?);
+        output.push_str(&rendered);
         cursor = span.end;
     }
     output.push_str(&input[cursor..]);
+    let text = output.as_str().to_owned();
+    output.zeroize();
     Ok(ValidatedToolInput {
-        text: output,
+        text,
+        executed: false,
+    })
+}
+
+/// Runtime adapter for the core recovery implementation.  This is the
+/// production entry point: callers still declare the operation surface here,
+/// while core owns the authenticated handle/view mapping and encoding.
+pub fn process_recovery_tool_input(
+    input: &str,
+    kind: ToolInputKind,
+    recovery: &Recovery,
+) -> Result<ValidatedToolInput, ToolInputError> {
+    let spans = scan_views(input)?;
+    validate_surface(kind, &spans)?;
+    let text = recovery
+        .resolve_with_views(input)
+        .map_err(|error| match error {
+            pentect_core::RecoveryViewError::Malformed => ToolInputError::MalformedView,
+            pentect_core::RecoveryViewError::UnknownHandle => ToolInputError::UnknownHandle,
+            pentect_core::RecoveryViewError::UnknownView => ToolInputError::MalformedView,
+        })?;
+    Ok(ValidatedToolInput {
+        text,
         executed: false,
     })
 }
@@ -170,29 +221,31 @@ fn scan_views(input: &str) -> Result<Vec<ViewSpan>, ToolInputError> {
     let mut cursor = 0;
     while let Some(relative_start) = input[cursor..].find("<<") {
         let start = cursor + relative_start;
-        let relative_end = input[start + 2..]
-            .find(">>")
-            .ok_or(ToolInputError::MalformedView)?;
+        let Some(relative_end) = input[start + 2..].find(">>") else {
+            if is_placeholder(&input[start + 2..]) {
+                return Err(ToolInputError::MalformedView);
+            }
+            break;
+        };
         let end = start + 2 + relative_end + 2;
         let body = &input[start + 2..end - 2];
-        let (handle, view) = match body.split_once('|') {
-            None => (body, HandleView::Raw),
-            Some((handle, name)) => (
-                handle,
-                match name {
-                    "base64" => HandleView::Base64,
-                    "json" => HandleView::Json,
-                    _ => return Err(ToolInputError::MalformedView),
-                },
-            ),
+        let (handle, name) = body
+            .split_once('|')
+            .map_or((body, None), |(handle, name)| (handle, Some(name)));
+        let Ok(parts) = parse_placeholder(handle) else {
+            cursor = start + 2;
+            continue;
         };
-        if handle.is_empty() || handle.contains('<') || handle.contains('>') {
-            return Err(ToolInputError::MalformedView);
-        }
+        let view = match name {
+            None => HandleView::Raw,
+            Some("base64") => HandleView::Base64,
+            Some("json") => HandleView::Json,
+            Some(_) => return Err(ToolInputError::MalformedView),
+        };
         spans.push(ViewSpan {
             start,
             end,
-            handle: format!("<<{handle}>>"),
+            handle: parts.handle,
             view,
         });
         cursor = end;
@@ -206,12 +259,7 @@ fn validate_surface(kind: ToolInputKind, spans: &[ViewSpan]) -> Result<(), ToolI
             ToolInputKind::Data | ToolInputKind::RawFile => {
                 matches!(span.view, HandleView::Raw | HandleView::Base64)
             }
-            ToolInputKind::JsonTemplate => {
-                matches!(
-                    span.view,
-                    HandleView::Raw | HandleView::Base64 | HandleView::Json
-                )
-            }
+            ToolInputKind::JsonTemplate => matches!(span.view, HandleView::Json),
             ToolInputKind::Code => matches!(span.view, HandleView::Base64),
             ToolInputKind::Unknown => return Err(ToolInputError::UnknownSurface),
         };
@@ -220,6 +268,10 @@ fn validate_surface(kind: ToolInputKind, spans: &[ViewSpan]) -> Result<(), ToolI
         }
     }
     Ok(())
+}
+
+fn is_placeholder(body: &str) -> bool {
+    parse_placeholder(body).is_ok()
 }
 
 #[cfg(test)]
@@ -250,6 +302,7 @@ mod tests {
             ),
             Err(ToolInputError::UnsupportedView)
         );
+        assert!(ToolInputError::UnsupportedView.retryable());
         assert_eq!(
             process_tool_input(
                 "echo <<KEY_abcdef0123456789|json>>",
@@ -257,6 +310,16 @@ mod tests {
                 &resolver
             ),
             Err(ToolInputError::UnsupportedView)
+        );
+        assert_eq!(
+            process_tool_input(
+                "{\"api_key\":<<KEY_abcdef0123456789|json>>}",
+                ToolInputKind::JsonTemplate,
+                &resolver,
+            )
+            .unwrap()
+            .text,
+            "{\"api_key\":\"secret\"}"
         );
     }
 
@@ -266,7 +329,7 @@ mod tests {
         let result = process_tool_input(
             "payload <<KEY_abcdef0123456789|base64>>",
             ToolInputKind::Unknown,
-            &|_, _| {
+            &|_: &str, _: HandleView| {
                 calls.set(calls.get() + 1);
                 Ok("unexpected".into())
             },
@@ -274,11 +337,11 @@ mod tests {
         assert_eq!(result, Err(ToolInputError::UnknownSurface));
         assert_eq!(calls.get(), 0);
         assert!(!ToolInputError::UnknownSurface.executed());
-        assert!(ToolInputError::UnknownSurface.retryable());
+        assert!(!ToolInputError::UnknownSurface.retryable());
     }
 
     #[test]
-    fn malformed_or_unknown_views_are_rejected_before_resolution() {
+    fn malformed_views_and_nonhandles_are_distinguished() {
         let calls = Cell::new(0);
         let resolve = |_: &str, _: HandleView| {
             calls.set(calls.get() + 1);
@@ -297,6 +360,12 @@ mod tests {
             Err(ToolInputError::MalformedView)
         );
         assert_eq!(calls.get(), 0);
+        assert_eq!(
+            process_tool_input("x << not a handle", ToolInputKind::Data, &resolve)
+                .unwrap()
+                .text,
+            "x << not a handle"
+        );
     }
 
     #[test]
@@ -305,7 +374,7 @@ mod tests {
         let result = process_tool_input(
             "a <<KEY_abcdef0123456789|base64>> b <<OTHER_abcdef0123456789|base64>>",
             ToolInputKind::Code,
-            &|handle, _| {
+            &|handle: &str, _view: HandleView| {
                 calls.set(calls.get() + 1);
                 if handle.starts_with("<<KEY_") {
                     Ok("first".into())
@@ -327,7 +396,18 @@ mod tests {
             tracker.record(&first).unwrap();
         }
         assert_eq!(tracker.record(&first), Err(ToolInputError::RetryLimit));
+        assert!(!ToolInputError::RetryLimit.retryable());
         tracker.record(&second).unwrap();
         assert_eq!(tracker.attempts(&second), 1);
+        tracker.finish(&second);
+        assert_eq!(tracker.attempts(&second), 0);
+        assert_eq!(
+            tracker.record(&OperationContext::new("", "operation")),
+            Err(ToolInputError::InvalidOperationContext)
+        );
+        assert_eq!(
+            tracker.record(&OperationContext::new("session", "x".repeat(257))),
+            Err(ToolInputError::InvalidOperationContext)
+        );
     }
 }
