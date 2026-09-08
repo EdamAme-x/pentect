@@ -715,6 +715,92 @@ pub enum RecoveryViewError {
     UnknownView,
 }
 
+/// Canonical bounded token kind shared by recovery consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryViewKind {
+    Raw,
+    Base64,
+    Json,
+}
+
+/// A syntactically valid exact handle found by [`scan_recovery_views`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryViewToken {
+    pub start: usize,
+    pub end: usize,
+    pub handle: String,
+    pub kind: RecoveryViewKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryViewScanError {
+    Malformed,
+    UnknownView,
+}
+
+/// Scan canonical raw and experimental view handles in one bounded pass.
+/// Non-handle prose (including heredocs containing `|`) is ignored. A valid
+/// exact handle followed by a malformed/unknown view fails closed.
+pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, RecoveryViewScanError> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' || i + 1 >= bytes.len() || bytes[i + 1] != b'<' {
+            i += utf8_len(bytes[i]);
+            continue;
+        }
+        let Some(close) = find_from_limited(bytes, i + 2, b">>", MAX_PLACEHOLDER_BYTES) else {
+            let end = bytes.len().min(i + 2 + MAX_PLACEHOLDER_BYTES);
+            if let Ok(candidate) = std::str::from_utf8(&bytes[i + 2..end]) {
+                if let Some((base, _)) = candidate.split_once('|') {
+                    if exact_handle(&format!("<<{base}>>")) {
+                        return Err(RecoveryViewScanError::Malformed);
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        };
+        let token = &text[i..close + 2];
+        let inner = &token[2..token.len() - 2];
+        if let Some((base, view)) = inner.rsplit_once('|') {
+            let base_token = format!("<<{base}>>");
+            if !exact_handle(&base_token) {
+                i += 1;
+                continue;
+            }
+            let kind = match view {
+                "base64" => RecoveryViewKind::Base64,
+                "json" => RecoveryViewKind::Json,
+                _ if view.is_empty() => return Err(RecoveryViewScanError::Malformed),
+                _ => return Err(RecoveryViewScanError::UnknownView),
+            };
+            tokens.push(RecoveryViewToken {
+                start: i,
+                end: close + 2,
+                handle: base_token,
+                kind,
+            });
+        } else if exact_handle(token) {
+            tokens.push(RecoveryViewToken {
+                start: i,
+                end: close + 2,
+                handle: token.to_string(),
+                kind: RecoveryViewKind::Raw,
+            });
+        }
+        i = close + 2;
+    }
+    Ok(tokens)
+}
+
+fn exact_handle(value: &str) -> bool {
+    crate::placeholder::parse_placeholder(value)
+        .map(|parts| parts.handle == value)
+        .unwrap_or(false)
+}
+
 impl std::fmt::Display for RecoveryViewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -736,6 +822,40 @@ fn view_rendered(value: &str, view: &str) -> Option<String> {
 }
 
 fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewError> {
+    let tokens = scan_recovery_views(text).map_err(|error| match error {
+        RecoveryViewScanError::Malformed => RecoveryViewError::Malformed,
+        RecoveryViewScanError::UnknownView => RecoveryViewError::UnknownView,
+    })?;
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for token in tokens {
+        out.push_str(&text[cursor..token.start]);
+        let Some(mut value) = rec.reveal(&token.handle) else {
+            out.zeroize();
+            return Err(RecoveryViewError::UnknownHandle);
+        };
+        match token.kind {
+            RecoveryViewKind::Raw => out.push_str(&value),
+            RecoveryViewKind::Base64 => {
+                let mut rendered = view_rendered(&value, "base64").expect("known view");
+                out.push_str(&rendered);
+                rendered.zeroize();
+            }
+            RecoveryViewKind::Json => {
+                let mut rendered = view_rendered(&value, "json").expect("known view");
+                out.push_str(&rendered);
+                rendered.zeroize();
+            }
+        }
+        value.zeroize();
+        cursor = token.end;
+    }
+    out.push_str(&text[cursor..]);
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn resolve_view_text_legacy(text: &str, rec: &Recovery) -> Result<String, RecoveryViewError> {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -1033,6 +1153,20 @@ mod tests {
         assert_eq!(rec.resolve_view("<<EOF|>>"), Ok("<<EOF|>>".into()));
         let long_unicode = format!("<<{}|base64", "雪".repeat(300));
         assert_eq!(rec.resolve_view(&long_unicode), Ok(long_unicode));
+        assert_eq!(
+            scan_recovery_views("<<KEY_0011223344556677|base64>>").unwrap(),
+            vec![RecoveryViewToken {
+                start: 0,
+                end: 31,
+                handle: "<<KEY_0011223344556677>>".into(),
+                kind: RecoveryViewKind::Base64,
+            }]
+        );
+        assert!(
+            scan_recovery_views("<<PENTECT_KEY_0011223344556677|base64>>")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
