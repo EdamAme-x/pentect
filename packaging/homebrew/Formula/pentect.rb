@@ -1,28 +1,28 @@
 class Pentect < Formula
   desc "Local secret masking boundary for AI agents"
   homepage "https://github.com/EdamAme-x/pentect"
-  version "0.0.80"
+  version "0.0.81"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.80/pentect-macos-aarch64"
-      sha256 "9de220cf928ab53137e6a56b9c769bac12a68f3a2b811e32793b3dc42838f9aa"
+      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.81/pentect-macos-aarch64"
+      sha256 "84118cea50424d26a507db6d76c826d5d967a2b5a3d51fb350eff7befc2840cd"
     end
     on_intel do
-      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.80/pentect-macos-x86_64"
-      sha256 "78264c02fdc5ccf15839c0a6595f7d6562db9c8b6f1da9e90046ec65b412fe93"
+      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.81/pentect-macos-x86_64"
+      sha256 "55245060724aa19e76e3b21047573ea88d8259a1ca2c55b511f0b7538c6cdf67"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.80/pentect-linux-aarch64"
-      sha256 "2e33f157ca70cad860e10f4a360011879c2a95587c213a876b13be6e3f74c9ea"
+      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.81/pentect-linux-aarch64"
+      sha256 "047fbc2c64efd72159a91628a8f092b271fc25d08ce26b48eeb4cb2d18bb5f46"
     end
     on_intel do
-      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.80/pentect-linux-x86_64"
-      sha256 "88c6161d0becf147c94058e941cb48a50bddec4158b6c2ab383bd1cffe50e367"
+      url "https://github.com/EdamAme-x/pentect/releases/download/v0.0.81/pentect-linux-x86_64"
+      sha256 "472c3b57572b651e2038de63ca76ff8e9f547873110f3a57cb562c1a6ef13e6a"
     end
   end
 
