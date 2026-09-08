@@ -85,7 +85,7 @@ enum StringControl {
 impl TerminalOutputRemasker {
     fn new(recovery: &Recovery) -> Self {
         Self {
-            matcher: recovery.stream_remasker(),
+            matcher: recovery.stream_remasker_with_views(),
             pending: Vec::new(),
             string_control: None,
             alternate_screen: false,
@@ -94,7 +94,7 @@ impl TerminalOutputRemasker {
     }
 
     fn merge_recovery(&mut self, recovery: &Recovery) {
-        self.matcher.merge_recovery(recovery);
+        self.matcher.merge_recovery_with_views(recovery);
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {

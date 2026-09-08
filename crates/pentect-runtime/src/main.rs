@@ -21,8 +21,9 @@ mod output_remask;
 mod plugin_middleware;
 mod secure_io;
 pub use handle_views::{
-    process_recovery_tool_input, process_tool_input, HandleView, OperationContext, RetryTracker,
-    ToolInputError, ToolInputKind, ValidatedToolInput, ViewResolver, MAX_OPERATION_RETRIES,
+    classify_tool_input_field, process_recovery_tool_input, process_tool_input,
+    raw_code_representation_supported, HandleView, ToolInputError, ToolInputKind,
+    ValidatedToolInput, ViewResolver,
 };
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
@@ -36,16 +37,16 @@ pub use plugin_middleware::{
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
 
-/// Opt-in guidance for integrations that explicitly support encoded handle
-/// views. The default agent contract remains unchanged for compatibility.
-pub fn experimental_handle_view_contract() -> &'static str {
+/// Guidance for integrations that support ordinary opaque handles and the
+/// optional explicit base64 representation.
+pub fn handle_view_contract() -> &'static str {
     concat!(
-        "Experimental encoded-view operation rules:\n",
-        "- Use a raw handle only where the requested operation consumes data or a raw file.\n",
-        "- For code, use an explicit `|base64` view in an ordinary quoted string, then let the local program decode that data and pass the result through a data API such as argv, stdin, or a JSON serializer; the model must not infer or print the plaintext.\n",
-        "- Use `|json` only as a complete JSON string value in a JSON-template operation; do not place it in arbitrary code or shell syntax.\n",
+        "Protected handle operation rules:\n",
+        "- Keep an ordinary opaque handle as one complete quoted data argument or string. Pentect restores conservatively representable token values locally.\n",
+        "- When a value cannot be represented safely by that conservative rule, use the explicit `|base64` view in one quoted data argument or string, then decode locally through a data API such as argv, stdin, or a JSON serializer.\n",
+        "- A patch is structured syntax, not raw file content. Do not use a handle to generate patch grammar or line structure.\n",
         "- Do not invoke Pentect, decode a raw handle yourself, print a secret, reread the source, or request an extra user action.\n",
-        "- Preserve the view marker byte-for-byte until the local tool input is complete.\n",
+        "- Preserve the handle or view marker byte-for-byte until the complete local tool input is validated.\n",
     )
 }
 mod session;
@@ -489,6 +490,26 @@ impl ActiveMemoryStoreResolver {
             .recovery
             .as_ref()
             .map(|recovery| resolve_known_references(text, recovery, &self.env_bindings)))
+    }
+
+    /// Validate and resolve one complete string on a known tool surface.
+    pub fn resolve_tool_input(
+        &self,
+        text: &str,
+        kind: ToolInputKind,
+    ) -> Result<Option<String>, ToolInputError> {
+        match &self.recovery {
+            Some(recovery) => {
+                process_recovery_tool_input(text, kind, recovery).map(|value| Some(value.text))
+            }
+            None if pentect_core::scan_recovery_views(text)
+                .map_err(|_| ToolInputError::MalformedView)?
+                .is_empty() =>
+            {
+                Ok(None)
+            }
+            None => Err(ToolInputError::UnknownHandle),
+        }
     }
 
     fn from_recovery(recovery: pentect_core::Recovery) -> Self {

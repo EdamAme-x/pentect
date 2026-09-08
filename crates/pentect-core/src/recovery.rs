@@ -95,7 +95,7 @@ impl Recovery {
         resolve_text(text, self)
     }
 
-    /// Resolve the experimental, explicitly requested encoded views of a
+    /// Resolve explicitly requested encoded views of a
     /// handle.  Unlike `resolve`, this is strict: a view-looking token with an
     /// unknown handle or view is rejected rather than being returned as
     /// plaintext.  The input is scanned once; generated values are never
@@ -253,7 +253,7 @@ struct StreamPattern {
     value: Vec<u8>,
     placeholder: Vec<u8>,
     token_boundaries: bool,
-    derived: bool,
+    priority: u8,
 }
 
 impl Recovery {
@@ -287,13 +287,22 @@ impl RecoveryStreamRemasker {
             .keys()
             .filter_map(|placeholder| {
                 recovery.reveal(placeholder).map(|mut value| {
-                    let mut patterns = Vec::new();
+                    // Known handles are identity patterns. Their full length
+                    // wins over any shorter encoded value embedded in a label,
+                    // so remasking is idempotent without exempting unknown
+                    // handle-shaped text.
+                    let mut patterns = vec![StreamPattern {
+                        value: placeholder.as_bytes().to_vec(),
+                        placeholder: placeholder.as_bytes().to_vec(),
+                        token_boundaries: false,
+                        priority: 2,
+                    }];
                     if is_remaskable_echo(&value, placeholder) {
                         patterns.push(StreamPattern {
                             value: value.clone().into_bytes(),
                             placeholder: placeholder.as_bytes().to_vec(),
                             token_boundaries: requires_token_boundaries(&value),
-                            derived: false,
+                            priority: 0,
                         });
                     }
                     if include_views {
@@ -301,14 +310,14 @@ impl RecoveryStreamRemasker {
                             .strip_suffix(">>")
                             .filter(|base| exact_handle(&format!("{base}>>")))
                         {
-                            for view in ["base64", "json"] {
+                            for view in ["base64"] {
                                 if let Some(rendered) = view_rendered(&value, view) {
                                     if !rendered.is_empty() {
                                         patterns.push(StreamPattern {
                                             value: rendered.into_bytes(),
                                             placeholder: format!("{base}|{view}>>").into_bytes(),
                                             token_boundaries: false,
-                                            derived: true,
+                                            priority: 1,
                                         });
                                     }
                                 }
@@ -325,9 +334,9 @@ impl RecoveryStreamRemasker {
         self.patterns.sort_by(|left, right| {
             left.value
                 .cmp(&right.value)
-                .then_with(|| right.derived.cmp(&left.derived))
+                .then_with(|| right.priority.cmp(&left.priority))
                 .then_with(|| {
-                    if left.derived || right.derived {
+                    if left.priority > 0 || right.priority > 0 {
                         std::cmp::Ordering::Equal
                     } else {
                         remask_placeholder_priority_bytes(&right.placeholder)
@@ -714,6 +723,7 @@ pub enum RecoveryViewError {
     UnknownHandle,
     /// The suffix is not one of the deliberately small supported view names.
     UnknownView,
+    OutputTooLarge,
 }
 
 /// Canonical bounded token kind shared by recovery consumers.
@@ -721,7 +731,6 @@ pub enum RecoveryViewError {
 pub enum RecoveryViewKind {
     Raw,
     Base64,
-    Json,
 }
 
 /// A syntactically valid exact handle found by [`scan_recovery_views`].
@@ -742,6 +751,7 @@ pub enum RecoveryViewScanError {
 
 const MAX_RECOVERY_VIEW_TOKENS: usize = 4096;
 const MAX_RECOVERY_VIEW_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RECOVERY_VIEW_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Scan canonical raw and experimental view handles in one bounded pass.
 /// Non-handle prose (including heredocs containing `|`) is ignored. A valid
@@ -781,7 +791,6 @@ pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, Recover
             }
             let kind = match view {
                 "base64" => RecoveryViewKind::Base64,
-                "json" => RecoveryViewKind::Json,
                 _ if view.is_empty() => return Err(RecoveryViewScanError::Malformed),
                 _ => return Err(RecoveryViewScanError::UnknownView),
             };
@@ -814,9 +823,7 @@ pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, Recover
 }
 
 fn exact_handle(value: &str) -> bool {
-    crate::placeholder::parse_placeholder(value)
-        .map(|parts| parts.handle == value)
-        .unwrap_or(false)
+    crate::placeholder::is_canonical_placeholder(value)
 }
 
 impl std::fmt::Display for RecoveryViewError {
@@ -825,6 +832,7 @@ impl std::fmt::Display for RecoveryViewError {
             Self::Malformed => write!(f, "malformed recovery view"),
             Self::UnknownHandle => write!(f, "unknown recovery view handle"),
             Self::UnknownView => write!(f, "unknown recovery view"),
+            Self::OutputTooLarge => write!(f, "resolved recovery view output is too large"),
         }
     }
 }
@@ -834,12 +842,19 @@ impl std::error::Error for RecoveryViewError {}
 fn view_rendered(value: &str, view: &str) -> Option<String> {
     match view {
         "base64" => Some(data_encoding::BASE64.encode(value.as_bytes())),
-        "json" => serde_json::to_string(value).ok(),
         _ => None,
     }
 }
 
 fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewError> {
+    resolve_view_text_bounded(text, rec, MAX_RECOVERY_VIEW_OUTPUT_BYTES)
+}
+
+fn resolve_view_text_bounded(
+    text: &str,
+    rec: &Recovery,
+    output_limit: usize,
+) -> Result<String, RecoveryViewError> {
     let tokens = scan_recovery_views(text).map_err(|error| match error {
         RecoveryViewScanError::Malformed => RecoveryViewError::Malformed,
         RecoveryViewScanError::UnknownView => RecoveryViewError::UnknownView,
@@ -848,26 +863,42 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
     for token in tokens {
+        if out.len().saturating_add(token.start - cursor) > output_limit {
+            out.zeroize();
+            return Err(RecoveryViewError::OutputTooLarge);
+        }
         out.push_str(&text[cursor..token.start]);
         let Some(mut value) = rec.reveal(&token.handle) else {
             out.zeroize();
             return Err(RecoveryViewError::UnknownHandle);
         };
         match token.kind {
-            RecoveryViewKind::Raw => out.push_str(&value),
+            RecoveryViewKind::Raw => {
+                if out.len().saturating_add(value.len()) > output_limit {
+                    value.zeroize();
+                    out.zeroize();
+                    return Err(RecoveryViewError::OutputTooLarge);
+                }
+                out.push_str(&value)
+            }
             RecoveryViewKind::Base64 => {
                 let mut rendered = view_rendered(&value, "base64").expect("known view");
-                out.push_str(&rendered);
-                rendered.zeroize();
-            }
-            RecoveryViewKind::Json => {
-                let mut rendered = view_rendered(&value, "json").expect("known view");
+                if out.len().saturating_add(rendered.len()) > output_limit {
+                    rendered.zeroize();
+                    value.zeroize();
+                    out.zeroize();
+                    return Err(RecoveryViewError::OutputTooLarge);
+                }
                 out.push_str(&rendered);
                 rendered.zeroize();
             }
         }
         value.zeroize();
         cursor = token.end;
+    }
+    if out.len().saturating_add(text.len() - cursor) > output_limit {
+        out.zeroize();
+        return Err(RecoveryViewError::OutputTooLarge);
     }
     out.push_str(&text[cursor..]);
     Ok(out)
@@ -876,13 +907,14 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
 fn remask_view_text(text: &str, rec: &Recovery) -> String {
     let mut pairs: Vec<(String, String, u8)> = Vec::new();
     for ph in rec.map.keys() {
+        pairs.push((ph.clone(), ph.clone(), 2));
         let Some(mut value) = rec.reveal(ph) else {
             continue;
         };
         if is_remaskable_echo(&value, ph) {
             pairs.push((value.clone(), ph.clone(), 0));
         }
-        for view in ["base64", "json"] {
+        for view in ["base64"] {
             if let Some(mut rendered) = view_rendered(&value, view) {
                 if let Some(base) = ph
                     .strip_suffix(">>")
@@ -1076,14 +1108,13 @@ mod tests {
         let value = "quote \" slash \\\nline\r\n雪\0";
         let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[7u8; 32]);
         let base = "<<KEY_0011223344556677|base64>>";
-        let json = "<<KEY_0011223344556677|json>>";
         assert_eq!(
             rec.resolve_view(base).unwrap(),
             data_encoding::BASE64.encode(value.as_bytes())
         );
         assert_eq!(
-            rec.resolve_view(json).unwrap(),
-            serde_json::to_string(value).unwrap()
+            rec.resolve_view("<<KEY_0011223344556677|json>>"),
+            Err(RecoveryViewError::UnknownView)
         );
         assert_eq!(
             rec.resolve_view("<<NOPE_0011223344556677|base64>>"),
@@ -1113,10 +1144,11 @@ mod tests {
                 kind: RecoveryViewKind::Base64,
             }]
         );
-        assert!(
+        assert_eq!(
             scan_recovery_views("<<PENTECT_KEY_0011223344556677|base64>>")
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
         assert_eq!(
             scan_recovery_views("<<KEY_0011223344556677|base64|junk>>"),
@@ -1150,18 +1182,36 @@ mod tests {
     }
 
     #[test]
+    fn emitted_pentect_prefixed_label_supports_raw_base64_and_remask() {
+        let ph = "<<PENTECT_API_KEY_0011223344556677>>";
+        let value = "sk-test_value";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[7u8; 32]);
+        let view = "<<PENTECT_API_KEY_0011223344556677|base64>>";
+        let encoded = data_encoding::BASE64.encode(value.as_bytes());
+        assert_eq!(rec.resolve_with_views(ph).unwrap(), value);
+        assert_eq!(rec.resolve_with_views(view).unwrap(), encoded);
+        assert_eq!(rec.remask_views(value), ph);
+        assert_eq!(rec.remask_views(&encoded), view);
+    }
+
+    #[test]
+    fn resolved_view_output_is_bounded_before_append() {
+        let ph = "<<KEY_0011223344556677>>";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), "abcdefgh".into())]), &[7u8; 32]);
+        assert_eq!(
+            resolve_view_text_bounded(&format!("{ph}{ph}"), &rec, 15),
+            Err(RecoveryViewError::OutputTooLarge)
+        );
+    }
+
+    #[test]
     fn experimental_remask_round_trips_raw_and_derived_views() {
         let ph = "<<KEY_0011223344556677>>";
         let value = "a\"b\n雪";
         let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[8u8; 32]);
         let base = "<<KEY_0011223344556677|base64>>";
-        let json = "<<KEY_0011223344556677|json>>";
-        let encoded = format!(
-            "{} {}",
-            rec.resolve_view(base).unwrap(),
-            rec.resolve_view(json).unwrap()
-        );
-        assert_eq!(rec.remask_views(&encoded), format!("{base} {json}"));
+        let encoded = rec.resolve_view(base).unwrap();
+        assert_eq!(rec.remask_views(&encoded), base);
         assert_eq!(rec.remask_views(value), ph);
         assert_eq!(
             rec.resolve_view(&rec.remask_views(&encoded)).unwrap(),
@@ -1171,16 +1221,6 @@ mod tests {
 
     #[test]
     fn experimental_views_cover_empty_nul_full_id_and_nested_text() {
-        let ph = "<<SECRET_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef>>";
-        let rec = Recovery::seal(HashMap::from([(ph.into(), "\0".into())]), &[9u8; 32]);
-        let view =
-            "<<SECRET_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|json>>";
-        assert_eq!(rec.resolve_with_views(view).unwrap(), "\"\\u0000\"");
-        assert_eq!(
-            rec.resolve_with_views(&format!("outer [{view}]")).unwrap(),
-            "outer [\"\\u0000\"]"
-        );
-
         let empty = "<<EMPTY_0123456789abcdef>>";
         let empty_rec = Recovery::seal(HashMap::from([(empty.into(), "".into())]), &[1u8; 32]);
         assert_eq!(
@@ -1221,10 +1261,7 @@ mod tests {
         let base = rec
             .resolve_with_views("<<KEY_0123456789abcdef|base64>>")
             .unwrap();
-        let json = rec
-            .resolve_with_views("<<KEY_0123456789abcdef|json>>")
-            .unwrap();
-        let input = format!("prefix {base} middle {json} suffix");
+        let input = format!("prefix {base} suffix");
         let expected = rec.remask_views(&input);
         for split in 0..=input.len() {
             let (left, right) = input.as_bytes().split_at(split);

@@ -54,8 +54,8 @@ pub use placeholder::{parse_placeholder, LengthHint, PlaceholderParts};
 pub use policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use policy::{Action, MaskAll, Policy, Profile, ProfilePolicy};
 pub use recovery::{
-    restore, scan_recovery_views, Recovery, RecoveryError, RecoveryViewError, RecoveryViewKind,
-    RecoveryViewScanError, RecoveryViewToken, RestoreError,
+    restore, scan_recovery_views, Recovery, RecoveryError, RecoveryStreamRemasker,
+    RecoveryViewError, RecoveryViewKind, RecoveryViewScanError, RecoveryViewToken, RestoreError,
 };
 
 /// Mask with the default engine. Build an `Engine` once for repeated calls.

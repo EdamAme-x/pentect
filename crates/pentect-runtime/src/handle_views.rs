@@ -9,7 +9,6 @@
 use pentect_core::{
     scan_recovery_views, Recovery, RecoveryViewKind, RecoveryViewScanError, RecoveryViewToken,
 };
-use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -18,8 +17,8 @@ use zeroize::{Zeroize, Zeroizing};
 pub enum ToolInputKind {
     Data,
     RawFile,
-    JsonTemplate,
     Code,
+    Patch,
     Unknown,
 }
 
@@ -28,26 +27,6 @@ pub enum ToolInputKind {
 pub enum HandleView {
     Raw,
     Base64,
-    Json,
-}
-
-/// Stable identity supplied by the caller for one logical operation.
-///
-/// Retry accounting intentionally does not attempt to compare arbitrary
-/// commands or payloads.  Callers must provide the same identity for a retry.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct OperationContext {
-    pub session_id: String,
-    pub operation_id: String,
-}
-
-impl OperationContext {
-    pub fn new(session_id: impl Into<String>, operation_id: impl Into<String>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            operation_id: operation_id.into(),
-        }
-    }
 }
 
 /// Errors are intentionally value-free: neither a handle nor resolved data is
@@ -58,8 +37,7 @@ pub enum ToolInputError {
     MalformedView,
     UnsupportedView,
     UnknownHandle,
-    RetryLimit,
-    InvalidOperationContext,
+    OutputTooLarge,
 }
 
 impl fmt::Display for ToolInputError {
@@ -69,8 +47,7 @@ impl fmt::Display for ToolInputError {
             Self::MalformedView => "protected handle view is malformed",
             Self::UnsupportedView => "protected handle view is unsupported for this operation",
             Self::UnknownHandle => "protected handle is unavailable in this session",
-            Self::RetryLimit => "the same protected operation exceeded its retry limit",
-            Self::InvalidOperationContext => "protected operation identity is invalid",
+            Self::OutputTooLarge => "protected tool input is too large after restoration",
         })
     }
 }
@@ -100,46 +77,6 @@ impl fmt::Debug for ValidatedToolInput {
             .field("text", &"<redacted>")
             .field("executed", &self.executed)
             .finish()
-    }
-}
-
-/// Maximum retries for one explicitly identified operation.
-pub const MAX_OPERATION_RETRIES: u8 = 3;
-const MAX_TRACKED_OPERATIONS: usize = 1024;
-
-#[derive(Default)]
-pub struct RetryTracker {
-    attempts: HashMap<OperationContext, u8>,
-}
-
-impl RetryTracker {
-    /// Records one execution attempt.  Different operation IDs never consume
-    /// each other's budget, even when their payloads happen to match.
-    pub fn record(&mut self, context: &OperationContext) -> Result<(), ToolInputError> {
-        if context.session_id.is_empty()
-            || context.operation_id.is_empty()
-            || context.session_id.len() > 256
-            || context.operation_id.len() > 256
-        {
-            return Err(ToolInputError::InvalidOperationContext);
-        }
-        if !self.attempts.contains_key(context) && self.attempts.len() >= MAX_TRACKED_OPERATIONS {
-            return Err(ToolInputError::RetryLimit);
-        }
-        let attempts = self.attempts.entry(context.clone()).or_default();
-        if *attempts >= MAX_OPERATION_RETRIES {
-            return Err(ToolInputError::RetryLimit);
-        }
-        *attempts += 1;
-        Ok(())
-    }
-
-    pub fn attempts(&self, context: &OperationContext) -> u8 {
-        self.attempts.get(context).copied().unwrap_or(0)
-    }
-
-    pub fn finish(&mut self, context: &OperationContext) {
-        self.attempts.remove(context);
     }
 }
 
@@ -176,6 +113,7 @@ pub fn process_tool_input<R: ViewResolver>(
         output.push_str(&input[cursor..span.start]);
         let rendered =
             Zeroizing::new(resolver.resolve_view(&span.handle, handle_view_from_core(span.kind))?);
+        validate_rendered(kind, span.kind, &rendered)?;
         output.push_str(&rendered);
         cursor = span.end;
     }
@@ -202,15 +140,24 @@ pub fn process_recovery_tool_input(
     if spans.iter().any(|span| !known.contains(&span.handle)) {
         return Err(ToolInputError::UnknownHandle);
     }
-    let text = recovery
-        .resolve_with_views(input)
-        .map_err(|error| match error {
-            pentect_core::RecoveryViewError::Malformed => ToolInputError::MalformedView,
-            pentect_core::RecoveryViewError::UnknownHandle => ToolInputError::UnknownHandle,
-            pentect_core::RecoveryViewError::UnknownView => ToolInputError::MalformedView,
-        })?;
+    for span in &spans {
+        if span.kind == RecoveryViewKind::Raw {
+            let rendered = Zeroizing::new(recovery.resolve(&span.handle));
+            validate_rendered(kind, span.kind, &rendered)?;
+        }
+    }
+    let text = Zeroizing::new(
+        recovery
+            .resolve_with_views(input)
+            .map_err(|error| match error {
+                pentect_core::RecoveryViewError::Malformed => ToolInputError::MalformedView,
+                pentect_core::RecoveryViewError::UnknownHandle => ToolInputError::UnknownHandle,
+                pentect_core::RecoveryViewError::UnknownView => ToolInputError::MalformedView,
+                pentect_core::RecoveryViewError::OutputTooLarge => ToolInputError::OutputTooLarge,
+            })?,
+    );
     Ok(ValidatedToolInput {
-        text,
+        text: text.to_string(),
         executed: false,
     })
 }
@@ -228,7 +175,6 @@ fn handle_view_from_core(kind: RecoveryViewKind) -> HandleView {
     match kind {
         RecoveryViewKind::Raw => HandleView::Raw,
         RecoveryViewKind::Base64 => HandleView::Base64,
-        RecoveryViewKind::Json => HandleView::Json,
     }
 }
 
@@ -241,8 +187,9 @@ fn validate_surface(
             ToolInputKind::Data | ToolInputKind::RawFile => {
                 matches!(span.kind, RecoveryViewKind::Raw | RecoveryViewKind::Base64)
             }
-            ToolInputKind::JsonTemplate => matches!(span.kind, RecoveryViewKind::Json),
-            ToolInputKind::Code => matches!(span.kind, RecoveryViewKind::Base64),
+            ToolInputKind::Code | ToolInputKind::Patch => {
+                matches!(span.kind, RecoveryViewKind::Raw | RecoveryViewKind::Base64)
+            }
             ToolInputKind::Unknown => return Err(ToolInputError::UnknownSurface),
         };
         if !supported {
@@ -250,6 +197,80 @@ fn validate_surface(
         }
     }
     Ok(())
+}
+
+fn validate_rendered(
+    kind: ToolInputKind,
+    view: RecoveryViewKind,
+    rendered: &str,
+) -> Result<(), ToolInputError> {
+    if matches!(kind, ToolInputKind::Code | ToolInputKind::Patch)
+        && view == RecoveryViewKind::Raw
+        && !raw_code_representation_supported(rendered)
+    {
+        return Err(ToolInputError::UnsupportedView);
+    }
+    Ok(())
+}
+
+/// Conservative representation guard for a raw handle embedded as one quoted
+/// data value in code or a patch. This is not a shell or language parser and
+/// does not make arbitrary interpolation safe.
+pub fn raw_code_representation_supported(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'.' | b'/' | b':' | b'@' | b'+' | b'=' | b',' | b'-'
+                )
+        })
+}
+
+/// Classify only argument fields whose data contract Pentect knows. Unknown
+/// tools and fields remain inert rather than receiving speculative recovery.
+pub fn classify_tool_input_field(tool_name: &str, field: &str) -> ToolInputKind {
+    let tool = tool_name.to_ascii_lowercase().replace('-', "_");
+    let field = field.to_ascii_lowercase();
+    if matches!(
+        tool.as_str(),
+        "bash" | "shell" | "exec" | "exec_command" | "run_command" | "terminal"
+    ) {
+        return match field.as_str() {
+            "command" | "cmd" | "script" => ToolInputKind::Code,
+            "cwd" | "workdir" | "working_directory" => ToolInputKind::Data,
+            _ => ToolInputKind::Unknown,
+        };
+    }
+    if matches!(tool.as_str(), "apply_patch" | "patch") {
+        return matches!(field.as_str(), "patch" | "patchtext" | "input" | "command")
+            .then_some(ToolInputKind::Patch)
+            .unwrap_or(ToolInputKind::Unknown);
+    }
+    if matches!(
+        tool.as_str(),
+        "edit" | "edit_file" | "multiedit" | "multi_edit"
+    ) {
+        return match field.as_str() {
+            "old_string" | "oldstring" | "old_text" | "oldtext" | "new_string" | "newstring"
+            | "new_text" | "newtext" => ToolInputKind::RawFile,
+            "path" | "file_path" | "filepath" => ToolInputKind::Data,
+            _ => ToolInputKind::Unknown,
+        };
+    }
+    if matches!(tool.as_str(), "write" | "write_file" | "create_file") {
+        return match field.as_str() {
+            "content" | "data" | "text" => ToolInputKind::RawFile,
+            "path" | "file_path" | "filepath" => ToolInputKind::Data,
+            _ => ToolInputKind::Unknown,
+        };
+    }
+    if matches!(tool.as_str(), "read" | "read_file")
+        && matches!(field.as_str(), "path" | "file_path" | "filepath")
+    {
+        return ToolInputKind::Data;
+    }
+    ToolInputKind::Unknown
 }
 
 #[cfg(test)]
@@ -261,14 +282,13 @@ mod tests {
     fn resolver(handle: &str, view: HandleView) -> Result<String, ToolInputError> {
         match (handle, view) {
             ("<<KEY_abcdef0123456789>>", HandleView::Base64) => Ok("c2VjcmV0".into()),
-            ("<<KEY_abcdef0123456789>>", HandleView::Json) => Ok("\"secret\"".into()),
             ("<<KEY_abcdef0123456789>>", HandleView::Raw) => Ok("secret".into()),
             _ => Err(ToolInputError::UnknownHandle),
         }
     }
 
     #[test]
-    fn code_allows_only_explicit_base64_view() {
+    fn code_allows_base64_and_conservative_raw_values() {
         let input = "python -c 'decode(\"<<KEY_abcdef0123456789|base64>>\")'";
         let result = process_tool_input(input, ToolInputKind::Code, &resolver).unwrap();
         assert_eq!(result.text, "python -c 'decode(\"c2VjcmV0\")'");
@@ -278,28 +298,12 @@ mod tests {
                 "echo <<KEY_abcdef0123456789>>",
                 ToolInputKind::Code,
                 &resolver
-            ),
-            Err(ToolInputError::UnsupportedView)
-        );
-        assert!(ToolInputError::UnsupportedView.retryable());
-        assert_eq!(
-            process_tool_input(
-                "echo <<KEY_abcdef0123456789|json>>",
-                ToolInputKind::Code,
-                &resolver
-            ),
-            Err(ToolInputError::UnsupportedView)
-        );
-        assert_eq!(
-            process_tool_input(
-                "{\"api_key\":<<KEY_abcdef0123456789|json>>}",
-                ToolInputKind::JsonTemplate,
-                &resolver,
             )
             .unwrap()
             .text,
-            "{\"api_key\":\"secret\"}"
+            "echo secret"
         );
+        assert!(ToolInputError::UnsupportedView.retryable());
     }
 
     #[test]
@@ -371,30 +375,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_is_scoped_to_explicit_session_and_operation() {
-        let mut tracker = RetryTracker::default();
-        let first = OperationContext::new("s", "one");
-        let second = OperationContext::new("s", "two");
-        for _ in 0..MAX_OPERATION_RETRIES {
-            tracker.record(&first).unwrap();
-        }
-        assert_eq!(tracker.record(&first), Err(ToolInputError::RetryLimit));
-        assert!(!ToolInputError::RetryLimit.retryable());
-        tracker.record(&second).unwrap();
-        assert_eq!(tracker.attempts(&second), 1);
-        tracker.finish(&second);
-        assert_eq!(tracker.attempts(&second), 0);
-        assert_eq!(
-            tracker.record(&OperationContext::new("", "operation")),
-            Err(ToolInputError::InvalidOperationContext)
-        );
-        assert_eq!(
-            tracker.record(&OperationContext::new("session", "x".repeat(257))),
-            Err(ToolInputError::InvalidOperationContext)
-        );
-    }
-
-    #[test]
     fn recovery_adapter_rejects_unknown_raw_and_handles_full_placeholder_grammar() {
         let mut values = HashMap::new();
         let long_handle =
@@ -421,16 +401,6 @@ mod tests {
             .unwrap()
             .text,
             data_encoding::BASE64.encode(b"synthetic-64")
-        );
-        assert_eq!(
-            process_recovery_tool_input(
-                "<<KEY_abcdef0123456789_length_12_chars|json>>",
-                ToolInputKind::JsonTemplate,
-                &recovery,
-            )
-            .unwrap()
-            .text,
-            "\"synthetic-hint\""
         );
     }
 
