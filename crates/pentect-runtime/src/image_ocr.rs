@@ -652,19 +652,19 @@ fn redact_image_bytes(
     }
 
     let mut visual_labels = Vec::new();
-    let mut visual_handles = Vec::new();
     let mut metadata_labels = Vec::new();
     let mut metadata_handles = Vec::new();
     for finding in &findings {
-        let (labels, handles) = if finding_redacts_pixels(finding) {
-            (&mut visual_labels, &mut visual_handles)
+        let visual = finding_redacts_pixels(finding);
+        let labels = if visual {
+            &mut visual_labels
         } else {
-            (&mut metadata_labels, &mut metadata_handles)
+            &mut metadata_labels
         };
         push_secret_labels(labels, &finding.labels);
         for (handle, value) in &finding.secrets {
-            if !handles.iter().any(|seen| seen == handle) {
-                handles.push(handle.clone());
+            if !visual && !metadata_handles.iter().any(|seen| seen == handle) {
+                metadata_handles.push(handle.clone());
             }
             state
                 .recovery
@@ -673,14 +673,15 @@ fn redact_image_bytes(
         }
     }
     state.secret_images += 1;
-    let index = state.secret_images;
+    // Count preceding clean/unscanned images too, so a note for the second
+    // image cannot accidentally identify the first image in this content.
+    let index = state.scanned_images + state.unscanned_images;
     for label in visual_labels.iter().chain(&metadata_labels) {
         *state.labels.entry(label.clone()).or_default() += 1;
     }
-    if let Some(summary) = image_note_summary(&visual_labels, &visual_handles) {
-        let note = format!("[{index}] {summary}");
-        state.visual_notes.push(note);
-    }
+    state
+        .visual_notes
+        .extend(image_region_notes(index, &findings));
     if let Some(summary) = image_note_summary(&metadata_labels, &metadata_handles) {
         let note = format!("[{index}] {summary}");
         state.metadata_notes.push(note);
@@ -697,6 +698,50 @@ fn image_note_summary(labels: &[String], handles: &[String]) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Keep each occurrence tied to its image position, even when two regions
+/// contain the same value. Coordinates use the source image's normalized
+/// frame, so resizing does not change their meaning. They describe the detected
+/// region; the actual opaque cover includes additional safety padding.
+fn image_region_notes(index: usize, findings: &[ImageSecretFinding]) -> Vec<String> {
+    let mut regions = Vec::new();
+    for finding in findings
+        .iter()
+        .filter(|finding| finding_redacts_pixels(finding))
+    {
+        let mut handles: Vec<_> = finding
+            .secrets
+            .iter()
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        handles.sort();
+        handles.dedup();
+        let Some(summary) = image_note_summary(&finding.labels, &handles) else {
+            continue;
+        };
+        #[cfg(feature = "ocr")]
+        let rect = finding.rect.map(|rect| {
+            [rect.top, rect.left, rect.bottom, rect.right]
+                .map(|coordinate| (coordinate.clamp(0.0, 1.0) * 1000.0).round() as u16)
+        });
+        #[cfg(not(feature = "ocr"))]
+        let rect: Option<[u16; 4]> = None;
+        regions.push((rect, summary));
+    }
+    // Unknown locations follow located regions. OCR/detector iteration order is
+    // deliberately not part of the public region-to-handle contract.
+    regions.sort_by(|a, b| a.0.is_none().cmp(&b.0.is_none()).then_with(|| a.cmp(b)));
+    regions.dedup();
+    regions.into_iter().enumerate().map(|(region, (rect, summary))| {
+        let location = match rect {
+            Some([top, left, bottom, right]) => format!(
+                "bounds left={left} top={top} right={right} bottom={bottom} (0..1000, image-relative)"
+            ),
+            None => "position unavailable; do not infer a location".to_string(),
+        };
+        format!("[{index}] region {}: {location}: {summary}", region + 1)
+    }).collect()
 }
 
 #[cfg(feature = "ocr")]
@@ -3141,6 +3186,126 @@ mod tests {
     use super::*;
     use crate::config::{ImageOcrMode, ImageRedactionStyle, UnscannedImagePolicy};
 
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn region_handles_preserve_location_identity_and_resize() {
+        let key = [41; 32];
+        let finding = |value: &str, top: f32| ImageSecretFinding {
+            labels: vec!["API_KEY".into()],
+            secrets: vec![(
+                render_placeholder("API_KEY", &identity_hash(&key, value), None),
+                value.to_string(),
+            )],
+            rect: NormalizedImageRect::new(0.2, top, 0.4, top + 0.1),
+            force_black: true,
+            pad_left: false,
+            redact_pixels: true,
+        };
+        let first = finding("synthetic-production-value", 0.1);
+        let second = finding("synthetic-staging-value", 0.6);
+        let repeated = finding("synthetic-staging-value", 0.8);
+        let mut unknown = finding("synthetic-unlocated-value", 0.0);
+        unknown.rect = None;
+        let mut metadata = finding("synthetic-metadata-value", 0.0);
+        metadata.redact_pixels = false;
+        let mut findings = vec![
+            second.clone(),
+            unknown,
+            repeated,
+            metadata,
+            first.clone(),
+            first.clone(),
+        ];
+        let notes = image_region_notes(2, &findings);
+        findings.reverse();
+        assert_eq!(notes, image_region_notes(2, &findings));
+        assert_eq!(notes.len(), 4);
+        assert!(image_region_notes(1, &findings)[0].starts_with("[1] region 1:"));
+        assert!(notes[0].contains("[2] region 1: bounds left=200 top=100 right=400 bottom=200"));
+        assert!(notes[1].contains("top=600"));
+        assert!(notes[1].ends_with(&second.secrets[0].0));
+        assert!(notes[2].ends_with(&second.secrets[0].0));
+        assert!(notes[3].contains("position unavailable"));
+        assert!(!notes.join("\n").contains("synthetic-"));
+        assert!(!notes.join("\n").contains(&render_placeholder(
+            "API_KEY",
+            &identity_hash(&key, "synthetic-metadata-value"),
+            None
+        )));
+
+        let mut config = test_config();
+        config.max_edge = 128;
+        let payload =
+            redacted_image_payload(&color_grid_png(), 2, &config, &[first, second]).unwrap();
+        let bytes = data_encoding::BASE64
+            .decode(payload.base64.as_bytes())
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!((image.width(), image.height()), (128, 128));
+        let pixel = image.get_pixel(image.width() * 3 / 10, image.height() * 65 / 100);
+        assert_eq!(pixel.0, [0, 0, 0, 255]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn region_selected_handle_reaches_the_matching_local_consumer() {
+        use std::io::{Read, Write};
+        let key = [42; 32];
+        let values = ["synthetic-production-value", "synthetic-staging-value"];
+        let findings: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| ImageSecretFinding {
+                labels: vec!["API_KEY".into()],
+                secrets: vec![(
+                    render_placeholder("API_KEY", &identity_hash(&key, value), None),
+                    value.to_string(),
+                )],
+                rect: NormalizedImageRect::new(0.1, i as f32 * 0.5, 0.5, i as f32 * 0.5 + 0.1),
+                force_black: true,
+                pad_left: false,
+                redact_pixels: true,
+            })
+            .collect();
+        let notes = image_region_notes(1, &findings);
+        let recovery = Recovery::seal(
+            findings
+                .iter()
+                .flat_map(|finding| finding.secrets.clone())
+                .collect(),
+            &key,
+        );
+        for (i, value) in values.iter().enumerate() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected = value.to_string();
+            let consumer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut received = String::new();
+                stream.read_to_string(&mut received).unwrap();
+                assert_eq!(received, expected);
+            });
+            let note = notes
+                .iter()
+                .find(|note| note.contains(&format!("top={}", i * 500)))
+                .unwrap();
+            let handle = &pentect_core::scan_recovery_views(note).unwrap()[0].handle;
+            let restored = crate::handle_views::process_recovery_tool_input(
+                handle,
+                crate::handle_views::ToolInputKind::Data,
+                &recovery,
+            )
+            .unwrap();
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.write_all(restored.text.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            consumer.join().unwrap();
+        }
+    }
+
     #[test]
     fn generic_base64_shaped_fields_require_an_image_signature() {
         let non_image = data_encoding::BASE64.encode(b"token-like bytes that are not an image");
@@ -3462,6 +3627,34 @@ mod tests {
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn region_image_numbers_include_preceding_clean_images() {
+        let clean = data_encoding::BASE64.encode(&color_grid_png());
+        let secret =
+            data_encoding::BASE64.encode(&qr_png("OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        let value = serde_json::json!({"content": [
+            {"type": "image", "mimeType": "image/png", "data": clean},
+            {"type": "image", "mimeType": "image/png", "data": secret},
+            {"type": "image", "mimeType": "image/png", "data": secret},
+        ]});
+        let result =
+            redact_tool_images_for_secrets(&value, &[7; 32], &[7; 32], &test_config()).unwrap();
+        assert!(result
+            .visual_notes
+            .iter()
+            .any(|note| note.starts_with("[2] region")));
+        assert!(result
+            .visual_notes
+            .iter()
+            .any(|note| note.starts_with("[3] region")));
+        assert!(!result
+            .visual_notes
+            .iter()
+            .any(|note| note.starts_with("[1]")));
+        assert_eq!(result.updated["content"][0], value["content"][0]);
     }
 
     #[cfg(feature = "ocr")]

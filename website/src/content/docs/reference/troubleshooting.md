@@ -27,9 +27,10 @@ claude --version
 
 ## A handle cannot be resolved
 
-The Pentect session that created a handle also restores it. If a handle came
-from an old session, read the source again in the current Pentect client. Do
-not copy an old handle.
+A protected session restores its known handles. On supported native tool
+inputs, it can also reacquire a registered file-backed handle from an earlier
+session when the source and identity still match. Otherwise, read the source
+again in the current protected client and use the resulting handle.
 
 A stable handle ID does not save the real value forever or share it everywhere.
 It only keeps the displayed handle from changing too often. The real value
@@ -46,6 +47,40 @@ Check these points:
 
 See [Handles](/start/handles/) for the difference between stable identity and
 live recovery data.
+
+Reacquisition errors distinguish disabled file remembering, changed source,
+unavailable source, changed identity scope, and unavailable recovery storage.
+They do not include the file path or secret. Restore ordinary read access if
+appropriate, or reread the source; do not edit the old handle. A path stated by
+a model or arbitrary tool output is insufficient to authorize file recovery.
+
+## Investigate a suspected false positive
+
+1. Inspect the input locally with `pentect mask --explain --json < fixture.env`.
+   Match the numbered occurrence and handle to `masked`, then inspect its
+   `evidence`. Check `conditions`, including format, profile, decode limits, and
+   parser fallback. Confidence describes a detector decision, not proof that a
+   value is secret.
+2. Create a synthetic example with the same field names and format. For
+   example, compare `API_KEY=synthetic-private-value` with a public fixture
+   such as `PUBLIC_CASE=CASE-12345678`. Use your configured plugin if it is the
+   source being investigated. A `configured-pattern` or `plugin-finding` reason
+   identifies that source class; it cannot name an exact rule that was not
+   retained.
+3. Rerun that synthetic input with the same profile, explicit `--kind`, packs,
+   and plugin configuration. Change one synthetic field or rule at a time and
+   compare the protected text and reasons. Keep the original protection enabled.
+4. For a public issue, extract only the safe report fields, and attach a
+   deliberately synthetic reproduction separately:
+
+   ```sh
+   pentect mask --explain --json < fixture.env | jq '.public_report'
+   ```
+
+Do not attach the full explanation of private input: unmasked surrounding text,
+labels, and handles may still be identifying. Pentect does not send this report
+or create a permanent exception. Rerunning `mask` changes its one-run handle IDs;
+compare occurrences, labels, and reasons rather than expecting identical IDs.
 
 ## A handle was not restored in a tool call
 

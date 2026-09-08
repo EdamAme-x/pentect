@@ -4,6 +4,7 @@
 //! usable while the original file still has the exact same size and SHA-256, so
 //! stale handles fail closed instead of expanding to the wrong bytes.
 
+use crate::handle_views::ToolInputError;
 use aho_corasick::AhoCorasickBuilder;
 use chacha20::cipher::StreamCipher;
 use chacha20::{ChaCha20, Key, KeyIvInit, Nonce};
@@ -19,8 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 const MANAGER_DIR: &str = "file-pointer-manager";
+const MAX_RECOVERY_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_VALUE_BYTES: usize = 32 * 1024 * 1024;
 const INDEX_FILE: &str = "index.bin";
 const KEY_FILE: &str = "key.bin";
 const ENVELOPE_MAGIC: &[u8] = b"PNFPM1";
@@ -53,16 +57,17 @@ struct FilePointerRecord {
 
 /// Register only file-backed handles. Shell/MCP/browser handles do not have a
 /// stable local source file, so they remain in-memory-only.
-pub(crate) fn register_file_pointers(path: &Path, source: &str, result: &MaskResult) {
+/// Returns whether every handle in the preview has a persisted file reference.
+pub(crate) fn register_file_pointers(path: &Path, source: &str, result: &MaskResult) -> bool {
     if !save_enabled() {
-        return;
+        return false;
     }
     if result.summary.masked_count == 0 {
-        return;
+        return false;
     }
     let records = records_for_result(path, source, result);
     if records.is_empty() {
-        return;
+        return false;
     }
     let mut index = load_index();
     let mut changed = false;
@@ -71,8 +76,120 @@ pub(crate) fn register_file_pointers(path: &Path, source: &str, result: &MaskRes
     }
     if changed {
         trim_index(&mut index.records);
-        let _ = save_index(&index);
+        if save_index(&index).is_err() {
+            return false;
+        }
     }
+    // Saving can trim older/oversized records. Do not suppress the transient
+    // warning for previews that also contain unregistrable decoded values.
+    let persisted = load_index();
+    pentect_core::scan_recovery_views(&result.masked).is_ok_and(|handles| {
+        !handles.is_empty()
+            && handles.iter().all(|handle| {
+                persisted
+                    .records
+                    .iter()
+                    .any(|record| record.handle == handle.handle)
+            })
+    })
+}
+
+/// Recover only requested, missing handles from this project's trusted index.
+/// The current identity key must reproduce the recorded handle: a new session
+/// identity or a different project identity cannot revive an old reference.
+pub(crate) fn recover_tool_input(
+    text: &str,
+    known: &Recovery,
+    key: &[u8; 32],
+    identity_key: &[u8; 32],
+) -> Result<Recovery, ToolInputError> {
+    if !save_enabled() {
+        return Err(ToolInputError::RecoveryDisabled);
+    }
+    let spans =
+        pentect_core::scan_recovery_views(text).map_err(|_| ToolInputError::MalformedView)?;
+    let known: std::collections::HashSet<_> = known.placeholders().into_iter().collect();
+    let index = load_index();
+    let mut recovered = HashMap::new();
+    let mut files: HashMap<String, (Zeroizing<Vec<u8>>, String)> = HashMap::new();
+    let mut source_bytes = 0u64;
+    let mut value_bytes = 0usize;
+    // Do not return a partial recovery if any requested source cannot be checked.
+    let result = (|| {
+        for span in spans {
+            if known.contains(&span.handle) || recovered.contains_key(&span.handle) {
+                continue;
+            }
+            let record = index
+                .records
+                .iter()
+                .find(|record| record.handle == span.handle)
+                .ok_or(ToolInputError::UnknownHandle)?;
+            if !files.contains_key(&record.path) {
+                source_bytes = source_bytes.saturating_add(record.file_size);
+                if source_bytes > MAX_RECOVERY_SOURCE_BYTES {
+                    return Err(ToolInputError::RecoveryLimitExceeded);
+                }
+                let bytes = read_verified_file_for_tool(record)?;
+                files.insert(record.path.clone(), (bytes, record.file_hash.clone()));
+            }
+            let (bytes, verified_hash) = &files[&record.path];
+            if bytes.len() as u64 != record.file_size || verified_hash != &record.file_hash {
+                return Err(ToolInputError::RecoverySourceChanged);
+            }
+            value_bytes = value_bytes.saturating_add(
+                usize::try_from(record.length)
+                    .map_err(|_| ToolInputError::RecoveryLimitExceeded)?,
+            );
+            if value_bytes > MAX_RECOVERY_VALUE_BYTES {
+                return Err(ToolInputError::RecoveryLimitExceeded);
+            }
+            let value = Zeroizing::new(
+                slice_record_value(bytes, record).ok_or(ToolInputError::RecoverySourceChanged)?,
+            );
+            let parts =
+                parse_placeholder(&record.handle).map_err(|_| ToolInputError::UnknownHandle)?;
+            if !pentect_core::placeholder::matches_identity_hash(identity_key, &parts.hash, &value)
+            {
+                return Err(ToolInputError::RecoveryScopeChanged);
+            }
+            recovered.insert(span.handle, value.to_string());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for value in recovered.values_mut() {
+            value.zeroize();
+        }
+        return Err(error);
+    }
+    Ok(Recovery::seal(recovered, key))
+}
+
+fn read_verified_file_for_tool(
+    record: &FilePointerRecord,
+) -> Result<Zeroizing<Vec<u8>>, ToolInputError> {
+    let path = Path::new(&record.path);
+    let metadata =
+        std::fs::metadata(path).map_err(|_| ToolInputError::RecoverySourceUnavailable)?;
+    if !metadata.is_file() {
+        return Err(ToolInputError::RecoverySourceUnavailable);
+    }
+    if metadata.len() != record.file_size {
+        return Err(ToolInputError::RecoverySourceChanged);
+    }
+    // Bound both allocations and reads even if a file changes after metadata().
+    if record.file_size > crate::MAX_INPUT_BYTES as u64 {
+        return Err(ToolInputError::RecoverySourceUnavailable);
+    }
+    let bytes = Zeroizing::new(
+        crate::secure_io::read_bounded_bytes(path, record.file_size, "recovery source")
+            .map_err(|_| ToolInputError::RecoverySourceUnavailable)?,
+    );
+    if bytes.len() as u64 != record.file_size || sha256_hex(&bytes) != record.file_hash {
+        return Err(ToolInputError::RecoverySourceChanged);
+    }
+    Ok(bytes)
 }
 
 /// Rebuild a temporary recovery map from unchanged files. No value is recovered

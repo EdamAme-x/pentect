@@ -98,6 +98,10 @@ impl OutputMasker {
         self.masked_count
     }
 
+    pub(crate) fn recovery_keys(&self) -> ([u8; 32], [u8; 32]) {
+        (self.store.session.key, self.store.session.identity_key)
+    }
+
     pub(crate) fn recovery_snapshot(&self) -> Result<Recovery, String> {
         let mut combined = Recovery::empty_for_key(&self.store.session.key);
         for recovery in self.store.snapshot().map_err(|error| error.to_string())? {
@@ -1136,6 +1140,14 @@ fn kind_name_for_plugin(kind: &Kind) -> &str {
 }
 
 fn merge_final_mask_result(result: &mut MaskResult, final_result: MaskResult) {
+    for (handle, evidence) in final_result.provenance {
+        let items = result.provenance.entry(handle).or_default();
+        for item in evidence {
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+    }
     result.masked = final_result.masked;
     result.segments = final_result.segments;
     result.items.extend(final_result.items);

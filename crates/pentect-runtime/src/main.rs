@@ -208,6 +208,29 @@ pub fn mask_input_with_engine_for_read(
     masking::mask_read_input_with_engine_and_identity(key, key, engine, input)
 }
 
+/// A user-requested file read uses the configured identity, so verified file
+/// references can be reacquired by a later protected session on that identity.
+pub fn mask_file_input_for_read(
+    key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<MaskResult, String> {
+    masking::mask_read_input_with_profile_and_identity(
+        key,
+        config::handle_identity_key()?,
+        input,
+        profile,
+        packs,
+    )
+}
+
+/// Only callers that actually read this local file may register its source.
+/// Never call this based on a filename asserted by model or remote tool text.
+pub fn remember_read_file(path: &Path, source: &str, result: &MaskResult) -> bool {
+    file_pointer_manager::register_file_pointers(path, source, result)
+}
+
 pub fn record_read_activity(result: &MaskResult, path: &Path) {
     activity_log::record_mask_result("read", result, Some(path));
 }
@@ -467,6 +490,16 @@ pub fn resolve_known_text_from_active_memory_store(text: &str) -> Result<Option<
 pub struct ActiveMemoryStoreResolver {
     recovery: Option<pentect_core::Recovery>,
     env_bindings: BTreeMap<String, String>,
+    file_recovery: Option<(MemoryStoreClient, [u8; 32], [u8; 32])>,
+}
+
+impl Drop for ActiveMemoryStoreResolver {
+    fn drop(&mut self) {
+        if let Some((_, key, identity_key)) = &mut self.file_recovery {
+            key.zeroize();
+            identity_key.zeroize();
+        }
+    }
 }
 
 impl ActiveMemoryStoreResolver {
@@ -475,6 +508,7 @@ impl ActiveMemoryStoreResolver {
             return Ok(Self {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
+                file_recovery: None,
             });
         };
         let snapshot = client.snapshot().map_err(|e| e.to_string())?;
@@ -482,6 +516,7 @@ impl ActiveMemoryStoreResolver {
         Ok(Self {
             recovery: Some(snapshot.recovery),
             env_bindings,
+            file_recovery: Some((client, snapshot.key, snapshot.identity_key)),
         })
     }
 
@@ -499,9 +534,26 @@ impl ActiveMemoryStoreResolver {
         kind: ToolInputKind,
     ) -> Result<Option<String>, ToolInputError> {
         match &self.recovery {
-            Some(recovery) => {
-                process_recovery_tool_input(text, kind, recovery).map(|value| Some(value.text))
-            }
+            Some(recovery) => match process_recovery_tool_input(text, kind, recovery) {
+                Err(ToolInputError::UnknownHandle) if self.file_recovery.is_some() => {
+                    let (client, key, identity_key) =
+                        self.file_recovery.as_ref().expect("checked file recovery");
+                    let recovered = file_pointer_manager::recover_tool_input(
+                        text,
+                        recovery,
+                        key,
+                        identity_key,
+                    )?;
+                    let mut combined = recovery.clone();
+                    combined.extend_same_key(recovered.clone());
+                    let validated = process_recovery_tool_input(text, kind, &combined)?;
+                    client
+                        .add_recovery(key, &recovered)
+                        .map_err(|_| ToolInputError::RecoveryStoreUnavailable)?;
+                    Ok(Some(validated.text))
+                }
+                result => result.map(|value| Some(value.text)),
+            },
             None if pentect_core::scan_recovery_views(text)
                 .map_err(|_| ToolInputError::MalformedView)?
                 .is_empty() =>
@@ -517,6 +569,7 @@ impl ActiveMemoryStoreResolver {
         Self {
             recovery: Some(recovery),
             env_bindings,
+            file_recovery: None,
         }
     }
 }
@@ -723,12 +776,20 @@ impl ActiveToolOutputMasker {
     /// after masking a request to restore completed local tool inputs.
     pub fn known_text_resolver(&self) -> Result<ActiveMemoryStoreResolver, String> {
         match &self.masker {
-            Some(masker) => masker
-                .recovery_snapshot()
-                .map(ActiveMemoryStoreResolver::from_recovery),
+            Some(masker) => {
+                let mut resolver =
+                    ActiveMemoryStoreResolver::from_recovery(masker.recovery_snapshot()?);
+                let (key, identity_key) = masker.recovery_keys();
+                resolver.file_recovery = self
+                    .client
+                    .clone()
+                    .map(|client| (client, key, identity_key));
+                Ok(resolver)
+            }
             None => Ok(ActiveMemoryStoreResolver {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
+                file_recovery: None,
             }),
         }
     }
@@ -1069,8 +1130,7 @@ fn register_read_file_pointers(
     if input_format != InputFormat::Text {
         return false;
     }
-    file_pointer_manager::register_file_pointers(path, source, result);
-    true
+    file_pointer_manager::register_file_pointers(path, source, result)
 }
 
 fn print_read_result(result: MaskResult, emit_meta: bool) {

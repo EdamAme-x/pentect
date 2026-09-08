@@ -79,9 +79,31 @@ sensitive areas before sending the image. Limits control the number of images,
 file size, image size, download time, and total check time.
 
 When pixels are covered, Pentect appends a short note for the agent explaining
-that the image was protected. Each region lists the same recoverable handle used
-for text, for example `[1] <<AWS_AKID_hash>>`; the original value is not included
-in the provider-visible note.
+that the image was protected. Each detected region lists its image number,
+region number, bounds, and the same recoverable handles used for text:
+
+```text
+[1] region 1: bounds left=200 top=100 right=400 bottom=200 (0..1000, image-relative): <<API_KEY_0123456789abcdef>>
+```
+
+Coordinates start at the upper-left corner and use a 0–1000 scale in each
+dimension. They keep their meaning when Pentect resizes the image. The bounds
+describe the detected region; the cover may extend beyond them for protection.
+Regions are sorted by position within each image, independently of detection
+order. Identical bounds and handle sets are deduplicated; overlapping detections
+with different handles remain separate. The same value at two positions keeps
+one handle and two region references. Region numbers are local to this image
+scan, not persistent identifiers across screenshots.
+Image numbers count preceding clean or unscanned images in the same scanned
+content. Gateways that scan one image at a time attach each note to that image;
+`[1]` can repeat in separate content blocks.
+
+QR codes and barcodes use their detected bounds too. When a location is
+unavailable, the note explicitly says `position unavailable; do not infer a
+location`. A region with several detected values lists all their handles;
+it does not claim a finer position within that region. Metadata secrets appear
+under separate metadata notes. The provider-visible note contains no original
+values, OCR snippets, or surrounding text.
 
 Text found by OCR can use the same case-sensitive `pentect(...)` and `mask(...)`
 force-mask markers as prompt text. Pentect protects the exact contents, including

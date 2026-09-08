@@ -39,6 +39,12 @@ pub enum ToolInputError {
     MalformedView,
     UnsupportedView,
     UnknownHandle,
+    RecoveryDisabled,
+    RecoverySourceChanged,
+    RecoverySourceUnavailable,
+    RecoveryScopeChanged,
+    RecoveryStoreUnavailable,
+    RecoveryLimitExceeded,
     OutputTooLarge,
 }
 
@@ -48,7 +54,13 @@ impl fmt::Display for ToolInputError {
             Self::UnknownSurface => "protected handle use is unsupported for this tool surface",
             Self::MalformedView => "protected handle view is malformed",
             Self::UnsupportedView => "protected handle view is unsupported for this operation",
-            Self::UnknownHandle => "protected handle is unavailable in this session",
+            Self::UnknownHandle => "protected handle is unavailable in this session; reread the original input",
+            Self::RecoveryDisabled => "file recovery is disabled; reread the original input in this session",
+            Self::RecoverySourceChanged => "protected handle source has changed; reread it to obtain a new handle",
+            Self::RecoverySourceUnavailable => "protected handle source cannot be read; restore access or reread the original input",
+            Self::RecoveryScopeChanged => "protected handle belongs to a different identity scope; reread the original input in this session",
+            Self::RecoveryStoreUnavailable => "protected handle recovery store is unavailable; restart the protected session and reread the original input",
+            Self::RecoveryLimitExceeded => "protected handle recovery exceeds this operation's read limit; reread only the required sources",
             Self::OutputTooLarge => "protected tool input is too large after restoration",
         })
     }

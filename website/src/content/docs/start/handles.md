@@ -90,9 +90,9 @@ Two different things have different lifetimes:
 - **Recovery data** lets the active local flow restore the value.
 
 With the default `handles.scope = "device"`, the same value normally gets the
-same ID on the same device. This does not store the value forever. After the
-protected session ends, a later session must read the source again before it
-can restore that handle.
+same ID on the same device. This does not store the value forever. A later
+protected session can reacquire a registered file-backed value after verifying
+the original file. Other values require the source to be read again.
 
 | Scope | ID behavior |
 | --- | --- |
@@ -105,9 +105,10 @@ scope.
 
 ## Known and unknown handles
 
-Pentect restores only handles present in the active recovery store. Text that
-looks like a handle but was invented, copied from another device, or created by
-an old session stays inert.
+Pentect restores handles in the active recovery store. At a supported native
+tool-input boundary, it can also reacquire a missing handle from a previously
+registered local file. Invented handles and references from another device or
+identity scope cannot be restored through that file reference.
 
 If an old handle no longer works, read the original file or input again inside
 the current protected client. Do not replace its ID by hand.
@@ -125,7 +126,41 @@ the real value.
 
 With `files.remember = true`, Pentect can remember where a handle came from and
 recover it only if the file still matches the recorded location and content.
-This is local metadata, not a copy of every secret.
+This is encrypted local metadata, not a persisted copy of the value. Explicit
+text-file reads through `pentect read PATH` or the runtime's own file reader can
+register a reference. A path mentioned by the model or returned by a shell,
+MCP server, or browser does not register a trusted source. OCR previews also do
+not create text-file references.
+
+On a completed native tool input, protected gateways can reacquire registered
+handles using their existing input validators:
+
+| Client / route | Reacquisition boundary |
+| --- | --- |
+| Codex | OpenAI Responses local tool arguments |
+| Claude | Anthropic Messages local tool arguments, including buffered streaming calls |
+| OpenCode and Pi | The same OpenAI Responses / Chat Completions and Anthropic Messages gateways |
+| Other protocol routes, unsupported tool fields, assistant prose | Reread the original input; no automatic file reacquisition |
+
+The current process must still be able to read the file. Its size and hash must
+match the recorded source, and the current identity key must reproduce the
+handle. Only then is the value added to the current recovery store. No tool
+input is returned for execution when a required reference or validation fails.
+Each tool-input string has a 64 MiB aggregate source-read budget and a 32 MiB
+reacquired-value budget, in addition to the normal per-file input limit. A limit
+failure requires reading only the needed sources or splitting the operation.
+
+References belong to the project where the file was read, even with device
+identity. Device and project identities support resumption within that project;
+session identity deliberately makes old-session references unusable. Setting
+`files.remember = false` disables both recording and reacquisition after restart.
+Values already held by the active session retain their normal lifetime.
+
+A changed, deleted, or unreadable file produces a value-free error with a
+reread instruction. Secret rotation never attaches an old handle to the new
+value: read the source again and use the newly produced handle. Inputs without
+a registered file source also need to be read again. Automatic reacquisition
+is for supported local tool inputs, not assistant prose or remote agents.
 
 Supported protected clients restore handles in completed tool calls
 automatically. `pentect exec` remains available for manual terminal workflows.

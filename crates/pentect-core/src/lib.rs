@@ -21,6 +21,7 @@
 
 pub mod codec;
 pub mod detect;
+pub mod explanation;
 pub mod model;
 pub mod normalize;
 pub mod pack;

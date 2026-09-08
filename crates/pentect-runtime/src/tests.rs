@@ -3227,7 +3227,14 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
         "{rendered}"
     );
     assert!(rendered.contains("Masked regions:"), "{rendered}");
-    assert!(rendered.contains("[1] <<KEYED_SECRET_"), "{rendered}");
+    assert!(
+        rendered.contains("[1] region 1: bounds left="),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("(0..1000, image-relative): <<KEYED_SECRET_"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("\"mimeType\":\"image/png\""),
         "{rendered}"
@@ -4788,6 +4795,86 @@ fn file_pointer_manager_save_can_be_disabled() {
         .join("file-pointer-manager")
         .join("key.bin")
         .exists());
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn native_file_recovery_checks_multiple_handles_from_one_source() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("native-file-multiple");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let source = "API_KEY=synthetic-first-value\nTOKEN=synthetic-second-value\n";
+    let path = Path::new(".env");
+    std::fs::write(path, source).unwrap();
+    let cfg = Config::new([81; 32]);
+    let result = Engine::default().mask(
+        Input {
+            kind: Kind::Env,
+            data: source.into(),
+        },
+        &cfg,
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        path, source, &result
+    ));
+    let key = [82; 32];
+    let recovered = file_pointer_manager::recover_tool_input(
+        &result.masked,
+        &pentect_core::Recovery::empty_for_key(&key),
+        &key,
+        &cfg.identity_key,
+    )
+    .unwrap();
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered.resolve(&result.masked), source);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn native_file_recovery_bounds_total_source_reads_before_publishing() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("native-file-budget");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let cfg = Config::new([83; 32]);
+    let engine = Engine::default();
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let value = format!("synthetic-value-{i}");
+        let source = format!("{value}{}", " ".repeat(22 * 1024 * 1024));
+        let path = PathBuf::from(format!("source-{i}.txt"));
+        std::fs::write(&path, &source).unwrap();
+        let result = engine.mask_spans(
+            Input::text(&source),
+            vec![pentect_core::Span {
+                range: pentect_core::ByteRange::new(0, value.len()),
+                label: "TOKEN".into(),
+                category: pentect_core::Category::Secret,
+                confidence: pentect_core::Confidence::High,
+                source: pentect_core::DetectorId::Explicit,
+            }],
+            &cfg,
+        );
+        assert!(file_pointer_manager::register_file_pointers(
+            &path, &source, &result
+        ));
+        handles.extend(result.recovery.placeholders());
+    }
+    let key = [84; 32];
+    let recovery = pentect_core::Recovery::empty_for_key(&key);
+    assert!(matches!(
+        file_pointer_manager::recover_tool_input(
+            &handles.join(" "),
+            &recovery,
+            &key,
+            &cfg.identity_key,
+        ),
+        Err(ToolInputError::RecoveryLimitExceeded)
+    ));
+    assert!(recovery.is_empty());
     drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }

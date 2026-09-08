@@ -106,6 +106,35 @@ cat .env | pentect mask
 printf '%s' 'CASE-12345678' | pentect mask --plugins ./company-policy
 ```
 
+Use `--explain` to keep masked text on stdout and print per-occurrence evidence
+on stderr. Add `--json` for a single structured report containing masked text,
+findings, parser fallback, profile, and effective decode limits:
+
+```sh
+pentect mask --explain < fixture.env
+pentect mask --kind env --explain --json < fixture.env > explanation.json
+```
+
+This runs the normal local masking pipeline with the same user/project
+configuration and enabled plugins. It does not call a model provider or create
+unmask exceptions. As with ordinary `mask`, separately launched invocations use
+different one-run handle IDs; detection and protected text structure are the same.
+Configured command plugins still execute under their usual permissions.
+
+Findings number occurrences in the final masked text, including Japanese,
+emoji, and multiline input, without exposing original offsets. Evidence records
+the winning detector class, label, category, confidence, and reason code after
+overlap resolution. Repeated handles share the evidence retained for that value
+across masking stages. Exact detector-rule IDs and individual plugin names are
+not retained; command-plugin findings use `plugin`, while declarative plugin
+patterns use `rule`. An explanation does not infer missing details.
+
+The complete report includes surrounding masked text and handles and is intended
+for local inspection. Its `public_report` field contains only version, safe
+configuration fields, parser fallback, and fixed reason codes. Nothing is
+uploaded automatically. See the [false-positive workflow](/reference/troubleshooting/#investigate-a-suspected-false-positive)
+before sharing a report.
+
 ### `read`
 
 Read a path with filename-aware format detection and print only the protected

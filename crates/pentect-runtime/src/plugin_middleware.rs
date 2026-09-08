@@ -4719,6 +4719,22 @@ for line in sys.stdin:
         assert_eq!(result.spans[0].range, ByteRange::new(0, 6));
         assert_eq!(result.spans[0].label, "CONFIGURED");
 
+        let masked = middleware
+            .detect_and_mask(
+                &Engine::default(),
+                Input::text("SECRET"),
+                None,
+                &Config::new([9; 32]),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        let explanation = masked.explain();
+        assert_eq!(explanation.len(), 1);
+        assert_eq!(explanation[0].evidence[0].source, DetectorId::Plugin);
+        assert_eq!(explanation[0].evidence[0].label, "CONFIGURED");
+        assert_eq!(masked.recovery.resolve(&masked.masked), "SECRET");
+
         drop(middleware);
         let global_id = format!("{nonce:032x}");
         let global_dirs = global_plugin_runtime_dirs(&global_id).unwrap();

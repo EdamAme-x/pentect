@@ -5054,6 +5054,42 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "ocr", target_os = "linux"))]
+    #[test]
+    fn inline_and_computer_tool_images_keep_region_handle_notes() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let original = data_encoding::BASE64
+            .encode(include_bytes!("../tests/fixtures/protected-region-qr.png"));
+        let image = serde_json::json!({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": original,
+        }});
+        for computer in [false, true] {
+            let mut content = if computer {
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "computer_1", "content": [image]}])
+            } else {
+                serde_json::json!([image])
+            };
+            redact_content_images(&mut content, &HashMap::new()).unwrap();
+            let blocks = if computer {
+                &content[0]["content"]
+            } else {
+                &content
+            };
+            assert_ne!(blocks[0]["source"]["data"], original);
+            assert_eq!(blocks[1]["type"], "text");
+            let note = blocks[1]["text"].as_str().unwrap();
+            assert!(note.contains("region 1: bounds left="), "{note}");
+            assert!(note.contains("(0..1000, image-relative)"), "{note}");
+            assert!(note.contains("<<KEYED_SECRET_"), "{note}");
+            assert!(!content.to_string().contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+            if computer {
+                assert_eq!(content[0]["tool_use_id"], "computer_1");
+            }
+        }
+    }
+
     #[test]
     fn custom_upstream_keeps_base_path_and_merges_queries() {
         let base = parse_upstream_base("https://gateway.example/anthropic?tenant=one").unwrap();

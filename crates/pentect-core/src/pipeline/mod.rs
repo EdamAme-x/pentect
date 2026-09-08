@@ -79,7 +79,7 @@ pub struct ResidualNote {
 /// One masked value, for reporting. Carries *what* was masked (label/category/
 /// detector), never *where*: a raw input offset would not map to `masked` anyway
 /// and would disclose each secret's position.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaskedItem {
     pub category: Category,
     pub label: Label,
@@ -112,6 +112,37 @@ pub struct MaskResult {
     /// What was masked (no raw offsets); see `MaskedItem`.
     pub items: Vec<MaskedItem>,
     pub summary: Summary,
+    /// Detector evidence keyed by the rendered handle. Retained across masking
+    /// stages without storing source offsets or original values.
+    pub provenance: std::collections::BTreeMap<String, Vec<MaskedItem>>,
+}
+
+fn rendered_provenance(
+    segments: &[RenderSegment],
+) -> std::collections::BTreeMap<String, Vec<MaskedItem>> {
+    let mut provenance: std::collections::BTreeMap<String, Vec<MaskedItem>> = Default::default();
+    for segment in segments {
+        if let RenderSegment::Masked {
+            text,
+            label,
+            category,
+            confidence,
+            source,
+        } = segment
+        {
+            let item = MaskedItem {
+                label: label.clone(),
+                category: *category,
+                confidence: *confidence,
+                source: *source,
+            };
+            let items = provenance.entry(text.clone()).or_default();
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+    }
+    provenance
 }
 
 /// Value-free scan output. It runs the same detectors, policy, merge, and sweep
@@ -343,6 +374,7 @@ impl Engine {
         };
         let items = masked_items(swept);
         MaskResult {
+            provenance: rendered_provenance(&rendered.segments),
             masked: rendered.masked,
             recovery: Recovery::seal(rendered.map, &config.key),
             segments: rendered.segments,
@@ -375,6 +407,7 @@ impl Engine {
         };
         let items = masked_items(swept);
         MaskResult {
+            provenance: rendered_provenance(&rendered.segments),
             masked: rendered.masked,
             recovery: Recovery::seal(rendered.map, &config.key),
             segments: rendered.segments,

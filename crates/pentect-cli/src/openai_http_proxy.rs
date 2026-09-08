@@ -6731,7 +6731,11 @@ mod tests {
         let _env = ProviderBoundaryTestEnv::install(&store);
         // A QR image containing only a fake test credential. This exercises the
         // real barcode/OCR, image rewrite, handle, and Responses note path.
-        let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/dAAAAAnRSTlP//8i138cAAAAJcEhZcwAACxIAAAsSAdLdfvwAAAF8SURBVGiB7ZrLrsIwEEP9/z/tq3beSSp1gXQX9VBKgbOypo4zAL4piPKSElFSIkpK/LMSsLrfXa95ZZ+KWpVgnG+1rsNUGwBEMZTArY+pVUrltSiclKC313XxrBdFMZSx5+i3XS+Kuspc/pbFNHvyL3yesuLyeFgf8Xkqqvk95hfjDb5OwSOEmb3nL/N9UdiVYFiW61XHsC6Kops4upOnVU3/oihm+6Ap5neo9dNoMohi3mfY8kJ6nSgM/0LEVGusSBO5ZojCsj6iDL9GE5laRXHZ6bB2jqFXix6iMFMaaozTxIk1URQXJehd1SaG+RSFNbnTu6vdnO5hM7RCFLO72GNX3zP1vApR7BOvSqW1oRx+D1FZcbvlWtlCrCimEiivyqifEzBR3JSgnWuRTCM7zFchiqlSzHRO+Z6iuPySwRgVeg/NIT5EYXQOfRlM3Y79RVFXxf8Acjt5f3jwL36esqpf0TK1bvMJiHpReANRVJSUiJISUVIi6pdK/AHPECxsuaPlLgAAAABJRU5ErkJggg==";
+        let image_url = format!(
+            "data:image/png;base64,{}",
+            data_encoding::BASE64
+                .encode(include_bytes!("../tests/fixtures/protected-region-qr.png"))
+        );
         let body = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "input": [{
@@ -6775,6 +6779,14 @@ mod tests {
         assert_eq!(note["content"][0]["type"], "input_text");
         let note_text = note["content"][0]["text"].as_str().unwrap();
         assert!(note_text.contains("Masked regions:"), "{note_text}");
+        assert!(
+            note_text.contains("[1] region 1: bounds left="),
+            "{note_text}"
+        );
+        assert!(
+            note_text.contains("(0..1000, image-relative)"),
+            "{note_text}"
+        );
         assert!(note_text.contains("<<KEYED_SECRET_"), "{note_text}");
         assert!(!serde_json::to_string(&protected)
             .unwrap()

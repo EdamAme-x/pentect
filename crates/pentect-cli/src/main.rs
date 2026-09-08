@@ -22,6 +22,7 @@ mod http_files;
 mod ide_clients;
 mod input;
 mod installation;
+mod mask_explain;
 mod model_definition;
 mod openai_client_injection;
 mod openai_clients;
@@ -140,7 +141,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "mask",
-        usage: "< input pentect mask",
+        usage: "pentect mask [--explain [--json]] < input",
         summary: "Mask UTF-8 text from standard input",
         audience: CommandAudience::Public,
     },
@@ -1086,7 +1087,7 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = match build_engine(profile, aggressive, packs) {
+    let (engine, decode) = match build_engine(profile, aggressive, packs) {
         Ok(engine) => engine,
         Err(error) => die(error),
     };
@@ -1100,6 +1101,19 @@ fn cmd_mask(args: &[String]) {
         Err(error) => die(error),
     };
 
+    if has_flag(args, "--explain") {
+        if let Err(error) = mask_explain::print(
+            &result,
+            &format!("{profile:?}"),
+            &kind_label,
+            &decode,
+            aggressive,
+            has_flag(args, "--json"),
+        ) {
+            die(error);
+        }
+        return;
+    }
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
     eprintln!(
@@ -1124,6 +1138,9 @@ fn cmd_mask(args: &[String]) {
 }
 
 fn validate_mask_args(args: &[String]) -> Result<(), String> {
+    if has_flag(args, "--json") && !has_flag(args, "--explain") {
+        return Err("mask --json requires --explain".to_string());
+    }
     let mut i = 2usize;
     'arguments: while i < args.len() {
         let argument = args[i].as_str();
@@ -1172,7 +1189,7 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
                 }
                 i += 2;
             }
-            "--aggressive" => {
+            "--aggressive" | "--explain" | "--json" => {
                 i += 1;
             }
             flag if flag.starts_with("--") => {
@@ -1238,6 +1255,9 @@ fn cmd_read(args: &[String]) {
         packs.clone(),
     ) {
         Ok(Some(result)) => {
+            if opts.input_format == ReadInputFormat::Text {
+                pentect_agent::remember_read_file(&opts.path, &input.data, &result);
+            }
             pentect_agent::record_read_activity(&result, &opts.path);
             print_read_result(result, opts.emit_meta);
             return;
@@ -1246,12 +1266,23 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     }
     let cfg = Config::generate();
-    let result = match pentect_agent::mask_input_for_read(cfg.key, input, opts.profile, packs) {
+    let result = match pentect_agent::mask_file_input_for_read(
+        cfg.key,
+        input.clone(),
+        opts.profile,
+        packs,
+    ) {
         Ok(result) => result,
         Err(e) => die(&e),
     };
     pentect_agent::record_read_activity(&result, &opts.path);
-    if let Some(warning) = transient_read_warning(result.summary.masked_count) {
+    let remembered = opts.input_format == ReadInputFormat::Text
+        && pentect_agent::remember_read_file(&opts.path, &input.data, &result);
+    if let Some(warning) = transient_read_warning(if remembered {
+        0
+    } else {
+        result.summary.masked_count
+    }) {
         eprintln!("{warning}");
     }
     print_read_result(result, opts.emit_meta);
@@ -1259,7 +1290,7 @@ fn cmd_read(args: &[String]) {
 
 fn transient_read_warning(masked_count: usize) -> Option<&'static str> {
     (masked_count > 0).then_some(
-        "[pentect] warning: no active memory store; handles in this output cannot be resolved later",
+        "[pentect] warning: no active memory store; handles without verified file references cannot be resolved later",
     )
 }
 
@@ -3594,12 +3625,17 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Result<Engine, String> {
+fn build_engine(
+    profile: Profile,
+    aggressive: bool,
+    packs: Vec<Pack>,
+) -> Result<(Engine, pentect_core::DecodeConfig), String> {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
     let decode = pentect_agent::load_decode_config(profile)?;
-    pentect_agent::build_masking_engine(profile, packs, aggressive, decode)
+    let engine = pentect_agent::build_masking_engine(profile, packs, aggressive, decode)?;
+    Ok((engine, decode))
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,

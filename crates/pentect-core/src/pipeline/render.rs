@@ -18,6 +18,7 @@ pub enum RenderSegment {
         label: Label,
         category: Category,
         confidence: Confidence,
+        source: DetectorId,
     },
 }
 
@@ -225,6 +226,7 @@ fn masked_seg(
         label: span.label.clone(),
         category: span.category,
         confidence: span.confidence,
+        source: span.source,
     }
 }
 
