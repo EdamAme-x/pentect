@@ -12,6 +12,7 @@ mod alcatraz;
 mod config;
 mod delegated_process_host;
 mod file_pointer_manager;
+mod handle_views;
 mod image_ocr;
 mod masking;
 mod memory_store;
@@ -19,6 +20,10 @@ mod network_address;
 mod output_remask;
 mod plugin_middleware;
 mod secure_io;
+pub use handle_views::{
+    process_tool_input, HandleView, OperationContext, RetryTracker, ToolInputError, ToolInputKind,
+    ValidatedToolInput, ViewResolver, MAX_OPERATION_RETRIES,
+};
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{
@@ -30,6 +35,19 @@ pub use plugin_middleware::{
 };
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
+
+/// Opt-in guidance for integrations that explicitly support encoded handle
+/// views. The default agent contract remains unchanged for compatibility.
+pub fn experimental_handle_view_contract() -> &'static str {
+    concat!(
+        "Experimental encoded-view operation rules:\n",
+        "- Use a raw handle only where the requested operation consumes data or a raw file.\n",
+        "- For code, use an explicit `|base64` view in an ordinary quoted string, then decode it with the local language runtime and pass the result through a data API such as argv, stdin, or a JSON serializer.\n",
+        "- Use `|json` only as a complete JSON string value in a JSON-template operation; do not place it in arbitrary code or shell syntax.\n",
+        "- Do not invoke Pentect, decode a handle yourself, print a secret, reread the source, or request an extra user action.\n",
+        "- Preserve the view marker byte-for-byte until the local tool input is complete.\n",
+    )
+}
 mod session;
 mod shell;
 
