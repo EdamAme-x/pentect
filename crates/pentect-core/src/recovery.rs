@@ -324,8 +324,12 @@ impl RecoveryStreamRemasker {
                 .cmp(&right.value)
                 .then_with(|| right.derived.cmp(&left.derived))
                 .then_with(|| {
-                    remask_placeholder_priority_bytes(&right.placeholder)
-                        .cmp(&remask_placeholder_priority_bytes(&left.placeholder))
+                    if left.derived || right.derived {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        remask_placeholder_priority_bytes(&right.placeholder)
+                            .cmp(&remask_placeholder_priority_bytes(&left.placeholder))
+                    }
                 })
                 .then_with(|| left.placeholder.cmp(&right.placeholder))
         });
@@ -739,11 +743,13 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
                 // Reject only a syntactically valid handle followed by a
                 // missing view terminator. Ordinary heredocs and prose with a
                 // pipe remain byte-identical.
-                let candidate = &text[i + 2..bytes.len().min(i + 2 + MAX_PLACEHOLDER_BYTES)];
-                if let Some((base, _)) = candidate.split_once('|') {
-                    if crate::placeholder::parse_placeholder(&format!("<<{base}>>")).is_ok() {
-                        out.zeroize();
-                        return Err(RecoveryViewError::Malformed);
+                let end = bytes.len().min(i + 2 + MAX_PLACEHOLDER_BYTES);
+                if let Ok(candidate) = std::str::from_utf8(&bytes[i + 2..end]) {
+                    if let Some((base, _)) = candidate.split_once('|') {
+                        if crate::placeholder::parse_placeholder(&format!("<<{base}>>")).is_ok() {
+                            out.zeroize();
+                            return Err(RecoveryViewError::Malformed);
+                        }
                     }
                 }
                 out.push('<');
@@ -753,15 +759,15 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
             let token = &text[i..close + 2];
             let inner = &token[2..token.len() - 2];
             if let Some((base, view)) = inner.rsplit_once('|') {
-                if base.is_empty() || view.is_empty() {
-                    out.zeroize();
-                    return Err(RecoveryViewError::Malformed);
-                }
                 if crate::placeholder::parse_placeholder(&format!("<<{base}>>")).is_err() {
                     let len = utf8_len(bytes[i]);
                     out.push_str(&text[i..i + len]);
                     i += len;
                     continue;
+                }
+                if view.is_empty() {
+                    out.zeroize();
+                    return Err(RecoveryViewError::Malformed);
                 }
                 if view_rendered("", view).is_none() {
                     out.zeroize();
@@ -1003,6 +1009,9 @@ mod tests {
             rec.resolve_view("cat <<EOF\nvalue | still-heredoc\nEOF"),
             Ok("cat <<EOF\nvalue | still-heredoc\nEOF".into())
         );
+        assert_eq!(rec.resolve_view("<<EOF|>>"), Ok("<<EOF|>>".into()));
+        let long_unicode = format!("<<{}|base64", "雪".repeat(300));
+        assert_eq!(rec.resolve_view(&long_unicode), Ok(long_unicode));
     }
 
     #[test]
