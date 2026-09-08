@@ -5,6 +5,7 @@ use pentect_core::{scan_recovery_views, Recovery, RecoveryViewKind};
 const VALUE_HANDLE: &str = "<<VALUE_0123456789abcdef>>";
 const VALUE_BASE64_HANDLE: &str = "<<VALUE_0123456789abcdef|base64>>";
 const AAAA_HANDLE: &str = "<<AAAA_KEY_fedcba9876543210>>";
+const AAAA_BASE64_HANDLE: &str = "<<AAAA_KEY_fedcba9876543210|base64>>";
 
 fn collision_recovery() -> Recovery {
     Recovery::seal(
@@ -23,6 +24,10 @@ fn derived_short_value_does_not_corrupt_a_known_handle() {
     // Three NUL bytes encode to "AAAA", which is also part of another known
     // handle's label. Known opaque handles must remain byte-identical.
     assert_eq!(recovery.remask_views(AAAA_HANDLE), AAAA_HANDLE);
+    assert_eq!(
+        recovery.remask_views(AAAA_BASE64_HANDLE),
+        AAAA_BASE64_HANDLE
+    );
     assert_eq!(recovery.remask_views(VALUE_HANDLE), VALUE_HANDLE);
     assert_eq!(
         recovery.remask_views(VALUE_BASE64_HANDLE),
@@ -33,9 +38,11 @@ fn derived_short_value_does_not_corrupt_a_known_handle() {
 #[test]
 fn collision_safe_remasking_is_idempotent_and_still_masks_values() {
     let recovery = collision_recovery();
-    let input = format!("stable-token AAAA {AAAA_HANDLE} {VALUE_BASE64_HANDLE}");
-    let expected =
-        format!("{AAAA_HANDLE} {VALUE_BASE64_HANDLE} {AAAA_HANDLE} {VALUE_BASE64_HANDLE}");
+    let input =
+        format!("stable-token AAAA {AAAA_HANDLE} {AAAA_BASE64_HANDLE} {VALUE_BASE64_HANDLE}");
+    let expected = format!(
+        "{AAAA_HANDLE} {VALUE_BASE64_HANDLE} {AAAA_HANDLE} {AAAA_BASE64_HANDLE} {VALUE_BASE64_HANDLE}"
+    );
 
     let remasked = recovery.remask_views(&input);
     assert_eq!(remasked, expected);
@@ -45,8 +52,8 @@ fn collision_safe_remasking_is_idempotent_and_still_masks_values() {
 #[test]
 fn streaming_remasking_matches_batch_at_every_split_point() {
     let recovery = collision_recovery();
-    let input = format!("prefix stable-token/AAAA/{AAAA_HANDLE}/{VALUE_BASE64_HANDLE} suffix");
-    let expected = recovery.remask_views(&input).into_bytes();
+    let input = format!("prefix/{AAAA_BASE64_HANDLE}/suffix");
+    let expected = input.as_bytes();
 
     for split in 0..=input.len() {
         let mut remasker = recovery.stream_remasker_with_views();

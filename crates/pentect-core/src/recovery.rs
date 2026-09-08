@@ -297,6 +297,15 @@ impl RecoveryStreamRemasker {
                         token_boundaries: false,
                         priority: 2,
                     }];
+                    if let Some(base) = placeholder.strip_suffix(">>") {
+                        let view_handle = format!("{base}|base64>>");
+                        patterns.push(StreamPattern {
+                            value: view_handle.as_bytes().to_vec(),
+                            placeholder: view_handle.into_bytes(),
+                            token_boundaries: false,
+                            priority: 2,
+                        });
+                    }
                     if is_remaskable_echo(&value, placeholder) {
                         patterns.push(StreamPattern {
                             value: value.clone().into_bytes(),
@@ -882,13 +891,13 @@ fn resolve_view_text_bounded(
                 out.push_str(&value)
             }
             RecoveryViewKind::Base64 => {
-                let mut rendered = view_rendered(&value, "base64").expect("known view");
-                if out.len().saturating_add(rendered.len()) > output_limit {
-                    rendered.zeroize();
+                let rendered_len = data_encoding::BASE64.encode_len(value.len());
+                if out.len().saturating_add(rendered_len) > output_limit {
                     value.zeroize();
                     out.zeroize();
                     return Err(RecoveryViewError::OutputTooLarge);
                 }
+                let mut rendered = view_rendered(&value, "base64").expect("known view");
                 out.push_str(&rendered);
                 rendered.zeroize();
             }
@@ -908,6 +917,10 @@ fn remask_view_text(text: &str, rec: &Recovery) -> String {
     let mut pairs: Vec<(String, String, u8)> = Vec::new();
     for ph in rec.map.keys() {
         pairs.push((ph.clone(), ph.clone(), 2));
+        if let Some(base) = ph.strip_suffix(">>") {
+            let view_handle = format!("{base}|base64>>");
+            pairs.push((view_handle.clone(), view_handle, 2));
+        }
         let Some(mut value) = rec.reveal(ph) else {
             continue;
         };
@@ -932,6 +945,13 @@ fn remask_view_text(text: &str, rec: &Recovery) -> String {
     pairs.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| {
+                if a.2 == 0 && b.2 == 0 {
+                    remask_placeholder_priority(&b.1).cmp(&remask_placeholder_priority(&a.1))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then_with(|| a.1.cmp(&b.1))
     });
     if pairs.is_empty() {
@@ -1167,9 +1187,7 @@ mod tests {
             scan_recovery_views(&malformed),
             Err(RecoveryViewScanError::Malformed)
         );
-        let many = std::iter::repeat("<<KEY_0011223344556677>>")
-            .take(4097)
-            .collect::<String>();
+        let many = "<<KEY_0011223344556677>>".repeat(4097);
         assert_eq!(
             scan_recovery_views(&many),
             Err(RecoveryViewScanError::Limit)

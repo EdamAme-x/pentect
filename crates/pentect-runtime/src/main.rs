@@ -3514,6 +3514,9 @@ fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, Str
 }
 
 pub fn contains_pentect_masked_handle(text: &str) -> bool {
+    if pentect_core::scan_recovery_views(text).is_ok_and(|tokens| !tokens.is_empty()) {
+        return true;
+    }
     let mut offset = 0usize;
     while let Some(start_rel) = text[offset..].find("<<") {
         let start = offset + start_rel;

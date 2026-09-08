@@ -12,6 +12,8 @@ use pentect_core::{
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
+const MAX_RESTORED_TOOL_INPUT_BYTES: usize = 32 * 1024 * 1024;
+
 /// The data contract of the operation receiving a tool input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolInputKind {
@@ -110,20 +112,29 @@ pub fn process_tool_input<R: ViewResolver>(
     let mut output = Zeroizing::new(String::with_capacity(input.len()));
     let mut cursor = 0;
     for span in spans {
-        output.push_str(&input[cursor..span.start]);
+        checked_append(&mut output, &input[cursor..span.start])?;
         let rendered =
             Zeroizing::new(resolver.resolve_view(&span.handle, handle_view_from_core(span.kind))?);
         validate_rendered(kind, span.kind, &rendered)?;
-        output.push_str(&rendered);
+        checked_append(&mut output, &rendered)?;
         cursor = span.end;
     }
-    output.push_str(&input[cursor..]);
+    checked_append(&mut output, &input[cursor..])?;
     let text = output.as_str().to_owned();
     output.zeroize();
     Ok(ValidatedToolInput {
         text,
         executed: false,
     })
+}
+
+fn checked_append(output: &mut String, value: &str) -> Result<(), ToolInputError> {
+    if output.len().saturating_add(value.len()) > MAX_RESTORED_TOOL_INPUT_BYTES {
+        output.zeroize();
+        return Err(ToolInputError::OutputTooLarge);
+    }
+    output.push_str(value);
+    Ok(())
 }
 
 /// Runtime adapter for the core recovery implementation. This opt-in adapter
