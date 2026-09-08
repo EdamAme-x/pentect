@@ -741,11 +741,15 @@ pub enum RecoveryViewScanError {
 }
 
 const MAX_RECOVERY_VIEW_TOKENS: usize = 4096;
+const MAX_RECOVERY_VIEW_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Scan canonical raw and experimental view handles in one bounded pass.
 /// Non-handle prose (including heredocs containing `|`) is ignored. A valid
 /// exact handle followed by a malformed/unknown view fails closed.
 pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, RecoveryViewScanError> {
+    if text.len() > MAX_RECOVERY_VIEW_INPUT_BYTES {
+        return Err(RecoveryViewScanError::Limit);
+    }
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -791,12 +795,18 @@ pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, Recover
                 kind,
             });
         } else if exact_handle(token) {
+            if tokens.len() >= MAX_RECOVERY_VIEW_TOKENS {
+                return Err(RecoveryViewScanError::Limit);
+            }
             tokens.push(RecoveryViewToken {
                 start: i,
                 end: close + 2,
                 handle: token.to_string(),
                 kind: RecoveryViewKind::Raw,
             });
+        } else {
+            i += 1;
+            continue;
         }
         i = close + 2;
     }
@@ -1185,10 +1195,26 @@ mod tests {
         let nested_tokens = scan_recovery_views(nested).unwrap();
         assert_eq!(nested_tokens.len(), 1);
         assert_eq!(nested_tokens[0].start, 14);
+        let nested_raw = "<<<KEY_0011223344556677>>";
+        let raw_tokens = scan_recovery_views(nested_raw).unwrap();
+        assert_eq!(raw_tokens.len(), 1);
+        assert_eq!(raw_tokens[0].start, 1);
         let malformed = format!("<<KEY_0011223344556677|{}", "雪".repeat(300));
         assert_eq!(
             scan_recovery_views(&malformed),
             Err(RecoveryViewScanError::Malformed)
+        );
+        let many = std::iter::repeat("<<KEY_0011223344556677>>")
+            .take(4097)
+            .collect::<String>();
+        assert_eq!(
+            scan_recovery_views(&many),
+            Err(RecoveryViewScanError::Limit)
+        );
+        let oversized = "x".repeat(32 * 1024 * 1024 + 1);
+        assert_eq!(
+            scan_recovery_views(&oversized),
+            Err(RecoveryViewScanError::Limit)
         );
     }
 
