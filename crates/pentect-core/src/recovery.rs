@@ -104,12 +104,12 @@ impl Recovery {
         resolve_view_text(text, self)
     }
 
-    /// Compatibility name for the opt-in combined raw/encoded resolver.
+    /// Compatibility name for the combined raw/encoded resolver.
     pub fn resolve_view(&self, text: &str) -> Result<String, RecoveryViewError> {
         self.resolve_with_views(text)
     }
 
-    /// Re-mask raw values and the values rendered by the experimental views.
+    /// Re-mask raw values and explicitly rendered base64 values.
     /// Derived values are preferred on an equal rendered-value collision so a
     /// resolved encoded handle remains the same encoded handle.
     pub fn remask_views(&self, text: &str) -> String {
@@ -276,7 +276,7 @@ impl RecoveryStreamRemasker {
         self.merge_recovery_inner(recovery, false);
     }
 
-    /// Add raw and experimental derived-view patterns to this stream.
+    /// Add raw and explicit derived-view patterns to this stream.
     pub fn merge_recovery_with_views(&mut self, recovery: &Recovery) {
         self.merge_recovery_inner(recovery, true);
     }
@@ -723,7 +723,7 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
     Ok(rec.resolve(text))
 }
 
-/// Errors returned by the opt-in encoded-view resolver.
+/// Errors returned by the encoded-view resolver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryViewError {
     /// A view token was not closed within the bounded placeholder size.
@@ -762,7 +762,7 @@ const MAX_RECOVERY_VIEW_TOKENS: usize = 4096;
 const MAX_RECOVERY_VIEW_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RECOVERY_VIEW_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
-/// Scan canonical raw and experimental view handles in one bounded pass.
+/// Scan canonical raw and explicit view handles in one bounded pass.
 /// Non-handle prose (including heredocs containing `|`) is ignored. A valid
 /// exact handle followed by a malformed/unknown view fails closed.
 pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, RecoveryViewScanError> {
@@ -1123,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_views_are_strict_and_single_pass() {
+    fn views_are_strict_and_single_pass() {
         let ph = "<<KEY_0011223344556677>>";
         let value = "quote \" slash \\\nline\r\n雪\0";
         let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[7u8; 32]);
@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_remask_round_trips_raw_and_derived_views() {
+    fn remask_round_trips_raw_and_derived_views() {
         let ph = "<<KEY_0011223344556677>>";
         let value = "a\"b\n雪";
         let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[8u8; 32]);
@@ -1238,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_views_cover_empty_nul_full_id_and_nested_text() {
+    fn views_cover_empty_nul_full_id_and_nested_text() {
         let empty = "<<EMPTY_0123456789abcdef>>";
         let empty_rec = Recovery::seal(HashMap::from([(empty.into(), "".into())]), &[1u8; 32]);
         assert_eq!(
@@ -1254,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_remask_equal_render_collision_is_deterministic_and_custom_keys_do_not_panic() {
+    fn remask_equal_render_collision_is_deterministic_and_custom_keys_do_not_panic() {
         let rec = Recovery::seal(
             HashMap::from([
                 ("raw-key".into(), "same".into()),
@@ -1272,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_stream_remask_matches_whole_for_every_byte_split() {
+    fn stream_remask_matches_whole_for_every_byte_split() {
         let ph = "<<KEY_0123456789abcdef>>";
         let value = "line\n雪 \"quoted\"";
         let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[4u8; 32]);
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_whole_and_stream_share_short_raw_boundaries() {
+    fn whole_and_stream_share_short_raw_boundaries() {
         let ph = "<<KEYED_SECRET_0123456789abcdef>>";
         let rec = Recovery::seal(HashMap::from([(ph.into(), "a".into())]), &[6u8; 32]);
         let input = "catalog a value=a";

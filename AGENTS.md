@@ -8,6 +8,11 @@ Values such as `<<API_KEY_ab12...>>` are opaque handles:
 
 - Copy a handle exactly. Do not edit, expand, guess, or explain it.
 - Use it only in a local tool call that needs the represented value.
+- Keep an ordinary handle as one complete quoted data argument or string. For
+  values Pentect cannot conservatively restore in code or patch text, append
+  `|base64` before the closing `>>`, keep that view as one quoted data value,
+  and decode it locally through argv, stdin, or another data API. Do not use a
+  handle to generate syntax, patch structure, or an `eval` input.
 - Never print a secret or ask a user to reveal one.
 - Do not bypass a Pentect block. Explain the blocked content or unsupported
   surface and let the user choose a documented compatibility setting.

@@ -3016,7 +3016,8 @@ fn unscanned_chat_image() -> Result<(), String> {
 
 type ChatFrameStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send>>;
-type ChatResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
+type ChatResolver =
+    Box<dyn FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send>;
 
 struct ChatStreamState {
     upstream: ChatFrameStream,
@@ -3031,7 +3032,7 @@ fn rewrite_chat_json_response(
     block_unknown_formats: bool,
     restore_output: bool,
 ) -> Result<Bytes, String> {
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
     rewrite_chat_json_response_with(
         body,
         plugins,
@@ -3049,7 +3050,7 @@ fn rewrite_chat_json_response_with<R>(
     resolve: &mut R,
 ) -> Result<Bytes, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -3133,7 +3134,7 @@ fn chat_sse_body_with_limit<S>(
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
 {
-    let resolve: ChatResolver = Box::new(crate::claude_http_proxy::request_scoped_resolver());
+    let resolve: ChatResolver = Box::new(crate::claude_http_proxy::request_scoped_tool_resolver());
     let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
         resolve,
         plugins,
@@ -3289,7 +3290,7 @@ fn run_chat_tool_plugins(
 
 fn resolve_chat_tool_calls<R>(value: &mut serde_json::Value, resolve: &mut R) -> Result<u64, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut restored_tools = 0u64;
     match value {
@@ -3326,7 +3327,7 @@ where
                             ),
                         };
                         let (resolved, changed) =
-                            crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                            crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
                                 &encoded,
                                 name.as_deref(),
                                 resolve,
@@ -3843,7 +3844,9 @@ mod tests {
             Bytes::from(format!("{first}{second}{stop}")),
         ))]);
         let resolve: ChatResolver =
-            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+            Box::new(
+                |text: &str, _| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            );
         let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
             resolve,
             Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
@@ -3879,7 +3882,7 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
             Bytes::from_static(input.as_bytes()),
         ))]);
-        let resolve: ChatResolver = Box::new(|text: &str| {
+        let resolve: ChatResolver = Box::new(|text: &str, _| {
             Ok(text.replace("<<KEYED_SECRET_0123456789abcdef>>", "local-value"))
         });
         let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
@@ -3909,7 +3912,8 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
             Bytes::from_static(input.as_bytes()),
         ))]);
-        let resolve: ChatResolver = Box::new(|_: &str| Err("memory store unavailable".to_string()));
+        let resolve: ChatResolver =
+            Box::new(|_: &str, _| Err("memory store unavailable".to_string()));
         let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
             resolve,
             Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
@@ -4726,7 +4730,7 @@ mod tests {
                 }}
             ]
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
         resolve_chat_tool_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["content"][0]["text"], format!("show {handle}"));
         assert_eq!(
@@ -4815,7 +4819,7 @@ mod tests {
             .unwrap(),
         );
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
         let rewritten =
             rewrite_chat_json_response_with(&body, &plugins, true, true, &mut resolve).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();

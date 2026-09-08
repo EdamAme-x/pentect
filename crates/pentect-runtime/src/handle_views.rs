@@ -60,10 +60,6 @@ impl ToolInputError {
     pub const fn executed(self) -> bool {
         false
     }
-
-    pub const fn retryable(self) -> bool {
-        matches!(self, Self::MalformedView | Self::UnsupportedView)
-    }
 }
 
 /// A validated input ready for the caller's local execution path.
@@ -137,8 +133,7 @@ fn checked_append(output: &mut String, value: &str) -> Result<(), ToolInputError
     Ok(())
 }
 
-/// Runtime adapter for the core recovery implementation. This opt-in adapter
-/// lets a future integration declare the operation surface while core owns
+/// Runtime adapter that lets a gateway declare the operation surface while core owns
 /// the authenticated handle/view mapping and encoding.
 pub fn process_recovery_tool_input(
     input: &str,
@@ -314,7 +309,6 @@ mod tests {
             .text,
             "echo secret"
         );
-        assert!(ToolInputError::UnsupportedView.retryable());
     }
 
     #[test]
