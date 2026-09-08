@@ -95,6 +95,32 @@ impl Recovery {
         resolve_text(text, self)
     }
 
+    /// Resolve the experimental, explicitly requested encoded views of a
+    /// handle.  Unlike `resolve`, this is strict: a view-looking token with an
+    /// unknown handle or view is rejected rather than being returned as
+    /// plaintext.  The input is scanned once; generated values are never
+    /// scanned again.
+    pub fn resolve_view(&self, text: &str) -> Result<String, RecoveryViewError> {
+        resolve_view_text(text, self)
+    }
+
+    /// Convenience form of [`Recovery::resolve_view`] for `|base64` views.
+    pub fn resolve_base64(&self, text: &str) -> Result<String, RecoveryViewError> {
+        self.resolve_view(text)
+    }
+
+    /// Convenience form of [`Recovery::resolve_view`] for `|json` views.
+    pub fn resolve_json(&self, text: &str) -> Result<String, RecoveryViewError> {
+        self.resolve_view(text)
+    }
+
+    /// Re-mask raw values and the values rendered by the experimental views.
+    /// Derived values are preferred on an equal rendered-value collision so a
+    /// resolved encoded handle remains the same encoded handle.
+    pub fn remask_views(&self, text: &str) -> String {
+        remask_view_text(text, self)
+    }
+
     /// Re-mask: replace any sealed original value that reappears in `text` (e.g.
     /// a tool echoed it after a resolve) with its placeholder. The other half of
     /// `resolve`, for the resolve-at-exec loop: resolve placeholders just before
@@ -640,6 +666,123 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
     Ok(rec.resolve(text))
 }
 
+/// Errors returned by the opt-in encoded-view resolver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryViewError {
+    /// A view token was not closed within the bounded placeholder size.
+    Malformed,
+    /// The handle portion of a view is not present in this recovery.
+    UnknownHandle(String),
+    /// The suffix is not one of the deliberately small supported view names.
+    UnknownView(String),
+}
+
+impl std::fmt::Display for RecoveryViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => write!(f, "malformed recovery view"),
+            Self::UnknownHandle(_) => write!(f, "unknown recovery view handle"),
+            Self::UnknownView(_) => write!(f, "unknown recovery view"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryViewError {}
+
+fn view_rendered(value: &str, view: &str) -> Option<String> {
+    match view {
+        "base64" => Some(data_encoding::BASE64.encode(value.as_bytes())),
+        "json" => serde_json::to_string(value).ok(),
+        _ => None,
+    }
+}
+
+fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewError> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
+            let Some(close) = find_from_limited(bytes, i + 2, b">>", MAX_PLACEHOLDER_BYTES) else {
+                // Only reject tokens that contain the view separator; ordinary
+                // incomplete placeholders retain the compatibility behavior.
+                if text[i..].contains('|') {
+                    return Err(RecoveryViewError::Malformed);
+                }
+                out.push('<');
+                i += 1;
+                continue;
+            };
+            let token = &text[i..close + 2];
+            let inner = &token[2..token.len() - 2];
+            if let Some((base, view)) = inner.rsplit_once('|') {
+                if base.is_empty() || view.is_empty() {
+                    return Err(RecoveryViewError::Malformed);
+                }
+                let rendered = view_rendered("", view);
+                if rendered.is_none() {
+                    return Err(RecoveryViewError::UnknownView(view.to_string()));
+                }
+                let Some(value) = rec.reveal(&format!("<<{base}>>")) else {
+                    return Err(RecoveryViewError::UnknownHandle(base.to_string()));
+                };
+                let rendered = view_rendered(&value, view).expect("validated view");
+                out.push_str(&rendered);
+                i = close + 2;
+                continue;
+            }
+        }
+        let len = utf8_len(bytes[i]);
+        out.push_str(&text[i..i + len]);
+        i += len;
+    }
+    Ok(out)
+}
+
+fn remask_view_text(text: &str, rec: &Recovery) -> String {
+    let mut pairs: Vec<(String, String, u8)> = Vec::new();
+    for ph in rec.map.keys() {
+        let Some(value) = rec.reveal(ph) else {
+            continue;
+        };
+        if is_remaskable_echo(&value, ph) {
+            pairs.push((value.clone(), ph.clone(), 0));
+        }
+        for view in ["base64", "json"] {
+            if let Some(rendered) = view_rendered(&value, view) {
+                pairs.push((rendered, format!("{}|{}>>", &ph[..ph.len() - 2], view), 1));
+            }
+        }
+    }
+    pairs.retain(|(value, _, _)| !value.is_empty());
+    pairs.sort_by(|a, b| {
+        b.0.len()
+            .cmp(&a.0.len())
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let mut found = None;
+        for (value, handle, _) in &pairs {
+            if text[i..].starts_with(value) {
+                found = Some((value, handle));
+                break;
+            }
+        }
+        if let Some((value, handle)) = found {
+            out.push_str(handle);
+            i += value.len();
+        } else {
+            let len = utf8_len(text.as_bytes()[i]);
+            out.push_str(&text[i..i + len]);
+            i += len;
+        }
+    }
+    out
+}
+
 /// Replace known `<<...>>` tokens with their originals; leave unknown tokens
 /// unchanged (a hallucinated placeholder has no mapping, so nothing can leak).
 fn resolve_text(text: &str, rec: &Recovery) -> String {
@@ -765,6 +908,61 @@ mod tests {
         assert_eq!(
             restore(&format!("use {ph}"), &rec).unwrap(),
             rec.resolve(&format!("use {ph}"))
+        );
+    }
+
+    #[test]
+    fn experimental_views_are_strict_and_single_pass() {
+        let ph = "<<KEY_0011223344556677>>";
+        let value = "quote \" slash \\\\nline\\r\\n雪\\0";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[7u8; 32]);
+        let base = "<<KEY_0011223344556677|base64>>";
+        let json = "<<KEY_0011223344556677|json>>";
+        assert_eq!(
+            rec.resolve_view(base).unwrap(),
+            data_encoding::BASE64.encode(value.as_bytes())
+        );
+        assert_eq!(
+            rec.resolve_base64(json).unwrap_err(),
+            RecoveryViewError::UnknownView("json".into())
+        );
+        assert_eq!(
+            rec.resolve_json(json).unwrap(),
+            serde_json::to_string(value).unwrap()
+        );
+        assert_eq!(
+            rec.resolve_view("<<NOPE_0011223344556677|base64>>"),
+            Err(RecoveryViewError::UnknownHandle(
+                "NOPE_0011223344556677".into()
+            ))
+        );
+        assert_eq!(
+            rec.resolve_view("<<KEY_0011223344556677|wat>>"),
+            Err(RecoveryViewError::UnknownView("wat".into()))
+        );
+        assert_eq!(
+            rec.resolve_view("<<KEY_0011223344556677|base64"),
+            Err(RecoveryViewError::Malformed)
+        );
+    }
+
+    #[test]
+    fn experimental_remask_round_trips_raw_and_derived_views() {
+        let ph = "<<KEY_0011223344556677>>";
+        let value = "a\"b\n雪";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), value.into())]), &[8u8; 32]);
+        let base = "<<KEY_0011223344556677|base64>>";
+        let json = "<<KEY_0011223344556677|json>>";
+        let encoded = format!(
+            "{} {}",
+            rec.resolve_view(base).unwrap(),
+            rec.resolve_view(json).unwrap()
+        );
+        assert_eq!(rec.remask_views(&encoded), format!("{base} {json}"));
+        assert_eq!(rec.remask_views(value), ph);
+        assert_eq!(
+            rec.resolve_view(&rec.remask_views(&encoded)).unwrap(),
+            encoded
         );
     }
 
