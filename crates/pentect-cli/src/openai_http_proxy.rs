@@ -68,6 +68,19 @@ type UpstreamByteStream =
 type HandleResolver =
     Box<dyn FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send>;
 
+fn request_scoped_bounded_resolver(limit: usize) -> HandleResolver {
+    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+    let mut resolved_bytes = 0usize;
+    Box::new(move |text, kind| {
+        let resolved = resolve(text, kind)?;
+        resolved_bytes = resolved_bytes.saturating_add(resolved.len());
+        if resolved_bytes > limit {
+            return Err("OpenAI restored response exceeded inspection limit".to_string());
+        }
+        Ok(resolved)
+    })
+}
+
 pub(crate) struct OpenAiHttpProxyGuard {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
@@ -2396,7 +2409,7 @@ fn rewrite_openai_json_response(body: &[u8], restore_output: bool) -> Result<Vec
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))?;
     let original = value.clone();
-    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+    let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
     let restored_tools = ToolRestorationDedup::default()
         .commit_nonstream(rewrite_function_calls(&mut value, &mut resolve)?);
     if restore_output {
@@ -2418,7 +2431,7 @@ fn rewrite_chat_completions_json_response(
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI Chat Completions response was not valid JSON: {error}"))?;
     let original = value.clone();
-    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+    let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
     let restored_tools = rewrite_chat_tool_calls(&mut value, &mut resolve)?;
     if restore_output {
         restore_chat_output_text(&mut value, &mut resolve)?;
@@ -2438,7 +2451,7 @@ fn rewrite_completions_json_response(body: &[u8], restore_output: bool) -> Resul
         .map_err(|error| format!("OpenAI Completions response was not valid JSON: {error}"))?;
     let original = value.clone();
     if restore_output {
-        let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+        let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
         restore_completion_output_text(&mut value, &mut resolve)?;
     }
     if value == original {
@@ -2823,6 +2836,11 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
             &mut state.responses_tool_started,
             &mut state.responses_tool_completed,
         );
+        if state.responses_tool_started.len() > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+            || state.responses_tool_completed.len() > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+        {
+            return Err("OpenAI Responses produced too many tool call identities".to_string());
+        }
     }
     let rewritten = match state.transform {
         StreamTransform::Responses => rewrite_openai_sse_block_tracked(
@@ -2942,11 +2960,16 @@ fn record_responses_tool_progress(
     let Ok(value) = serde_json::from_str::<Value>(data.as_ref()) else {
         return;
     };
-    fn visit(value: &Value, started: &mut HashSet<String>, completed: &mut HashSet<String>) {
+    fn visit(
+        value: &Value,
+        completion_envelope: bool,
+        started: &mut HashSet<String>,
+        completed: &mut HashSet<String>,
+    ) {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    visit(value, started, completed);
+                    visit(value, completion_envelope, started, completed);
                 }
             }
             Value::Object(object) => {
@@ -2957,23 +2980,24 @@ fn record_responses_tool_progress(
                 if call {
                     for identity in function_call_identities(object) {
                         started.insert(identity.clone());
-                        if ["arguments", "input"]
-                            .into_iter()
-                            .any(|key| object.get(key).is_some_and(Value::is_string))
-                        {
+                        if completion_envelope {
                             completed.insert(identity);
                         }
                     }
                 }
                 for value in object.values() {
-                    visit(value, started, completed);
+                    visit(value, completion_envelope, started, completed);
                 }
             }
             _ => {}
         }
     }
-    visit(&value, started, completed);
     let event_type = value.get("type").and_then(Value::as_str);
+    let completion_envelope = matches!(
+        event_type,
+        Some("response.output_item.done" | "response.completed")
+    );
+    visit(&value, completion_envelope, started, completed);
     if matches!(
         event_type,
         Some(
@@ -3025,7 +3049,7 @@ fn streaming_response_body(
         restore_output,
         block_unknown_formats,
         output_text: HashMap::new(),
-        output_resolve: Box::new(crate::claude_http_proxy::request_scoped_tool_resolver()),
+        output_resolve: request_scoped_bounded_resolver(MAX_PENDING_SSE_BYTES),
         restored_tools: ToolRestorationDedup::default(),
         responses_tool_pending: VecDeque::new(),
         responses_tool_pending_bytes: 0,
@@ -3090,6 +3114,17 @@ fn streaming_response_body(
                         state.ready.push_back(Err(Box::new(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "OpenAI Responses stream ended before a completed response",
+                        ))));
+                        continue;
+                    }
+                    if state.transform == StreamTransform::ChatCompletions
+                        && !state.chat.calls.is_empty()
+                    {
+                        state.chat.calls.clear();
+                        state.chat.buffered_bytes = 0;
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "OpenAI Chat Completions stream ended before [DONE]",
                         ))));
                         continue;
                     }
@@ -3267,6 +3302,8 @@ impl ChatStreamState {
         };
         if data == "[DONE]" {
             let mut output = self.finish_output_text(text)?;
+            let mut output_bytes = output.iter().map(Bytes::len).sum::<usize>();
+            let mut restored_tools = 0u64;
             if !self.calls.is_empty() {
                 let envelope = self.last_envelope.take().ok_or_else(|| {
                     "OpenAI Chat Completions stream ended without a tool call envelope".to_string()
@@ -3279,9 +3316,20 @@ impl ChatStreamState {
                 choices.sort_unstable();
                 choices.dedup();
                 for choice in choices {
-                    output.push(self.completed_tool_block(text, &envelope, choice, plugins)?);
+                    let (block, count) =
+                        self.completed_tool_block(text, &envelope, choice, plugins, resolve)?;
+                    output_bytes = output_bytes.saturating_add(block.len());
+                    if output_bytes > MAX_PENDING_SSE_BYTES {
+                        return Err(
+                            "OpenAI Chat Completions tool output exceeded inspection limit"
+                                .to_string(),
+                        );
+                    }
+                    output.push(block);
+                    restored_tools = restored_tools.saturating_add(count);
                 }
             }
+            crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
             output.push(Bytes::copy_from_slice(block));
             return Ok(output);
         }
@@ -3415,7 +3463,8 @@ impl ChatStreamState {
         envelope: &Value,
         choice_index: u64,
         plugins: &Mutex<pentect_agent::PluginMiddleware>,
-    ) -> Result<Bytes, String> {
+        resolve: &mut HandleResolver,
+    ) -> Result<(Bytes, u64), String> {
         let mut indexes = self
             .calls
             .keys()
@@ -3426,7 +3475,6 @@ impl ChatStreamState {
         let plugins = plugins
             .lock()
             .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
-        let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
         let mut restored_tools = 0u64;
         for index in indexes {
             let call = self
@@ -3452,7 +3500,7 @@ impl ChatStreamState {
                 crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
                     arguments,
                     Some(name),
-                    &mut resolve,
+                    resolve,
                 )?;
             restored_tools = restored_tools.saturating_add(u64::from(changed));
             calls.push(serde_json::json!({
@@ -3469,8 +3517,7 @@ impl ChatStreamState {
             "finish_reason": null
         }]);
         let encoded = encode_sse_value(template, &completed)?;
-        crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
-        Ok(encoded)
+        Ok((encoded, restored_tools))
     }
 }
 
@@ -3601,6 +3648,11 @@ fn rewrite_openai_sse_block_tracked(
     let Ok(mut value) = serde_json::from_str::<Value>(data.as_ref()) else {
         return Ok(vec![Bytes::copy_from_slice(block)]);
     };
+    if value.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+        && contains_any_function_call(&value)
+    {
+        return Ok(vec![Bytes::copy_from_slice(block)]);
+    }
     if matches!(
         value.get("type").and_then(Value::as_str),
         Some("response.function_call_arguments.done" | "response.custom_tool_call_input.done")
@@ -5528,7 +5580,7 @@ mod tests {
         let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
         process_stream_block(
             &mut state,
-            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":null}}\n\n".to_vec(),
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"\"}}\n\n".to_vec(),
         )
         .unwrap();
         assert!(state.ready.is_empty());
@@ -5664,7 +5716,7 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_final_chat_event_is_processed_at_eof() {
+    fn unterminated_final_chat_event_is_rejected_at_eof() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = ProviderBoundaryTestEnv::install(&store);
