@@ -6,13 +6,12 @@
 //! complete input before the resolver is called, so a late failure cannot
 //! publish a partially resolved tool input.
 
-use pentect_core::{parse_placeholder, Recovery};
+use pentect_core::{
+    scan_recovery_views, Recovery, RecoveryViewKind, RecoveryViewScanError, RecoveryViewToken,
+};
 use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
-
-const MAX_VIEW_INPUT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_VIEW_TOKENS: usize = 4096;
 
 /// The data contract of the operation receiving a tool input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,7 +174,8 @@ pub fn process_tool_input<R: ViewResolver>(
     let mut cursor = 0;
     for span in spans {
         output.push_str(&input[cursor..span.start]);
-        let rendered = Zeroizing::new(resolver.resolve_view(&span.handle, span.view)?);
+        let rendered =
+            Zeroizing::new(resolver.resolve_view(&span.handle, handle_view_from_core(span.kind))?);
         output.push_str(&rendered);
         cursor = span.end;
     }
@@ -215,61 +215,34 @@ pub fn process_recovery_tool_input(
     })
 }
 
-#[derive(Clone, Debug)]
-struct ViewSpan {
-    start: usize,
-    end: usize,
-    handle: String,
-    view: HandleView,
-}
-
-fn scan_views(input: &str) -> Result<Vec<ViewSpan>, ToolInputError> {
-    if input.len() > MAX_VIEW_INPUT_BYTES {
-        return Err(ToolInputError::MalformedView);
-    }
-    let mut spans = Vec::new();
-    for (start, _) in input.match_indices("<<") {
-        if spans.len() >= MAX_VIEW_TOKENS {
-            return Err(ToolInputError::MalformedView);
-        }
-        let Some(relative_end) = input[start + 2..].find(">>") else {
-            if is_placeholder(&input[start + 2..]) {
-                return Err(ToolInputError::MalformedView);
-            }
-            break;
-        };
-        let end = start + 2 + relative_end + 2;
-        let body = &input[start + 2..end - 2];
-        let (handle, name) = body
-            .split_once('|')
-            .map_or((body, None), |(handle, name)| (handle, Some(name)));
-        let Ok(parts) = parse_placeholder(handle) else {
-            continue;
-        };
-        let view = match name {
-            None => HandleView::Raw,
-            Some("base64") => HandleView::Base64,
-            Some("json") => HandleView::Json,
-            Some(_) => return Err(ToolInputError::MalformedView),
-        };
-        spans.push(ViewSpan {
-            start,
-            end,
-            handle: parts.handle,
-            view,
-        });
-    }
+fn scan_views(input: &str) -> Result<Vec<RecoveryViewToken>, ToolInputError> {
+    let spans = scan_recovery_views(input).map_err(|error| match error {
+        RecoveryViewScanError::Malformed
+        | RecoveryViewScanError::UnknownView
+        | RecoveryViewScanError::Limit => ToolInputError::MalformedView,
+    })?;
     Ok(spans)
 }
 
-fn validate_surface(kind: ToolInputKind, spans: &[ViewSpan]) -> Result<(), ToolInputError> {
+fn handle_view_from_core(kind: RecoveryViewKind) -> HandleView {
+    match kind {
+        RecoveryViewKind::Raw => HandleView::Raw,
+        RecoveryViewKind::Base64 => HandleView::Base64,
+        RecoveryViewKind::Json => HandleView::Json,
+    }
+}
+
+fn validate_surface(
+    kind: ToolInputKind,
+    spans: &[RecoveryViewToken],
+) -> Result<(), ToolInputError> {
     for span in spans {
         let supported = match kind {
             ToolInputKind::Data | ToolInputKind::RawFile => {
-                matches!(span.view, HandleView::Raw | HandleView::Base64)
+                matches!(span.kind, RecoveryViewKind::Raw | RecoveryViewKind::Base64)
             }
-            ToolInputKind::JsonTemplate => matches!(span.view, HandleView::Json),
-            ToolInputKind::Code => matches!(span.view, HandleView::Base64),
+            ToolInputKind::JsonTemplate => matches!(span.kind, RecoveryViewKind::Json),
+            ToolInputKind::Code => matches!(span.kind, RecoveryViewKind::Base64),
             ToolInputKind::Unknown => return Err(ToolInputError::UnknownSurface),
         };
         if !supported {
@@ -277,10 +250,6 @@ fn validate_surface(kind: ToolInputKind, spans: &[ViewSpan]) -> Result<(), ToolI
         }
     }
     Ok(())
-}
-
-fn is_placeholder(body: &str) -> bool {
-    parse_placeholder(body).is_ok()
 }
 
 #[cfg(test)]
@@ -366,7 +335,11 @@ mod tests {
             Err(ToolInputError::MalformedView)
         );
         assert_eq!(
-            process_tool_input("x <<KEY_abcdef0123456789", ToolInputKind::Data, &resolve),
+            process_tool_input(
+                "x <<KEY_abcdef0123456789|base64",
+                ToolInputKind::Data,
+                &resolve,
+            ),
             Err(ToolInputError::MalformedView)
         );
         assert_eq!(calls.get(), 0);
