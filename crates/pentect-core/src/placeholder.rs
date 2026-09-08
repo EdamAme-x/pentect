@@ -126,6 +126,25 @@ pub fn parse_placeholder(value: &str) -> Result<PlaceholderParts, String> {
     })
 }
 
+/// Whether `value` is an exact canonical handle emitted by
+/// [`render_placeholder`]. Unlike [`parse_placeholder`], this deliberately
+/// does not apply the legacy unwrapped `PENTECT_` input alias.
+pub(crate) fn is_canonical_placeholder(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix("<<")
+        .and_then(|value| value.strip_suffix(">>"))
+    else {
+        return false;
+    };
+    let Ok((core, _)) = split_length_hint(inner) else {
+        return false;
+    };
+    let Some((label, hash)) = core.rsplit_once('_') else {
+        return false;
+    };
+    validate_label(label).is_ok() && validate_hash(hash).is_ok()
+}
+
 fn split_length_hint(inner: &str) -> Result<(&str, Option<LengthHint>), String> {
     if let Some((prefix, suffix)) = inner.rsplit_once("_length_at_least_") {
         let Some(raw_n) = suffix.strip_suffix("_chars") else {
@@ -222,6 +241,9 @@ mod tests {
             render_placeholder("X", "abc", Some(24)),
             "<<X_abc_length_24_chars>>"
         );
+        assert!(is_canonical_placeholder(
+            "<<PENTECT_API_KEY_0123456789abcdef>>"
+        ));
     }
 
     #[test]

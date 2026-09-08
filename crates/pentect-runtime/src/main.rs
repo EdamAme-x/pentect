@@ -12,6 +12,7 @@ mod alcatraz;
 mod config;
 mod delegated_process_host;
 mod file_pointer_manager;
+mod handle_views;
 mod image_ocr;
 mod masking;
 mod memory_store;
@@ -19,6 +20,11 @@ mod network_address;
 mod output_remask;
 mod plugin_middleware;
 mod secure_io;
+pub use handle_views::{
+    classify_tool_input_field, process_recovery_tool_input, process_tool_input,
+    raw_code_representation_supported, HandleView, ToolInputError, ToolInputKind,
+    ValidatedToolInput, ViewResolver,
+};
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{
@@ -30,6 +36,19 @@ pub use plugin_middleware::{
 };
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
+
+/// Guidance for integrations that support ordinary opaque handles and the
+/// optional explicit base64 representation.
+pub fn handle_view_contract() -> &'static str {
+    concat!(
+        "Protected handle operation rules:\n",
+        "- Keep an ordinary opaque handle as one complete quoted data argument or string. Pentect restores conservatively representable token values locally.\n",
+        "- When a value cannot be represented safely by that conservative rule, use the explicit `|base64` view in one quoted data argument or string, then decode locally through a data API such as argv, stdin, or a JSON serializer.\n",
+        "- A patch is structured syntax, not raw file content. Do not use a handle to generate patch grammar or line structure.\n",
+        "- Do not invoke Pentect, decode a raw handle yourself, print a secret, reread the source, or request an extra user action.\n",
+        "- Preserve the handle or view marker byte-for-byte until the complete local tool input is validated.\n",
+    )
+}
 mod session;
 mod shell;
 
@@ -471,6 +490,26 @@ impl ActiveMemoryStoreResolver {
             .recovery
             .as_ref()
             .map(|recovery| resolve_known_references(text, recovery, &self.env_bindings)))
+    }
+
+    /// Validate and resolve one complete string on a known tool surface.
+    pub fn resolve_tool_input(
+        &self,
+        text: &str,
+        kind: ToolInputKind,
+    ) -> Result<Option<String>, ToolInputError> {
+        match &self.recovery {
+            Some(recovery) => {
+                process_recovery_tool_input(text, kind, recovery).map(|value| Some(value.text))
+            }
+            None if pentect_core::scan_recovery_views(text)
+                .map_err(|_| ToolInputError::MalformedView)?
+                .is_empty() =>
+            {
+                Ok(None)
+            }
+            None => Err(ToolInputError::UnknownHandle),
+        }
     }
 
     fn from_recovery(recovery: pentect_core::Recovery) -> Self {
@@ -3475,6 +3514,9 @@ fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, Str
 }
 
 pub fn contains_pentect_masked_handle(text: &str) -> bool {
+    if pentect_core::scan_recovery_views(text).is_ok_and(|tokens| !tokens.is_empty()) {
+        return true;
+    }
     let mut offset = 0usize;
     while let Some(start_rel) = text[offset..].find("<<") {
         let start = offset + start_rel;

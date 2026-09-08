@@ -699,11 +699,14 @@ impl OutputMasker {
         match &self.mode {
             OutputMaskerMode::Shared => self.store.remask_all(text).map_err(|e| e.to_string()),
             OutputMaskerMode::Deferred { remask_recoveries } => {
-                let mut out = text.to_string();
+                let mut remasker = pentect_core::RecoveryStreamRemasker::default();
                 for rec in remask_recoveries {
-                    out = rec.remask(&out);
+                    remasker.merge_recovery_with_views(rec);
                 }
-                Ok(out)
+                let mut out = remasker.push_text(text.as_bytes());
+                out.extend(remasker.finish());
+                String::from_utf8(out)
+                    .map_err(|_| "recovery remask produced invalid UTF-8".to_string())
             }
         }
     }
