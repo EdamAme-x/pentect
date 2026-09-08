@@ -3812,16 +3812,12 @@ mod tests {
             4,
         );
 
-        let error = match body.collect().await {
-            Ok(_) => panic!("oversized uninspected event must not be emitted"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("SSE event exceeded inspection limit"),
-            "{error}"
+        let output = body.collect().await.unwrap().to_bytes();
+        assert_eq!(
+            output,
+            crate::claude_http_proxy::anthropic_tool_rejection_sse()
         );
+        assert!(!output.windows(b"12345".len()).any(|part| part == b"12345"));
     }
 
     #[tokio::test]

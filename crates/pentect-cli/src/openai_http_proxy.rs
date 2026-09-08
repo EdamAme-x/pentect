@@ -4289,20 +4289,30 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = "<<KEYED_SECRET_a2c25e122d2e002f>>";
-        let secret = "fixture key with @ and 'quote'";
+        let secret = "fixture_key_with-safe.characters";
         let input = serde_json::json!({
             "command": format!(
                 "Invoke-WebRequest -UseBasicParsing http://{address}/check -Headers @{{ Authorization = \"Bearer {handle}\" }} | Out-Null"
             )
         })
         .to_string();
-        let mut resolve = |text: &str, _kind| Ok(text.replace(handle, secret));
-        let restored = crate::claude_http_proxy::resolve_tool_input_json(
+        let recovery = pentect_core::Recovery::seal(
+            std::collections::HashMap::from([(handle.to_string(), secret.to_string())]),
+            &[7u8; 32],
+        );
+        let mut resolve = |text: &str, kind| {
+            assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+            pentect_agent::process_recovery_tool_input(text, kind, &recovery)
+                .map(|input| input.text)
+                .map_err(|error| error.to_string())
+        };
+        let restored = crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
             &input,
             Some("PowerShell"),
             &mut resolve,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let command = serde_json::from_str::<Value>(&restored).unwrap()["command"]
             .as_str()
             .unwrap()

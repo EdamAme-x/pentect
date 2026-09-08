@@ -240,7 +240,7 @@ pub fn classify_tool_input_field(tool_name: &str, field: &str) -> ToolInputKind 
     let field = field.to_ascii_lowercase();
     if matches!(
         tool.as_str(),
-        "bash" | "shell" | "exec" | "exec_command" | "run_command" | "terminal"
+        "bash" | "shell" | "powershell" | "exec" | "exec_command" | "run_command" | "terminal"
     ) {
         return match field.as_str() {
             "command" | "cmd" | "script" => ToolInputKind::Code,
@@ -325,6 +325,18 @@ mod tests {
         assert_eq!(result, Err(ToolInputError::UnknownSurface));
         assert_eq!(calls.get(), 0);
         assert!(!ToolInputError::UnknownSurface.executed());
+    }
+
+    #[test]
+    fn powershell_command_is_a_declared_code_surface() {
+        assert_eq!(
+            classify_tool_input_field("PowerShell", "command"),
+            ToolInputKind::Code
+        );
+        assert_eq!(
+            classify_tool_input_field("PowerShell", "metadata"),
+            ToolInputKind::Unknown
+        );
     }
 
     #[test]
