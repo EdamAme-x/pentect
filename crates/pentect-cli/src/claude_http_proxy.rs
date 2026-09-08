@@ -2669,10 +2669,41 @@ fn rewrite_anthropic_sse_with_tool_context_tracked<R>(
 where
     R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
+    rewrite_anthropic_sse_with_tool_context_tracked_bounded(
+        input,
+        forced_tool_name,
+        resolve,
+        plugins,
+        plugin_context,
+        MAX_PENDING_SSE_BYTES,
+    )
+}
+
+fn rewrite_anthropic_sse_with_tool_context_tracked_bounded<R>(
+    input: &str,
+    forced_tool_name: Option<&str>,
+    resolve: &mut R,
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+    plugin_context: PluginContext,
+    restored_limit: usize,
+) -> Result<(String, u64), String>
+where
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
+{
     let mut blocks = parse_sse(input);
     let mut tool_indices = HashSet::new();
     let mut pending: HashMap<u64, PendingToolInput> = HashMap::new();
     let mut restored_tools = 0u64;
+    let mut restored_bytes = 0usize;
+    let mut budgeted_resolve = |text: &str, kind| {
+        let mut restored = resolve(text, kind)?;
+        if restored_bytes.saturating_add(restored.len()) > restored_limit {
+            restored.zeroize();
+            return Err("restored Anthropic SSE response exceeded inspection limit".to_string());
+        }
+        restored_bytes += restored.len();
+        Ok(restored)
+    };
 
     for block_index in 0..blocks.len() {
         let Some(data) = blocks[block_index].data.as_ref() else {
@@ -2769,8 +2800,11 @@ where
                 joined = serde_json::to_string(input)
                     .map_err(|error| format!("plugin middleware: encode failed: {error}"))?;
             }
-            let (resolved, changed) =
-                resolve_tool_input_json_with_change_typed(&joined, tool.name.as_deref(), resolve)?;
+            let (resolved, changed) = resolve_tool_input_json_with_change_typed(
+                &joined,
+                tool.name.as_deref(),
+                &mut budgeted_resolve,
+            )?;
             for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
                 if let Some(partial_json) = blocks[*chunk_index]
                     .data
@@ -5122,6 +5156,30 @@ mod tests {
             &mut unchanged,
         )
         .is_err());
+    }
+
+    #[test]
+    fn streaming_tool_batch_enforces_aggregate_restored_budget_before_publish() {
+        let input = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"one\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"two\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut resolve = |_: &str, _| Ok("12345678".to_string());
+        let error = rewrite_anthropic_sse_with_tool_context_tracked_bounded(
+            input,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+            15,
+        )
+        .unwrap_err();
+        assert!(error.contains("inspection limit"), "{error}");
     }
 
     #[test]

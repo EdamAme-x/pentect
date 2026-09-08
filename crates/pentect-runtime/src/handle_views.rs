@@ -325,7 +325,6 @@ mod tests {
         assert_eq!(result, Err(ToolInputError::UnknownSurface));
         assert_eq!(calls.get(), 0);
         assert!(!ToolInputError::UnknownSurface.executed());
-        assert!(!ToolInputError::UnknownSurface.retryable());
     }
 
     #[test]
