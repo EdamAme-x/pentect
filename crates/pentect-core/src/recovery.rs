@@ -699,10 +699,15 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
     while i < bytes.len() {
         if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
             let Some(close) = find_from_limited(bytes, i + 2, b">>", MAX_PLACEHOLDER_BYTES) else {
-                // Only reject tokens that contain the view separator; ordinary
-                // incomplete placeholders retain the compatibility behavior.
-                if text[i..].contains('|') {
-                    return Err(RecoveryViewError::Malformed);
+                // Reject only a syntactically valid handle followed by a
+                // missing view terminator. Ordinary heredocs and prose with a
+                // pipe remain byte-identical.
+                let candidate = &text[i + 2..bytes.len().min(i + 2 + MAX_PLACEHOLDER_BYTES)];
+                if let Some((base, _)) = candidate.split_once('|') {
+                    if crate::placeholder::parse_placeholder(&format!("<<{base}>>")).is_ok() {
+                        out.zeroize();
+                        return Err(RecoveryViewError::Malformed);
+                    }
                 }
                 out.push('<');
                 i += 1;
@@ -712,20 +717,30 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
             let inner = &token[2..token.len() - 2];
             if let Some((base, view)) = inner.rsplit_once('|') {
                 if base.is_empty() || view.is_empty() {
+                    out.zeroize();
                     return Err(RecoveryViewError::Malformed);
                 }
+                if crate::placeholder::parse_placeholder(&format!("<<{base}>>")).is_err() {
+                    let len = utf8_len(bytes[i]);
+                    out.push_str(&text[i..i + len]);
+                    i += len;
+                    continue;
+                }
                 if view_rendered("", view).is_none() {
+                    out.zeroize();
                     return Err(RecoveryViewError::UnknownView);
                 }
                 let Some(value) = rec.reveal(&format!("<<{base}>>")) else {
+                    out.zeroize();
                     return Err(RecoveryViewError::UnknownHandle);
                 };
-                let rendered = view_rendered(&value, view).expect("validated view");
+                let mut rendered = view_rendered(&value, view).expect("validated view");
                 out.push_str(&rendered);
                 // `rendered` is the only output copy; do not retain the
                 // recovered value after this token.
                 let mut value = value;
                 value.zeroize();
+                rendered.zeroize();
                 i = close + 2;
                 continue;
             }
@@ -746,19 +761,22 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
 fn remask_view_text(text: &str, rec: &Recovery) -> String {
     let mut pairs: Vec<(String, String, u8)> = Vec::new();
     for ph in rec.map.keys() {
-        let Some(value) = rec.reveal(ph) else {
+        let Some(mut value) = rec.reveal(ph) else {
             continue;
         };
         if is_remaskable_echo(&value, ph) {
             pairs.push((value.clone(), ph.clone(), 0));
         }
         for view in ["base64", "json"] {
-            if let Some(rendered) = view_rendered(&value, view) {
+            if let Some(mut rendered) = view_rendered(&value, view) {
                 if let Some(base) = ph.strip_suffix(">>") {
                     pairs.push((rendered, format!("{base}|{view}>>"), 1));
+                } else {
+                    rendered.zeroize();
                 }
             }
         }
+        value.zeroize();
     }
     pairs.retain(|(value, _, _)| !value.is_empty());
     pairs.sort_by(|a, b| {
@@ -944,6 +962,10 @@ mod tests {
             rec.resolve_view("<<KEY_0011223344556677|base64"),
             Err(RecoveryViewError::Malformed)
         );
+        assert_eq!(
+            rec.resolve_view("cat <<EOF\nvalue | still-heredoc\nEOF"),
+            Ok("cat <<EOF\nvalue | still-heredoc\nEOF".into())
+        );
     }
 
     #[test]
@@ -963,6 +985,50 @@ mod tests {
         assert_eq!(
             rec.resolve_view(&rec.remask_views(&encoded)).unwrap(),
             encoded
+        );
+    }
+
+    #[test]
+    fn experimental_views_cover_empty_nul_full_id_and_nested_text() {
+        let ph = "<<SECRET_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef>>";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), "\0".into())]), &[9u8; 32]);
+        let view =
+            "<<SECRET_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|json>>";
+        assert_eq!(rec.resolve_with_views(view).unwrap(), "\"\\u0000\"");
+        assert_eq!(
+            rec.resolve_with_views(&format!("outer [{view}]")).unwrap(),
+            "outer [\"\\u0000\"]"
+        );
+
+        let empty = "<<EMPTY_0123456789abcdef>>";
+        let empty_rec = Recovery::seal(HashMap::from([(empty.into(), "".into())]), &[1u8; 32]);
+        assert_eq!(
+            empty_rec
+                .resolve_with_views("<<EMPTY_0123456789abcdef|base64>>")
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            empty_rec.remask_views("<<EMPTY_0123456789abcdef|base64>>"),
+            "<<EMPTY_0123456789abcdef|base64>>"
+        );
+    }
+
+    #[test]
+    fn experimental_remask_equal_render_collision_is_deterministic_and_custom_keys_do_not_panic() {
+        let rec = Recovery::seal(
+            HashMap::from([
+                ("raw-key".into(), "same".into()),
+                ("<<KEY_0123456789abcdef>>".into(), "c2FtZQ==".into()),
+            ]),
+            &[3u8; 32],
+        );
+        let first = rec.remask_views("c2FtZQ==");
+        assert_eq!(first, rec.remask_views("c2FtZQ=="));
+        assert_eq!(
+            rec.resolve_with_views("<<KEY_0123456789abcdef|base64>>")
+                .unwrap(),
+            "YzJGdFpRPT0="
         );
     }
 
