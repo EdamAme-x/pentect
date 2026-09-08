@@ -3198,13 +3198,12 @@ where
                         Ok(chunks) => state
                             .ready
                             .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                        Err(error) => {
-                            eprintln!("[pentect] Claude App Chat response blocked: {error}");
+                        Err(_error) => {
+                            eprintln!("[pentect] Claude App Chat response blocked by validation");
                             state.finished = true;
-                            state.ready.push_back(Err(Box::new(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                error,
-                            ))));
+                            state.ready.push_back(Ok(Frame::data(
+                                crate::claude_http_proxy::anthropic_tool_rejection_sse(),
+                            )));
                         }
                     }
                 }
@@ -3219,14 +3218,13 @@ where
                             Ok(chunks) => state
                                 .ready
                                 .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                            Err(error) => {
+                            Err(_error) => {
                                 eprintln!(
-                                    "[pentect] Claude App Chat response blocked at EOF: {error}"
+                                    "[pentect] Claude App Chat response blocked at EOF by validation"
                                 );
-                                state.ready.push_back(Err(Box::new(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    error,
-                                ))));
+                                state.ready.push_back(Ok(Frame::data(
+                                    crate::claude_http_proxy::anthropic_tool_rejection_sse(),
+                                )));
                             }
                         }
                     }
@@ -3923,14 +3921,14 @@ mod tests {
             MAX_CHAT_BODY_BYTES,
         );
 
-        let error = chat_sse_body_with_transformer(stream, transformer)
+        let output = chat_sse_body_with_transformer(stream, transformer)
             .collect()
             .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("memory store unavailable"),
-            "{error}"
-        );
+            .unwrap()
+            .to_bytes();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("invalid_request_error"), "{output}");
+        assert!(!output.contains("<<SECRET_"), "{output}");
     }
 
     #[test]

@@ -1354,12 +1354,12 @@ fn streaming_response_body(
                     Ok(chunks) => state
                         .ready
                         .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                    Err(error) => {
+                    Err(_error) => {
                         state.finished = true;
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            error,
-                        ))));
+                        diagnostic("sse-tool-rejected", "validation", "messages", false);
+                        state
+                            .ready
+                            .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
                     }
                 },
                 Some(Err(error)) => {
@@ -1374,16 +1374,24 @@ fn streaming_response_body(
                         Ok(chunks) => state
                             .ready
                             .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                        Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            error,
-                        )))),
+                        Err(_error) => {
+                            diagnostic("sse-tool-rejected", "validation", "messages", false);
+                            state
+                                .ready
+                                .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
+                        }
                     }
                 }
             }
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+pub(crate) fn anthropic_tool_rejection_sse() -> Bytes {
+    Bytes::from_static(
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Pentect rejected an unsafe or invalid protected tool input. Use a supported handle representation and try again.\"}}\n\n",
+    )
 }
 
 pub(crate) struct SseStreamTransformer<R> {
@@ -5180,6 +5188,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("inspection limit"), "{error}");
+    }
+
+    #[test]
+    fn native_anthropic_validation_error_frame_is_value_free_and_terminal() {
+        let bytes = anthropic_tool_rejection_sse();
+        let frame = std::str::from_utf8(&bytes).unwrap();
+        assert!(frame.starts_with("event: error\n"));
+        assert!(frame.contains("invalid_request_error"));
+        assert!(frame.ends_with("\n\n"));
+        assert!(!frame.contains("<<"));
     }
 
     #[test]
