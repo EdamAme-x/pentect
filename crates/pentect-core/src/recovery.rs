@@ -297,9 +297,10 @@ impl RecoveryStreamRemasker {
                         });
                     }
                     if include_views {
-                        if let Some(base) = placeholder.strip_suffix(">>").filter(|base| {
-                            crate::placeholder::parse_placeholder(&format!("{base}>>")).is_ok()
-                        }) {
+                        if let Some(base) = placeholder
+                            .strip_suffix(">>")
+                            .filter(|base| exact_handle(&format!("{base}>>")))
+                        {
                             for view in ["base64", "json"] {
                                 if let Some(rendered) = view_rendered(&value, view) {
                                     if !rendered.is_empty() {
@@ -736,7 +737,10 @@ pub struct RecoveryViewToken {
 pub enum RecoveryViewScanError {
     Malformed,
     UnknownView,
+    Limit,
 }
+
+const MAX_RECOVERY_VIEW_TOKENS: usize = 4096;
 
 /// Scan canonical raw and experimental view handles in one bounded pass.
 /// Non-handle prose (including heredocs containing `|`) is ignored. A valid
@@ -752,8 +756,9 @@ pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, Recover
         }
         let Some(close) = find_from_limited(bytes, i + 2, b">>", MAX_PLACEHOLDER_BYTES) else {
             let end = bytes.len().min(i + 2 + MAX_PLACEHOLDER_BYTES);
-            if let Ok(candidate) = std::str::from_utf8(&bytes[i + 2..end]) {
-                if let Some((base, _)) = candidate.split_once('|') {
+            let candidate = &bytes[i + 2..end];
+            if let Some(pipe) = candidate.iter().position(|byte| *byte == b'|') {
+                if let Ok(base) = std::str::from_utf8(&candidate[..pipe]) {
                     if exact_handle(&format!("<<{base}>>")) {
                         return Err(RecoveryViewScanError::Malformed);
                     }
@@ -764,7 +769,7 @@ pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, Recover
         };
         let token = &text[i..close + 2];
         let inner = &token[2..token.len() - 2];
-        if let Some((base, view)) = inner.rsplit_once('|') {
+        if let Some((base, view)) = inner.split_once('|') {
             let base_token = format!("<<{base}>>");
             if !exact_handle(&base_token) {
                 i += 1;
@@ -776,6 +781,9 @@ pub fn scan_recovery_views(text: &str) -> Result<Vec<RecoveryViewToken>, Recover
                 _ if view.is_empty() => return Err(RecoveryViewScanError::Malformed),
                 _ => return Err(RecoveryViewScanError::UnknownView),
             };
+            if tokens.len() >= MAX_RECOVERY_VIEW_TOKENS {
+                return Err(RecoveryViewScanError::Limit);
+            }
             tokens.push(RecoveryViewToken {
                 start: i,
                 end: close + 2,
@@ -825,6 +833,7 @@ fn resolve_view_text(text: &str, rec: &Recovery) -> Result<String, RecoveryViewE
     let tokens = scan_recovery_views(text).map_err(|error| match error {
         RecoveryViewScanError::Malformed => RecoveryViewError::Malformed,
         RecoveryViewScanError::UnknownView => RecoveryViewError::UnknownView,
+        RecoveryViewScanError::Limit => RecoveryViewError::Malformed,
     })?;
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -934,9 +943,10 @@ fn remask_view_text(text: &str, rec: &Recovery) -> String {
         }
         for view in ["base64", "json"] {
             if let Some(mut rendered) = view_rendered(&value, view) {
-                if let Some(base) = ph.strip_suffix(">>").filter(|base| {
-                    crate::placeholder::parse_placeholder(&format!("{base}>>")).is_ok()
-                }) {
+                if let Some(base) = ph
+                    .strip_suffix(">>")
+                    .filter(|base| exact_handle(&format!("{base}>>")))
+                {
                     pairs.push((rendered, format!("{base}|{view}>>"), 1));
                 } else {
                     rendered.zeroize();
@@ -1166,6 +1176,19 @@ mod tests {
             scan_recovery_views("<<PENTECT_KEY_0011223344556677|base64>>")
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            scan_recovery_views("<<KEY_0011223344556677|base64|junk>>"),
+            Err(RecoveryViewScanError::UnknownView)
+        );
+        let nested = "<<NOPE| prose <<KEY_0011223344556677|base64>>";
+        let nested_tokens = scan_recovery_views(nested).unwrap();
+        assert_eq!(nested_tokens.len(), 1);
+        assert_eq!(nested_tokens[0].start, 14);
+        let malformed = format!("<<KEY_0011223344556677|{}", "雪".repeat(300));
+        assert_eq!(
+            scan_recovery_views(&malformed),
+            Err(RecoveryViewScanError::Malformed)
         );
     }
 
