@@ -2031,6 +2031,77 @@ def anthropic_tool_response(sequence: int, command: str) -> bytes:
     ])
 
 
+def anthropic_write_response(sequence: int, handle: str, file_path: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Edit",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(
+                    {
+                        "file_path": file_path,
+                        "old_string": "PLACEHOLDER",
+                        "new_string": handle,
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
+def anthropic_read_response(sequence: int, file_path: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Read",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(
+                    {"file_path": file_path}, separators=(",", ":")
+                ),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
 def anthropic_text_response(sequence: int, text: str) -> bytes:
     return anthropic_sse([
         {"type": "message_start", "message": anthropic_message(sequence)},
@@ -2055,10 +2126,31 @@ def anthropic_text_response(sequence: int, text: str) -> bytes:
 
 
 class State:
-    def __init__(self, valid: str, invalid: str, *, hold_model: bool = False) -> None:
+    def __init__(
+        self,
+        valid: str,
+        invalid: str,
+        *,
+        hold_model: bool = False,
+        native_write: bool = False,
+        native_patch: bool = False,
+    ) -> None:
         self.valid = valid
         self.invalid = invalid
         self.hold_model = hold_model
+        self.native_write = native_write
+        self.native_patch = native_patch
+        self.native_target_path = ""
+        self.native_read_sent = False
+        self.native_read_back_sent = False
+        self.native_read_back_id: str | None = None
+        self.native_write_sent = False
+        self.native_patch_sent = False
+        self.native_patch_read_sent = False
+        self.native_patch_read_call_id: str | None = None
+        self.native_write_inputs: list[dict[str, str]] = []
+        self.native_patch_inputs: list[str] = []
+        self.last_handles: list[str] = []
         self.model_request_seen = threading.Event()
         self.release_model_request = threading.Event()
         self.model_requests: list[str] = []
@@ -2102,6 +2194,10 @@ class Handler(BaseHTTPRequestHandler):
                 for tool in parsed.get("tools", [])
             )
             handles = anthropic_env_handles(parsed)
+            if handles:
+                self.server.state.last_handles = handles
+            elif self.server.state.native_write:
+                handles = self.server.state.last_handles
             attempts = len(self.server.state.service_attempts)
             if not bash_enabled:
                 action = "text:no-bash"
@@ -2119,6 +2215,32 @@ class Handler(BaseHTTPRequestHandler):
                 action = f"tool:probe:{attempts}"
                 payload = anthropic_tool_response(
                     sequence, self._probe_command(handles[attempts], posix_shell=True)
+                )
+            elif self.server.state.native_write and not self.server.state.native_read_sent:
+                self.server.state.native_read_sent = True
+                action = "tool:Read"
+                payload = anthropic_read_response(
+                    sequence, self.server.state.native_target_path
+                )
+            elif self.server.state.native_write and not self.server.state.native_write_sent:
+                handle = handles[1]
+                self.server.state.native_write_sent = True
+                self.server.state.native_write_inputs.append({
+                    "name": "Edit",
+                    "file_path": self.server.state.native_target_path,
+                    "old_string": "PLACEHOLDER",
+                    "new_string": handle,
+                })
+                action = "tool:Edit"
+                payload = anthropic_write_response(
+                    sequence, handle, self.server.state.native_target_path
+                )
+            elif self.server.state.native_write and not self.server.state.native_read_back_sent:
+                self.server.state.native_read_back_sent = True
+                self.server.state.native_read_back_id = f"toolu_e2e_{sequence}"
+                action = "tool:Read:back"
+                payload = anthropic_read_response(
+                    sequence, self.server.state.native_target_path
                 )
             else:
                 action = "text:done"
@@ -2153,16 +2275,54 @@ class Handler(BaseHTTPRequestHandler):
                 payload = text_response(sequence, "DONE")
             elif sequence == 1:
                 command = shell_command(["python", "e2e_helper.py", "roundtrip"])
-                payload = tool_response(
-                    sequence,
-                    f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
-                )
+                if self.server.state.native_patch:
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); "
+                        "text(r);"
+                    )
+                else:
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); "
+                        "text(r.output);"
+                    )
+                payload = tool_response(sequence, source)
             else:
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
+                env_handles = codex_env_handles(request)
+                if len(env_handles) == 2:
+                    handles = env_handles
+                if handles:
+                    self.server.state.last_handles = handles
+                elif self.server.state.native_patch:
+                    handles = self.server.state.last_handles
                 if sequence == 2 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[0]))
                 elif sequence == 3 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[1]))
+                elif self.server.state.native_patch and not self.server.state.native_patch_sent and len(handles) >= 2:
+                    self.server.state.native_patch_sent = True
+                    patch = (
+                        "*** Begin Patch\n"
+                        f"*** Update File: {self.server.state.native_target_path}\n"
+                        "@@\n"
+                        '-{"api_key":"PLACEHOLDER"}\n'
+                        f'+{{"api_key":"{handles[1]}"}}\n'
+                        "*** End Patch\n"
+                    )
+                    self.server.state.native_patch_inputs.append(patch)
+                    source = (
+                        f"const r = await tools.apply_patch({json.dumps(patch)}); "
+                        "text(r);"
+                    )
+                    payload = tool_response(sequence, source)
+                elif self.server.state.native_patch and not self.server.state.native_patch_read_sent:
+                    self.server.state.native_patch_read_sent = True
+                    self.server.state.native_patch_read_call_id = f"call_e2e_{sequence}"
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(shell_command(['python', 'e2e_helper.py', 'read_file', 'verified-config.json']))}}}); "
+                        "text(r.output);"
+                    )
+                    payload = tool_response(sequence, source)
                 else:
                     payload = text_response(sequence, "DONE")
             self.send_response(200)
@@ -2261,6 +2421,36 @@ def request_tool_result_summary(requests: list[str]) -> list[str]:
     return summaries[-4:]
 
 
+def tool_output_for_call(requests: list[str], call_id: str) -> object | None:
+    def walk(value: object) -> object | None:
+        if isinstance(value, dict):
+            if (
+                value.get("type") in {"custom_tool_call_output", "function_call_output"}
+                and value.get("call_id") == call_id
+            ):
+                return value.get("output", value.get("content"))
+            for child in value.values():
+                found = walk(child)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found is not None:
+                    return found
+        return None
+
+    for request in requests:
+        try:
+            parsed = json.loads(request)
+        except json.JSONDecodeError:
+            continue
+        found = walk(parsed)
+        if found is not None:
+            return found
+    return None
+
+
 def anthropic_env_handles(request: dict[str, object]) -> list[str]:
     messages = request.get("messages", [])
     if not isinstance(messages, list):
@@ -2279,10 +2469,43 @@ def anthropic_env_handles(request: dict[str, object]) -> list[str]:
     return []
 
 
+def codex_env_handles(request: str) -> list[str]:
+    match = re.search(
+        r"FIRST_KEY=(<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>).*?"
+        r"SECOND_KEY=(<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>)",
+        request,
+        re.DOTALL,
+    )
+    return list(match.groups()) if match else []
+
+
 def client_command(
-    pentect: str, client: str, project: Path, upstream: str
+    pentect: str,
+    client: str,
+    project: Path,
+    upstream: str,
+    *,
+    native_write: bool = False,
+    native_patch: bool = False,
 ) -> list[str]:
-    prompt = "Read .env, write/read a Unicode path roundtrip, try each key against the local service, and finish after one succeeds."
+    prompt = (
+        "Read .env, write/read a Unicode path roundtrip, try each key against the local "
+        "service, and finish after one succeeds."
+    )
+    tools = "Read,Bash,Edit" if native_write else "Bash"
+    if native_write:
+        prompt = (
+            "Read .env, try each key against the local service, then use the native Edit "
+            "tool exactly once to update verified-config.json with the successful key in an "
+            "api_key JSON field, including a final newline. Read that file back and finish. "
+            "Do not use Bash, cp, shell redirection, or a helper script for the file edit."
+        )
+    if native_patch:
+        prompt = (
+            "Read .env, try each key against the local service, then use the native apply_patch "
+            "tool exactly once to update verified-config.json with the successful key. Read "
+            "that file back and finish. Do not use shell redirection, cp, or a helper script."
+        )
     if client == "codex":
         return [
             pentect,
@@ -2326,7 +2549,7 @@ def client_command(
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--tools",
-            "Bash",
+            tools,
             "--model",
             "claude-sonnet-4-5",
             prompt,
@@ -2350,10 +2573,16 @@ def client_command(
     ]
 
 
-def run_client(pentect: str, client: str) -> None:
+def run_client(
+    pentect: str,
+    client: str,
+    *,
+    native_write: bool = False,
+    native_patch: bool = False,
+) -> None:
     valid = "".join(("rpa_", "PENTECT_VALID_", "0123456789abcdef"))
     invalid = "".join(("rpa_", "PENTECT_INVALID_", "fedcba9876543210"))
-    state = State(valid, invalid)
+    state = State(valid, invalid, native_write=native_write, native_patch=native_patch)
     server = FixtureServer(state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2367,6 +2596,10 @@ def run_client(pentect: str, client: str) -> None:
             home.mkdir()
             project.mkdir()
             (project / ".env").write_text(f"FIRST_KEY={invalid}\nSECOND_KEY={valid}\n", encoding="utf-8")
+            if native_write or native_patch:
+                (project / "verified-config.json").write_bytes(
+                    b'{"api_key":"PLACEHOLDER"}\n'
+                )
             (project / "plugin-input.txt").write_text(
                 PLUGIN_PLAINTEXT + "\n", encoding="utf-8"
             )
@@ -2379,6 +2612,8 @@ import urllib.request
 if sys.argv[1] == "read":
     print(Path(".env").read_text(encoding="utf-8"))
     print(Path("plugin-input.txt").read_text(encoding="utf-8"))
+elif sys.argv[1] == "read_file":
+    sys.stdout.write(Path(sys.argv[2]).read_text(encoding="utf-8"))
 elif sys.argv[1] == "roundtrip":
     path = Path("unicode 東京 path.txt")
     path.write_text("write/read ✓ 東京 — multiline\\nsecond line\\n", encoding="utf-8")
@@ -2396,6 +2631,7 @@ else:
                 encoding="utf-8",
             )
             environment = isolated_environment(home, root / "logs")
+            state.native_target_path = str(project / "verified-config.json")
             environment.update({
                 "OPENAI_API_KEY": "local-fixture",
                 "ANTHROPIC_API_KEY": "local-fixture",
@@ -2414,6 +2650,8 @@ else:
                 client,
                 project,
                 f"http://127.0.0.1:{server.server_port}/v1",
+                native_write=native_write,
+                native_patch=native_patch,
             )
             if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *command]
@@ -2472,6 +2710,120 @@ else:
                 raise RuntimeError(
                     f"{client} did not record a completed HTTP tool-input restoration"
                 )
+            if native_write:
+                expected_content = json.dumps(
+                    {"api_key": valid}, separators=(",", ":")
+                ) + "\n"
+                written = project / "verified-config.json"
+                if len(state.native_write_inputs) != 1 or state.native_write_inputs[0]["name"] != "Edit":
+                    raise RuntimeError("native Edit fixture did not emit exactly one Edit call")
+                if not state.native_read_back_sent:
+                    raise RuntimeError("native Edit fixture did not perform the requested readback")
+                if state.native_write_inputs[0]["file_path"] != str(written):
+                    raise RuntimeError("native Edit fixture did not use the absolute target path")
+                if not HANDLE.search(state.native_write_inputs[0]["new_string"]):
+                    raise RuntimeError("native Edit fixture did not carry an opaque handle")
+                written_bytes = written.read_bytes() if written.is_file() else b"<missing>"
+                expected_bytes = expected_content.encode("utf-8")
+                if written_bytes != expected_bytes:
+                    safe_bytes = written_bytes.replace(valid.encode(), b"<synthetic-key>").replace(
+                        invalid.encode(), b"<synthetic-key>"
+                    )
+                    raise RuntimeError(
+                        "native Edit did not produce exact verified-config.json content: "
+                        + repr(safe_bytes)
+                        + "\nagent output:\n"
+                        + completed.stdout.replace(valid, "<synthetic-key>")
+                        .replace(invalid, "<synthetic-key>")[-4000:]
+                        + f"\nfixture actions={state.anthropic_actions!r}"
+                        + f"\nmodel requests={len(state.model_requests)}"
+                    )
+                if not written_bytes.endswith(b"\n") or json.loads(written_bytes) != {"api_key": valid}:
+                    raise RuntimeError("native Edit JSON content or final newline was incorrect")
+                if HANDLE.search(written_bytes.decode("utf-8")):
+                    raise RuntimeError("native Edit left an opaque handle on disk")
+                readback = None
+                for request in state.model_requests:
+                    try:
+                        parsed_request = json.loads(request)
+                    except json.JSONDecodeError:
+                        continue
+                    for message in parsed_request.get("messages", []):
+                        for block in message.get("content", []) if isinstance(message, dict) else []:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_result"
+                                and block.get("tool_use_id") == state.native_read_back_id
+                            ):
+                                readback = block
+                readback_content = readback.get("content") if readback else ""
+                readback_text = (
+                    readback_content if isinstance(readback_content, str) else ""
+                )
+                if not state.native_read_back_sent or not readback or readback.get("is_error"):
+                    raise RuntimeError("native Edit readback was not returned successfully")
+                if '"api_key"' not in readback_text or not HANDLE.search(readback_text):
+                    raise RuntimeError(
+                        "native Edit readback was not protected before model delivery: "
+                        + repr(readback_text)
+                    )
+            elif native_patch:
+                expected_content = json.dumps(
+                    {"api_key": valid}, separators=(",", ":")
+                ) + "\n"
+                written = project / "verified-config.json"
+                written_bytes = written.read_bytes() if written.is_file() else b"<missing>"
+                expected_bytes = expected_content.encode("utf-8")
+                if len(state.native_patch_inputs) != 1:
+                    raise RuntimeError("native apply_patch fixture did not emit exactly one patch")
+                if not state.native_patch_read_sent or not state.native_patch_read_call_id:
+                    raise RuntimeError("native apply_patch fixture did not perform readback")
+                if not HANDLE.search(state.native_patch_inputs[0]):
+                    raise RuntimeError("fixture patch did not carry an opaque handle")
+                if written_bytes != expected_bytes:
+                    safe_bytes = written_bytes.replace(valid.encode(), b"<synthetic-key>").replace(
+                        invalid.encode(), b"<synthetic-key>"
+                    )
+                    raise RuntimeError(
+                        "native apply_patch did not produce exact file content: "
+                        + repr(safe_bytes)
+                    )
+                if not written_bytes.endswith(b"\n") or json.loads(written_bytes) != {"api_key": valid}:
+                    raise RuntimeError("native apply_patch JSON content or final newline was incorrect")
+                if HANDLE.search(written_bytes.decode("utf-8")):
+                    raise RuntimeError("native apply_patch left an opaque handle on disk")
+                readback_output = tool_output_for_call(
+                    state.model_requests, state.native_patch_read_call_id
+                )
+                readback_text = (
+                    readback_output
+                    if isinstance(readback_output, str)
+                    else json.dumps(readback_output, ensure_ascii=True)
+                )
+                if (
+                    readback_output is None
+                    or "api_key" not in readback_text
+                    or not HANDLE.search(readback_text)
+                ):
+                    output_records = []
+                    for request in state.model_requests:
+                        try:
+                            parsed_request = json.loads(request)
+                        except json.JSONDecodeError:
+                            continue
+                        output_records.extend(
+                            (value.get("type"), value.get("call_id"))
+                            for value in parsed_request.get("input", [])
+                            if isinstance(value, dict)
+                            and value.get("type") in {
+                                "custom_tool_call_output",
+                                "function_call_output",
+                            }
+                        )
+                    raise RuntimeError(
+                        "native apply_patch readback was not returned protected to the model: "
+                        + repr({"expected": state.native_patch_read_call_id, "outputs": output_records})
+                    )
             if not unicode_path.is_file() or unicode_path.read_text(encoding="utf-8") != UNICODE_ROUNDTRIP:
                 raise RuntimeError(f"{client} did not complete the Unicode file write/read roundtrip")
             remove_detector_plugin(pentect, project, environment)
@@ -2479,6 +2831,13 @@ else:
                 f"installed {client} E2E passed: project plugin "
                 "inspect/test/add/setup/update/reinstall/mask/remove, two key handles, "
                 "no model/log plaintext"
+                + (
+                    "; native Read/Edit handle roundtrip with exact disk JSON"
+                    if native_write
+                    else "; native apply_patch handle roundtrip with exact disk JSON"
+                    if native_patch
+                    else ""
+                )
             )
     finally:
         server.shutdown()
@@ -3276,6 +3635,17 @@ def main() -> int:
     parser.add_argument("--claude-parent-kill", action="store_true")
     parser.add_argument("--tmux-cancellation", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
+    native_mode = parser.add_mutually_exclusive_group()
+    native_mode.add_argument(
+        "--native-handle-write",
+        action="store_true",
+        help="run the deterministic Claude native Edit handle roundtrip only",
+    )
+    native_mode.add_argument(
+        "--native-handle-patch",
+        action="store_true",
+        help="run the deterministic Codex native apply_patch handle roundtrip only",
+    )
     args = parser.parse_args()
     candidate = Path(args.pentect)
     if candidate.is_file():
@@ -3292,10 +3662,23 @@ def main() -> int:
     if args.tmux_cancellation:
         run_cancellation(args.pentect, tmux_pty=True)
         return 0
+    if args.native_handle_write:
+        if args.clients and args.clients != ["claude"]:
+            parser.error("--native-handle-write only supports --client claude")
+        run_client(args.pentect, "claude", native_write=True)
+        return 0
+    if args.native_handle_patch:
+        if args.clients and args.clients != ["codex"]:
+            parser.error("--native-handle-patch only supports --client codex")
+        run_client(args.pentect, "codex", native_patch=True)
+        return 0
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.
     for client in args.clients or ("claude", "codex", "opencode", "pi"):
         run_client(args.pentect, client)
+    if args.clients is None:
+        run_client(args.pentect, "claude", native_write=True)
+        run_client(args.pentect, "codex", native_patch=True)
     if args.clients is None or "codex" in args.clients:
         run_cancellation(args.pentect)
         if not args.skip_image:

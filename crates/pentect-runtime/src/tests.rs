@@ -1497,6 +1497,133 @@ fn exec_capability_env_does_not_shadow_parent_environment() {
 }
 
 #[test]
+fn json_tool_output_recovers_exact_secret_across_output_shapes() {
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let cases = [
+        ("plain", format!("LIVE_KEY={raw}\n")),
+        (
+            "json-envelope",
+            serde_json::json!({"stdout": format!("LIVE_KEY={raw}\n")}).to_string(),
+        ),
+        (
+            "json-stringified-output",
+            serde_json::to_string(&format!("LIVE_KEY={raw}\n")).unwrap(),
+        ),
+        (
+            "codex-function-output",
+            serde_json::json!({
+                "type": "function_call_output",
+                "output": format!("LIVE_KEY={raw}\n")
+            })
+            .to_string(),
+        ),
+        (
+            "codex-response-output",
+            serde_json::json!({
+                "output": [{
+                    "type": "function_call_output",
+                    "output": format!("LIVE_KEY={raw}\n")
+                }]
+            })
+            .to_string(),
+        ),
+        (
+            "codex-exec-header",
+            format!(
+                "Chunk ID: synthetic\nWall time: 0.1 seconds\nProcess exited with code 0\nFinal output:\nLIVE_KEY={raw}\n"
+            ),
+        ),
+    ];
+
+    for (name, output) in cases {
+        let root = temp_root(&format!("diagnostic-recovered-{name}"));
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let store = MemoryStore::for_session(&session);
+        let masked = mask_tool_output(&session, &output).unwrap();
+        let handle = first_masked_handle(&masked);
+        let recovered = store.resolve_all(&handle).unwrap();
+        let shape = format!(
+            "len={},actual_lf={},actual_cr={},literal_backslash_n_suffix={}",
+            recovered.len(),
+            recovered.contains('\n'),
+            recovered.contains('\r'),
+            recovered.ends_with(r"\n"),
+        );
+        assert!(recovered == raw, "{name}: recovered shape {shape}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn json_tool_output_preserves_literal_backslash_and_metadata() {
+    let root = temp_root("diagnostic-json-literal-backslash");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\\n";
+    let output = serde_json::json!({
+        "label": "東京 \"quoted\"",
+        "stdout": format!("LIVE_KEY={raw}")
+    })
+    .to_string();
+    let masked = mask_tool_output(&session, &output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    let parsed: Value = serde_json::from_str(&masked).unwrap();
+    assert_eq!(parsed["label"], "東京 \"quoted\"");
+    assert!(!masked.contains(raw));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn malformed_json_uses_text_masking_fallback() {
+    let root = temp_root("diagnostic-json-malformed");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = format!(r#"{{"stdout":"LIVE_KEY={raw}\\n"}} trailing"#);
+    let masked = mask_tool_output(&session, &output).unwrap();
+    assert!(masked.contains("<<"));
+    assert!(!masked.contains(raw));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn json_tool_output_without_plugins_still_decodes_recovery() {
+    let root = temp_root("diagnostic-json-no-plugins");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = serde_json::json!({"stdout": format!("LIVE_KEY={raw}\n")}).to_string();
+    let mut masker = masking::OutputMasker::new_shared(store.clone()).unwrap();
+    let masked = masker.mask_tool_output_without_plugins(&output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    assert_eq!(
+        serde_json::from_str::<Value>(&masked).unwrap()["stdout"],
+        format!("LIVE_KEY={handle}\n")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn json_tool_output_with_image_payload_uses_text_policy_path() {
+    let root = temp_root("json-tool-image-policy");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = serde_json::json!({
+        "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+        "stdout": format!("LIVE_KEY={raw}")
+    })
+    .to_string();
+    let masked = mask_tool_output(&session, &output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    assert!(masked.contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+    assert!(serde_json::from_str::<Value>(&masked).is_ok());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn exec_resolves_masked_handle_in_command_text() {
     let root = temp_root("exec-command-handle");
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -3564,6 +3691,32 @@ fn env_like_tool_output_masks_all_env_values() {
     assert!(masked.contains("TEST_SECRET=<<TEST_SECRET_"), "{masked}");
     assert!(masked.contains("NOTE=<<NOTE_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_output_masking_roundtrips_plain_envelopes_and_json_escaped_newlines() {
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let cases = [
+        format!("LIVE_KEY={raw}\n"),
+        serde_json::json!({
+            "stdout": format!("LIVE_KEY={raw}\n"),
+            "exit_code": 0,
+            "status": "completed"
+        })
+        .to_string(),
+        serde_json::to_string(&format!("LIVE_KEY={raw}\n")).unwrap(),
+    ];
+
+    for (index, output) in cases.into_iter().enumerate() {
+        let (root, session) = empty_session(&format!("tool-output-envelope-roundtrip-{index}"));
+        let masked = mask_tool_output(&session, &output).unwrap();
+        assert!(!masked.contains(raw), "protected output leaked: {masked}");
+        let restored = MemoryStore::for_session(&session)
+            .resolve_all(&masked)
+            .unwrap();
+        assert_eq!(restored, output);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[test]
