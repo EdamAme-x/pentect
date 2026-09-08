@@ -297,7 +297,9 @@ impl RecoveryStreamRemasker {
                         });
                     }
                     if include_views {
-                        if let Some(base) = placeholder.strip_suffix(">>") {
+                        if let Some(base) = placeholder.strip_suffix(">>").filter(|base| {
+                            crate::placeholder::parse_placeholder(&format!("{base}>>")).is_ok()
+                        }) {
                             for view in ["base64", "json"] {
                                 if let Some(rendered) = view_rendered(&value, view) {
                                     if !rendered.is_empty() {
@@ -812,7 +814,9 @@ fn remask_view_text(text: &str, rec: &Recovery) -> String {
         }
         for view in ["base64", "json"] {
             if let Some(mut rendered) = view_rendered(&value, view) {
-                if let Some(base) = ph.strip_suffix(">>") {
+                if let Some(base) = ph.strip_suffix(">>").filter(|base| {
+                    crate::placeholder::parse_placeholder(&format!("{base}>>")).is_ok()
+                }) {
                     pairs.push((rendered, format!("{base}|{view}>>"), 1));
                 } else {
                     rendered.zeroize();
@@ -837,10 +841,27 @@ fn remask_view_text(text: &str, rec: &Recovery) -> String {
         .expect("non-empty remask view patterns");
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    for m in ac.find_iter(text) {
-        out.push_str(&text[cursor..m.start()]);
-        out.push_str(&pairs[m.pattern().as_usize()].1);
-        cursor = m.end();
+    let mut search = 0;
+    while let Some(m) = ac.find(&text[search..]) {
+        let start = search + m.start();
+        let end = search + m.end();
+        let index = m.pattern().as_usize();
+        if pairs[index].2 == 0
+            && requires_token_boundaries(&pairs[index].0)
+            && !short_value_has_token_boundaries(text, start, end)
+        {
+            search = start
+                + text[start..]
+                    .chars()
+                    .next()
+                    .expect("match is non-empty")
+                    .len_utf8();
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&pairs[index].1);
+        cursor = end;
+        search = end;
     }
     out.push_str(&text[cursor..]);
     for (value, handle, _) in &mut pairs {
@@ -1107,6 +1128,22 @@ mod tests {
         merged.merge_recovery_with_views(&rec);
         let mut output = merged.push_text(input.as_bytes());
         output.extend(merged.finish());
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    #[test]
+    fn experimental_whole_and_stream_share_short_raw_boundaries() {
+        let ph = "<<KEYED_SECRET_0123456789abcdef>>";
+        let rec = Recovery::seal(HashMap::from([(ph.into(), "a".into())]), &[6u8; 32]);
+        let input = "catalog a value=a";
+        let expected = rec.remask_views(input);
+        assert_eq!(
+            expected,
+            "catalog <<KEYED_SECRET_0123456789abcdef>> value=<<KEYED_SECRET_0123456789abcdef>>"
+        );
+        let mut stream = rec.stream_remasker_with_views();
+        let mut output = stream.push_text(input.as_bytes());
+        output.extend(stream.finish());
         assert_eq!(String::from_utf8(output).unwrap(), expected);
     }
 
