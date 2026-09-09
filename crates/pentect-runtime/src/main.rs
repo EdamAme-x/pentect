@@ -498,10 +498,14 @@ pub struct ActiveMemoryStoreResolver {
     recovery: Option<pentect_core::Recovery>,
     env_bindings: BTreeMap<String, String>,
     store: Option<MemoryStore>,
-    file_batch: std::sync::Mutex<Option<file_pointer_manager::FileRecoveryBatch>>,
+    transaction: std::sync::Mutex<ToolInputTransactionState>,
     recovery_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    committed: std::sync::atomic::AtomicBool,
-    failed: std::sync::atomic::AtomicBool,
+}
+
+enum ToolInputTransactionState {
+    Active(Option<file_pointer_manager::FileRecoveryBatch>),
+    Failed,
+    Committed,
 }
 
 #[derive(Clone)]
@@ -534,10 +538,8 @@ impl ActiveMemoryStoreResolver {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
                 store: None,
-                file_batch: std::sync::Mutex::new(None),
+                transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
                 recovery_revision: Default::default(),
-                committed: Default::default(),
-                failed: Default::default(),
             });
         };
         let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -551,10 +553,8 @@ impl ActiveMemoryStoreResolver {
             recovery: Some(recovery),
             env_bindings,
             store: Some(store),
-            file_batch: std::sync::Mutex::new(None),
+            transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
             recovery_revision: Default::default(),
-            committed: Default::default(),
-            failed: Default::default(),
         })
     }
 
@@ -571,8 +571,18 @@ impl ActiveMemoryStoreResolver {
         text: &str,
         kind: ToolInputKind,
     ) -> Result<Option<String>, ToolInputError> {
+        let mut transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| ToolInputError::RecoveryStoreUnavailable)?;
+        let batch = match &mut *transaction {
+            ToolInputTransactionState::Active(batch) => batch,
+            ToolInputTransactionState::Failed | ToolInputTransactionState::Committed => {
+                return Err(ToolInputError::RecoveryTransactionFinalized)
+            }
+        };
         if kind == ToolInputKind::PassiveData {
-            return match &self.recovery {
+            let result = match &self.recovery {
                 Some(recovery) => {
                     match process_recovery_tool_input(text, ToolInputKind::Data, recovery) {
                         Ok(value) => Ok(Some(value.text)),
@@ -582,6 +592,10 @@ impl ActiveMemoryStoreResolver {
                 }
                 None => Ok(None),
             };
+            if result.is_err() {
+                *transaction = ToolInputTransactionState::Failed;
+            }
+            return result;
         }
         let result = (|| match &self.recovery {
             Some(recovery) => match process_recovery_tool_input(text, kind, recovery) {
@@ -591,10 +605,6 @@ impl ActiveMemoryStoreResolver {
                         .store
                         .as_ref()
                         .ok_or(ToolInputError::RecoveryStoreUnavailable)?;
-                    let mut batch = self
-                        .file_batch
-                        .lock()
-                        .map_err(|_| ToolInputError::RecoveryStoreUnavailable)?;
                     let batch = match batch.as_mut() {
                         Some(batch) => batch,
                         None => batch.insert(file_pointer_manager::FileRecoveryBatch::new()?),
@@ -620,8 +630,7 @@ impl ActiveMemoryStoreResolver {
             None => Err(ToolInputError::UnknownHandle),
         })();
         if result.is_err() {
-            self.failed
-                .store(true, std::sync::atomic::Ordering::Release);
+            *transaction = ToolInputTransactionState::Failed;
         }
         result
     }
@@ -655,40 +664,42 @@ impl ActiveMemoryStoreResolver {
             recovery: Some(recovery),
             env_bindings,
             store: Some(store),
-            file_batch: std::sync::Mutex::new(None),
+            transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
             recovery_revision,
-            committed: Default::default(),
-            failed: Default::default(),
         }
     }
 
     /// Publish file-backed recoveries only after the complete response passed validation.
     pub fn commit_file_recoveries(&self) -> Result<bool, String> {
-        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("file recovery transaction was rejected".to_string());
-        }
-        let Some(store) = &self.store else {
-            return Ok(false);
-        };
-        let batch = self
-            .file_batch
+        let mut transaction = self
+            .transaction
             .lock()
-            .map_err(|_| "file recovery lock poisoned".to_string())?;
-        if self.committed.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(false);
-        }
-        let Some(batch) = batch.as_ref() else {
+            .map_err(|_| "file recovery transaction lock poisoned".to_string())?;
+        let staged = match &*transaction {
+            ToolInputTransactionState::Active(batch) => match (&self.store, batch.as_ref()) {
+                (Some(store), Some(batch)) => {
+                    Some((store.clone(), batch.staged(&store.session.key)))
+                }
+                _ => None,
+            },
+            ToolInputTransactionState::Failed => {
+                return Err("file recovery transaction was rejected".to_string())
+            }
+            ToolInputTransactionState::Committed => return Ok(false),
+        };
+        let Some((store, recovery)) = staged else {
+            *transaction = ToolInputTransactionState::Committed;
             return Ok(false);
         };
-        let recovery = batch.staged(&store.session.key);
         if recovery.is_empty() {
+            *transaction = ToolInputTransactionState::Committed;
             return Ok(false);
         }
-        store
-            .add_recovery(recovery)
-            .map_err(|_| "file recovery could not be committed".to_string())?;
-        self.committed
-            .store(true, std::sync::atomic::Ordering::Release);
+        if store.add_recovery(recovery).is_err() {
+            *transaction = ToolInputTransactionState::Failed;
+            return Err("file recovery could not be committed".to_string());
+        }
+        *transaction = ToolInputTransactionState::Committed;
         self.recovery_revision
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(true)
@@ -914,10 +925,8 @@ impl ActiveToolOutputMasker {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
                 store: None,
-                file_batch: std::sync::Mutex::new(None),
+                transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
                 recovery_revision: Default::default(),
-                committed: Default::default(),
-                failed: Default::default(),
             }),
         }
     }

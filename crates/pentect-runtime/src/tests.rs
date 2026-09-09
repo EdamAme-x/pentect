@@ -1464,6 +1464,115 @@ fn active_tool_resolver_stages_verified_file_recovery_until_commit() {
 }
 
 #[test]
+fn file_recovery_transaction_rejects_resolve_after_commit_and_repeated_commit_is_inert() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-recovery-finalized-transaction");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) =
+        ActiveMemoryStoreEnv::start("file-recovery-finalized-transaction-store");
+    let source = "PASSWORD=local fixture phrase!?\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(remember_read_file(&path, source, &result));
+    let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+        Ok(Some("local fixture phrase!?".to_string()))
+    );
+    assert!(resolver.commit_file_recoveries().unwrap());
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+        Err(ToolInputError::RecoveryTransactionFinalized)
+    );
+    assert!(!resolver.commit_file_recoveries().unwrap());
+
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn cloned_file_recovery_transaction_serializes_invalid_resolve_against_commit() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-recovery-resolve-commit-race");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) =
+        ActiveMemoryStoreEnv::start("file-recovery-resolve-commit-race-store");
+    let client = MemoryStoreClient::from_env().unwrap();
+
+    for iteration in 0..8 {
+        let raw = format!("local fixture phrase {iteration} !?");
+        let source = format!("PASSWORD={raw}\n");
+        let path = root.join(format!("fixture-{iteration}.env"));
+        std::fs::write(&path, &source).unwrap();
+        let session = Session::open_capability("default").unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: source.clone(),
+            },
+            &Config::new(session.key).with_identity_key(session.identity_key),
+        );
+        assert!(remember_read_file(&path, &source, &result));
+        let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+        let resolver = std::sync::Arc::new(ActiveMemoryStoreResolver::new().unwrap());
+        assert_eq!(
+            resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+            Ok(Some(raw.clone()))
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let resolve_thread = {
+            let resolver = std::sync::Arc::clone(&resolver);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                resolver.resolve_tool_input("<<UNKNOWN_0123456789abcdef>>", ToolInputKind::Data)
+            })
+        };
+        let commit_thread = {
+            let resolver = std::sync::Arc::clone(&resolver);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                resolver.commit_file_recoveries()
+            })
+        };
+        barrier.wait();
+        let invalid = resolve_thread.join().unwrap();
+        let commit = commit_thread.join().unwrap();
+
+        match (invalid, commit) {
+            (Err(ToolInputError::UnknownHandle), Err(_)) => {
+                assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
+            }
+            (Err(ToolInputError::RecoveryTransactionFinalized), Ok(true)) => {
+                assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), raw);
+            }
+            outcome => panic!("unexpected resolve/commit race outcome: {outcome:?}"),
+        }
+        assert_eq!(
+            resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+            Err(ToolInputError::RecoveryTransactionFinalized)
+        );
+    }
+
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn file_recovery_commit_updates_masker_and_invalidates_low_entropy_cache() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-recovery-masker-cache");
@@ -1667,7 +1776,7 @@ fn late_invalid_tool_input_discards_staged_file_recovery_and_repeated_commit_fai
     );
     assert_eq!(
         resolver.resolve_tool_input("<<UNKNOWN_0123456789abcdef>>", ToolInputKind::Data),
-        Err(ToolInputError::UnknownHandle)
+        Err(ToolInputError::RecoveryTransactionFinalized)
     );
     assert!(resolver.commit_file_recoveries().is_err());
     assert!(resolver.commit_file_recoveries().is_err());
@@ -1869,6 +1978,116 @@ fn file_recovery_rejects_permission_denied_source_without_store_mutation() {
     assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn rotated_file_rejects_old_handle_then_reread_registers_a_new_working_handle() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-recovery-rotation");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("file-recovery-rotation-store");
+    let old_raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let new_raw = "sk-ZYXWVUTSRQPONMLKJIHGFEDC";
+    assert_eq!(old_raw.len(), new_raw.len());
+    let path = root.join(".env");
+
+    let old_source = format!("OPENAI_API_KEY={old_raw}\n");
+    std::fs::write(&path, &old_source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let old_result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: old_source.clone(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(remember_read_file(&path, &old_source, &old_result));
+    let old_handle = masked_handle_from_assignment(&old_result.masked, "OPENAI_API_KEY");
+
+    let new_source = format!("OPENAI_API_KEY={new_raw}\n");
+    assert_eq!(old_source.len(), new_source.len());
+    std::fs::write(&path, &new_source).unwrap();
+    let client = MemoryStoreClient::from_env().unwrap();
+    let before = client.snapshot().unwrap().recovery;
+    let stale = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        stale.resolve_tool_input(&old_handle, ToolInputKind::Data),
+        Err(ToolInputError::RecoverySourceChanged)
+    );
+    assert!(stale.commit_file_recoveries().is_err());
+    assert_eq!(
+        client.snapshot().unwrap().recovery.resolve(&old_handle),
+        old_handle
+    );
+    assert_eq!(before.resolve(&old_handle), old_handle);
+
+    let new_result = mask_input_into_active_memory_store(
+        Input {
+            kind: Kind::Env,
+            data: new_source.clone(),
+        },
+        Profile::Strict,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(remember_read_file(&path, &new_source, &new_result));
+    let new_handle = masked_handle_from_assignment(&new_result.masked, "OPENAI_API_KEY");
+    assert_ne!(new_handle, old_handle);
+    let fresh = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        fresh.resolve_tool_input(&new_handle, ToolInputKind::Data),
+        Ok(Some(new_raw.to_string()))
+    );
+    // The active reread registered the replacement immediately, so the fresh
+    // resolver has no deferred file recovery left to commit.
+    assert!(!fresh.commit_file_recoveries().unwrap());
+    let committed = client.snapshot().unwrap().recovery;
+    assert_eq!(committed.resolve(&old_handle), old_handle);
+    assert_eq!(committed.resolve(&new_handle), new_raw);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn handle_identity_scope_contract_is_stable_for_device_and_project_but_not_session() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("handle-identity-scope-contract");
+    let _home = write_user_config(&root, "[update]\ncheck = false\n");
+    let project_a = root.join("project-a");
+    let project_b = root.join("project-b");
+    for project in [&project_a, &project_b] {
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        write_project_config(project, "[handles]\nscope = \"device\"\n");
+    }
+    let cwd_a = enter_temp_cwd(&project_a);
+    let device_a = config::handle_identity_key().unwrap();
+    drop(cwd_a);
+    let cwd_b = enter_temp_cwd(&project_b);
+    let device_b = config::handle_identity_key().unwrap();
+    drop(cwd_b);
+    assert_eq!(device_a, device_b);
+
+    write_project_config(&project_a, "[handles]\nscope = \"project\"\n");
+    write_project_config(&project_b, "[handles]\nscope = \"project\"\n");
+    let cwd_a = enter_temp_cwd(&project_a);
+    let project_a_first = config::handle_identity_key().unwrap();
+    let project_a_second = config::handle_identity_key().unwrap();
+    drop(cwd_a);
+    let cwd_b = enter_temp_cwd(&project_b);
+    let project_b_key = config::handle_identity_key().unwrap();
+    drop(cwd_b);
+    assert_eq!(project_a_first, project_a_second);
+    assert_ne!(project_a_first, project_b_key);
+
+    write_project_config(&project_a, "[handles]\nscope = \"session\"\n");
+    let cwd_a = enter_temp_cwd(&project_a);
+    let session_a = config::handle_identity_key().unwrap();
+    let session_b = config::handle_identity_key().unwrap();
+    drop(cwd_a);
+    assert_ne!(session_a, session_b);
     let _ = std::fs::remove_dir_all(root);
 }
 

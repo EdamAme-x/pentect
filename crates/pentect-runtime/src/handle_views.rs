@@ -47,6 +47,7 @@ pub enum ToolInputError {
     RecoveryScopeChanged,
     RecoveryStoreUnavailable,
     RecoveryLimitExceeded,
+    RecoveryTransactionFinalized,
     OutputTooLarge,
 }
 
@@ -63,6 +64,7 @@ impl fmt::Display for ToolInputError {
             Self::RecoveryScopeChanged => "protected handle belongs to a different identity scope; reread the original input in this session",
             Self::RecoveryStoreUnavailable => "protected handle recovery store is unavailable; restart the protected session and reread the original input",
             Self::RecoveryLimitExceeded => "protected handle recovery exceeds this response's read limit; reread only the required sources",
+            Self::RecoveryTransactionFinalized => "protected tool input recovery transaction is already finalized",
             Self::OutputTooLarge => "protected tool input is too large after restoration",
         })
     }

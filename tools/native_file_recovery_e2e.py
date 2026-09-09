@@ -312,6 +312,25 @@ def main() -> int:
         literal_handle_written = (
             destination.exists() and isinstance(handle, str) and destination.read_text(errors="replace") == handle
         )
+        diagnostic_files = sorted(root.rglob("pentect.log"))
+        diagnostic_files_bounded = [path for path in diagnostic_files if path.stat().st_size <= MAX_BODY]
+        diagnostic_payloads = [path.read_bytes() for path in diagnostic_files_bounded]
+        diagnostic_value_absent = all(VALUE.encode() not in payload for payload in diagnostic_payloads)
+        diagnostic_handle_absent = not isinstance(handle, str) or all(
+            handle.encode() not in payload for payload in diagnostic_payloads
+        )
+        diagnostic_events = []
+        for payload in diagnostic_payloads:
+            for line in payload.splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    diagnostic_events.append({
+                        key: event[key] for key in ("action", "surface", "event", "kind")
+                        if isinstance(event.get(key), str)
+                    })
         common_checks = {
             "registration_call_issued": registered["call_issued"], "registration_result_seen": registered["result_seen"],
             "opaque_handle_captured": isinstance(handle, str), "registration_provider_plaintext_absent": not registered["provider_raw_seen"],
@@ -320,6 +339,10 @@ def main() -> int:
             "recovery_call_issued": bool(recovered.get("call_issued")),
             "recovery_provider_plaintext_absent": not recovered.get("provider_raw_seen", True), "recovery_process_completed": recovered.get("timed_out") is False,
             "handlers_clean": not registered["handler_error"] and not recovered.get("handler_error", True),
+            "persistent_diagnostic_value_absent": diagnostic_value_absent,
+            "persistent_diagnostic_handle_absent": diagnostic_handle_absent,
+            "persistent_diagnostics_present": bool(diagnostic_files),
+            "persistent_diagnostics_all_bounded_and_inspected": len(diagnostic_files_bounded) == len(diagnostic_files),
             "bounded": registered["http_count"] <= MAX_HTTP and recovered.get("http_count", MAX_HTTP + 1) <= MAX_HTTP,
         }
         pointer_present = {"index.bin", "key.bin"}.issubset(pointer_files_after_registration)
@@ -333,6 +356,10 @@ def main() -> int:
             "blocked": {"registration_state_as_expected": (not pointer_present if args.remember == "disabled" else pointer_present), "tool_result_withheld": not recovered.get("result_seen", False), "tool_side_effect_absent": not destination.exists()},
             "registration-missing": {"persistent_pointer_files_absent_after_a": not pointer_present, "tool_result_withheld": not recovered.get("result_seen", False), "tool_side_effect_absent": not destination.exists()},
         }[expected]
+        if expected != "recovered":
+            outcome_checks["persistent_warning_diagnostic_present"] = any(
+                event.get("action") == "warning" for event in diagnostic_events
+            )
         checks = {**common_checks, **outcome_checks}
         client_executable = shutil.which(args.client if args.client != "opencode" else "opencode", path=env["PATH"])
         if client_executable is None: raise RuntimeError(f"{args.client} executable unavailable")
@@ -345,6 +372,9 @@ def main() -> int:
                   "pentect_file_paths_after_registration": pentect_files_after_registration,
                   "destination_exists": destination.exists(), "destination_exact": exact,
                   "destination_literal_handle": literal_handle_written,
+                  "persistent_diagnostic_file_count": len(diagnostic_files),
+                  "persistent_diagnostic_inspected_count": len(diagnostic_files_bounded),
+                  "persistent_diagnostic_events": diagnostic_events,
                   "recovery_outcome": "exact" if exact else "literal_handle" if literal_handle_written else "missing" if not destination.exists() else "wrong_bytes",
                   "checks": checks, "passed": all(checks.values()),
                   "scope": {"source": args.source_state, "project": args.scope, "note": "different-project does not copy the registered index; it tests an unregistered project reference, not identity-key mismatch", "provider": "deterministic localhost; no resolve/remask"}}
