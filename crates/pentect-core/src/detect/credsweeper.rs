@@ -7975,7 +7975,7 @@ mod tests {
         );
         let candidates = twilio_multi_candidates(&raw);
 
-        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "73c1a036711392721c39fdbd43537f21");
         assert_eq!(candidates[0].line_data.len(), 2);
         assert_eq!(candidates[0].line_data[0].value, account_sid);
