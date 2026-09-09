@@ -8398,7 +8398,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_auth_password_value_matches_official_ml_group() {
+    fn shared_auth_password_morpheme_fixture_matches_official_uuid_only_result() {
         let line = r#"            "password : Password for authorization\n        BAIT: bace4d59-fa7e-beef-cafe-9129474bcd81","#;
         let common = |rule_name: &str, variable: &str, start: isize| {
             MlInput {
@@ -8427,7 +8427,32 @@ mod tests {
             ..common("UUID", "", -2)
         };
         let (score, threshold) = credsweeper_ml::score_group_for_test(&[&uuid, &auth, &password]);
-        assert!(score >= threshold, "score={score} threshold={threshold}");
+        assert!(score < threshold, "score={score} threshold={threshold}");
+
+        // CredSweeper v1.18.1 adds `cafe` to the morpheme checklist. Its
+        // tests/data/no_ml.json and tests/data/output.json fixtures therefore
+        // retain only the UUID finding for this upstream example.
+        let region = crate::model::Region {
+            span: ByteRange::new(0, line.len()),
+            ctx: crate::model::Context {
+                path: Some(
+                    "crates/pentect-core/vendors/CredSweeper/tests/file_handler/test_text_content_provider.py"
+                        .to_string(),
+                ),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, line);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert_eq!(findings.len(), 1, "findings={findings:?}");
+        assert_eq!(findings[0].rule_name, "UUID", "findings={findings:?}");
+        assert_eq!(
+            findings[0].value, "bace4d59-fa7e-beef-cafe-9129474bcd81",
+            "findings={findings:?}"
+        );
     }
 
     #[test]
@@ -8526,13 +8551,7 @@ mod tests {
             (
                 "crates/pentect-core/vendors/CredSweeper/tests/file_handler/test_text_content_provider.py",
                 r#"            "password : Password for authorization\n        BAIT: bace4d59-fa7e-beef-cafe-9129474bcd81","#,
-                "Auth",
-                "bace4d59-fa7e-beef-cafe-9129474bcd81",
-            ),
-            (
-                "crates/pentect-core/vendors/CredSweeper/tests/file_handler/test_text_content_provider.py",
-                r#"            "password : Password for authorization\n        BAIT: bace4d59-fa7e-beef-cafe-9129474bcd81","#,
-                "Password",
+                "UUID",
                 "bace4d59-fa7e-beef-cafe-9129474bcd81",
             ),
             (
