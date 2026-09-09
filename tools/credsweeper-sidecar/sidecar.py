@@ -11,7 +11,7 @@ except ModuleNotFoundError:
     import credsweeper
 
     APP_PATH = Path(credsweeper.__file__).resolve().parent
-from credsweeper.common.constants import Severity, ThresholdPreset
+from credsweeper.common.constants import Confidence, Severity, ThresholdPreset
 from credsweeper.config.config import Config
 from credsweeper.credentials.candidate import Candidate
 from credsweeper.credentials.candidate_key import CandidateKey
@@ -31,6 +31,7 @@ def build_config(use_filters: bool) -> Config:
     config_dict["depth"] = 0
     config_dict["doc"] = False
     config_dict["severity"] = Severity.INFO.value
+    config_dict["confidence"] = Confidence.WEAK.value
     return Config(config_dict)
 
 
