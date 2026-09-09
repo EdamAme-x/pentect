@@ -993,10 +993,10 @@ fn bridge_session_exports_only_the_owned_runtime_session() {
     std::env::set_var("PENTECT_BIN", "/tmp/pentect-bin");
 
     let session = bridge_session_value().unwrap();
-    assert!(session["contract"]
-        .as_str()
-        .unwrap()
-        .contains("Session rules"));
+    let contract = session["contract"].as_str().unwrap();
+    assert!(contract.contains("Session rules"));
+    assert!(contract.contains("not corruption, truncation, invalid file content"));
+    assert!(contract.contains("Preserve every handle byte-for-byte"));
     let environment = session["environment"].as_object().unwrap();
     assert_eq!(environment.len(), 4);
     for name in [ENV_ADDR, ENV_TOKEN, PENTECT_AGENT_LAUNCHED_ENV] {
@@ -1116,6 +1116,200 @@ fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
         .unwrap();
     assert!(!masked.contains(raw), "{masked}");
     assert!(masked.contains("OPENAI_API_KEY=<<"), "{masked}");
+}
+
+#[test]
+fn prompt_masking_runs_prepare_and_finalize_once() {
+    let Some(python) = ["python3", "python"].into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }) else {
+        return;
+    };
+    let root = temp_root("prompt-plugin-stage-count");
+    std::fs::create_dir_all(&root).unwrap();
+    let calls = root.join("calls.txt");
+    let script = r#"import json,sys
+path=sys.argv[1]
+for line in sys.stdin:
+    request=json.loads(line)
+    with open(path, 'a', encoding='utf-8') as output:
+        output.write(request['hook'] + '\t' + request['payload']['text'] + '\n')
+    print(json.dumps({
+        'schema':'pentect.plugin.v1',
+        'id':request['id'],
+        'type':'result',
+        'action':'next',
+        'payload':request['payload'],
+    }), flush=True)
+"#;
+    let plugins = plugin_middleware::PluginMiddleware::from_test_command(
+        vec![
+            python.to_string(),
+            "-u".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            calls.display().to_string(),
+        ],
+        [
+            plugin_middleware::MiddlewareStage::Prepare,
+            plugin_middleware::MiddlewareStage::Finalize,
+        ],
+    )
+    .unwrap();
+    let session = Session::open_capability_at(&root, "stage-count").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let mut masker = masking::OutputMasker::new_shared_with_plugins(store, plugins).unwrap();
+
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    masker
+        .mask_prompt_text(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap();
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let calls = calls.lines().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].starts_with("prepare\tOPENAI_API_KEY=<<"));
+    assert!(calls[1].starts_with("finalize\tOPENAI_API_KEY=<<"));
+    assert!(calls.iter().all(|call| !call.contains(raw)), "{calls:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn prompt_dotenv_activity_counts_each_finding_once() {
+    const CHILD_ROOT_ENV: &str = "PENTECT_TEST_DOTENV_ACTIVITY_CHILD_ROOT";
+    const MIXED_PROMPT: &str =
+        "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nContact alice@example.com";
+
+    if let Some(child_root) = std::env::var_os(CHILD_ROOT_ENV) {
+        let child_root = PathBuf::from(child_root);
+        let session = Session::open_capability_at(&child_root, "emitted-activity").unwrap();
+        let store = MemoryStore::for_session(&session);
+        let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+        let masked = masker
+            .mask_prompt_text_without_plugins(MIXED_PROMPT)
+            .unwrap();
+        assert_eq!(
+            MemoryStore::for_session(&session)
+                .resolve_all(&masked)
+                .unwrap(),
+            MIXED_PROMPT
+        );
+        masker.flush_activity();
+        activity_log::flush_persistent();
+        return;
+    }
+
+    let root = temp_root("prompt-dotenv-activity-count");
+    std::fs::create_dir_all(&root).unwrap();
+
+    for (session_name, prompt, expected_count, expected_labels) in [
+        (
+            "dotenv-only",
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            1,
+            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 0)],
+        ),
+        (
+            "dotenv-and-text",
+            MIXED_PROMPT,
+            2,
+            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 1)],
+        ),
+    ] {
+        let session = Session::open_capability_at(&root, session_name).unwrap();
+        let store = MemoryStore::for_session(&session);
+        let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+        let masked = masker.mask_prompt_text_without_plugins(prompt).unwrap();
+        assert_ne!(masked, prompt);
+        assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(!masked.contains("alice@example.com"));
+        assert_eq!(
+            MemoryStore::for_session(&session)
+                .resolve_all(&masked)
+                .unwrap(),
+            prompt
+        );
+
+        let (count, labels) = masker.pending_activity_for("prompt").unwrap();
+        assert_eq!(count, expected_count);
+        for (label, expected) in expected_labels {
+            assert_eq!(labels.get(label).copied().unwrap_or_default(), expected);
+        }
+        assert_eq!(labels.values().sum::<u64>(), count);
+    }
+
+    let child_root = root.join("activity-child");
+    let child_home = child_root.join("home");
+    let child_work = child_root.join("work");
+    let child_log = child_root.join("logs");
+    std::fs::create_dir_all(&child_home).unwrap();
+    std::fs::create_dir_all(child_root.join("runtime")).unwrap();
+    std::fs::create_dir_all(child_root.join("tmp")).unwrap();
+    std::fs::create_dir_all(child_work.join(".pentect")).unwrap();
+    std::fs::write(
+        child_work.join(".pentect/config.toml"),
+        "[activity]\nshare = false\n[update]\ncheck = false\n",
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("tests::prompt_dotenv_activity_counts_each_finding_once")
+        .arg("--nocapture")
+        .env_clear()
+        .env(CHILD_ROOT_ENV, &child_root)
+        .env("PENTECT_LOG_DIR", &child_log)
+        .env("HOME", &child_home)
+        .env("USERPROFILE", &child_home)
+        .env("XDG_CONFIG_HOME", child_home.join(".config"))
+        .env("XDG_RUNTIME_DIR", child_root.join("runtime"))
+        .env("TMPDIR", child_root.join("tmp"))
+        .env("TMP", child_root.join("tmp"))
+        .env("TEMP", child_root.join("tmp"))
+        .current_dir(&child_work);
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload = std::fs::read_to_string(child_log.join("pentect.log")).unwrap();
+    let events = payload
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "{payload}");
+    assert_eq!(events[0]["action"], "mask");
+    assert_eq!(events[0]["surface"], "prompt");
+    assert_eq!(events[0]["count"], 2);
+    assert_eq!(
+        events[0]["labels"],
+        json!([
+            { "name": "EMAIL_ADDRESS", "count": 1 },
+            { "name": "OPENAI_API_KEY", "count": 1 }
+        ])
+    );
+    for private_value in [
+        MIXED_PROMPT,
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+        "alice@example.com",
+        "Contact alice",
+    ] {
+        assert!(!payload.contains(private_value), "{payload}");
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1303,6 +1497,133 @@ fn exec_capability_env_does_not_shadow_parent_environment() {
 }
 
 #[test]
+fn json_tool_output_recovers_exact_secret_across_output_shapes() {
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let cases = [
+        ("plain", format!("LIVE_KEY={raw}\n")),
+        (
+            "json-envelope",
+            serde_json::json!({"stdout": format!("LIVE_KEY={raw}\n")}).to_string(),
+        ),
+        (
+            "json-stringified-output",
+            serde_json::to_string(&format!("LIVE_KEY={raw}\n")).unwrap(),
+        ),
+        (
+            "codex-function-output",
+            serde_json::json!({
+                "type": "function_call_output",
+                "output": format!("LIVE_KEY={raw}\n")
+            })
+            .to_string(),
+        ),
+        (
+            "codex-response-output",
+            serde_json::json!({
+                "output": [{
+                    "type": "function_call_output",
+                    "output": format!("LIVE_KEY={raw}\n")
+                }]
+            })
+            .to_string(),
+        ),
+        (
+            "codex-exec-header",
+            format!(
+                "Chunk ID: synthetic\nWall time: 0.1 seconds\nProcess exited with code 0\nFinal output:\nLIVE_KEY={raw}\n"
+            ),
+        ),
+    ];
+
+    for (name, output) in cases {
+        let root = temp_root(&format!("diagnostic-recovered-{name}"));
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let store = MemoryStore::for_session(&session);
+        let masked = mask_tool_output(&session, &output).unwrap();
+        let handle = first_masked_handle(&masked);
+        let recovered = store.resolve_all(&handle).unwrap();
+        let shape = format!(
+            "len={},actual_lf={},actual_cr={},literal_backslash_n_suffix={}",
+            recovered.len(),
+            recovered.contains('\n'),
+            recovered.contains('\r'),
+            recovered.ends_with(r"\n"),
+        );
+        assert!(recovered == raw, "{name}: recovered shape {shape}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn json_tool_output_preserves_literal_backslash_and_metadata() {
+    let root = temp_root("diagnostic-json-literal-backslash");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\\n";
+    let output = serde_json::json!({
+        "label": "東京 \"quoted\"",
+        "stdout": format!("LIVE_KEY={raw}")
+    })
+    .to_string();
+    let masked = mask_tool_output(&session, &output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    let parsed: Value = serde_json::from_str(&masked).unwrap();
+    assert_eq!(parsed["label"], "東京 \"quoted\"");
+    assert!(!masked.contains(raw));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn malformed_json_uses_text_masking_fallback() {
+    let root = temp_root("diagnostic-json-malformed");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = format!(r#"{{"stdout":"LIVE_KEY={raw}\\n"}} trailing"#);
+    let masked = mask_tool_output(&session, &output).unwrap();
+    assert!(masked.contains("<<"));
+    assert!(!masked.contains(raw));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn json_tool_output_without_plugins_still_decodes_recovery() {
+    let root = temp_root("diagnostic-json-no-plugins");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = serde_json::json!({"stdout": format!("LIVE_KEY={raw}\n")}).to_string();
+    let mut masker = masking::OutputMasker::new_shared(store.clone()).unwrap();
+    let masked = masker.mask_tool_output_without_plugins(&output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    assert_eq!(
+        serde_json::from_str::<Value>(&masked).unwrap()["stdout"],
+        format!("LIVE_KEY={handle}\n")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn json_tool_output_with_image_payload_uses_text_policy_path() {
+    let root = temp_root("json-tool-image-policy");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let output = serde_json::json!({
+        "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+        "stdout": format!("LIVE_KEY={raw}")
+    })
+    .to_string();
+    let masked = mask_tool_output(&session, &output).unwrap();
+    let handle = first_masked_handle(&masked);
+    assert_eq!(store.resolve_all(&handle).unwrap(), raw);
+    assert!(masked.contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+    assert!(serde_json::from_str::<Value>(&masked).is_ok());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn exec_resolves_masked_handle_in_command_text() {
     let root = temp_root("exec-command-handle");
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -1407,6 +1728,260 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
     assert!(!safe.contains("114514810"), "{safe}");
     assert!(!safe.contains("hello world"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_tracks_selected_recovery_env_without_a_handle_in_command() {
+    let root = temp_root("exec-restored-env-input");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
+    let env_name =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "KAGGLE_API_TOKEN"));
+    let command = if cfg!(windows) {
+        format!("Write-Output $env:{env_name}")
+    } else {
+        format!("printf '%s' \"${env_name}\"")
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: false,
+        secret_stdin: None,
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Shell(command.clone()),
+    };
+
+    let prepared = resolve_exec_inputs(&MemoryStore::for_session(&session), &opts).unwrap();
+    assert!(prepared.restored());
+    match prepared {
+        ResolvedExecInputs::Shell {
+            command: shell,
+            script,
+            ..
+        } => {
+            assert_eq!(script, prepare_shell_script(&command, ScriptShell::Native));
+            assert!(shell.get_envs().any(|(name, configured)| {
+                name == env_name.as_str()
+                    && configured.is_some_and(|configured| configured == value)
+            }));
+        }
+        ResolvedExecInputs::Program { .. } => panic!("expected shell inputs"),
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_aggregates_multiple_restoration_channels() {
+    let root = temp_root("exec-restored-mixed-inputs");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: true,
+        secret_stdin: Some(handle.clone()),
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["program".to_string(), handle]),
+    };
+
+    let prepared = resolve_exec_inputs(&MemoryStore::for_session(&session), &opts).unwrap();
+    assert!(prepared.restored());
+    match prepared {
+        ResolvedExecInputs::Program {
+            args, secret_stdin, ..
+        } => {
+            assert_eq!(args, ["program", raw]);
+            assert_eq!(secret_stdin.as_deref().map(String::as_str), Some(raw));
+        }
+        ResolvedExecInputs::Shell { .. } => panic!("expected program inputs"),
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_does_not_commit_partial_restoration() {
+    let root = temp_root("exec-restored-late-failure");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: true,
+        secret_stdin: Some("<<UNKNOWN_0123456789abcdef>>".to_string()),
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["program".to_string(), handle]),
+    };
+
+    let error = match resolve_exec_inputs(&MemoryStore::for_session(&session), &opts) {
+        Ok(_) => panic!("unknown late secret-stdin handle should fail preparation"),
+        Err(error) => error,
+    };
+    assert!(error.contains("unknown masked handle"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_leaves_plain_inputs_untracked() {
+    let root = temp_root("exec-unrestored-inputs");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        allow_secret_argv: false,
+        secret_stdin: None,
+        script_shell: ScriptShell::Native,
+        mode: ExecMode::Program(vec!["program".to_string(), "ordinary".to_string()]),
+    };
+
+    let prepared = resolve_exec_inputs(&MemoryStore::for_session(&session), &opts).unwrap();
+    assert!(!prepared.restored());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_input_preparation_emits_only_after_the_whole_operation_is_ready() {
+    const CHILD_CASE_ENV: &str = "PENTECT_TEST_EXEC_METRIC_CASE";
+    const CHILD_ROOT_ENV: &str = "PENTECT_TEST_EXEC_METRIC_ROOT";
+
+    if let (Ok(case), Some(root)) = (
+        std::env::var(CHILD_CASE_ENV),
+        std::env::var_os(CHILD_ROOT_ENV).map(PathBuf::from),
+    ) {
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+        let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+        let env_name = pentect_env_name_for_handle(&handle);
+        let store = MemoryStore::for_session(&session);
+        let opts = match case.trim_end_matches("-live") {
+            "env-only" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: case.ends_with("-live"),
+                allow_secret_argv: false,
+                secret_stdin: None,
+                script_shell: ScriptShell::Native,
+                mode: ExecMode::Shell(if cfg!(windows) {
+                    format!("Write-Output $env:{env_name}")
+                } else {
+                    format!("printf '%s' \"${env_name}\"")
+                }),
+            },
+            "unreferenced" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: false,
+                allow_secret_argv: false,
+                secret_stdin: None,
+                script_shell: ScriptShell::Native,
+                mode: ExecMode::Program(vec!["pentect-test-missing-program".to_string()]),
+            },
+            "shell-failure" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: case.ends_with("-live"),
+                allow_secret_argv: false,
+                secret_stdin: None,
+                script_shell: ScriptShell::Bash,
+                mode: ExecMode::Shell(handle),
+            },
+            "late-failure" => ExecOpts {
+                session: DEFAULT_SESSION.to_string(),
+                live: false,
+                allow_secret_argv: true,
+                secret_stdin: Some("<<UNKNOWN_0123456789abcdef>>".to_string()),
+                script_shell: ScriptShell::Native,
+                mode: ExecMode::Program(vec!["program".to_string(), handle]),
+            },
+            _ => panic!("unknown child case"),
+        };
+        let result = if opts.live {
+            run_resolved_command_live(&store, &opts).map(|_| ())
+        } else {
+            run_resolved_command(&store, &opts).map(|_| ())
+        };
+        assert_eq!(
+            result.is_ok(),
+            case.starts_with("env-only"),
+            "{case}: {result:?}"
+        );
+        activity_log::flush_persistent();
+        return;
+    }
+
+    let root = temp_root("exec-restoration-emission");
+    std::fs::create_dir_all(&root).unwrap();
+    for (case, expected) in [
+        ("env-only", 1),
+        ("env-only-live", 1),
+        ("unreferenced", 0),
+        ("shell-failure", 0),
+        ("shell-failure-live", 0),
+        ("late-failure", 0),
+    ] {
+        let child_root = root.join(case);
+        let home = child_root.join("home");
+        let work = child_root.join("work");
+        let log = child_root.join("logs");
+        std::fs::create_dir_all(work.join(".pentect")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            work.join(".pentect/config.toml"),
+            "[activity]\nshare = false\n[update]\ncheck = false\n",
+        )
+        .unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("tests::exec_input_preparation_emits_only_after_the_whole_operation_is_ready")
+            .arg("--nocapture")
+            .env_clear()
+            .env(CHILD_CASE_ENV, case)
+            .env(CHILD_ROOT_ENV, &child_root)
+            .env("PENTECT_LOG_DIR", &log)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("LOCALAPPDATA", child_root.join("local-app-data"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", child_root.join("data"))
+            .env("XDG_CACHE_HOME", child_root.join("cache"))
+            .env("XDG_STATE_HOME", child_root.join("state"))
+            .env("XDG_RUNTIME_DIR", child_root.join("runtime"))
+            .env("TMPDIR", child_root.join("tmp"))
+            .env("TMP", child_root.join("tmp"))
+            .env("TEMP", child_root.join("tmp"))
+            .current_dir(&work);
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{case} child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload = std::fs::read_to_string(log.join("pentect.log")).unwrap_or_default();
+        assert!(
+            !payload.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            "{payload}"
+        );
+        let events = payload
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["action"] == "resolve" && event["surface"] == "exec")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), expected, "{case}: {payload}");
+        if let Some(event) = events.first() {
+            assert_eq!(event["count"], 1);
+            assert!(event.get("labels").is_none(), "{event}");
+            assert!(event.get("target").is_none(), "{event}");
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2979,10 +3554,43 @@ fn canonical_claude_hook_applies_otp_detection_to_browser_rows() {
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
+    let store = MemoryStore::for_session(&session);
+    let without_known_handles = without_known_opaque_handles(&rendered, &store);
     for secret in ["837291", "1234", "7QK4P", "729004", "483920", "7391"] {
-        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(
+            !without_known_handles.contains(secret),
+            "raw OTP remained outside a known opaque handle: {rendered}"
+        );
+        assert!(store.resolve_all(&rendered).unwrap().contains(secret));
     }
     assert!(rendered.contains("<<OTP_"), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn otp_assertion_ignores_only_well_formed_known_handles() {
+    let (root, session) = empty_session("otp-known-handle-assertion");
+    let store = MemoryStore::for_session(&session);
+    let handle = "<<OTP_3a78a312691234b3>>";
+    store
+        .add_recovery(pentect_core::Recovery::seal(
+            std::collections::HashMap::from([(handle.to_string(), "1234".to_string())]),
+            &session.key,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        without_known_opaque_handles(&format!("masked={handle}"), &store),
+        "masked=<KNOWN_OPAQUE_HANDLE>"
+    );
+    for visible in [
+        "raw=1234",
+        "unknown=<<OTP_1234deadbeef5678>>",
+        "broken=<<OTP_1234",
+    ] {
+        assert!(without_known_opaque_handles(visible, &store).contains("1234"));
+    }
+    assert_eq!(store.resolve_all(handle).unwrap(), "1234");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3083,6 +3691,32 @@ fn env_like_tool_output_masks_all_env_values() {
     assert!(masked.contains("TEST_SECRET=<<TEST_SECRET_"), "{masked}");
     assert!(masked.contains("NOTE=<<NOTE_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_output_masking_roundtrips_plain_envelopes_and_json_escaped_newlines() {
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let cases = [
+        format!("LIVE_KEY={raw}\n"),
+        serde_json::json!({
+            "stdout": format!("LIVE_KEY={raw}\n"),
+            "exit_code": 0,
+            "status": "completed"
+        })
+        .to_string(),
+        serde_json::to_string(&format!("LIVE_KEY={raw}\n")).unwrap(),
+    ];
+
+    for (index, output) in cases.into_iter().enumerate() {
+        let (root, session) = empty_session(&format!("tool-output-envelope-roundtrip-{index}"));
+        let masked = mask_tool_output(&session, &output).unwrap();
+        assert!(!masked.contains(raw), "protected output leaked: {masked}");
+        let restored = MemoryStore::for_session(&session)
+            .resolve_all(&masked)
+            .unwrap();
+        assert_eq!(restored, output);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[test]
@@ -3685,8 +4319,12 @@ fn pretool_rewrites_direct_read_tool_to_masked_copy() {
 
 #[test]
 fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
-    let (root, session) = empty_session("hook-pre-read-many-secret");
-    let project = temp_root("pentect-read-many-secret");
+    let session_fixture = TestDirectory::new("hook-pre-read-many-secret-session");
+    let session = Session::open_at(session_fixture.path(), "t").unwrap();
+    let fixture = TestDirectory::new("pentect-read-many-secret");
+    std::fs::create_dir_all(fixture.path().join(".pentect")).unwrap();
+    let project = fixture.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
     let result = {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _cwd = enter_temp_cwd(&project);
@@ -3724,8 +4362,7 @@ fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
     };
     assert!(result.contains("<<RUNPOD_API_KEY_"), "{result}");
     assert!(!result.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    let _ = std::fs::remove_dir_all(project);
-    let _ = std::fs::remove_dir_all(root);
+    assert_directory_empty(&fixture.path().join(".pentect"));
 }
 
 #[test]
@@ -3771,12 +4408,113 @@ fn masked_read_copy_path_mirrors_relative_paths() {
 }
 
 #[test]
+fn masked_read_copy_paths_do_not_collide_for_project_punctuation() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-project-collision");
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let first = project.join("a b.env");
+    let second = project.join("a_b.env");
+    std::fs::write(
+        &first,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    std::fs::write(&second, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let (first_masked, second_masked) = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        (
+            masked_read_copy(&session, "a b.env").unwrap().unwrap(),
+            masked_read_copy(&session, "a_b.env").unwrap().unwrap(),
+        )
+    };
+
+    assert_ne!(first_masked, second_masked);
+    assert!(std::fs::read_to_string(&first_masked)
+        .unwrap()
+        .contains("<<RUNPOD_API_KEY_"));
+    assert!(std::fs::read_to_string(&second_masked)
+        .unwrap()
+        .contains("<<OPENAI_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn masked_read_copy_paths_remain_distinct_for_unicode_names() {
+    let first = safe_masked_read_component("café.env");
+    let second = safe_masked_read_component("café.env");
+    assert_ne!(first, second);
+    assert!(first.starts_with("caf"));
+    assert!(second.starts_with("caf"));
+}
+
+#[test]
+fn masked_read_copy_paths_remain_distinct_after_component_truncation() {
+    let first = format!("{}A.env", "x".repeat(80));
+    let second = format!("{}B.env", "x".repeat(80));
+    assert_ne!(
+        safe_masked_read_component(&first),
+        safe_masked_read_component(&second)
+    );
+}
+
+#[test]
+fn project_external_component_cannot_alias_external_source_namespace() {
+    let project_path = safe_masked_read_path(Path::new("_external/abc/file.env"));
+    let external_path = PathBuf::from("_external").join("abc").join("file.env");
+    assert_ne!(project_path, external_path);
+}
+
+#[test]
+fn batched_read_paths_get_distinct_masked_copies() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-batched-paths");
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let first = project.join("a b.env");
+    let second = project.join("a_b.env");
+    std::fs::write(
+        &first,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    std::fs::write(&second, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let updated = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        let input = json!({
+            "paths": ["a b.env", "a_b.env"]
+        });
+        apply_masked_read_before_tool(&session, &input)
+            .unwrap()
+            .expect("secret files should be rewritten")
+    };
+    let paths = updated["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 2);
+    let first_masked = Path::new(paths[0].as_str().unwrap());
+    let second_masked = Path::new(paths[1].as_str().unwrap());
+    assert_ne!(first_masked, second_masked);
+    assert!(std::fs::read_to_string(first_masked)
+        .unwrap()
+        .contains("<<RUNPOD_API_KEY_"));
+    assert!(std::fs::read_to_string(second_masked)
+        .unwrap()
+        .contains("<<OPENAI_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let root = temp_root("masked-read-external-collision");
+    let fixture = TestDirectory::new("masked-read-external-collision");
+    std::fs::create_dir_all(fixture.path().join(".pentect")).unwrap();
+    let root = fixture.path();
     let project = root.join("project");
     let external = root.join("external");
-    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(project.join(".git")).unwrap();
     std::fs::create_dir_all(external.join("one")).unwrap();
     std::fs::create_dir_all(external.join("two")).unwrap();
     let first = external.join("one").join(".env");
@@ -3811,6 +4549,62 @@ fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     let second_text = std::fs::read_to_string(&second_masked).unwrap();
     assert!(first_text.contains("<<RUNPOD_API_KEY_"), "{first_text}");
     assert!(second_text.contains("<<OPENAI_API_KEY_"), "{second_text}");
+    assert_directory_empty(&root.join(".pentect"));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_bytes_rejects_a_fifo_without_bypassing_the_input_limit() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = temp_root("read-bytes-fifo-limit");
+    let regular = root.join("large.txt");
+    let fifo = root.join("input.pipe");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = std::fs::File::create(&regular).unwrap();
+    file.set_len(MAX_INPUT_BYTES as u64 + 1).unwrap();
+    assert!(read_bytes(&regular).is_err());
+
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let writer_path = std::ffi::CString::new(writer_path.as_os_str().as_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let writer = loop {
+            let fd = unsafe { libc::open(writer_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, 0) }, 0);
+                break Some(unsafe { std::fs::File::from_raw_fd(fd) });
+            }
+            if std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            } else {
+                break None;
+            }
+        };
+        if let Some(mut writer) = writer {
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..=(MAX_INPUT_BYTES / chunk.len()) {
+                if std::io::Write::write_all(&mut writer, &chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = read_bytes(&fifo);
+    writer.join().unwrap();
+    if let Ok(bytes) = result {
+        panic!(
+            "FIFO input returned {} bytes despite the {MAX_INPUT_BYTES}-byte limit",
+            bytes.len()
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4374,6 +5168,36 @@ fn temp_root(name: &str) -> PathBuf {
     ))
 }
 
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        let path = temp_root(name);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn assert_directory_empty(path: &Path) {
+    assert!(
+        std::fs::read_dir(path).unwrap().next().is_none(),
+        "hostile ancestor was modified: {}",
+        path.display()
+    );
+}
+
 fn write_project_config(root: &Path, config: &str) {
     let dir = root.join(".pentect");
     std::fs::create_dir_all(&dir).unwrap();
@@ -4451,6 +5275,32 @@ fn first_masked_handle(masked: &str) -> String {
         .map(|offset| start + offset + 2)
         .unwrap_or_else(|| panic!("unterminated handle in {masked}"));
     masked[start..end].to_string()
+}
+
+fn without_known_opaque_handles(text: &str, store: &MemoryStore) -> String {
+    let mut remaining = text;
+    let mut visible = String::with_capacity(text.len());
+    while let Some(start) = remaining.find("<<") {
+        visible.push_str(&remaining[..start]);
+        let candidate_start = &remaining[start..];
+        let Some(end) = candidate_start.find(">>").map(|offset| offset + 2) else {
+            visible.push_str(candidate_start);
+            return visible;
+        };
+        let candidate = &candidate_start[..end];
+        let known = parse_placeholder(candidate).is_ok()
+            && store
+                .resolve_all(candidate)
+                .is_ok_and(|resolved| resolved != candidate);
+        if known {
+            visible.push_str("<KNOWN_OPAQUE_HANDLE>");
+        } else {
+            visible.push_str(candidate);
+        }
+        remaining = &candidate_start[end..];
+    }
+    visible.push_str(remaining);
+    visible
 }
 
 fn pentect_env_name_for_handle(handle: &str) -> String {

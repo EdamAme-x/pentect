@@ -6,7 +6,8 @@ mod sweep;
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CliCredentialDetector, CredSweeperNativeDetector,
     DecodeConfig, DecodeDetector, Detector, EnvValueDetector, ExplicitSecretDetector, JwtDetector,
-    KeyValueDetector, SensitiveKeyDetector, StructuralDetector, UrlDetector, SECRET_VALUE_HINT,
+    KeyValueDetector, PentectTempParser, SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    SECRET_VALUE_HINT,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -704,6 +705,7 @@ impl EngineBuilder {
             .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
+            .detector(Box::new(PentectTempParser))
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
@@ -729,6 +731,7 @@ impl EngineBuilder {
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(ExplicitSecretDetector))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
+            .detector(Box::new(PentectTempParser))
             .detector(Box::new(JwtDetector))
             .detector(Box::new(KeyValueDetector))
             .detector(Box::new(UrlDetector))
@@ -1297,6 +1300,22 @@ mod tests {
         assert_eq!(o["public_key"].as_str().unwrap(), "visible");
         assert_eq!(o["note"].as_str().unwrap(), "ok");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn json_key_component_values_are_masked_and_recoverable() {
+        let input = r#"{"signing_key":"signing-material","masterKey":"master-material","encryption-key":"encryption-material","deploy_key":"deploy-material","public_key":"visible","correlation_key":"request-id","monkey_value":"banana"}"#;
+        let result = mj(input);
+        let value: serde_json::Value =
+            serde_json::from_str(&result.masked).expect("masked output is valid JSON");
+        let object = value.as_object().unwrap();
+        for key in ["signing_key", "masterKey", "encryption-key", "deploy_key"] {
+            assert!(object[key].as_str().unwrap().starts_with("<<"), "{key}");
+        }
+        assert_eq!(object["public_key"].as_str().unwrap(), "visible");
+        assert_eq!(object["correlation_key"].as_str().unwrap(), "request-id");
+        assert_eq!(object["monkey_value"].as_str().unwrap(), "banana");
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
     }
 
     #[test]

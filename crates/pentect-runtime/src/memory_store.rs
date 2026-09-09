@@ -52,11 +52,13 @@ impl MemoryStore {
 
     pub(crate) fn remask_all(&self, text: &str) -> Result<String> {
         let recoveries = self.lock()?;
-        let mut out = text.to_string();
+        let mut remasker = pentect_core::RecoveryStreamRemasker::default();
         for recovery in recoveries.iter() {
-            out = recovery.remask(&out);
+            remasker.merge_recovery_with_views(recovery);
         }
-        Ok(out)
+        let mut out = remasker.push_text(text.as_bytes());
+        out.extend(remasker.finish());
+        String::from_utf8(out).map_err(|_| anyhow!("recovery remask produced invalid UTF-8"))
     }
 
     pub(crate) fn snapshot(&self) -> Result<Vec<Recovery>> {

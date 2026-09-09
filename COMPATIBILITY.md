@@ -4,19 +4,53 @@ Pentect validates its HTTP gateways against provider-shaped mock servers in
 the Rust test suite. Every release also launches these exact public CLI builds
 through the release binary:
 
+The current official coding-client scope is four clients: **Codex CLI, Claude
+Code, OpenCode, and Pi**. Pentect is concentrating compatibility work on these
+four rather than adding more client launchers. Desktop rows below are separate
+surfaces within the Codex and Claude client families, not additional core
+clients.
+
 | Client | Release gate | Protected mode |
 | --- | --- | --- |
-| Codex CLI `0.147.0` | automated on Linux | `pentect codex` |
-| Claude Code `2.1.227` | automated on Linux | `pentect claude` |
-| OpenCode `1.18.16` | automated on Linux | `pentect opencode` |
-| Pi `0.84.1` | launcher and published extension discovery | `pentect pi` or `@pentect/pi` |
+| Codex CLI `0.149.0` | real launch on Linux and all installer platforms | `pentect codex` |
+| Claude Code `2.1.238` | real launch on Linux and all installer platforms | `pentect claude` |
+| OpenCode `1.18.20` | real launch on Linux and all installer platforms | `pentect opencode` |
+| Pi `0.84.2` | real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
 | ChatGPT desktop app (Codex mode) | launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop | protocol tests; signed app `1.24012.9` was manually launch-tested, while `1.34493.1` is known incompatible | `pentect claude app` only on an explicitly compatible build |
+
+Release pins are intentionally separate from the daily current-client
+monitor. The latest successful monitor on 2026-09-03 exercised the published
+Pentect binary and the then-current downloadable clients on Windows, macOS,
+and Linux:
+
+| Client | Current-client evidence | Installed handle path |
+| --- | --- | --- |
+| Codex CLI `0.153.0` | passed on Windows, macOS, and Linux | OpenAI Responses request, local shell tool arguments, cancellation recovery, and image redaction |
+| Claude Code `2.1.259` | passed on Windows, macOS, and Linux | Anthropic Messages request and local Bash tool arguments |
+| OpenCode `1.18.27` | passed on Windows, macOS, and Linux | configured OpenAI Chat request and local tool arguments |
+| Pi `0.84.4` | passed on Windows, macOS, and Linux | configured OpenAI Chat request and local Bash tool arguments |
+
+These current-client results are compatibility observations, not retroactive
+changes to a release's pinned gate. A client name alone also does not imply
+coverage of every provider, transport, hosted tool, or execution location.
 
 The CLI gate proves that the vendor executable still starts under Pentect.
 Mock protocol tests cover text, streaming responses, completed tool calls,
 structured content, file references, malformed content, and custom upstream
 path preservation without sending repository secrets to a model provider.
+The installed handle-flow test goes further: a real client reads two synthetic
+local keys, receives only distinct handles from a localhost provider fixture,
+uses those handles in local tool calls, and reaches the fixture service with
+the exact originals. The provider requests and persistent diagnostics must not
+contain either plaintext value. It does not make a paid provider request.
+
+Pentect commands such as `pentect read`, `pentect exec`, `pentect resolve`,
+`pentect bridge`, and `pentect hook` remain available as standalone commands.
+They are deliberately unavailable when invoked from inside a Pentect-launched
+client: normal shell, file, and MCP tools are restored and remasked at the
+local gateway boundary without giving the client process or its descendants
+the memory-store authority.
 
 Desktop vendor apps are not installed on ephemeral release runners, so their
 full signed-GUI flow is not yet a release gate. Pentect does not claim an App
@@ -59,9 +93,14 @@ or unsupported attachment formats are blocked by default.
 
 Codex Responses-compatible, OpenAI Chat Completions-compatible, and Anthropic Messages-compatible upstreams can be
 selected with `--upstream URL`. Existing Codex provider configuration and
-Claude's managed/user endpoint configuration are preserved as the upstream
-when Pentect inserts its local gateway. Unsupported wire protocols are rejected
-before launch.
+Claude user endpoint configuration are preserved as the upstream when Pentect
+inserts its local gateway. Claude supports the Anthropic Messages HTTP route
+with normal Anthropic authentication and gateways implementing that contract.
+Claude Code's Bedrock, Vertex AI, Foundry, and Mantle transports are rejected
+before launch; they require separate authenticated transport designs. Managed
+policy/configuration remains compatible only when it does not select one of
+those transports, override the enforced route, or use a policy helper whose
+route cannot be verified.
 
 Bifrost's `/openai/v1` and `/anthropic` integration base paths are covered by
 the URL-routing tests. This verifies Pentect's protocol boundary and path

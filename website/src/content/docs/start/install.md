@@ -10,6 +10,10 @@ package builds the Rust workspace on your machine.
 
 <HomeInstall />
 
+Pentect is currently distributed through its own flake, not as a package in
+Nixpkgs. Use `github:EdamAme-x/pentect#pentect`; `nix run nixpkgs#pentect`
+cannot work until Pentect is accepted into the upstream Nixpkgs collection.
+
 ## Check the install
 
 ```sh

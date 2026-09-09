@@ -1346,7 +1346,7 @@ impl ClaudeAppProxyGuard {
         });
         let proxy_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Claude App proxy did not start within 30 seconds".to_string())??;
+            .map_err(|_| "Claude App proxy initialization timed out".to_string())??;
         Ok(Self {
             proxy_url,
             #[cfg(not(windows))]
@@ -2558,6 +2558,28 @@ struct ProtectedChatRequest {
     local_response: Option<Bytes>,
 }
 
+fn enforce_chat_request_plugin_result(
+    run: &pentect_agent::MiddlewareRun,
+    block_unknown_formats: bool,
+) -> Result<(), String> {
+    if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message.as_deref().unwrap_or("request blocked")
+        ));
+    }
+    if run.stopped.is_none()
+        && block_unknown_formats
+        && run.coverage == pentect_agent::MiddlewareCoverage::Partial
+    {
+        return Err(
+            "unknown format blocked: a Claude App plugin reported partial request coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn protect_chat_request(
     body: &Bytes,
     masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
@@ -2582,20 +2604,9 @@ fn protect_chat_request(
             value,
             Some(serde_json::json!({"provider": "claude", "transport": "desktop-http"})),
         )?;
-    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
-        return Err(
-            "unknown format blocked: a Claude App plugin reported partial request coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
-                .to_string(),
-        );
-    }
+    enforce_chat_request_plugin_result(&run, block_unknown_formats)?;
     value = run.payload;
-    if let Some(outcome) = run.stopped {
-        if outcome == pentect_agent::StopOutcome::Block {
-            return Err(format!(
-                "plugin blocked: {}",
-                run.message.unwrap_or_else(|| "request blocked".to_string())
-            ));
-        }
+    if run.stopped.is_some() {
         let body = serde_json::to_vec(&value)
             .map(Bytes::from)
             .map_err(|error| format!("could not encode Claude App plugin response: {error}"))?;
@@ -2852,6 +2863,14 @@ fn inspect_chat_image(
         .get_mut("source")
         .and_then(serde_json::Value::as_object_mut)
     {
+        if let Some(id) = ["file_id", "id"]
+            .into_iter()
+            .find_map(|key| source.get(key).and_then(serde_json::Value::as_str))
+        {
+            if files.get(id) == Some(&crate::http_files::Coverage::Full) {
+                return Ok(None);
+            }
+        }
         if source.get("type").and_then(serde_json::Value::as_str) == Some("base64")
             && source
                 .get("media_type")
@@ -2997,7 +3016,8 @@ fn unscanned_chat_image() -> Result<(), String> {
 
 type ChatFrameStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send>>;
-type ChatResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
+type ChatResolver =
+    Box<dyn FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send>;
 
 struct ChatStreamState {
     upstream: ChatFrameStream,
@@ -3012,7 +3032,7 @@ fn rewrite_chat_json_response(
     block_unknown_formats: bool,
     restore_output: bool,
 ) -> Result<Bytes, String> {
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
     rewrite_chat_json_response_with(
         body,
         plugins,
@@ -3030,7 +3050,7 @@ fn rewrite_chat_json_response_with<R>(
     resolve: &mut R,
 ) -> Result<Bytes, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -3072,11 +3092,18 @@ where
             .clone();
         run_chat_tool_plugins(&mut value, &plugins)?;
     }
-    resolve_chat_tool_calls(&mut value, resolve)?;
-    crate::claude_http_proxy::restore_anthropic_json_value(&mut value, restore_output, resolve)?;
-    serde_json::to_vec(&value)
+    let mut restored_tools = resolve_chat_tool_calls(&mut value, resolve)?;
+    restored_tools =
+        restored_tools.saturating_add(crate::claude_http_proxy::restore_anthropic_json_value(
+            &mut value,
+            restore_output,
+            resolve,
+        )?);
+    let encoded = serde_json::to_vec(&value)
         .map(Bytes::from)
-        .map_err(|error| format!("could not encode Claude App Chat response: {error}"))
+        .map_err(|error| format!("could not encode Claude App Chat response: {error}"))?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn chat_sse_body<S>(
@@ -3107,7 +3134,7 @@ fn chat_sse_body_with_limit<S>(
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send + 'static,
 {
-    let resolve: ChatResolver = Box::new(crate::claude_http_proxy::request_scoped_resolver());
+    let resolve: ChatResolver = Box::new(crate::claude_http_proxy::request_scoped_tool_resolver());
     let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
         resolve,
         plugins,
@@ -3171,13 +3198,12 @@ where
                         Ok(chunks) => state
                             .ready
                             .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                        Err(error) => {
-                            eprintln!("[pentect] Claude App Chat response blocked: {error}");
+                        Err(_error) => {
+                            eprintln!("[pentect] Claude App Chat response blocked by validation");
                             state.finished = true;
-                            state.ready.push_back(Err(Box::new(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                error,
-                            ))));
+                            state.ready.push_back(Ok(Frame::data(
+                                crate::claude_http_proxy::anthropic_tool_rejection_sse(),
+                            )));
                         }
                     }
                 }
@@ -3192,14 +3218,13 @@ where
                             Ok(chunks) => state
                                 .ready
                                 .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                            Err(error) => {
+                            Err(_error) => {
                                 eprintln!(
-                                    "[pentect] Claude App Chat response blocked at EOF: {error}"
+                                    "[pentect] Claude App Chat response blocked at EOF by validation"
                                 );
-                                state.ready.push_back(Err(Box::new(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    error,
-                                ))));
+                                state.ready.push_back(Ok(Frame::data(
+                                    crate::claude_http_proxy::anthropic_tool_rejection_sse(),
+                                )));
                             }
                         }
                     }
@@ -3261,14 +3286,16 @@ fn run_chat_tool_plugins(
     Ok(())
 }
 
-fn resolve_chat_tool_calls<R>(value: &mut serde_json::Value, resolve: &mut R) -> Result<(), String>
+fn resolve_chat_tool_calls<R>(value: &mut serde_json::Value, resolve: &mut R) -> Result<u64, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     match value {
         serde_json::Value::Array(values) => {
             for value in values {
-                resolve_chat_tool_calls(value, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_chat_tool_calls(value, resolve)?);
             }
         }
         serde_json::Value::Object(object) => {
@@ -3281,6 +3308,7 @@ where
                 || kind.contains("tool_call")
                 || kind.contains("function_call");
             if tool_call {
+                let mut call_changed = false;
                 let name = object
                     .get("name")
                     .and_then(serde_json::Value::as_str)
@@ -3296,11 +3324,12 @@ where
                                 false,
                             ),
                         };
-                        let resolved = crate::claude_http_proxy::resolve_tool_input_json(
-                            &encoded,
-                            name.as_deref(),
-                            resolve,
-                        )?;
+                        let (resolved, changed) =
+                            crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
+                                &encoded,
+                                name.as_deref(),
+                                resolve,
+                            )?;
                         *arguments = if was_string {
                             serde_json::Value::String(resolved)
                         } else {
@@ -3308,16 +3337,19 @@ where
                                 format!("could not decode Claude App tool input: {error}")
                             })?
                         };
+                        call_changed |= changed;
                     }
                 }
+                restored_tools = restored_tools.saturating_add(u64::from(call_changed));
             }
             for nested in object.values_mut() {
-                resolve_chat_tool_calls(nested, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_chat_tool_calls(nested, resolve)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
 fn metadata_path(path: &str) -> String {
@@ -3369,15 +3401,15 @@ fn looks_like_uuid(segment: &str) -> bool {
 
 fn remove_hop_by_hop_headers(headers: &mut hyper::HeaderMap) {
     let connection_headers = headers
-        .get(hyper::header::CONNECTION)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
             value
                 .split(',')
                 .filter_map(|name| name.trim().parse::<hyper::header::HeaderName>().ok())
-                .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
     for name in connection_headers {
         headers.remove(name);
     }
@@ -3780,16 +3812,12 @@ mod tests {
             4,
         );
 
-        let error = match body.collect().await {
-            Ok(_) => panic!("oversized uninspected event must not be emitted"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("SSE event exceeded inspection limit"),
-            "{error}"
+        let output = body.collect().await.unwrap().to_bytes();
+        assert_eq!(
+            output,
+            crate::claude_http_proxy::anthropic_tool_rejection_sse()
         );
+        assert!(!output.windows(b"12345".len()).any(|part| part == b"12345"));
     }
 
     #[tokio::test]
@@ -3810,7 +3838,9 @@ mod tests {
             Bytes::from(format!("{first}{second}{stop}")),
         ))]);
         let resolve: ChatResolver =
-            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+            Box::new(
+                |text: &str, _| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            );
         let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
             resolve,
             Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
@@ -3836,17 +3866,19 @@ mod tests {
     async fn streaming_chat_reassembles_tool_input_and_multiline_data() {
         let input = concat!(
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"http\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\n",
-            "data: \"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"token\\\":\\\"<<KEYED_SECRET_0123456789abcdef>>\\\"}\"}}\n\n",
+            "data: \"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo <<KEYED_SECRET_0123456789abcdef>>\\\"}\"}}\n\n",
             "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
         );
         let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
             Bytes::from_static(input.as_bytes()),
         ))]);
-        let resolve: ChatResolver = Box::new(|text: &str| {
+        let resolve: ChatResolver = Box::new(|text: &str, _| {
             Ok(text.replace("<<KEYED_SECRET_0123456789abcdef>>", "local-value"))
         });
         let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
@@ -3876,7 +3908,8 @@ mod tests {
         let stream = futures_util::stream::iter(vec![Ok::<_, ProxyBodyError>(Frame::data(
             Bytes::from_static(input.as_bytes()),
         ))]);
-        let resolve: ChatResolver = Box::new(|_: &str| Err("memory store unavailable".to_string()));
+        let resolve: ChatResolver =
+            Box::new(|_: &str, _| Err("memory store unavailable".to_string()));
         let transformer = crate::claude_http_proxy::SseStreamTransformer::new_for_claude_app(
             resolve,
             Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
@@ -3884,14 +3917,14 @@ mod tests {
             MAX_CHAT_BODY_BYTES,
         );
 
-        let error = chat_sse_body_with_transformer(stream, transformer)
+        let output = chat_sse_body_with_transformer(stream, transformer)
             .collect()
             .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("memory store unavailable"),
-            "{error}"
-        );
+            .unwrap()
+            .to_bytes();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("invalid_request_error"), "{output}");
+        assert!(!output.contains("<<SECRET_"), "{output}");
     }
 
     #[test]
@@ -4428,6 +4461,65 @@ mod tests {
     }
 
     #[test]
+    fn explicit_plugin_stop_precedes_partial_request_coverage() {
+        let responding = pentect_agent::MiddlewareRun {
+            payload: serde_json::json!({"response": "local"}),
+            coverage: pentect_agent::MiddlewareCoverage::Partial,
+            stopped: Some(pentect_agent::StopOutcome::Respond),
+            message: None,
+        };
+        assert!(enforce_chat_request_plugin_result(&responding, true).is_ok());
+
+        let blocking = pentect_agent::MiddlewareRun {
+            payload: serde_json::json!({}),
+            coverage: pentect_agent::MiddlewareCoverage::Partial,
+            stopped: Some(pentect_agent::StopOutcome::Block),
+            message: Some("policy denied the request".to_string()),
+        };
+        assert_eq!(
+            enforce_chat_request_plugin_result(&blocking, true).unwrap_err(),
+            "plugin blocked: policy denied the request"
+        );
+
+        let partial = pentect_agent::MiddlewareRun {
+            payload: serde_json::json!({}),
+            coverage: pentect_agent::MiddlewareCoverage::Partial,
+            stopped: None,
+            message: None,
+        };
+        assert!(enforce_chat_request_plugin_result(&partial, true)
+            .unwrap_err()
+            .starts_with("unknown format blocked:"));
+    }
+
+    #[test]
+    fn inspected_image_source_file_references_are_accepted() {
+        for id_key in ["file_id", "id"] {
+            let mut object = serde_json::json!({
+                "type": "image",
+                "source": {"type": "file"}
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            object
+                .get_mut("source")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(
+                    id_key.to_string(),
+                    serde_json::Value::String("file-inspected".to_string()),
+                );
+            let files = HashMap::from([(
+                "file-inspected".to_string(),
+                crate::http_files::Coverage::Full,
+            )]);
+            assert_eq!(inspect_chat_image(&mut object, &files).unwrap(), None);
+        }
+    }
+
+    #[test]
     fn chat_request_masks_content_without_rewriting_protocol_metadata() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -4623,25 +4715,22 @@ mod tests {
     }
 
     #[test]
-    fn completed_tool_calls_restore_nested_inputs_but_normal_text_stays_opaque() {
+    fn completed_tool_calls_restore_declared_inputs_but_normal_text_stays_opaque() {
         let handle = "<<SECRET_0011223344556677>>";
         let mut value = serde_json::json!({
             "content": [
                 {"type": "text", "text": format!("show {handle}")},
-                {"type": "tool_use", "name": "http", "input": {
-                    "headers": {"x-token": handle},
-                    "body": [handle]
+                {"type": "tool_use", "name": "Write", "input": {
+                    "content": handle,
+                    "metadata": {"x-token": handle}
                 }}
             ]
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
         resolve_chat_tool_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["content"][0]["text"], format!("show {handle}"));
-        assert_eq!(
-            value["content"][1]["input"]["headers"]["x-token"],
-            "local-value"
-        );
-        assert_eq!(value["content"][1]["input"]["body"][0], "local-value");
+        assert_eq!(value["content"][1]["input"]["content"], "local-value");
+        assert_eq!(value["content"][1]["input"]["metadata"]["x-token"], handle);
     }
 
     #[test]
@@ -4715,15 +4804,15 @@ mod tests {
                     {"type": "thinking", "thinking": format!("consider {handle}"),
                         "signature": format!("signed-{handle}")},
                     {"type": "redacted_thinking", "data": format!("opaque-{handle}")},
-                    {"type": "tool_use", "name": "http", "input": {
-                        "headers": {"x-token": handle}
+                    {"type": "tool_use", "name": "Write", "input": {
+                        "content": handle
                     }}
                 ]
             }))
             .unwrap(),
         );
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
         let rewritten =
             rewrite_chat_json_response_with(&body, &plugins, true, true, &mut resolve).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
@@ -4731,21 +4820,26 @@ mod tests {
         assert_eq!(value["content"][1]["thinking"], "consider local-value");
         assert_eq!(value["content"][1]["signature"], format!("signed-{handle}"));
         assert_eq!(value["content"][2]["data"], format!("opaque-{handle}"));
-        assert_eq!(
-            value["content"][3]["input"]["headers"]["x-token"],
-            "local-value"
-        );
+        assert_eq!(value["content"][3]["input"]["content"], "local-value");
     }
 
     #[test]
     fn proxy_removes_standard_and_connection_named_hop_headers() {
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(
+        headers.append(
             hyper::header::CONNECTION,
-            hyper::header::HeaderValue::from_static("keep-alive, x-private-hop"),
+            hyper::header::HeaderValue::from_static("keep-alive, x-first-hop"),
+        );
+        headers.append(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("x-second-hop"),
         );
         headers.insert(
-            hyper::header::HeaderName::from_static("x-private-hop"),
+            hyper::header::HeaderName::from_static("x-first-hop"),
+            hyper::header::HeaderValue::from_static("remove"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-second-hop"),
             hyper::header::HeaderValue::from_static("remove"),
         );
         headers.insert(
@@ -4754,7 +4848,8 @@ mod tests {
         );
         remove_hop_by_hop_headers(&mut headers);
         assert!(!headers.contains_key(hyper::header::CONNECTION));
-        assert!(!headers.contains_key("x-private-hop"));
+        assert!(!headers.contains_key("x-first-hop"));
+        assert!(!headers.contains_key("x-second-hop"));
         assert_eq!(headers["x-end-to-end"], "keep");
     }
 

@@ -28,7 +28,7 @@ jobs:
   publish:
     if: github.repository == 'EdamAme-x/pentect'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: integrations/pi
@@ -61,7 +61,7 @@ jobs:
           release_commit=$(git rev-list -n 1 "v$version")
           test -n "$release_commit"
           test "$(git rev-parse HEAD)" = "$release_commit"
-          test "$(npm view "pentect@$version" version)" = "$version"
+          ../../tools/wait_for_npm_version.sh pentect "$version" 30 5
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Prepare package
         run: |
@@ -82,3 +82,29 @@ jobs:
           else
             npm publish --access public
           fi
+
+  readiness:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Wait for exact Pi version visibility
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            version=$INPUT_VERSION
+          else
+            version=${GITHUB_REF_NAME#pi-v}
+          fi
+          tools/wait_for_npm_version.sh @pentect/pi "$version" 30 5

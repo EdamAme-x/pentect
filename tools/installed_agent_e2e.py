@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import io
 import json
 import os
 import re
@@ -23,6 +25,7 @@ from pathlib import Path
 HANDLE = re.compile(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>")
 PLUGIN_HANDLE = re.compile(r"<<PLUGIN_E2E_[0-9a-f]{16}>>")
 PLUGIN_PLAINTEXT = "PENTECT-PLUGIN-E2E-VALUE"
+UNICODE_ROUNDTRIP = "write/read ✓ 東京 — multiline\nsecond line\n"
 IMAGE_SECRET = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
 IMAGE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/d"
@@ -78,6 +81,26 @@ def shell_command(arguments: list[str]) -> str:
     return shlex.join(arguments)
 
 
+def has_completed_tool_restoration(logs: str) -> bool:
+    for line in logs.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        count = event.get("count")
+        if (
+            event.get("action") == "resolve"
+            and event.get("surface") == "tool"
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        ):
+            return True
+    return False
+
+
 def pentect_command(pentect: str, arguments: list[str]) -> list[str]:
     command = [pentect, *arguments]
     if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
@@ -98,6 +121,7 @@ def run_pentect(
     cwd: Path,
     environment: dict[str, str],
     stdin: str | None = None,
+    timeout: float = 30,
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         pentect_command(pentect, arguments),
@@ -107,7 +131,7 @@ def run_pentect(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=30,
+        timeout=timeout,
     )
     if completed.returncode != 0:
         output = completed.stdout.replace(PLUGIN_PLAINTEXT, "<plugin-fixture>")
@@ -247,7 +271,24 @@ def remove_detector_plugin(
 
 
 def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
-    environment = os.environ.copy()
+    # Client launchers honor provider-specific config and process injection
+    # before they consult HOME/XDG. Start with only the OS/toolchain variables
+    # needed to run a client and the local plugin fixtures; never inherit an
+    # arbitrary caller variable (credentials, proxies, startup hooks, etc.).
+    allowed = {
+        "PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
+        "TEMP", "TMP", "TMPDIR", "LANG", "TERM", "TERMINFO", "CI",
+        "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR",
+        "CARGO_NET_OFFLINE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    }
+    allowed_upper = {name.upper() for name in allowed}
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in allowed_upper or key.upper().startswith("LC_")
+    }
+    original_home_value = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    original_home = Path(original_home_value) if original_home_value else None
     environment.update({
         "HOME": str(home),
         "USERPROFILE": str(home),
@@ -257,6 +298,14 @@ def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
         "XDG_STATE_HOME": str(home / ".local" / "state"),
         "PENTECT_LOG_DIR": str(log_dir),
     })
+    if original_home is not None:
+        for variable, directory in (
+            ("CARGO_HOME", ".cargo"),
+            ("RUSTUP_HOME", ".rustup"),
+        ):
+            candidate = original_home / directory
+            if variable not in environment and candidate.is_dir():
+                environment[variable] = str(candidate)
     if os.name == "nt":
         local_app_data = home / "AppData" / "Local"
         roaming_app_data = home / "AppData" / "Roaming"
@@ -387,6 +436,757 @@ command = ["python", "-c", "import sys; sys.exit(17)"]
         raise RuntimeError("failed plugin setup remained enabled")
 
 
+def verify_home_rooted_project_storage_boundary(pentect: str) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="pentect-plugin-e2e-home-project-", ignore_cleanup_errors=True
+    ) as raw_home:
+        home = Path(raw_home)
+        (home / ".git").mkdir()
+        plugin = home / "optional-home-plugin"
+        plugin.mkdir()
+        manifest = plugin / "plugin.toml"
+        script = plugin / "server.py"
+        manifest_source = '''schema = "pentect.plugin.v1"
+name = "optional-home-storage-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = false
+'''
+        manifest.write_text(manifest_source, encoding="utf-8")
+        script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        config_dir = home / ".pentect"
+        config_dir.mkdir()
+        (config_dir / "config.toml").write_text(
+            f"plugins = [{json.dumps(str(plugin))}]\n", encoding="utf-8"
+        )
+        environment = isolated_environment(home, home / "logs")
+        ordinary = "ordinary HOME-rooted project fixture"
+        optional = run_pentect(
+            pentect,
+            ["mask"],
+            cwd=home,
+            environment=environment,
+            stdin=ordinary,
+        )
+        if (
+            ordinary not in optional.stdout
+            or "optional plugin 'optional-home-storage-e2e' skipped during startup"
+            not in optional.stdout
+            or "Pentect plugin data directory must be outside the project"
+            not in optional.stdout
+        ):
+            raise RuntimeError(
+                "optional HOME-rooted project plugin did not fail open with its reason:\n"
+                + optional.stdout
+            )
+
+        manifest.write_text(
+            manifest_source.replace("required = false", "required = true"),
+            encoding="utf-8",
+        )
+        required = subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=home,
+            env=environment,
+            input=ordinary,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if (
+            required.returncode == 0
+            or "Pentect plugin data directory must be outside the project"
+            not in required.stdout
+        ):
+            raise RuntimeError(
+                "required HOME-rooted project plugin did not fail closed with its reason:\n"
+                + required.stdout
+            )
+
+
+def verify_interrupted_setup_rolls_back(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "interrupted-setup-plugin"
+    plugin.mkdir()
+    setup = plugin / "setup.py"
+    setup.write_text(
+        '''import os
+import time
+
+with open("setup-pid.txt", "w", encoding="utf-8") as marker:
+    marker.write(str(os.getpid()))
+while True:
+    time.sleep(1)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "server.py").write_text(
+        '''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "interrupted-setup-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+
+[setup]
+command = ["python", "{plugin}/setup.py"]
+''',
+        encoding="utf-8",
+    )
+    before = snapshot_regular_files(home, project)
+    popen_options: dict[str, object] = {}
+    if os.name == "nt":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(
+        pentect_command(
+            pentect,
+            ["plugins", "add", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        **popen_options,
+    )
+    marker = plugin / "setup-pid.txt"
+    deadline = time.monotonic() + 10
+    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not marker.exists():
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        raise RuntimeError("plugin setup did not reach its interrupt fixture:\n" + output)
+    setup_pid = int(marker.read_text(encoding="utf-8"))
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        os.kill(process.pid, signal.SIGINT)
+    try:
+        output, _ = process.communicate(timeout=8)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.wait()
+        raise RuntimeError("interrupted plugin setup did not exit within 8 seconds") from error
+    if process.returncode == 0 or "plugin environment setup was interrupted" not in output:
+        raise RuntimeError("interrupted plugin setup did not report interruption:\n" + output)
+    if not wait_for_process_exit(setup_pid, timeout=2.0):
+        raise RuntimeError(f"interrupted plugin setup process {setup_pid} was not terminated")
+    if snapshot_regular_files(home, project) != before:
+        raise RuntimeError("interrupted plugin setup left partial persistent state")
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "interrupted-setup-e2e:" in listed.stdout:
+        raise RuntimeError("interrupted plugin setup remained enabled")
+
+    setup.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin="ordinary recovered setup fixture",
+    )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "interrupted-setup-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
+def verify_forced_setup_termination_is_clean(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "forced-setup-plugin"
+    plugin.mkdir()
+    setup = plugin / "setup.py"
+    setup.write_text(
+        '''import json
+import os
+import time
+
+with open("setup-pid.txt", "w", encoding="utf-8") as marker:
+    json.dump({"setup": os.getpid(), "supervisor": os.getppid()}, marker)
+while True:
+    time.sleep(1)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "server.py").write_text(
+        '''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "forced-setup-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+
+[setup]
+command = ["python", "{plugin}/setup.py"]
+''',
+        encoding="utf-8",
+    )
+    before = snapshot_regular_files(home, project)
+    process = subprocess.Popen(
+        pentect_command(
+            pentect,
+            ["plugins", "add", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    marker = plugin / "setup-pid.txt"
+    deadline = time.monotonic() + 10
+    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not marker.exists():
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        raise RuntimeError("plugin setup did not reach its forced-termination fixture:\n" + output)
+    setup_processes = None
+    parse_error = None
+    publication_deadline = time.monotonic() + 2
+    while process.poll() is None and time.monotonic() < publication_deadline:
+        try:
+            text = marker.read_text(encoding="utf-8")
+            if text:
+                setup_processes = json.loads(text)
+                break
+        except (FileNotFoundError, json.JSONDecodeError) as error:
+            parse_error = error
+        time.sleep(0.05)
+    if setup_processes is None:
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        raise RuntimeError(
+            "plugin setup marker was not published as valid JSON"
+            + (f": {parse_error}" if parse_error else "")
+            + "\n"
+            + output
+        )
+    setup_pid = int(setup_processes["setup"])
+    supervisor_pid = int(setup_processes["supervisor"])
+    if supervisor_pid == process.pid:
+        process.kill()
+        process.communicate(timeout=5)
+        raise RuntimeError("plugin setup did not run below a distinct supervisor")
+    process.kill()
+    process.communicate(timeout=5)
+    if not wait_for_process_exit(setup_pid, timeout=3.0):
+        raise RuntimeError(f"forced plugin setup process {setup_pid} survived its Pentect owner")
+    if not wait_for_process_exit(supervisor_pid, timeout=3.0):
+        raise RuntimeError(
+            f"forced plugin setup supervisor {supervisor_pid} survived its Pentect owner"
+        )
+    if snapshot_regular_files(home, project) != before:
+        raise RuntimeError("forced plugin setup termination left partial persistent state")
+    listed = run_pentect(
+        pentect,
+        ["plugins", "list"],
+        cwd=project,
+        environment=environment,
+    )
+    if "forced-setup-e2e:" in listed.stdout:
+        raise RuntimeError("forced plugin setup termination left the plugin enabled")
+
+    setup.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "forced-setup-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
+def verify_failed_update_preserves_command_runtime(
+    pentect: str,
+    root: Path,
+    home: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "failed-update-plugin"
+    plugin.mkdir()
+    manifest = plugin / "plugin.toml"
+    server = plugin / "server.py"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "failed-update-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[setup]
+command = ["python", "-c", "raise SystemExit(0)"]
+'''
+    server.write_text(
+        r'''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    manifest.write_text(manifest_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    ordinary = "ordinary failed update fixture"
+    run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=ordinary,
+    )
+    before = snapshot_regular_files(home, project)
+    manifest.write_text(
+        manifest_source.replace(
+            'required = true\n', 'required = true\ndescription = "updated"\n'
+        ).replace("raise SystemExit(0)", "raise SystemExit(17)"),
+        encoding="utf-8",
+    )
+    failed = subprocess.run(
+        pentect_command(
+            pentect,
+            ["plugins", "update", str(plugin), "--project", "--yes"],
+        ),
+        cwd=project,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+    if (
+        failed.returncode == 0
+        or "plugin environment setup failed with exit 17" not in failed.stdout
+    ):
+        raise RuntimeError(
+            "failed plugin update did not expose its setup failure:\n" + failed.stdout
+        )
+    if snapshot_regular_files(home, project) != before:
+        raise RuntimeError("failed plugin update changed approved persistent state")
+
+    # A local source is owned by the user and is not rewritten by Pentect. Once
+    # that source is restored, the previously approved runtime must work without
+    # another setup. Remote sources restore this side through the cache rollback.
+    manifest.write_text(manifest_source, encoding="utf-8")
+    recovered = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=ordinary,
+    )
+    if ordinary not in recovered.stdout:
+        raise RuntimeError(
+            "previously approved plugin did not recover after failed update:\n"
+            + recovered.stdout
+        )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "failed-update-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
+def verify_command_runtime_concurrency_and_restart(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "concurrent-command-plugin"
+    plugin.mkdir()
+    workers = plugin / "workers"
+    workers.mkdir()
+    script = plugin / "server.py"
+    (plugin / "plugin.toml").write_text(
+        '''schema = "pentect.plugin.v1"
+name = "concurrent-command-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[execution]
+timeout_ms = 10000
+startup_timeout_ms = 10000
+''',
+        encoding="utf-8",
+    )
+    script.write_text(
+        r'''import json
+import os
+import sys
+import time
+from pathlib import Path
+
+workers = Path(__file__).parent / "workers"
+workers.mkdir(exist_ok=True)
+leader_file = workers / "leader"
+try:
+    descriptor = os.open(leader_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+except FileExistsError:
+    role = "follower"
+else:
+    os.close(descriptor)
+    role = "leader"
+marker = workers / f"{os.getpid()}.worker"
+marker.write_text(json.dumps({"parent": os.getppid(), "role": role}), encoding="utf-8")
+deadline = time.monotonic() + 5
+while len(list(workers.glob("*.worker"))) < 2 and time.monotonic() < deadline:
+    time.sleep(0.02)
+if len(list(workers.glob("*.worker"))) < 2:
+    raise SystemExit(23)
+if role == "follower":
+    release = workers / "release"
+    release_deadline = time.monotonic() + 15
+    while not release.exists() and time.monotonic() < release_deadline:
+        time.sleep(0.02)
+    if not release.exists():
+        raise SystemExit(24)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    ordinary = "ordinary concurrent command fixture"
+
+    def invoke() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=environment,
+            input=ordinary,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+
+    processes = [
+        subprocess.Popen(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        assert process.stdin is not None
+        process.stdin.write(ordinary)
+        process.stdin.close()
+        process.stdin = None
+    deadline = time.monotonic() + 5
+    while len(list(workers.glob("*.worker"))) < 2 and time.monotonic() < deadline:
+        if any(process.poll() is not None for process in processes):
+            break
+        time.sleep(0.02)
+    marker_paths = list(workers.glob("*.worker"))
+    if len(marker_paths) != 2:
+        for process in processes:
+            process.kill()
+        outputs = [process.communicate()[0] for process in processes]
+        raise RuntimeError(
+            "concurrent Pentect processes did not start two plugin workers:\n"
+            + "\n".join(outputs)
+        )
+    markers = {
+        int(path.stem): json.loads(path.read_text(encoding="utf-8"))
+        for path in marker_paths
+    }
+    leaders = [(pid, data) for pid, data in markers.items() if data["role"] == "leader"]
+    followers = [(pid, data) for pid, data in markers.items() if data["role"] == "follower"]
+    if len(leaders) != 1 or len(followers) != 1:
+        raise RuntimeError("concurrent command workers did not elect one leader and one follower")
+    processes_by_pid = {process.pid: process for process in processes}
+    _, leader_data = leaders[0]
+    follower_worker, follower_data = followers[0]
+    leader = processes_by_pid.get(leader_data["parent"])
+    follower = processes_by_pid.get(follower_data["parent"])
+    if leader is None or follower is None:
+        raise RuntimeError("command worker markers did not identify their Pentect parents")
+    leader_output, _ = leader.communicate(timeout=15)
+    if leader.returncode != 0 or ordinary not in leader_output:
+        raise RuntimeError("leading concurrent command invocation failed:\n" + leader_output)
+    if follower.poll() is not None or not process_exists(follower_worker):
+        follower_output, _ = follower.communicate(timeout=5)
+        raise RuntimeError(
+            "ending one Pentect process terminated the other plugin worker:\n"
+            + follower_output
+        )
+    (workers / "release").write_text("continue\n", encoding="utf-8")
+    follower_output, _ = follower.communicate(timeout=15)
+    if follower.returncode != 0 or ordinary not in follower_output:
+        raise RuntimeError("following concurrent command invocation failed:\n" + follower_output)
+    first_workers = sorted(markers)
+    for pid in first_workers:
+        if not wait_for_process_exit(pid, timeout=2.0):
+            raise RuntimeError(f"concurrent command plugin worker {pid} survived its Pentect process")
+
+    restarted = invoke()
+    if restarted.returncode != 0 or ordinary not in restarted.stdout:
+        raise RuntimeError("restarted installed command invocation failed:\n" + restarted.stdout)
+    all_workers = sorted(int(path.stem) for path in workers.glob("*.worker"))
+    if len(all_workers) != 3 or not set(first_workers).issubset(all_workers):
+        raise RuntimeError("restarted Pentect did not create exactly one new plugin worker")
+    restarted_pid = next(pid for pid in all_workers if pid not in first_workers)
+    if not wait_for_process_exit(restarted_pid, timeout=2.0):
+        raise RuntimeError(
+            f"restarted command plugin worker {restarted_pid} survived its Pentect process"
+        )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "concurrent-command-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
+def verify_long_setup_and_waiter_complete(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "concurrent-setup-plugin"
+    plugin.mkdir()
+    runs = plugin / "setup-runs"
+    runs.mkdir()
+    manifest = plugin / "plugin.toml"
+    server = plugin / "server.py"
+    setup = plugin / "setup.py"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "concurrent-setup-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[execution]
+timeout_ms = 1000
+startup_timeout_ms = 1000
+'''
+    server.write_text(
+        r'''import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "schema": "pentect.plugin.v1",
+        "id": request["id"],
+        "type": "result",
+        "action": "next",
+        "spans": [],
+    }, separators=(",", ":")), flush=True)
+''',
+        encoding="utf-8",
+    )
+    setup.write_text(
+        r'''import json
+import os
+import time
+from pathlib import Path
+
+runs = Path(__file__).parent / "setup-runs"
+first_file = runs / "first"
+try:
+    descriptor = os.open(first_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+except FileExistsError:
+    role = "fast"
+else:
+    os.close(descriptor)
+    role = "slow"
+(runs / f"{os.getpid()}.setup").write_text(
+    json.dumps({"parent": os.getppid(), "role": role}), encoding="utf-8"
+)
+if role == "slow":
+    time.sleep(6)
+''',
+        encoding="utf-8",
+    )
+    manifest.write_text(manifest_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    manifest.write_text(
+        manifest_source
+        + '''
+[setup]
+command = ["python", "{plugin}/setup.py"]
+''',
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    processes = [
+        subprocess.Popen(
+            pentect_command(
+                pentect,
+                ["plugins", "setup", str(plugin), "--project", "--yes"],
+            ),
+            cwd=project,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    deadline = time.monotonic() + 5
+    while len(list(runs.glob("*.setup"))) < 1 and time.monotonic() < deadline:
+        if any(process.poll() is not None for process in processes):
+            break
+        time.sleep(0.02)
+    initial_markers = list(runs.glob("*.setup"))
+    if len(initial_markers) != 1 or any(process.poll() is not None for process in processes):
+        for process in processes:
+            process.kill()
+        outputs = [process.communicate()[0] for process in processes]
+        raise RuntimeError(
+            "concurrent setup was not serialized before the first setup completed:\n"
+            + "\n".join(outputs)
+        )
+    first_data = json.loads(initial_markers[0].read_text(encoding="utf-8"))
+    if first_data["role"] != "slow":
+        raise RuntimeError("first concurrent setup did not enter the long-running fixture")
+    outputs = {process.pid: process.communicate(timeout=20)[0] for process in processes}
+    elapsed = time.monotonic() - started
+    markers = {
+        int(path.stem): json.loads(path.read_text(encoding="utf-8"))
+        for path in runs.glob("*.setup")
+    }
+    if len(markers) != 2:
+        raise RuntimeError(f"serialized setup started {len(markers)} setup children, expected 2")
+    supervisor_pids = {data["parent"] for data in markers.values()}
+    if supervisor_pids & {process.pid for process in processes}:
+        raise RuntimeError("setup children did not run below a distinct setup supervisor")
+    if {data["role"] for data in markers.values()} != {"slow", "fast"}:
+        raise RuntimeError("serialized setup did not run one slow and one fast setup child")
+    for process in processes:
+        if process.returncode != 0 or "setup: complete" not in outputs[process.pid]:
+            raise RuntimeError(
+                "long-running serialized setup did not complete:\n" + outputs[process.pid]
+            )
+    waiting = [
+        output
+        for output in outputs.values()
+        if "waiting for another plugin operation to finish" in output
+    ]
+    if len(waiting) != 1:
+        raise RuntimeError("exactly one concurrent setup did not wait for the mutation lock")
+    if elapsed < 5.5:
+        raise RuntimeError("long-running setup fixture did not exercise its six-second operation")
+
+    ordinary = "ordinary long-running setup fixture"
+    recovered = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin=ordinary,
+    )
+    if ordinary not in recovered.stdout:
+        raise RuntimeError("plugin was unusable after long-running serialized setup completed")
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "concurrent-setup-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
 def run_plugin_lifecycle(pentect: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="pentect-plugin-e2e-project-", ignore_cleanup_errors=True
@@ -417,62 +1217,677 @@ def run_plugin_lifecycle(pentect: str) -> None:
         verify_failed_setup_rolls_back(
             pentect, root, home, project, environment
         )
-        verify_plugin_startup_failure_modes(pentect, root, project, environment)
+        verify_interrupted_setup_rolls_back(
+            pentect, root, home, project, environment
+        )
+        verify_forced_setup_termination_is_clean(
+            pentect, root, home, project, environment
+        )
+        verify_failed_update_preserves_command_runtime(
+            pentect, root, home, project, environment
+        )
+        verify_command_runtime_concurrency_and_restart(
+            pentect, root, project, environment
+        )
+        verify_long_setup_and_waiter_complete(
+            pentect, root, project, environment
+        )
+        verify_installed_command_failure_boundaries(pentect, root, project, environment)
+        verify_installed_wasm_failure_boundaries(pentect, root, project, environment)
+        verify_home_rooted_project_storage_boundary(pentect)
         print(
             "installed plugin lifecycle E2E passed: inspect, test, project/user "
-            "add/setup/update/reinstall/remove, failed-setup rollback, no log plaintext"
+            "add/setup/update/reinstall/remove, failed/interrupted/forced-setup and failed-update rollback, "
+            "Command runtime concurrency/restart, long-running serialized setup completion, "
+            "Command fail-closed boundaries and process cleanup, installed Wasm trap/timeout/"
+            "malformed/oversized required/optional boundaries, HOME-rooted optional/required "
+            "storage boundaries, no log plaintext"
         )
 
 
-def verify_plugin_startup_failure_modes(
+def verify_installed_wasm_failure_boundaries(
     pentect: str,
     root: Path,
     project: Path,
     environment: dict[str, str],
 ) -> None:
-    for required in (False, True):
-        plugin = root / ("required-broken-plugin" if required else "optional-broken-plugin")
-        plugin.mkdir()
-        (plugin / "plugin.toml").write_text(
-            f'''schema = "pentect.plugin.v1"
-name = "{'required' if required else 'optional'}-broken-plugin"
-command = ["missing-pentect-plugin-command"]
-hooks = ["inspect"]
-required = {str(required).lower()}
+    plugin = root / "wasm-failure-plugin"
+    source = plugin / "src"
+    source.mkdir(parents=True)
+    repository = Path(__file__).resolve().parents[1]
+    sdk = repository / "sdk" / "rust" / "pentect-plugin"
+    if not sdk.is_dir():
+        raise RuntimeError(f"Pentect Rust plugin SDK is unavailable: {sdk}")
+    (plugin / "Cargo.toml").write_text(
+        f'''[package]
+name = "wasm-failure-e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pentect-plugin = {{ path = {json.dumps(sdk.as_posix())} }}
+
+[workspace]
+''',
+        encoding="utf-8",
+    )
+    manifest = plugin / "plugin.toml"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "wasm-failure-e2e"
+wasm = "wasm-failure-e2e.wasm"
+required = true
 
 [execution]
-timeout_ms = 0
+timeout_ms = 1000
+max_output_bytes = 1024
+'''
+    manifest.write_text(manifest_source, encoding="utf-8")
+    (source / "lib.rs").write_text(
+        r'''use pentect_plugin::__serde_json as serde_json;
+use pentect_plugin::__serde_json::{json, Value};
+
+#[no_mangle]
+pub extern "C" fn pentect_alloc(len: i32) -> i32 {
+    let input = vec![0_u8; usize::try_from(len).expect("negative input length")]
+        .into_boxed_slice();
+    Box::into_raw(input) as *mut u8 as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pentect_inspect(pointer: i32, len: i32) -> i64 {
+    let pointer = usize::try_from(pointer).expect("negative input pointer");
+    let len = usize::try_from(len).expect("negative input length");
+    let input = unsafe {
+        Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer as *mut u8, len))
+    };
+    let request: Value = serde_json::from_slice(&input).expect("invalid fixture input");
+    let text = request["payload"]["text"].as_str().unwrap_or_default();
+    if text.contains("WASM_TIMEOUT") {
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+    if text.contains("WASM_TRAP") {
+        panic!("intentional installed Wasm E2E trap");
+    }
+    let output = if text.contains("WASM_MALFORMED") {
+        b"not-json".to_vec()
+    } else if text.contains("WASM_OVERSIZED") {
+        vec![b'x'; 2048]
+    } else {
+        serde_json::to_vec(&json!({
+            "schema": "pentect.plugin.v1",
+            "id": request["id"],
+            "type": "result",
+            "action": "next"
+        }))
+        .expect("fixture response serialization failed")
+    }
+    .into_boxed_slice();
+    let output_len = u32::try_from(output.len()).expect("fixture output too large");
+    let output_pointer = Box::into_raw(output) as *mut u8 as u32;
+    (((output_pointer as u64) << 32) | u64::from(output_len)) as i64
+}
 ''',
-            encoding="utf-8",
-        )
-        completed = subprocess.run(
-            pentect_command(
-                pentect,
-                ["mask", "--plugins", str(plugin)],
-            ),
+        encoding="utf-8",
+    )
+    config_dir = project / ".pentect"
+    created_config_dir = not config_dir.exists()
+    config_dir.mkdir(exist_ok=True)
+    config = config_dir / "config.toml"
+    previous_config = config.read_text(encoding="utf-8") if config.exists() else None
+    config.write_text(
+        f"plugins = [{json.dumps(plugin.as_posix())}]\n",
+        encoding="utf-8",
+    )
+    wasm_environment = environment.copy()
+    wasm_environment["CARGO_TARGET_DIR"] = str(repository / "target")
+    wasm_environment["CARGO_NET_OFFLINE"] = "true"
+
+    def activate() -> None:
+        activated = run_pentect(
+            pentect,
+            ["plugins", "dev", str(plugin), "--yes"],
             cwd=project,
-            env=environment,
-            input="ordinary plugin failure fixture",
+            environment=wasm_environment,
+            timeout=180,
+        )
+        if "active: local development build" not in activated.stdout:
+            raise RuntimeError(
+                "Wasm development plugin did not activate:\n" + activated.stdout
+            )
+
+    def invoke(text: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=wasm_environment,
+            input=text,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=30,
         )
-        if required:
-            if completed.returncode == 0 or "execution limits" not in completed.stdout:
+
+    try:
+        activate()
+        for text, reason in (
+            ("WASM_TRAP", "execution failed"),
+            ("WASM_TIMEOUT", "timed out"),
+            ("WASM_MALFORMED", "returned invalid JSON"),
+            ("WASM_OVERSIZED", "returned too much output"),
+        ):
+            completed = invoke(text)
+            if completed.returncode == 0 or reason not in completed.stdout:
                 raise RuntimeError(
-                    "required broken plugin did not fail closed:\n" + completed.stdout
-                )
-        else:
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    "optional broken plugin aborted Pentect:\n" + completed.stdout
-                )
-            if "optional plugin 'optional-broken-plugin' skipped during startup" not in completed.stdout:
-                raise RuntimeError(
-                    "optional broken plugin did not emit its startup reason:\n"
+                    f"required installed Wasm plugin did not fail closed with {reason!r}:\n"
                     + completed.stdout
                 )
+
+        manifest.write_text(
+            manifest_source.replace("required = true", "required = false"),
+            encoding="utf-8",
+        )
+        activate()
+        for text, reason in (
+            ("WASM_TRAP", "execution failed"),
+            ("WASM_TIMEOUT", "timed out"),
+            ("WASM_MALFORMED", "returned invalid JSON"),
+            ("WASM_OVERSIZED", "returned too much output"),
+        ):
+            completed = invoke(text)
+            if (
+                completed.returncode != 0
+                or text not in completed.stdout
+                or "optional plugin 'wasm-failure-e2e' skipped" not in completed.stdout
+                or reason not in completed.stdout
+            ):
+                raise RuntimeError(
+                    f"optional installed Wasm plugin did not fail open with {reason!r}:\n"
+                    + completed.stdout
+                )
+    finally:
+        if previous_config is None:
+            config.unlink(missing_ok=True)
+        else:
+            config.write_text(previous_config, encoding="utf-8")
+        if created_config_dir:
+            shutil.rmtree(config_dir, ignore_errors=True)
+
+
+def verify_installed_command_failure_boundaries(
+    pentect: str,
+    root: Path,
+    project: Path,
+    environment: dict[str, str],
+) -> None:
+    plugin = root / "command-failure-plugin"
+    plugin.mkdir()
+    manifest = plugin / "plugin.toml"
+    script = plugin / "server.py"
+    manifest_source = '''schema = "pentect.plugin.v1"
+name = "command-failure-e2e"
+command = ["python", "{plugin}/server.py"]
+hooks = ["inspect"]
+required = true
+
+[execution]
+timeout_ms = 1000
+# Leave enough bounded startup time for Windows Python to publish the child
+# identities before this fixture intentionally withholds its first response.
+startup_timeout_ms = 3000
+max_output_bytes = 1024
+'''
+    script_source = r'''import json
+import os
+import subprocess
+import sys
+import time
+
+for line in sys.stdin:
+    request = json.loads(line)
+    mode = request.get("config", {}).get("mode", "valid")
+    if mode == "invalid-json":
+        print("not-json", flush=True)
+    elif mode == "oversized":
+        print("x" * 2048, flush=True)
+    elif mode == "timeout":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        with open("timeout-pids.json.tmp", "w", encoding="utf-8") as marker:
+            json.dump([os.getpid(), child.pid], marker)
+        os.replace("timeout-pids.json.tmp", "timeout-pids.json")
+        time.sleep(30)
+    elif mode == "exit":
+        sys.exit(17)
+    else:
+        print(json.dumps({
+            "schema": "pentect.plugin.v1",
+            "id": request["id"],
+            "type": "result",
+            "action": "next",
+            "spans": [],
+        }, separators=(",", ":")), flush=True)
+'''
+    manifest.write_text(manifest_source, encoding="utf-8")
+    script.write_text(script_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(plugin), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+
+    def set_mode(mode: str) -> None:
+        run_pentect(
+            pentect,
+            ["plugins", "config", "command-failure-e2e", f"mode={mode}", "--project"],
+            cwd=project,
+            environment=environment,
+        )
+
+    def expect_mask_failure(reason: str) -> None:
+        completed = subprocess.run(
+            pentect_command(pentect, ["mask"]),
+            cwd=project,
+            env=environment,
+            input="ordinary command plugin fixture",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        if completed.returncode == 0 or reason not in completed.stdout:
+            raise RuntimeError(
+                f"required command plugin did not fail closed with {reason!r}:\n"
+                + completed.stdout
+            )
+
+    set_mode("valid")
+    run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin="ordinary command plugin fixture",
+    )
+    for mode, reason in (
+        ("invalid-json", "returned invalid JSON"),
+        ("oversized", "response exceeds its limit"),
+        ("exit", "closed stdout"),
+        ("timeout", "command startup timed out"),
+    ):
+        set_mode(mode)
+        expect_mask_failure(reason)
+
+    timeout_marker = plugin / "timeout-pids.json"
+    if not timeout_marker.exists():
+        raise RuntimeError(
+            "timed-out command plugin did not publish its process identities "
+            "before the bounded startup deadline"
+        )
+    timeout_pids = json.loads(timeout_marker.read_text(encoding="utf-8"))
+    for pid in timeout_pids:
+        if not wait_for_process_exit(pid, timeout=2.0):
+            raise RuntimeError(f"timed-out command plugin process {pid} was not terminated")
+
+    set_mode("valid")
+    manifest.write_text(
+        manifest_source.replace(
+            'name = "command-failure-e2e"\n',
+            'name = "command-failure-e2e"\ndescription = "changed"\n',
+        ),
+        encoding="utf-8",
+    )
+    expect_mask_failure("changed after approval")
+    manifest.write_text(manifest_source, encoding="utf-8")
+
+    script.write_text(script_source + "\n# changed after setup\n", encoding="utf-8")
+    expect_mask_failure("changed after setup")
+    script.write_text(script_source, encoding="utf-8")
+    script.unlink()
+    expect_mask_failure("is unavailable")
+
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "command-failure-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+    optional = root / "optional-command-failure-plugin"
+    optional.mkdir()
+    optional_manifest = manifest_source.replace(
+        'name = "command-failure-e2e"',
+        'name = "optional-command-failure-e2e"',
+    ).replace("required = true", "required = false")
+    (optional / "plugin.toml").write_text(optional_manifest, encoding="utf-8")
+    optional_script = optional / "server.py"
+    optional_script.write_text(script_source, encoding="utf-8")
+    run_pentect(
+        pentect,
+        ["plugins", "add", str(optional), "--project", "--yes"],
+        cwd=project,
+        environment=environment,
+    )
+    optional_script.unlink()
+    completed = run_pentect(
+        pentect,
+        ["mask"],
+        cwd=project,
+        environment=environment,
+        stdin="ordinary optional command plugin fixture",
+    )
+    if (
+        "optional plugin 'optional-command-failure-e2e' skipped during startup"
+        not in completed.stdout
+        or "is unavailable" not in completed.stdout
+    ):
+        raise RuntimeError(
+            "optional installed command failure did not expose its reason:\n"
+            + completed.stdout
+        )
+    run_pentect(
+        pentect,
+        ["plugins", "remove", "optional-command-failure-e2e", "--project"],
+        cwd=project,
+        environment=environment,
+    )
+
+
+def process_exists(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    completed = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+    )
+    return any(
+        len(row) > 1 and row[1] == str(pid)
+        for row in csv.reader(io.StringIO(completed.stdout))
+    )
+
+
+def wait_for_process_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while process_exists(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def process_identity(pid: int) -> str | None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in (87, 1168):
+                return None
+            raise OSError(error, f"OpenProcess({pid}) failed")
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        try:
+            wait = kernel32.WaitForSingleObject(handle, 0)
+            if wait == 0x00000000:
+                return None
+            if wait != 0x00000102:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return f"{creation.dwHighDateTime}:{creation.dwLowDateTime}"
+        finally:
+            kernel32.CloseHandle(handle)
+    stat = Path(f"/proc/{pid}/stat")
+    if Path("/proc").is_dir():
+        try:
+            value = stat.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        _, separator, suffix = value.rpartition(") ")
+        fields = suffix.split()
+        if not separator or len(fields) <= 19:
+            raise RuntimeError(f"could not parse /proc identity for PID {pid}")
+        if fields[0] == "Z":
+            return None
+        return fields[19]
+    completed = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    value = completed.stdout.strip()
+    return value or None
+
+
+def terminate_process_identity(pid: int, identity: str) -> None:
+    if os.name != "nt":
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return
+            try:
+                if process_identity(pid) == identity:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            finally:
+                os.close(descriptor)
+        elif process_identity(pid) == identity:
+            # macOS has no pidfd; revalidate immediately before this scoped PID kill.
+            os.kill(pid, signal.SIGKILL)
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x00100000 | 0x0001 | 0x1000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in (87, 1168):
+            return
+        raise OSError(error, f"OpenProcess({pid}) for termination failed")
+    try:
+        creation = wintypes.FILETIME()
+        times = [wintypes.FILETIME() for _ in range(3)]
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(times[0]),
+            ctypes.byref(times[1]),
+            ctypes.byref(times[2]),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        handle_identity = f"{creation.dwHighDateTime}:{creation.dwLowDateTime}"
+        wait = kernel32.WaitForSingleObject(handle, 0)
+        if wait == 0xFFFFFFFF:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if (
+            handle_identity == identity
+            and wait == 0x00000102
+            and not kernel32.TerminateProcess(handle, 1)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def wait_for_process_identities_exit(identities: dict[int, str], timeout: float) -> list[int]:
+    deadline = time.monotonic() + timeout
+    remaining = dict(identities)
+    while remaining and time.monotonic() < deadline:
+        remaining = {
+            pid: identity
+            for pid, identity in remaining.items()
+            if process_identity(pid) == identity
+        }
+        if remaining:
+            time.sleep(0.05)
+    return [
+        pid
+        for pid, identity in remaining.items()
+        if process_identity(pid) == identity
+    ]
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    if os.name == "nt":
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            raise RuntimeError("PowerShell is required to inspect the Claude process tree")
+        completed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | "
+                "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+                "ConvertTo-Json -Compress",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=True,
+        )
+        values = json.loads(completed.stdout)
+        if isinstance(values, dict):
+            values = [values]
+        return {
+            int(value["ProcessId"]): (
+                int(value["ParentProcessId"]),
+                str(value.get("CommandLine") or value.get("Name") or ""),
+            )
+            for value in values
+        }
+    if Path("/proc").is_dir():
+        table = {}
+        for directory in Path("/proc").iterdir():
+            if not directory.name.isdigit():
+                continue
+            try:
+                value = (directory / "stat").read_text(encoding="utf-8")
+                command = (directory / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                    errors="replace"
+                )
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            _, separator, suffix = value.rpartition(") ")
+            fields = suffix.split()
+            if separator and len(fields) > 1:
+                table[int(directory.name)] = (int(fields[1]), command)
+        return table
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=True,
+    )
+    table = {}
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) >= 2:
+            table[int(fields[0])] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+    return table
+
+
+def descendant_processes(parent_pid: int) -> dict[int, tuple[int, str]]:
+    table = process_table()
+    descendants: dict[int, tuple[int, str]] = {}
+    frontier = {parent_pid}
+    while frontier:
+        children = {
+            pid: record
+            for pid, record in table.items()
+            if record[0] in frontier and pid not in descendants
+        }
+        descendants.update(children)
+        frontier = set(children)
+    return descendants
+
+
+def linux_process_diagnostics(
+    pids: list[int], identities: dict[int, str]
+) -> list[dict[str, object]]:
+    diagnostics: list[dict[str, object]] = []
+    for pid in pids:
+        try:
+            raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+            _, separator, suffix = raw.rpartition(") ")
+            fields = suffix.split()
+            if not separator or len(fields) <= 19:
+                raise RuntimeError("malformed stat")
+            executable = os.readlink(Path("/proc") / str(pid) / "exe")
+            diagnostics.append({
+                "pid": pid,
+                "basename": Path(executable).name,
+                "ppid": int(fields[1]),
+                "pgid": int(fields[2]),
+                "sid": int(fields[3]),
+                "state": fields[0],
+                "recorded_identity": identities.get(pid),
+                "current_identity": fields[19],
+            })
+        except (FileNotFoundError, ProcessLookupError):
+            diagnostics.append({"pid": pid, "state": "exited"})
+    return diagnostics
 
 
 def tool_response(sequence: int, source: str) -> bytes:
@@ -616,6 +2031,77 @@ def anthropic_tool_response(sequence: int, command: str) -> bytes:
     ])
 
 
+def anthropic_write_response(sequence: int, handle: str, file_path: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Edit",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(
+                    {
+                        "file_path": file_path,
+                        "old_string": "PLACEHOLDER",
+                        "new_string": handle,
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
+def anthropic_read_response(sequence: int, file_path: str) -> bytes:
+    return anthropic_sse([
+        {"type": "message_start", "message": anthropic_message(sequence)},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_e2e_{sequence}",
+                "name": "Read",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(
+                    {"file_path": file_path}, separators=(",", ":")
+                ),
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ])
+
+
 def anthropic_text_response(sequence: int, text: str) -> bytes:
     return anthropic_sse([
         {"type": "message_start", "message": anthropic_message(sequence)},
@@ -640,10 +2126,31 @@ def anthropic_text_response(sequence: int, text: str) -> bytes:
 
 
 class State:
-    def __init__(self, valid: str, invalid: str, *, hold_model: bool = False) -> None:
+    def __init__(
+        self,
+        valid: str,
+        invalid: str,
+        *,
+        hold_model: bool = False,
+        native_write: bool = False,
+        native_patch: bool = False,
+    ) -> None:
         self.valid = valid
         self.invalid = invalid
         self.hold_model = hold_model
+        self.native_write = native_write
+        self.native_patch = native_patch
+        self.native_target_path = ""
+        self.native_read_sent = False
+        self.native_read_back_sent = False
+        self.native_read_back_id: str | None = None
+        self.native_write_sent = False
+        self.native_patch_sent = False
+        self.native_patch_read_sent = False
+        self.native_patch_read_call_id: str | None = None
+        self.native_write_inputs: list[dict[str, str]] = []
+        self.native_patch_inputs: list[str] = []
+        self.last_handles: list[str] = []
         self.model_request_seen = threading.Event()
         self.release_model_request = threading.Event()
         self.model_requests: list[str] = []
@@ -677,6 +2184,9 @@ class Handler(BaseHTTPRequestHandler):
         if request_path.endswith("/messages"):
             request = body.decode("utf-8")
             self.server.state.model_requests.append(request)
+            if self.server.state.hold_model:
+                self.server.state.model_request_seen.set()
+                self.server.state.release_model_request.wait(timeout=30)
             sequence = len(self.server.state.model_requests)
             parsed = json.loads(request)
             bash_enabled = any(
@@ -684,14 +2194,18 @@ class Handler(BaseHTTPRequestHandler):
                 for tool in parsed.get("tools", [])
             )
             handles = anthropic_env_handles(parsed)
+            if handles:
+                self.server.state.last_handles = handles
+            elif self.server.state.native_write:
+                handles = self.server.state.last_handles
             attempts = len(self.server.state.service_attempts)
             if not bash_enabled:
                 action = "text:no-bash"
                 payload = anthropic_text_response(sequence, "DONE")
             elif len(handles) < 2:
-                action = "tool:read"
+                action = "tool:roundtrip"
                 payload = anthropic_tool_response(
-                    sequence, shell_command(["python", "e2e_helper.py", "read"])
+                    sequence, shell_command(["python", "e2e_helper.py", "roundtrip"])
                 )
             elif (
                 attempts < 2
@@ -701,6 +2215,32 @@ class Handler(BaseHTTPRequestHandler):
                 action = f"tool:probe:{attempts}"
                 payload = anthropic_tool_response(
                     sequence, self._probe_command(handles[attempts], posix_shell=True)
+                )
+            elif self.server.state.native_write and not self.server.state.native_read_sent:
+                self.server.state.native_read_sent = True
+                action = "tool:Read"
+                payload = anthropic_read_response(
+                    sequence, self.server.state.native_target_path
+                )
+            elif self.server.state.native_write and not self.server.state.native_write_sent:
+                handle = handles[1]
+                self.server.state.native_write_sent = True
+                self.server.state.native_write_inputs.append({
+                    "name": "Edit",
+                    "file_path": self.server.state.native_target_path,
+                    "old_string": "PLACEHOLDER",
+                    "new_string": handle,
+                })
+                action = "tool:Edit"
+                payload = anthropic_write_response(
+                    sequence, handle, self.server.state.native_target_path
+                )
+            elif self.server.state.native_write and not self.server.state.native_read_back_sent:
+                self.server.state.native_read_back_sent = True
+                self.server.state.native_read_back_id = f"toolu_e2e_{sequence}"
+                action = "tool:Read:back"
+                payload = anthropic_read_response(
+                    sequence, self.server.state.native_target_path
                 )
             else:
                 action = "text:done"
@@ -734,17 +2274,55 @@ class Handler(BaseHTTPRequestHandler):
             if '"type":"input_image"' in request:
                 payload = text_response(sequence, "DONE")
             elif sequence == 1:
-                command = shell_command(["python", "e2e_helper.py", "read"])
-                payload = tool_response(
-                    sequence,
-                    f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); text(r.output);",
-                )
+                command = shell_command(["python", "e2e_helper.py", "roundtrip"])
+                if self.server.state.native_patch:
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); "
+                        "text(r);"
+                    )
+                else:
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(command)}}}); "
+                        "text(r.output);"
+                    )
+                payload = tool_response(sequence, source)
             else:
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
+                env_handles = codex_env_handles(request)
+                if len(env_handles) == 2:
+                    handles = env_handles
+                if handles:
+                    self.server.state.last_handles = handles
+                elif self.server.state.native_patch:
+                    handles = self.server.state.last_handles
                 if sequence == 2 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[0]))
                 elif sequence == 3 and len(handles) >= 2:
                     payload = tool_response(sequence, self._probe_source(handles[1]))
+                elif self.server.state.native_patch and not self.server.state.native_patch_sent and len(handles) >= 2:
+                    self.server.state.native_patch_sent = True
+                    patch = (
+                        "*** Begin Patch\n"
+                        f"*** Update File: {self.server.state.native_target_path}\n"
+                        "@@\n"
+                        '-{"api_key":"PLACEHOLDER"}\n'
+                        f'+{{"api_key":"{handles[1]}"}}\n'
+                        "*** End Patch\n"
+                    )
+                    self.server.state.native_patch_inputs.append(patch)
+                    source = (
+                        f"const r = await tools.apply_patch({json.dumps(patch)}); "
+                        "text(r);"
+                    )
+                    payload = tool_response(sequence, source)
+                elif self.server.state.native_patch and not self.server.state.native_patch_read_sent:
+                    self.server.state.native_patch_read_sent = True
+                    self.server.state.native_patch_read_call_id = f"call_e2e_{sequence}"
+                    source = (
+                        f"const r = await tools.exec_command({{cmd:{json.dumps(shell_command(['python', 'e2e_helper.py', 'read_file', 'verified-config.json']))}}}); "
+                        "text(r.output);"
+                    )
+                    payload = tool_response(sequence, source)
                 else:
                     payload = text_response(sequence, "DONE")
             self.send_response(200)
@@ -768,7 +2346,7 @@ class Handler(BaseHTTPRequestHandler):
                 handles = list(dict.fromkeys(HANDLE.findall(request)))
                 if sequence == 1:
                     payload = chat_tool_response(
-                        sequence, shell_command(["python", "e2e_helper.py", "read"])
+                        sequence, shell_command(["python", "e2e_helper.py", "roundtrip"])
                     )
                 elif sequence == 2 and len(handles) >= 2:
                     payload = chat_tool_response(
@@ -843,6 +2421,36 @@ def request_tool_result_summary(requests: list[str]) -> list[str]:
     return summaries[-4:]
 
 
+def tool_output_for_call(requests: list[str], call_id: str) -> object | None:
+    def walk(value: object) -> object | None:
+        if isinstance(value, dict):
+            if (
+                value.get("type") in {"custom_tool_call_output", "function_call_output"}
+                and value.get("call_id") == call_id
+            ):
+                return value.get("output", value.get("content"))
+            for child in value.values():
+                found = walk(child)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found is not None:
+                    return found
+        return None
+
+    for request in requests:
+        try:
+            parsed = json.loads(request)
+        except json.JSONDecodeError:
+            continue
+        found = walk(parsed)
+        if found is not None:
+            return found
+    return None
+
+
 def anthropic_env_handles(request: dict[str, object]) -> list[str]:
     messages = request.get("messages", [])
     if not isinstance(messages, list):
@@ -861,10 +2469,43 @@ def anthropic_env_handles(request: dict[str, object]) -> list[str]:
     return []
 
 
+def codex_env_handles(request: str) -> list[str]:
+    match = re.search(
+        r"FIRST_KEY=(<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>).*?"
+        r"SECOND_KEY=(<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>)",
+        request,
+        re.DOTALL,
+    )
+    return list(match.groups()) if match else []
+
+
 def client_command(
-    pentect: str, client: str, project: Path, upstream: str
+    pentect: str,
+    client: str,
+    project: Path,
+    upstream: str,
+    *,
+    native_write: bool = False,
+    native_patch: bool = False,
 ) -> list[str]:
-    prompt = "Read .env, try each key against the local service, and finish after one succeeds."
+    prompt = (
+        "Read .env, write/read a Unicode path roundtrip, try each key against the local "
+        "service, and finish after one succeeds."
+    )
+    tools = "Read,Bash,Edit" if native_write else "Bash"
+    if native_write:
+        prompt = (
+            "Read .env, try each key against the local service, then use the native Edit "
+            "tool exactly once to update verified-config.json with the successful key in an "
+            "api_key JSON field, including a final newline. Read that file back and finish. "
+            "Do not use Bash, cp, shell redirection, or a helper script for the file edit."
+        )
+    if native_patch:
+        prompt = (
+            "Read .env, try each key against the local service, then use the native apply_patch "
+            "tool exactly once to update verified-config.json with the successful key. Read "
+            "that file back and finish. Do not use shell redirection, cp, or a helper script."
+        )
     if client == "codex":
         return [
             pentect,
@@ -908,7 +2549,7 @@ def client_command(
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--tools",
-            "Bash",
+            tools,
             "--model",
             "claude-sonnet-4-5",
             prompt,
@@ -932,10 +2573,16 @@ def client_command(
     ]
 
 
-def run_client(pentect: str, client: str) -> None:
+def run_client(
+    pentect: str,
+    client: str,
+    *,
+    native_write: bool = False,
+    native_patch: bool = False,
+) -> None:
     valid = "".join(("rpa_", "PENTECT_VALID_", "0123456789abcdef"))
     invalid = "".join(("rpa_", "PENTECT_INVALID_", "fedcba9876543210"))
-    state = State(valid, invalid)
+    state = State(valid, invalid, native_write=native_write, native_patch=native_patch)
     server = FixtureServer(state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -949,9 +2596,14 @@ def run_client(pentect: str, client: str) -> None:
             home.mkdir()
             project.mkdir()
             (project / ".env").write_text(f"FIRST_KEY={invalid}\nSECOND_KEY={valid}\n", encoding="utf-8")
+            if native_write or native_patch:
+                (project / "verified-config.json").write_bytes(
+                    b'{"api_key":"PLACEHOLDER"}\n'
+                )
             (project / "plugin-input.txt").write_text(
                 PLUGIN_PLAINTEXT + "\n", encoding="utf-8"
             )
+            unicode_path = project / "unicode 東京 path.txt"
             (project / "e2e_helper.py").write_text(
                 """from pathlib import Path
 import sys
@@ -960,6 +2612,14 @@ import urllib.request
 if sys.argv[1] == "read":
     print(Path(".env").read_text(encoding="utf-8"))
     print(Path("plugin-input.txt").read_text(encoding="utf-8"))
+elif sys.argv[1] == "read_file":
+    sys.stdout.write(Path(sys.argv[2]).read_text(encoding="utf-8"))
+elif sys.argv[1] == "roundtrip":
+    path = Path("unicode 東京 path.txt")
+    path.write_text("write/read ✓ 東京 — multiline\\nsecond line\\n", encoding="utf-8")
+    print(Path(".env").read_text(encoding="utf-8"))
+    print(Path("plugin-input.txt").read_text(encoding="utf-8"))
+    print(path.read_text(encoding="utf-8"))
 elif sys.argv[1] == "probe":
     request = urllib.request.Request(
         sys.argv[2], data=b"", headers={"Authorization": f"Bearer {sys.argv[3]}"}
@@ -971,6 +2631,7 @@ else:
                 encoding="utf-8",
             )
             environment = isolated_environment(home, root / "logs")
+            state.native_target_path = str(project / "verified-config.json")
             environment.update({
                 "OPENAI_API_KEY": "local-fixture",
                 "ANTHROPIC_API_KEY": "local-fixture",
@@ -989,6 +2650,8 @@ else:
                 client,
                 project,
                 f"http://127.0.0.1:{server.server_port}/v1",
+                native_write=native_write,
+                native_patch=native_patch,
             )
             if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", *command]
@@ -1043,11 +2706,138 @@ else:
             logs = log_path.read_text(encoding="utf-8")
             if valid in logs or invalid in logs or PLUGIN_PLAINTEXT in logs:
                 raise RuntimeError("a synthetic plaintext key reached persistent diagnostics")
+            if not has_completed_tool_restoration(logs):
+                raise RuntimeError(
+                    f"{client} did not record a completed HTTP tool-input restoration"
+                )
+            if native_write:
+                expected_content = json.dumps(
+                    {"api_key": valid}, separators=(",", ":")
+                ) + "\n"
+                written = project / "verified-config.json"
+                if len(state.native_write_inputs) != 1 or state.native_write_inputs[0]["name"] != "Edit":
+                    raise RuntimeError("native Edit fixture did not emit exactly one Edit call")
+                if not state.native_read_back_sent:
+                    raise RuntimeError("native Edit fixture did not perform the requested readback")
+                if state.native_write_inputs[0]["file_path"] != str(written):
+                    raise RuntimeError("native Edit fixture did not use the absolute target path")
+                if not HANDLE.search(state.native_write_inputs[0]["new_string"]):
+                    raise RuntimeError("native Edit fixture did not carry an opaque handle")
+                written_bytes = written.read_bytes() if written.is_file() else b"<missing>"
+                expected_bytes = expected_content.encode("utf-8")
+                if written_bytes != expected_bytes:
+                    safe_bytes = written_bytes.replace(valid.encode(), b"<synthetic-key>").replace(
+                        invalid.encode(), b"<synthetic-key>"
+                    )
+                    raise RuntimeError(
+                        "native Edit did not produce exact verified-config.json content: "
+                        + repr(safe_bytes)
+                        + "\nagent output:\n"
+                        + completed.stdout.replace(valid, "<synthetic-key>")
+                        .replace(invalid, "<synthetic-key>")[-4000:]
+                        + f"\nfixture actions={state.anthropic_actions!r}"
+                        + f"\nmodel requests={len(state.model_requests)}"
+                    )
+                if not written_bytes.endswith(b"\n") or json.loads(written_bytes) != {"api_key": valid}:
+                    raise RuntimeError("native Edit JSON content or final newline was incorrect")
+                if HANDLE.search(written_bytes.decode("utf-8")):
+                    raise RuntimeError("native Edit left an opaque handle on disk")
+                readback = None
+                for request in state.model_requests:
+                    try:
+                        parsed_request = json.loads(request)
+                    except json.JSONDecodeError:
+                        continue
+                    for message in parsed_request.get("messages", []):
+                        for block in message.get("content", []) if isinstance(message, dict) else []:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_result"
+                                and block.get("tool_use_id") == state.native_read_back_id
+                            ):
+                                readback = block
+                readback_content = readback.get("content") if readback else ""
+                readback_text = (
+                    readback_content if isinstance(readback_content, str) else ""
+                )
+                if not state.native_read_back_sent or not readback or readback.get("is_error"):
+                    raise RuntimeError("native Edit readback was not returned successfully")
+                if '"api_key"' not in readback_text or not HANDLE.search(readback_text):
+                    raise RuntimeError(
+                        "native Edit readback was not protected before model delivery: "
+                        + repr(readback_text)
+                    )
+            elif native_patch:
+                expected_content = json.dumps(
+                    {"api_key": valid}, separators=(",", ":")
+                ) + "\n"
+                written = project / "verified-config.json"
+                written_bytes = written.read_bytes() if written.is_file() else b"<missing>"
+                expected_bytes = expected_content.encode("utf-8")
+                if len(state.native_patch_inputs) != 1:
+                    raise RuntimeError("native apply_patch fixture did not emit exactly one patch")
+                if not state.native_patch_read_sent or not state.native_patch_read_call_id:
+                    raise RuntimeError("native apply_patch fixture did not perform readback")
+                if not HANDLE.search(state.native_patch_inputs[0]):
+                    raise RuntimeError("fixture patch did not carry an opaque handle")
+                if written_bytes != expected_bytes:
+                    safe_bytes = written_bytes.replace(valid.encode(), b"<synthetic-key>").replace(
+                        invalid.encode(), b"<synthetic-key>"
+                    )
+                    raise RuntimeError(
+                        "native apply_patch did not produce exact file content: "
+                        + repr(safe_bytes)
+                    )
+                if not written_bytes.endswith(b"\n") or json.loads(written_bytes) != {"api_key": valid}:
+                    raise RuntimeError("native apply_patch JSON content or final newline was incorrect")
+                if HANDLE.search(written_bytes.decode("utf-8")):
+                    raise RuntimeError("native apply_patch left an opaque handle on disk")
+                readback_output = tool_output_for_call(
+                    state.model_requests, state.native_patch_read_call_id
+                )
+                readback_text = (
+                    readback_output
+                    if isinstance(readback_output, str)
+                    else json.dumps(readback_output, ensure_ascii=True)
+                )
+                if (
+                    readback_output is None
+                    or "api_key" not in readback_text
+                    or not HANDLE.search(readback_text)
+                ):
+                    output_records = []
+                    for request in state.model_requests:
+                        try:
+                            parsed_request = json.loads(request)
+                        except json.JSONDecodeError:
+                            continue
+                        output_records.extend(
+                            (value.get("type"), value.get("call_id"))
+                            for value in parsed_request.get("input", [])
+                            if isinstance(value, dict)
+                            and value.get("type") in {
+                                "custom_tool_call_output",
+                                "function_call_output",
+                            }
+                        )
+                    raise RuntimeError(
+                        "native apply_patch readback was not returned protected to the model: "
+                        + repr({"expected": state.native_patch_read_call_id, "outputs": output_records})
+                    )
+            if not unicode_path.is_file() or unicode_path.read_text(encoding="utf-8") != UNICODE_ROUNDTRIP:
+                raise RuntimeError(f"{client} did not complete the Unicode file write/read roundtrip")
             remove_detector_plugin(pentect, project, environment)
             print(
                 f"installed {client} E2E passed: project plugin "
                 "inspect/test/add/setup/update/reinstall/mask/remove, two key handles, "
                 "no model/log plaintext"
+                + (
+                    "; native Read/Edit handle roundtrip with exact disk JSON"
+                    if native_write
+                    else "; native apply_patch handle roundtrip with exact disk JSON"
+                    if native_patch
+                    else ""
+                )
             )
     finally:
         server.shutdown()
@@ -1055,7 +2845,7 @@ else:
         thread.join()
 
 
-def run_cancellation(pentect: str) -> None:
+def run_cancellation(pentect: str, *, tmux_pty: bool = False) -> None:
     valid = "rpa_PENTECT_CANCEL_VALID_0123456789abcdef"
     invalid = "rpa_PENTECT_CANCEL_INVALID_fedcba9876543210"
     state = State(valid, invalid, hold_model=True)
@@ -1063,6 +2853,18 @@ def run_cancellation(pentect: str) -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     process: subprocess.Popen[str] | None = None
+    tmux_socket: Path | None = None
+    tmux_session: str | None = None
+
+    def cleanup_tmux() -> None:
+        nonlocal tmux_socket, tmux_session
+        if tmux_socket is not None and tmux_session is not None:
+            subprocess.run(
+                ["tmux", "-S", str(tmux_socket), "kill-session", "-t", tmux_session],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            tmux_socket = None
+            tmux_session = None
     try:
         with tempfile.TemporaryDirectory(
             prefix="pentect-cancel-e2e-", ignore_cleanup_errors=True
@@ -1084,7 +2886,7 @@ def run_cancellation(pentect: str) -> None:
                 "# cancellation E2E sentinel\n"
             )
             config.write_text(sentinel, encoding="utf-8")
-            environment = os.environ.copy()
+            environment = isolated_environment(home, root / "logs")
             environment.update({
                 "HOME": str(home),
                 "USERPROFILE": str(home),
@@ -1109,36 +2911,92 @@ def run_cancellation(pentect: str) -> None:
                     "/c",
                     *command,
                 ]
-            popen_options: dict[str, object] = {}
-            if os.name == "nt":
-                popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            if tmux_pty:
+                if os.name == "nt":
+                    raise RuntimeError("tmux PTY cancellation is only supported on POSIX")
+                tmux_socket = root / "tmux-cancellation.sock"
+                tmux_session = f"pentect-cancel-{os.getpid()}"
+                output_path = root / "tmux-cancellation.output"
+                shell = (
+                    f"{shlex.join(command)}; "
+                    f"printf '%s' $? >{shlex.quote(str(root / 'tmux-cancellation.status'))}"
+                )
+                subprocess.run(
+                    ["tmux", "-S", str(tmux_socket), "new-session", "-d", "-s", tmux_session,
+                     "sh", "-lc", shell],
+                    cwd=project, env=environment, check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                # Keep stdout/stderr attached to the foreground PTY. Capture
+                # the pane stream after the session starts instead of redirecting
+                # the child to files, so C-c exercises the real terminal path.
+                try:
+                    subprocess.run(
+                        ["tmux", "-S", str(tmux_socket), "pipe-pane", "-o", "-t", tmux_session,
+                         f"cat >{shlex.quote(str(output_path))}"],
+                        env=environment, check=True, stdout=subprocess.DEVNULL,
+                    )
+                except BaseException:
+                    # The temporary root is still alive here; reap the owned
+                    # server before propagating a setup failure.
+                    cleanup_tmux()
+                    raise
             else:
-                popen_options["start_new_session"] = True
-            process = subprocess.Popen(
-                command,
-                cwd=project,
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                **popen_options,
-            )
+                popen_options: dict[str, object] = {}
+                if os.name == "nt":
+                    popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    popen_options["start_new_session"] = True
+                process = subprocess.Popen(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    **popen_options,
+                )
             if not state.model_request_seen.wait(timeout=20):
+                cleanup_tmux()
                 raise RuntimeError("cancellation E2E never reached the model fixture")
-            if os.name == "nt":
-                process.send_signal(signal.CTRL_BREAK_EVENT)
+            if tmux_pty:
+                try:
+                    probe = subprocess.run(
+                        ["tmux", "-S", str(tmux_socket), "send-keys", "-t", tmux_session, "C-c"],
+                        env=environment, check=True, stdout=subprocess.DEVNULL,
+                    )
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        probe = subprocess.run(
+                            ["tmux", "-S", str(tmux_socket), "has-session", "-t", tmux_session],
+                            env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                        if probe.returncode != 0:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise RuntimeError("tmux foreground client did not exit within 8 seconds")
+                    time.sleep(0.2)
+                    output = output_path.read_text(encoding="utf-8", errors="replace")
+                    returncode = int((root / "tmux-cancellation.status").read_text())
+                finally:
+                    cleanup_tmux()
             else:
-                os.killpg(process.pid, signal.SIGINT)
-            try:
-                output, _ = process.communicate(timeout=8)
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError(
-                    "Pentect did not finish client cleanup within 8 seconds after interrupt"
-                ) from error
+                if os.name == "nt":
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(process.pid, signal.SIGINT)
+                try:
+                    output, _ = process.communicate(timeout=8)
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError(
+                        "Pentect did not finish client cleanup within 8 seconds after interrupt"
+                    ) from error
+                returncode = process.returncode
             sanitized = output.replace(valid, "<synthetic-key>").replace(
                 invalid, "<synthetic-key>"
             )
-            if process.returncode == 0:
+            if returncode == 0:
                 raise RuntimeError(
                     "interrupted Pentect unexpectedly returned success:\n" + sanitized
                 )
@@ -1170,10 +3028,492 @@ def run_cancellation(pentect: str) -> None:
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
+        cleanup_tmux()
         state.release_model_request.set()
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def fixture_settings(roots: tuple[Path, ...], sentinel: str) -> list[Path]:
+    matches: list[Path] = []
+    encoded = sentinel.encode()
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                if encoded in path.read_bytes():
+                    matches.append(path)
+            except FileNotFoundError:
+                continue
+    return matches
+
+
+def generated_claude_settings(roots: tuple[Path, ...], sentinel: str) -> list[Path]:
+    if os.name != "nt":
+        return fixture_settings(roots, sentinel)
+    # The supervisor intentionally holds settings DELETE_ON_CLOSE. Python's
+    # Windows file open does not share DELETE, so discover the isolated,
+    # uniquely named generated path without weakening the production handle.
+    return [
+        path
+        for root in roots
+        for path in root.glob("pentect-claude-settings-*/settings.json")
+    ]
+
+
+def claude_descendant_identities(
+    wrapper_pid: int, installed_claude: Path
+) -> tuple[int, dict[int, str]]:
+    descendants = descendant_processes(wrapper_pid)
+    candidates = []
+    named_candidates = []
+    for pid, (_, command) in descendants.items():
+        executable = Path(command.split(" ", 1)[0].strip('"')).name.lower()
+        if "pentect" not in executable:
+            candidates.append(pid)
+            if "claude" in command.lower():
+                named_candidates.append(pid)
+    if not candidates:
+        raise RuntimeError(
+            "could not identify installed Claude below wrapper; descendants="
+            + repr({pid: command for pid, (_, command) in descendants.items()})
+        )
+
+    def depth(pid: int) -> int:
+        value = 0
+        while pid in descendants:
+            value += 1
+            pid = descendants[pid][0]
+        return value
+
+    client_pid = max(named_candidates or candidates, key=depth)
+    client_command = descendants[client_pid][1].lower()
+    expected = {
+        str(installed_claude).lower(),
+        str(installed_claude.resolve()).lower(),
+        installed_claude.name.lower(),
+        "claude-code",
+    }
+    if not any(token and token in client_command for token in expected):
+        raise RuntimeError(
+            "selected client process does not identify the installed Claude command: "
+            + repr(descendants[client_pid][1])
+        )
+    identities = {}
+    for pid in descendants:
+        identity = process_identity(pid)
+        if identity is None:
+            raise RuntimeError(f"Claude descendant PID {pid} exited before identity capture")
+        identities[pid] = identity
+    return client_pid, identities
+
+
+def capture_descendant_identities(wrapper_pid: int, identities: dict[int, str]) -> None:
+    for pid in descendant_processes(wrapper_pid):
+        identity = process_identity(pid)
+        if identity is not None:
+            identities.setdefault(pid, identity)
+
+
+def run_codex_parent_kill(pentect: str) -> None:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("Codex parent-exit E2E currently requires Linux pidfd cleanup")
+    state = State("unused-valid", "unused-invalid", hold_model=True)
+    server = FixtureServer(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process: subprocess.Popen[str] | None = None
+    recorded_identities: dict[int, str] = {}
+    before_kill: list[dict[str, object]] = []
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pentect-codex-parent-kill-", ignore_cleanup_errors=True
+        ) as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            project = root / "project"
+            runtime = root / "runtime"
+            temporary = root / "tmp"
+            for directory in (home, project, runtime, temporary):
+                directory.mkdir()
+            (project / ".git").mkdir()
+            synthetic_input = project / "lifecycle-input.txt"
+            synthetic_input.write_text("ordinary lifecycle fixture\n", encoding="utf-8")
+            input_snapshot = synthetic_input.read_bytes()
+
+            marker = root / "mcp-ready.json"
+            mcp_server = root / "mcp-lifecycle.py"
+            mcp_server.write_text(
+                r'''import json
+import os
+import signal
+import subprocess
+import sys
+
+marker = sys.argv[1]
+if len(sys.argv) == 3 and sys.argv[2] == "--child":
+    while True:
+        signal.pause()
+
+child = subprocess.Popen([sys.executable, __file__, marker, "--child"])
+
+def publish(initialized):
+    temporary = marker + ".tmp"
+    with open(temporary, "x", encoding="utf-8") as output:
+        json.dump({
+            "server_pid": os.getpid(),
+            "child_pid": child.pid,
+            "initialized": initialized,
+        }, output, separators=(",", ":"))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, marker)
+
+publish(False)
+for line in sys.stdin:
+    request = json.loads(line)
+    identifier = request.get("id")
+    method = request.get("method")
+    if identifier is None:
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": request.get("params", {}).get(
+                "protocolVersion", "2025-06-18"
+            ),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "pentect-lifecycle-fixture", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": []}
+    elif method == "ping":
+        result = {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": identifier, "result": result},
+                     separators=(",", ":")), flush=True)
+    if method == "initialize":
+        publish(True)
+''',
+                encoding="utf-8",
+            )
+            server_snapshot = mcp_server.read_bytes()
+
+            codex_home = home / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                f"[projects.{json.dumps(str(project.resolve()))}]\n"
+                'trust_level = "trusted"\n\n'
+                "[mcp_servers.pentect_lifecycle]\n"
+                f"command = {json.dumps(sys.executable)}\n"
+                f"args = {json.dumps([str(mcp_server), str(marker)])}\n"
+                "startup_timeout_sec = 10\n",
+                encoding="utf-8",
+            )
+            config_snapshot = config.read_bytes()
+            environment = isolated_environment(home, root / "logs")
+            for name in tuple(environment):
+                upper = name.upper()
+                if any(
+                    marker in upper
+                    for marker in ("TOKEN", "SECRET", "API_KEY", "PASSWORD", "CREDENTIAL")
+                ):
+                    environment.pop(name)
+            environment.update({
+                "CODEX_HOME": str(codex_home),
+                "OPENAI_API_KEY": "local-fixture",
+                "TMP": str(temporary),
+                "TEMP": str(temporary),
+                "TMPDIR": str(temporary),
+                "XDG_RUNTIME_DIR": str(runtime),
+                "PENTECT_DISABLE_UPDATE_CHECK": "1",
+            })
+            command = [
+                pentect,
+                "codex",
+                "--upstream",
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "--model",
+                "gpt-5.6-luna",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "Wait for the local lifecycle fixture response.",
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            ready: dict[str, object] | None = None
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                capture_descendant_identities(process.pid, recorded_identities)
+                if marker.exists():
+                    try:
+                        candidate = json.loads(marker.read_text(encoding="utf-8"))
+                        if candidate.get("initialized") is True:
+                            ready = candidate
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
+                if ready is not None and state.model_request_seen.is_set():
+                    break
+                if process.poll() is not None:
+                    break
+                state.model_request_seen.wait(timeout=0.05)
+            capture_descendant_identities(process.pid, recorded_identities)
+            if ready is None:
+                raise RuntimeError("installed Codex did not initialize the synthetic MCP server")
+            if not state.model_request_seen.is_set():
+                raise RuntimeError("installed Codex did not reach the local model fixture")
+            mcp_pids = [int(ready["server_pid"]), int(ready["child_pid"])]
+            descendants = descendant_processes(process.pid)
+            if any(pid not in descendants for pid in mcp_pids):
+                raise RuntimeError(
+                    "synthetic MCP server tree was not below the Pentect wrapper: "
+                    + repr({pid: descendants.get(pid) for pid in mcp_pids})
+                )
+            for pid in mcp_pids:
+                identity = process_identity(pid)
+                if identity is None:
+                    raise RuntimeError(f"synthetic MCP process {pid} exited before parent kill")
+                recorded_identities[pid] = identity
+            if config.read_bytes() != config_snapshot:
+                raise RuntimeError("Codex modified the caller-owned lifecycle config")
+            if synthetic_input.read_bytes() != input_snapshot:
+                raise RuntimeError("Codex modified the synthetic lifecycle input")
+
+            before_kill = linux_process_diagnostics(
+                sorted(recorded_identities), recorded_identities
+            )
+            process.kill()
+            process.wait(timeout=10)
+            surviving = wait_for_process_identities_exit(recorded_identities, 10)
+            if surviving:
+                raise RuntimeError(
+                    "installed Codex descendants survived wrapper exit: "
+                    + json.dumps(
+                        linux_process_diagnostics(surviving, recorded_identities),
+                        separators=(",", ":"),
+                    )
+                    + "; before wrapper kill: "
+                    + json.dumps(before_kill, separators=(",", ":"))
+                )
+            if config.read_bytes() != config_snapshot:
+                raise RuntimeError("Codex changed lifecycle config after wrapper exit")
+            if synthetic_input.read_bytes() != input_snapshot:
+                raise RuntimeError("Codex changed lifecycle input after wrapper exit")
+            runtime_root = home / ".cache" / "pentect" / "runtime"
+            residue = list(runtime_root.glob("process-host-candidate-*.json"))
+            residue.extend(runtime_root.glob("delegated-process-host.json"))
+            if residue:
+                raise RuntimeError(
+                    "Pentect left process-host registration after Codex parent exit: "
+                    + ", ".join(path.name for path in residue)
+                )
+            if mcp_server.read_bytes() != server_snapshot:
+                raise RuntimeError("Codex modified the synthetic MCP fixture")
+            print(
+                "installed Codex parent-exit E2E passed: initialized MCP server, "
+                "ordinary child, and client tree exited"
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        for pid in surviving_cleanup:
+            terminate_process_identity(pid, recorded_identities[pid])
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        state.release_model_request.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        if surviving_cleanup:
+            raise RuntimeError(
+                "test cleanup could not reap recorded Codex identities: "
+                + ", ".join(map(str, surviving_cleanup))
+            )
+
+
+def run_claude_parent_kill(pentect: str) -> None:
+    if os.name == "nt" and Path(pentect).suffix.lower() != ".exe":
+        raise RuntimeError(
+            "Claude parent-exit E2E requires a native pentect.exe on Windows; "
+            "command shims cannot provide exact wrapper process identity"
+        )
+    sentinel = "PENTECT_CLAUDE_LIFETIME_SYNTHETIC_SENTINEL"
+    state = State("unused-valid", "unused-invalid", hold_model=True)
+    server = FixtureServer(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process: subprocess.Popen[str] | None = None
+    recorded_identities: dict[int, str] = {}
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pentect-claude-parent-kill-", ignore_cleanup_errors=True
+        ) as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            project = root / "project"
+            temporary = root / "tmp"
+            runtime = root / "runtime"
+            for directory in (home, project, temporary, runtime):
+                directory.mkdir()
+            generated_roots = (temporary, runtime)
+            if sys.platform == "darwin":
+                generated_roots += (
+                    home
+                    / "Library"
+                    / "Caches"
+                    / "pentect"
+                    / "private"
+                    / "claude-settings-v1",
+                )
+            environment = isolated_environment(home, root / "logs")
+            environment.update({
+                "ANTHROPIC_API_KEY": "local-fixture",
+                "TMP": str(temporary),
+                "TEMP": str(temporary),
+                "TMPDIR": str(temporary),
+                "XDG_RUNTIME_DIR": str(runtime),
+            })
+            if os.name == "nt":
+                git_bash = shutil.which("bash.exe") or shutil.which("bash")
+                if git_bash is None:
+                    raise RuntimeError("Claude lifetime E2E requires Git Bash on Windows")
+                environment["CLAUDE_CODE_GIT_BASH_PATH"] = git_bash
+            installed_claude_value = shutil.which("claude", path=environment.get("PATH"))
+            if installed_claude_value is None:
+                raise RuntimeError("installed Claude executable is unavailable on PATH")
+            installed_claude = Path(installed_claude_value)
+            input_settings = root / "input-settings.json"
+            input_settings.write_text(
+                json.dumps(
+                    {"env": {"PENTECT_LIFETIME_SENTINEL": sentinel}},
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            input_snapshot = input_settings.read_bytes()
+            command = [
+                pentect,
+                "claude",
+                "--upstream",
+                f"http://127.0.0.1:{server.server_port}",
+                "--bare",
+                "--print",
+                "--output-format",
+                "text",
+                "--no-session-persistence",
+                "--dangerously-skip-permissions",
+                "--tools",
+                "",
+                "--model",
+                "claude-sonnet-4-5",
+                "--settings",
+                str(input_settings),
+                "Reply with DONE.",
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            deadline = time.monotonic() + 20
+            while not state.model_request_seen.is_set() and time.monotonic() < deadline:
+                capture_descendant_identities(process.pid, recorded_identities)
+                if process.poll() is not None:
+                    break
+                state.model_request_seen.wait(timeout=0.05)
+            capture_descendant_identities(process.pid, recorded_identities)
+            if not state.model_request_seen.is_set():
+                raise RuntimeError("installed Claude did not reach the local model fixture")
+            client_pid, ready_identities = claude_descendant_identities(
+                process.pid, installed_claude
+            )
+            recorded_identities.update(ready_identities)
+            generated = generated_claude_settings(generated_roots, sentinel)
+            if len(generated) != 1:
+                raise RuntimeError(
+                    "expected one generated Claude settings file, found "
+                    + repr([str(path) for path in generated])
+                )
+            settings_path = generated[0]
+            if input_settings.read_bytes() != input_snapshot:
+                raise RuntimeError("Claude modified the caller-owned settings input")
+
+            # Popen.kill targets the wrapper process only. The supervisor owns
+            # cleanup of the externally recorded descendant identities.
+            process.kill()
+            process.wait(timeout=10)
+            surviving = wait_for_process_identities_exit(recorded_identities, 10)
+            if surviving:
+                subject = "recorded Claude client" if client_pid in surviving else "Claude descendants"
+                raise RuntimeError(
+                    f"{subject} survived wrapper: "
+                    + ", ".join(map(str, surviving))
+                )
+            if settings_path.exists():
+                raise RuntimeError("generated Claude settings survived guardian cleanup")
+            if input_settings.read_bytes() != input_snapshot:
+                raise RuntimeError("caller-owned Claude settings changed after parent exit")
+
+            state.hold_model = False
+            state.release_model_request.set()
+            completed = subprocess.run(
+                command,
+                cwd=project,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "follow-up Claude cleanup launch failed:\n"
+                    + completed.stdout.replace(sentinel, "<synthetic-sentinel>")
+                )
+            residue = generated_claude_settings(generated_roots, sentinel)
+            if residue:
+                raise RuntimeError(
+                    "generated Claude settings residue remained after follow-up launch: "
+                    + repr([str(path) for path in residue])
+                )
+            if input_settings.read_bytes() != input_snapshot:
+                raise RuntimeError("caller-owned Claude settings changed after cleanup launch")
+            print(
+                "installed Claude parent-exit E2E passed: exact client exited "
+                "and generated settings were cleaned"
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        for pid in surviving_cleanup:
+            terminate_process_identity(pid, recorded_identities[pid])
+        surviving_cleanup = wait_for_process_identities_exit(recorded_identities, 5)
+        state.release_model_request.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        if surviving_cleanup:
+            raise RuntimeError(
+                "test cleanup could not reap recorded Claude identities: "
+                + ", ".join(map(str, surviving_cleanup))
+            )
 
 
 def run_image_redaction(pentect: str) -> None:
@@ -1192,7 +3532,7 @@ def run_image_redaction(pentect: str) -> None:
             project.mkdir()
             image = project / "secret.png"
             image.write_bytes(base64.b64decode(IMAGE_PNG_BASE64))
-            environment = os.environ.copy()
+            environment = isolated_environment(home, root / "logs")
             environment.update({
                 "HOME": str(home),
                 "USERPROFILE": str(home),
@@ -1291,7 +3631,21 @@ def main() -> int:
         dest="clients",
     )
     parser.add_argument("--skip-image", action="store_true")
+    parser.add_argument("--codex-parent-kill", action="store_true")
+    parser.add_argument("--claude-parent-kill", action="store_true")
+    parser.add_argument("--tmux-cancellation", action="store_true")
     parser.add_argument("--plugin-lifecycle-only", action="store_true")
+    native_mode = parser.add_mutually_exclusive_group()
+    native_mode.add_argument(
+        "--native-handle-write",
+        action="store_true",
+        help="run the deterministic Claude native Edit handle roundtrip only",
+    )
+    native_mode.add_argument(
+        "--native-handle-patch",
+        action="store_true",
+        help="run the deterministic Codex native apply_patch handle roundtrip only",
+    )
     args = parser.parse_args()
     candidate = Path(args.pentect)
     if candidate.is_file():
@@ -1299,10 +3653,32 @@ def main() -> int:
     if args.plugin_lifecycle_only:
         run_plugin_lifecycle(args.pentect)
         return 0
+    if args.codex_parent_kill:
+        run_codex_parent_kill(args.pentect)
+        return 0
+    if args.claude_parent_kill:
+        run_claude_parent_kill(args.pentect)
+        return 0
+    if args.tmux_cancellation:
+        run_cancellation(args.pentect, tmux_pty=True)
+        return 0
+    if args.native_handle_write:
+        if args.clients and args.clients != ["claude"]:
+            parser.error("--native-handle-write only supports --client claude")
+        run_client(args.pentect, "claude", native_write=True)
+        return 0
+    if args.native_handle_patch:
+        if args.clients and args.clients != ["codex"]:
+            parser.error("--native-handle-patch only supports --client codex")
+        run_client(args.pentect, "codex", native_patch=True)
+        return 0
     # Run Claude first because it has the strictest native Windows tool
     # transport. A regression should fail before the slower Codex startup.
     for client in args.clients or ("claude", "codex", "opencode", "pi"):
         run_client(args.pentect, client)
+    if args.clients is None:
+        run_client(args.pentect, "claude", native_write=True)
+        run_client(args.pentect, "codex", native_patch=True)
     if args.clients is None or "codex" in args.clients:
         run_cancellation(args.pentect)
         if not args.skip_image:

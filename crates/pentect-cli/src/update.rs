@@ -15,6 +15,8 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_CACHE: &str = "update-check.json";
 const MAX_UPDATE_CACHE_BYTES: u64 = 4 * 1024;
+const UPDATE_REPLACE_ATTEMPTS: usize = 600;
+const UPDATE_REPLACE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize)]
 struct UpdateCheckRelease {
@@ -766,19 +768,66 @@ fn apply_update(args: &[String]) -> Result<(), String> {
     }
     let destination = Path::new(destination);
     let backup = Path::new(backup);
-    for _ in 0..600 {
-        match std::fs::copy(&source, destination) {
-            Ok(_) if sha256_file(destination)? == expected.to_ascii_lowercase() => {
-                #[cfg(windows)]
-                let _ = spawn_windows_staged_cleanup(&source);
-                return Ok(());
+    replace_update_binary(&source, destination, backup, expected)
+}
+
+fn replace_update_binary(
+    source: &Path,
+    destination: &Path,
+    backup: &Path,
+    expected: &str,
+) -> Result<(), String> {
+    replace_update_binary_with(
+        source,
+        destination,
+        backup,
+        &expected.to_ascii_lowercase(),
+        UPDATE_REPLACE_ATTEMPTS,
+        UPDATE_REPLACE_RETRY_DELAY,
+        sha256_file,
+    )?;
+    #[cfg(windows)]
+    let _ = spawn_windows_staged_cleanup(source);
+    Ok(())
+}
+
+fn replace_update_binary_with(
+    source: &Path,
+    destination: &Path,
+    backup: &Path,
+    expected: &str,
+    attempts: usize,
+    retry_delay: Duration,
+    mut read_hash: impl FnMut(&Path) -> Result<String, String>,
+) -> Result<(), String> {
+    let mut replaced = false;
+    let mut last_verification_error = None;
+    for attempt in 0..attempts {
+        if std::fs::copy(source, destination).is_ok() {
+            replaced = true;
+            match read_hash(destination) {
+                Ok(actual) if actual == expected => return Ok(()),
+                Ok(_) => {
+                    let _ = std::fs::copy(backup, destination);
+                    return Err("installed update checksum mismatch".to_string());
+                }
+                Err(error) => last_verification_error = Some(error),
             }
-            Ok(_) => {
-                let _ = std::fs::copy(backup, destination);
-                return Err("installed update checksum mismatch".to_string());
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(500)),
         }
+        if attempt + 1 < attempts {
+            std::thread::sleep(retry_delay);
+        }
+    }
+    if replaced {
+        let error = last_verification_error
+            .map(|error| format!("timed out verifying the installed update: {error}"))
+            .unwrap_or_else(|| "timed out verifying the installed update".to_string());
+        return match std::fs::copy(backup, destination) {
+            Ok(_) => Err(error),
+            Err(restore_error) => Err(format!(
+                "{error}; could not restore the previous executable: {restore_error}"
+            )),
+        };
     }
     Err("timed out waiting to replace the executable".to_string())
 }
@@ -1040,5 +1089,83 @@ mod tests {
         let cache = update_check_cache_for_release(&stable, 789).unwrap();
         assert_eq!(cache.checked_at, 789);
         assert_eq!(cache.latest.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn update_retries_a_transient_verification_read_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "pentect-update-verify-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source");
+        let destination = directory.join("destination");
+        let backup = directory.join("backup");
+        std::fs::write(&source, b"new executable").unwrap();
+        std::fs::write(&destination, b"old executable").unwrap();
+        std::fs::write(&backup, b"old executable").unwrap();
+        let expected = sha256_file(&source).unwrap();
+        let mut reads = 0;
+
+        replace_update_binary_with(
+            &source,
+            &destination,
+            &backup,
+            &expected,
+            2,
+            Duration::ZERO,
+            |path| {
+                reads += 1;
+                if reads == 1 {
+                    Err("temporary file lock".to_string())
+                } else {
+                    sha256_file(path)
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reads, 2);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new executable");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn update_restores_backup_after_verification_retries_are_exhausted() {
+        let directory = std::env::temp_dir().join(format!(
+            "pentect-update-verify-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source");
+        let destination = directory.join("destination");
+        let backup = directory.join("backup");
+        std::fs::write(&source, b"new executable").unwrap();
+        std::fs::write(&destination, b"old executable").unwrap();
+        std::fs::write(&backup, b"old executable").unwrap();
+
+        let error = replace_update_binary_with(
+            &source,
+            &destination,
+            &backup,
+            "unused",
+            2,
+            Duration::ZERO,
+            |_| Err("persistent file lock".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out verifying"), "{error}");
+        assert!(error.contains("persistent file lock"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old executable");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

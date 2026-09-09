@@ -15,8 +15,8 @@ the model. A handle looks like `<<API_KEY_ab12...>>`.
   let the user choose a documented compatibility setting.
 - Do not assume that a remote or cloud agent uses the local Pentect gateway.
 
-Use `pentect doctor` to check the installation and `pentect log` for
-diagnostics that do not contain secret values.
+Use `pentect doctor` to check the installation and `pentect log --once --tail
+100` for bounded diagnostics that do not contain secret values.
 
 The same instructions are available in the repository's
 [`AGENTS.md`](https://github.com/EdamAme-x/pentect/blob/main/AGENTS.md).

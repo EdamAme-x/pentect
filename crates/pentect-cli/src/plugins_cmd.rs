@@ -6,7 +6,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_COMMAND_LOCK_FILE: &str = "command.lock";
@@ -15,6 +19,11 @@ const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_PLUGIN_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_PLUGIN_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_WASM_BYTES: u64 = 32 * 1024 * 1024;
+const SETUP_CHILD_POLL: Duration = Duration::from_millis(25);
+const SETUP_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+
+static SETUP_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static SETUP_INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub(crate) fn cmd_plugins(args: &[String]) {
     let opts = match PluginCmd::parse(args) {
@@ -1232,7 +1241,13 @@ fn build_local_plugin(
         .output()
         .map_err(|error| format!("could not inspect Cargo build directory: {error}"))?;
     if !metadata.status.success() {
-        return Err("could not inspect Cargo build directory".to_string());
+        let detail = String::from_utf8_lossy(&metadata.stderr);
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            "could not inspect Cargo build directory".to_string()
+        } else {
+            format!("could not inspect Cargo build directory: {detail}")
+        });
     }
     let target_directory = serde_json::from_slice::<serde_json::Value>(&metadata.stdout)
         .ok()
@@ -1302,16 +1317,26 @@ jobs:
 
 fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
+    let checks = plugin_checks(&active);
+    report_plugin_checks(&checks, json_output)?;
+    Ok(())
+}
+
+fn plugin_checks(active: &plugins::ActivePlugins) -> Vec<Check> {
     let mut checks = Vec::new();
     for path in active.config_paths() {
         checks.push(test_pack(path));
     }
-    for path in active.binary_paths() {
+    for path in active.all_binary_paths() {
         checks.push(test_binary(path));
     }
     if checks.is_empty() {
         checks.push(Check::fail("plugin", "empty"));
     }
+    checks
+}
+
+fn report_plugin_checks(checks: &[Check], json_output: bool) -> Result<(), String> {
     if json_output {
         println!(
             "{}",
@@ -1324,7 +1349,7 @@ fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             })
         );
     } else {
-        for check in &checks {
+        for check in checks {
             println!("{}: {}", check.name, check.status.as_str());
         }
     }
@@ -2385,9 +2410,21 @@ fn setup_plugin_source_inner(
         if !approved && !confirm_setup()? {
             return Err("plugin setup was not approved".to_string());
         }
-        write_command_lock(&name, &source, &manifest)?;
+        let remote_command = !plugins::remote_command_files(&source)
+            .map_err(|error| error.to_string())?
+            .is_empty();
+        // A local setup does not need runtime metadata. Commit it only after
+        // the external setup succeeds, so SIGKILL cannot leave a new lock.
+        // Remote setup executes from the managed command directory and must
+        // still stage that directory first.
+        if remote_command {
+            write_command_lock(&name, &source, &manifest)?;
+        }
         if let Some(setup) = manifest.setup.as_ref() {
             run_command_environment_setup(&name, &source, setup, profile)?;
+        }
+        if !remote_command {
+            write_command_lock(&name, &source, &manifest)?;
         }
         manifest.hooks.clone()
     };
@@ -2450,15 +2487,28 @@ fn run_command_environment_setup(
         argv.push(profile.to_string());
     }
     let executable = resolve_command_executable(&argv[0])?;
+    install_setup_interrupt_handler()?;
+    SETUP_INTERRUPTED.store(false, Ordering::SeqCst);
     println!("environment setup: starting");
-    let status = Command::new(executable)
-        .args(&argv[1..])
-        .current_dir(&root)
+    let mut command = setup_supervisor_command(&root, &executable, &argv[1..])?;
+    command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::inherit());
+    configure_setup_process_tree(&mut command);
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("could not start plugin environment setup: {error}"))?;
+    let _tree = SetupProcessTree::attach(&child).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        format!("could not isolate plugin environment setup: {error}")
+    })?;
+    let status = wait_for_setup_child(&mut child)?;
+    let interrupted = SETUP_INTERRUPTED.swap(false, Ordering::SeqCst);
+    if interrupted {
+        return Err("plugin environment setup was interrupted".to_string());
+    }
     if !status.success() {
         return Err(format!(
             "plugin environment setup failed with {}",
@@ -2471,6 +2521,256 @@ fn run_command_environment_setup(
     println!("environment setup: complete");
     Ok(())
 }
+
+#[cfg(not(test))]
+fn setup_supervisor_command(
+    root: &Path,
+    executable: &Path,
+    args: &[String],
+) -> Result<Command, String> {
+    let parent_pid = std::process::id();
+    let parent_started = process_start_time(parent_pid)
+        .ok_or_else(|| "could not identify the plugin setup owner process".to_string())?;
+    let pentect = std::env::current_exe()
+        .map_err(|error| format!("could not locate Pentect for plugin setup: {error}"))?;
+    let mut command = Command::new(pentect);
+    command
+        .arg("__plugin-setup-supervisor")
+        .arg(parent_pid.to_string())
+        .arg(parent_started.to_string())
+        .arg(root)
+        .arg(executable)
+        .args(args);
+    Ok(command)
+}
+
+#[cfg(test)]
+fn setup_supervisor_command(
+    root: &Path,
+    executable: &Path,
+    args: &[String],
+) -> Result<Command, String> {
+    let mut command = Command::new(executable);
+    command.args(args).current_dir(root);
+    Ok(command)
+}
+
+pub(crate) fn cmd_setup_supervisor(args: &[String]) -> i32 {
+    match run_setup_supervisor(args) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("[pentect] {error}");
+            1
+        }
+    }
+}
+
+fn run_setup_supervisor(args: &[String]) -> Result<i32, String> {
+    let parent_pid = args
+        .get(2)
+        .ok_or_else(|| "plugin setup supervisor is missing its owner PID".to_string())?
+        .parse::<u32>()
+        .map_err(|_| "plugin setup supervisor owner PID is invalid".to_string())?;
+    let parent_started = args
+        .get(3)
+        .ok_or_else(|| "plugin setup supervisor is missing its owner identity".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "plugin setup supervisor owner identity is invalid".to_string())?;
+    let cwd = args
+        .get(4)
+        .ok_or_else(|| "plugin setup supervisor is missing its working directory".to_string())?;
+    let executable = args
+        .get(5)
+        .ok_or_else(|| "plugin setup supervisor is missing its executable".to_string())?;
+    if !process_identity_matches(parent_pid, parent_started) {
+        return Err("plugin setup owner exited before setup could start".to_string());
+    }
+    let mut child = Command::new(executable)
+        .args(&args[6..])
+        .current_dir(cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("could not start plugin environment setup command: {error}"))?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(status.code().unwrap_or(1));
+            }
+            Ok(None) if process_identity_matches(parent_pid, parent_started) => {
+                thread::sleep(SETUP_CHILD_POLL);
+            }
+            Ok(None) => {
+                terminate_setup_process_tree(std::process::id(), true);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("plugin setup owner exited".to_string());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "could not wait for plugin environment setup command: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).and_then(|process| {
+        (process.status() != sysinfo::ProcessStatus::Zombie).then(|| process.start_time())
+    })
+}
+
+fn process_identity_matches(pid: u32, started: u64) -> bool {
+    process_start_time(pid).is_some_and(|observed| observed == started)
+}
+
+fn install_setup_interrupt_handler() -> Result<(), String> {
+    SETUP_INTERRUPT_HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| {
+                SETUP_INTERRUPTED.store(true, Ordering::SeqCst);
+            })
+            .map_err(|error| format!("could not install plugin setup interrupt handler: {error}"))
+        })
+        .clone()
+}
+
+fn wait_for_setup_child(child: &mut Child) -> Result<std::process::ExitStatus, String> {
+    let mut interrupted_at = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_setup_process_tree(child.id(), true);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "could not wait for plugin environment setup: {error}"
+                ));
+            }
+        }
+        if SETUP_INTERRUPTED.load(Ordering::SeqCst) {
+            let started = interrupted_at.get_or_insert_with(Instant::now);
+            terminate_setup_process_tree(child.id(), started.elapsed() >= SETUP_INTERRUPT_GRACE);
+        }
+        thread::sleep(SETUP_CHILD_POLL);
+    }
+}
+
+#[cfg(unix)]
+fn configure_setup_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_setup_process_tree(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_setup_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+struct SetupProcessTree;
+
+#[cfg(unix)]
+impl SetupProcessTree {
+    fn attach(_child: &Child) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+struct SetupProcessTree {
+    job: usize,
+}
+
+#[cfg(windows)]
+impl SetupProcessTree {
+    fn attach(child: &Child) -> Result<Self, String> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err("could not create a Windows Job Object".to_string());
+        }
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(information).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured
+            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } != 0;
+        if !assigned {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            return Err("could not assign plugin setup to a Windows Job Object".to_string());
+        }
+        Ok(Self { job: job as usize })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SetupProcessTree {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job as *mut _) };
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct SetupProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+impl SetupProcessTree {
+    fn attach(_child: &Child) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
+#[cfg(unix)]
+fn terminate_setup_process_tree(pid: u32, force: bool) {
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_setup_process_tree(pid: u32, _force: bool) {
+    let _ = Command::new(crate::windows_system_executable("taskkill.exe"))
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_setup_process_tree(_pid: u32, _force: bool) {}
 
 struct CommandRuntimeSnapshot {
     data_dir: PathBuf,
@@ -3941,6 +4241,69 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    struct OwnedTestRoot(std::path::PathBuf);
+
+    impl Drop for OwnedTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PluginRuntimeTest {
+        root: std::path::PathBuf,
+        _env: crate::EnvVarGuard,
+        _root: OwnedTestRoot,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PluginRuntimeTest {
+        fn new(prefix: &str) -> Self {
+            let env_lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let root_guard = OwnedTestRoot(root.clone());
+            let home = root.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let env = crate::EnvVarGuard::set_optional([
+                ("HOME", Some(home.clone().into_os_string())),
+                ("USERPROFILE", Some(home.into_os_string())),
+                (
+                    "LOCALAPPDATA",
+                    Some(root.join("local-app-data").into_os_string()),
+                ),
+                ("XDG_DATA_HOME", Some(root.join("data").into_os_string())),
+                ("XDG_CACHE_HOME", Some(root.join("cache").into_os_string())),
+                ("XDG_STATE_HOME", Some(root.join("state").into_os_string())),
+                (
+                    "XDG_RUNTIME_DIR",
+                    Some(root.join("runtime").into_os_string()),
+                ),
+            ]);
+            Self {
+                root: root.clone(),
+                _env: env,
+                _root: root_guard,
+                _env_lock: env_lock,
+            }
+        }
+
+        fn project(&self) -> std::path::PathBuf {
+            let project = self.root.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            project
+        }
+
+        fn assert_owned(&self, path: &Path) {
+            assert!(path.starts_with(&self.root), "{}", path.display());
+        }
+    }
+
     #[test]
     fn windows_command_plugins_accept_batch_shims_only() {
         for extension in [".EXE", "com", ".CMD", "bat"] {
@@ -4410,6 +4773,7 @@ mod tests {
 
     #[test]
     fn approved_command_setup_runs_selected_profile_and_is_locked() {
+        let fixture = PluginRuntimeTest::new("pentect-command-setup");
         let Some(python) = python_test_executable() else {
             return;
         };
@@ -4418,8 +4782,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("command-setup-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture.project();
         std::fs::write(root.join("server.py"), "print('unused')\n").unwrap();
         std::fs::write(
             root.join("setup.py"),
@@ -4435,6 +4798,7 @@ mod tests {
         .unwrap();
         let source = plugins::plugin_source(&root.to_string_lossy()).unwrap();
         let runtime = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        fixture.assert_owned(&runtime.data_dir);
 
         setup_plugin_source(source, true, Some("cpu"), false).unwrap();
 
@@ -4445,8 +4809,6 @@ mod tests {
         let lock =
             std::fs::read_to_string(runtime.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
         assert!(lock.contains("path = \"setup.py\""), "{lock}");
-        let _ = std::fs::remove_dir_all(runtime.data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4479,6 +4841,7 @@ mod tests {
 
     #[test]
     fn local_command_files_are_hashed_into_the_runtime_lock() {
+        let fixture = PluginRuntimeTest::new("pentect-command-lock");
         let Some(python) = python_test_executable() else {
             return;
         };
@@ -4487,8 +4850,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("command-lock-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture.project();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(
             &manifest_path,
@@ -4508,8 +4870,9 @@ mod tests {
             runtime_id: name.clone(),
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
-        write_command_lock(&name, &source, &manifest).unwrap();
         let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        fixture.assert_owned(&dirs.data_dir);
+        write_command_lock(&name, &source, &manifest).unwrap();
         let first = std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
         assert!(first.contains("path = \"server.py\""));
 
@@ -4517,12 +4880,11 @@ mod tests {
         write_command_lock(&name, &source, &manifest).unwrap();
         let second = std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
         assert_ne!(first, second);
-        let _ = std::fs::remove_dir_all(dirs.data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn command_runtime_snapshot_restores_only_managed_state() {
+        let fixture = PluginRuntimeTest::new("pentect-command-rollback");
         let Some(python) = python_test_executable() else {
             return;
         };
@@ -4531,8 +4893,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("command-rollback-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture.project();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(
             &manifest_path,
@@ -4550,6 +4911,7 @@ mod tests {
             runtime_id: name.clone(),
         };
         let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        fixture.assert_owned(&dirs.data_dir);
         std::fs::create_dir_all(dirs.data_dir.join("command")).unwrap();
         std::fs::write(dirs.data_dir.join("command/server.py"), "old").unwrap();
         std::fs::write(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE), "old-lock").unwrap();
@@ -4573,8 +4935,6 @@ mod tests {
             std::fs::read_to_string(dirs.data_dir.join(PLUGIN_APPROVAL_FILE)).unwrap(),
             "old-approval"
         );
-        let _ = std::fs::remove_dir_all(dirs.data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4616,9 +4976,8 @@ mod tests {
 
     #[test]
     fn release_binary_is_portable_wasm_with_optional_override() {
-        let root =
-            std::env::temp_dir().join(format!("pentect-plugin-destination-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = PluginRuntimeTest::new("pentect-plugin-destination");
+        let root = fixture.project();
         let manifest = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(&manifest, "schema = \"pentect.plugin.v1\"\n").unwrap();
         let source = plugins::PluginSource {
@@ -4642,12 +5001,10 @@ mod tests {
             binary_destination("test", "../outside.wasm", PluginRuntime::Wasm, &source).is_err()
         );
         assert!(binary_destination("test", "helper", PluginRuntime::Wasm, &source).is_err());
-        assert!(
-            binary_destination("test", "helper.wasm", PluginRuntime::Wasm, &source)
-                .unwrap()
-                .is_absolute()
-        );
-        let _ = std::fs::remove_dir_all(root);
+        let destination =
+            binary_destination("test", "helper.wasm", PluginRuntime::Wasm, &source).unwrap();
+        assert!(destination.is_absolute());
+        fixture.assert_owned(&destination);
     }
 
     #[test]
@@ -4807,9 +5164,9 @@ pattern = "token-[0-9]+"
             .unwrap()
             .as_nanos();
         let name = format!("update-approval-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
-        let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
+        let fixture = PluginRuntimeTest::new("pentect-update-approval");
+        let project = fixture.project();
+        let manifest_path = project.join(plugins::PLUGIN_MANIFEST_FILE);
         let manifest_source = format!(
             "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper.wasm\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n"
         );
@@ -4827,6 +5184,7 @@ pattern = "token-[0-9]+"
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()
             .data_dir;
+        fixture.assert_owned(&data_dir);
         std::fs::create_dir_all(data_dir.join("bin")).unwrap();
         let wasm = wat::parse_str(
             r#"(module
@@ -4847,12 +5205,6 @@ pattern = "token-[0-9]+"
         .unwrap();
         let changed = load_plugin_manifest(&source).unwrap().unwrap();
         assert!(verify_plugin_update_approval(&name, &source, &changed).is_err());
-
-        let data_dir = plugin_runtime_dirs_for_source(&name, &source)
-            .unwrap()
-            .data_dir;
-        let _ = std::fs::remove_dir_all(data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4881,9 +5233,29 @@ pattern = "token-[0-9]+"
         let _ = std::fs::remove_dir_all(&root);
         let plugin = root.join("global-command");
         std::fs::create_dir_all(&plugin).unwrap();
+        let output =
+            br#"{"schema":"pentect.plugin.v1","id":1,"type":"result","action":"next","spans":[]}"#;
+        let packed = ((2048_u64) << 32) | output.len() as u64;
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 2048) "{}")
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_inspect") (param i32 i32) (result i64)
+                    (i64.const {packed}))
+            )"#,
+            String::from_utf8_lossy(output).replace('"', "\\22")
+        ))
+        .unwrap();
+        std::fs::write(plugin.join("global-command.wasm"), wasm).unwrap();
         std::fs::write(
             plugin.join(plugins::PLUGIN_MANIFEST_FILE),
-            "schema = \"pentect.plugin.v1\"\nname = \"global-command\"\ncommand = [\"tool\"]\nhooks = [\"inspect\"]\n",
+            concat!(
+                "schema = \"pentect.plugin.v1\"\n",
+                "name = \"global-command\"\n",
+                "wasm = \"global-command.wasm\"\n",
+            ),
         )
         .unwrap();
 
@@ -4895,8 +5267,15 @@ pattern = "token-[0-9]+"
             false,
         )
         .unwrap();
-        assert!(active.binary_paths().is_empty());
         assert!(active.has_binary());
+        let paths = active.all_binary_paths().collect::<Vec<_>>();
+        let manifest = std::fs::canonicalize(plugin.join(plugins::PLUGIN_MANIFEST_FILE)).unwrap();
+        assert_eq!(paths, [manifest]);
+        let checks = plugin_checks(&active);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "binary");
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(checks[0].detail.contains("binary is not locked"));
 
         let row = plugin_row("global-command".to_string(), "user", &active)
             .expect("user-scoped binary should be listed");
@@ -4976,8 +5355,8 @@ pattern = "token-[0-9]+"
             .unwrap()
             .as_nanos();
         let name = format!("downgrade-{nonce}");
-        let root = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = PluginRuntimeTest::new("pentect-plugin-downgrade");
+        let root = fixture.project();
         let manifest = root.join(plugins::PLUGIN_MANIFEST_FILE);
         std::fs::write(&manifest, "schema = \"pentect.plugin.v1\"\n").unwrap();
         let source = plugins::PluginSource {
@@ -4991,6 +5370,7 @@ pattern = "token-[0-9]+"
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()
             .data_dir;
+        fixture.assert_owned(&data_dir);
         std::fs::write(
             data_dir.join(PLUGIN_BINARY_LOCK_FILE),
             "schema = \"pentect.plugin-lock.v1\"\nversion = \"2.0.0\"\n",
@@ -5000,9 +5380,6 @@ pattern = "token-[0-9]+"
         assert!(reject_plugin_downgrade(&name, &source, &semver::Version::new(1, 9, 9)).is_err());
         assert!(reject_plugin_downgrade(&name, &source, &semver::Version::new(2, 0, 0)).is_ok());
         assert!(reject_plugin_downgrade(&name, &source, &semver::Version::new(2, 1, 0)).is_ok());
-
-        let _ = std::fs::remove_dir_all(data_dir);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -343,7 +343,7 @@ fn push_cli_secret(
     });
 }
 
-fn cli_secret_is_material(value: &str) -> bool {
+pub(crate) fn cli_secret_is_material(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value == "-" {
         return false;

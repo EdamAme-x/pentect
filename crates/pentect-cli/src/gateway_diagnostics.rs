@@ -98,7 +98,13 @@ pub(crate) fn is_local_rejection(error: &str) -> bool {
 
 fn failure_kind(error: &str) -> (&'static str, bool) {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
+    if error.starts_with("unknown format blocked: OpenAI endpoint is not supported")
+        || error.starts_with("unknown format blocked: Anthropic endpoint is not supported")
+        || error.starts_with("unknown format blocked: Gemini endpoint is not supported")
+        || error.starts_with("unknown format blocked: Google Cloud Code endpoint is not supported")
+    {
+        ("unsupported-endpoint", false)
+    } else if lower.contains("timed out") || lower.contains("timeout") {
         ("timeout", true)
     } else if lower.contains("connection failed") || lower.contains("could not reach") {
         ("connect", true)
@@ -158,6 +164,10 @@ mod tests {
         assert_eq!(
             failure_kind("request body blocked: fixture"),
             ("policy", false)
+        );
+        assert_eq!(
+            failure_kind("unknown format blocked: OpenAI endpoint is not supported"),
+            ("unsupported-endpoint", false)
         );
         assert_eq!(
             failure_kind("arbitrary secret-bearing detail"),

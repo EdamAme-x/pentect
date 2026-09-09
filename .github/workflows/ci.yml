@@ -61,6 +61,7 @@ jobs:
       claude_app: ${{ steps.filter.outputs.claude_app }}
       openai_proxy: ${{ steps.filter.outputs.openai_proxy }}
       command_shims: ${{ steps.filter.outputs.command_shims }}
+      claude_supervisor: ${{ steps.filter.outputs.claude_supervisor }}
       runtime_log: ${{ steps.filter.outputs.runtime_log }}
       cli_general: ${{ steps.filter-general.outputs.cli_general }}
       runtime_general: ${{ steps.filter-general.outputs.runtime_general }}
@@ -108,6 +109,7 @@ jobs:
             packaging:
               - 'crates/pentect-cli/src/client_descriptor.rs'
               - '.github/workflows/current-clients.yml'
+              - '.github/workflows/packages.yml'
               - '.github/workflows/release.yml'
               - 'packaging/**'
               - 'tools/install.ps1'
@@ -121,6 +123,10 @@ jobs:
               - 'tools/build_apt_repository.sh'
               - 'tools/download_recent_stable_debs.sh'
               - 'tools/test_download_recent_stable_debs.sh'
+              - 'tools/prepare_stable_debs.sh'
+              - 'tools/test_prepare_stable_debs.sh'
+              - 'tools/dispatch_package_site.sh'
+              - 'tools/test_dispatch_package_site.sh'
               - 'tools/propose_automation_pr.sh'
               - 'tools/test_propose_automation_pr.sh'
               - 'tools/wait_for_automation_pr.sh'
@@ -132,6 +138,7 @@ jobs:
               - 'tools/install_portable_client_smoke.py'
               - 'tools/installed_agent_e2e.py'
               - 'tools/test_client_smoke_coverage.py'
+              - 'tools/test_installed_agent_environment.py'
               - 'tools/verify_client_smoke_log.py'
               - 'tools/codex-app-smoke-fixture.c'
               - 'tools/codex-app-smoke-fixture.cs'
@@ -179,10 +186,24 @@ jobs:
               - 'crates/pentect-cli/src/upstream.rs'
             command_shims:
               - 'crates/pentect-cli/src/main.rs'
+            claude_supervisor:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/pentect-cli/Cargo.toml'
+              - 'crates/pentect-cli/src/main.rs'
+              - 'crates/pentect-cli/src/claude_settings_session.rs'
+              - 'crates/pentect-cli/src/claude_unix_supervisor.rs'
+              - 'crates/pentect-cli/src/claude_windows_supervisor.rs'
+              - 'crates/pentect-cli/tests/native_interrupt.rs'
+              - 'crates/pentect-cli/tests/native_unix_supervisor.rs'
+              - 'crates/pentect-cli/tests/native_windows_supervisor.rs'
+              - 'crates/pentect-cli/tests/*claude*.rs'
             runtime_log:
               - 'crates/pentect-runtime/src/activity_log.rs'
               - 'crates/pentect-runtime/src/delegated_process_host.rs'
               - 'crates/pentect-runtime/src/memory_store.rs'
+              - 'crates/pentect-cli/tests/metrics.rs'
             runtime_main:
               - 'crates/pentect-runtime/src/main.rs'
       # Negated globs require AND semantics. With paths-filter's default OR
@@ -278,8 +299,11 @@ jobs:
         if: needs.changes.outputs.detector == 'true'
         run: cargo test -p pentect-runtime --lib --locked canonical_engine_construction_stays_off_the_warm_up_path -- --nocapture
       - name: Test plugin runtime
-        if: needs.changes.outputs.plugins == 'true'
+        if: needs.changes.outputs.plugins == 'true' && runner.os != 'Windows'
         run: cargo test -p pentect-runtime plugin_middleware::tests --locked
+      - name: Test plugin runtime without Windows process-start contention
+        if: needs.changes.outputs.plugins == 'true' && runner.os == 'Windows'
+        run: cargo test -p pentect-runtime plugin_middleware::tests --locked -- --test-threads=1
       - name: Test plugin CLI
         if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-cli plugins::tests --bin pentect --locked
@@ -323,14 +347,14 @@ jobs:
         if: needs.changes.result != 'success'
         run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true'
         with:
           submodules: recursive
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true'
       - name: Configure fast Windows test linking
-        if: runner.os == 'Windows' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true')
+        if: runner.os == 'Windows' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true')
         shell: pwsh
         run: |
           $linker = (Get-Command lld-link.exe -ErrorAction Stop).Source
@@ -338,7 +362,7 @@ jobs:
           "CARGO_PROFILE_TEST_DEBUG=0" >> $env:GITHUB_ENV
           "Using linker: $linker"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.claude_supervisor == 'true'
         with:
           save-if: ${{ github.event_name == 'push' }}
       - name: Test Codex App launcher and recovery
@@ -356,8 +380,18 @@ jobs:
       - name: Test Windows npm command shims
         if: needs.changes.outputs.command_shims == 'true' && runner.os == 'Windows'
         run: cargo test -p pentect-cli --no-default-features windows_npm_cmd_shim --locked
+      - name: Test Windows Claude supervisor
+        if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'Windows'
+        run: cargo test -p pentect-cli --no-default-features --bin pentect claude_windows_supervisor::tests --locked
+      - name: Test Windows native supervisor
+        if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'Windows'
+        run: cargo test -p pentect-cli --no-default-features --test native_windows_supervisor --locked
+      - name: Test macOS Claude supervisor boundaries
+        if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'macOS'
+        timeout-minutes: 5
+        run: cargo test -p pentect-cli --no-default-features --locked --test claude_guardian_boundary --test claude_unix_supervisor --test native_interrupt --test native_unix_supervisor
       - name: No app changes
-        if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true'
+        if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true' && needs.changes.outputs.claude_supervisor != 'true'
         run: echo "No app changes"
 
   windows-powershell-installer:
@@ -426,10 +460,13 @@ jobs:
         run: |
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
           python tools/test_client_smoke_coverage.py
+          python tools/test_installed_agent_environment.py
           python tools/test_release_package_metadata.py
           python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/installed_agent_e2e.py tools/test_client_smoke_coverage.py tools/test_release_package_metadata.py tools/verify_client_smoke_log.py
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/propose_automation_pr.sh tools/wait_for_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/download_recent_stable_debs.sh tools/prepare_stable_debs.sh tools/dispatch_package_site.sh tools/propose_automation_pr.sh tools/wait_for_automation_pr.sh tools/install_client_smoke.sh tools/test_install.sh tools/testdata/install-curl.sh
           sh tools/test_download_recent_stable_debs.sh
+          sh tools/test_prepare_stable_debs.sh
+          sh tools/test_dispatch_package_site.sh
           sh tools/test_install.sh
           bash -n .github/scripts/publish-aur.sh
           cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$RUNNER_TEMP/codex-app-smoke-fixture"
@@ -473,6 +510,11 @@ jobs:
       - name: Test runtime activity log
         if: needs.changes.outputs.runtime_log == 'true'
         run: cargo test -p pentect-runtime --no-default-features activity_log::tests --locked
+      - name: Test privacy metrics CLI
+        if: needs.changes.outputs.runtime_log == 'true'
+        run: |
+          cargo test -p pentect-cli --no-default-features --locked --test metrics
+          cargo test -p pentect-cli --all-features --locked --test metrics
       - name: Test general CLI changes
         if: needs.changes.outputs.cli_general == 'true'
         run: cargo test -p pentect-cli --no-default-features --locked

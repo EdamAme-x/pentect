@@ -66,8 +66,7 @@ pub(crate) fn run(
     // real OpenAI key into agent tools or extensions.
     command.env_remove("OPENAI_API_KEY");
     crate::apply_plugin_env(&mut command, &active_plugins)?;
-    crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
-    crate::apply_memory_store_env(&mut command, Some(&memory_store));
+    crate::apply_untrusted_client_env(&mut command, pentect)?;
 
     match client {
         IdeClient::Continue => {

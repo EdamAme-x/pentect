@@ -12,6 +12,7 @@ mod alcatraz;
 mod config;
 mod delegated_process_host;
 mod file_pointer_manager;
+mod handle_views;
 mod image_ocr;
 mod masking;
 mod memory_store;
@@ -19,6 +20,11 @@ mod network_address;
 mod output_remask;
 mod plugin_middleware;
 mod secure_io;
+pub use handle_views::{
+    classify_tool_input_field, process_recovery_tool_input, process_tool_input,
+    raw_code_representation_supported, HandleView, ToolInputError, ToolInputKind,
+    ValidatedToolInput, ViewResolver,
+};
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{
@@ -26,10 +32,23 @@ pub use plugin_middleware::{
     plugin_runtime_dirs_for_manifest, test_local_wasm_plugin, valid_plugin_publisher_workflow,
     windows_command_extension_supported, windows_executable_candidates, DetectSpansRun,
     MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware, PluginRuntimeDirs,
-    StopOutcome, DEFAULT_PUBLISHER_WORKFLOW,
+    StopOutcome, DEFAULT_PUBLISHER_WORKFLOW, MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT,
 };
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
+
+/// Guidance for integrations that support ordinary opaque handles and the
+/// optional explicit base64 representation.
+pub fn handle_view_contract() -> &'static str {
+    concat!(
+        "Protected handle operation rules:\n",
+        "- Keep an ordinary opaque handle as one complete quoted data argument or string. Pentect restores conservatively representable token values locally.\n",
+        "- When a value cannot be represented safely by that conservative rule, use the explicit `|base64` view in one quoted data argument or string, then decode locally through a data API such as argv, stdin, or a JSON serializer.\n",
+        "- A patch is structured syntax, not raw file content. Do not use a handle to generate patch grammar or line structure.\n",
+        "- Do not invoke Pentect, decode a raw handle yourself, print a secret, reread the source, or request an extra user action.\n",
+        "- Preserve the handle or view marker byte-for-byte until the complete local tool input is validated.\n",
+    )
+}
 mod session;
 mod shell;
 
@@ -83,8 +102,9 @@ pub fn agent_contract_instructions(_environment_prefix: &str) -> String {
         "Session rules:\n",
         "- Work normally with the host's tools and current shell. Do not invoke Pentect commands, explain the protection layer, or change approach because it is present unless the user asks.\n",
         "- User-authorized secret work is allowed: retrieve, read, use, transform, and store secrets at the requested destination. Complete it normally.\n",
-        "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
-        "- Copy a protected handle unchanged into the local tool input that needs the value. Pentect restores known handles after the provider response returns locally, including command, file, and MCP arguments. You do not need to know or print the plaintext.\n",
+        "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is an intentional protected handle, not corruption, truncation, invalid file content, or a failed operation; do not retry because it appears.\n",
+        "- Treat files containing protected handles as usable. Preserve every handle byte-for-byte while reading, reasoning about, or editing the surrounding content; do not delete, repair, expand, guess, or reformat it.\n",
+        "- Copy a protected handle unchanged into the local tool input that needs the represented value. Pentect restores known handles after the provider response returns locally, including command, file, and MCP arguments. You do not need to know or print the plaintext.\n",
         "- Once a handle exists, use it immediately. Do not reread or reparse the source file, fetch the same secret again, or claim that the secret is unavailable or inaccessible. Do not echo, print, decode, or reconstruct its value.\n",
         "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
     )
@@ -244,6 +264,14 @@ pub fn record_process_activity(
 
 pub fn flush_activity_log() {
     activity_log::flush_persistent();
+}
+
+/// Record completed local restoration of model-authored tool-call objects.
+///
+/// Callers stage this count while rewriting a response and invoke this only
+/// after the rewritten object has been encoded successfully.
+pub fn record_completed_tool_restorations(count: u64) {
+    activity_log::record_summary("resolve", "tool", count, BTreeMap::new(), None);
 }
 
 fn mask_input_into_memory_store_client(
@@ -417,6 +445,7 @@ pub fn resolve_text_from_active_memory_store(text: &str) -> Result<Option<String
     let store = MemoryStore::for_session(&session);
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
+        activity_log::record_restoration_blocked("exec-server");
         return Err("unknown masked handle in exec-server request".to_string());
     }
     Ok(Some(resolved))
@@ -461,6 +490,26 @@ impl ActiveMemoryStoreResolver {
             .recovery
             .as_ref()
             .map(|recovery| resolve_known_references(text, recovery, &self.env_bindings)))
+    }
+
+    /// Validate and resolve one complete string on a known tool surface.
+    pub fn resolve_tool_input(
+        &self,
+        text: &str,
+        kind: ToolInputKind,
+    ) -> Result<Option<String>, ToolInputError> {
+        match &self.recovery {
+            Some(recovery) => {
+                process_recovery_tool_input(text, kind, recovery).map(|value| Some(value.text))
+            }
+            None if pentect_core::scan_recovery_views(text)
+                .map_err(|_| ToolInputError::MalformedView)?
+                .is_empty() =>
+            {
+                Ok(None)
+            }
+            None => Err(ToolInputError::UnknownHandle),
+        }
     }
 
     fn from_recovery(recovery: pentect_core::Recovery) -> Self {
@@ -685,11 +734,26 @@ impl ActiveToolOutputMasker {
     }
 
     pub fn mask_tool_output(&mut self, text: &str) -> Result<Option<String>, String> {
+        self.mask_tool_output_with_plugins(text, true)
+    }
+
+    pub fn mask_tool_output_without_plugins(
+        &mut self,
+        text: &str,
+    ) -> Result<Option<String>, String> {
+        self.mask_tool_output_with_plugins(text, false)
+    }
+
+    fn mask_tool_output_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<Option<String>, String> {
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
-        let cache_key =
-            (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES).then(|| tool_output_cache_key(text));
+        let cache_key = (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES)
+            .then(|| tool_output_cache_key(text, run_plugins));
         if let Some(key) = cache_key {
             if let Some(cached) = self.cache.get(&key) {
                 if cached.masked_count > 0 {
@@ -702,7 +766,11 @@ impl ActiveToolOutputMasker {
                 return Ok(Some(cached.masked.clone()));
             }
         }
-        let masked = masker.mask_tool_output(text)?;
+        let masked = if run_plugins {
+            masker.mask_tool_output(text)?
+        } else {
+            masker.mask_tool_output_without_plugins(text)?
+        };
         masker.flush_activity();
         let total = masker.masked_count();
         let delta = total.saturating_sub(self.reported_masked_count);
@@ -732,11 +800,26 @@ impl ActiveToolOutputMasker {
     }
 
     pub fn mask_prompt_text(&mut self, text: &str) -> Result<Option<String>, String> {
+        self.mask_prompt_text_with_plugins(text, true)
+    }
+
+    pub fn mask_prompt_text_without_plugins(
+        &mut self,
+        text: &str,
+    ) -> Result<Option<String>, String> {
+        self.mask_prompt_text_with_plugins(text, false)
+    }
+
+    fn mask_prompt_text_with_plugins(
+        &mut self,
+        text: &str,
+        run_plugins: bool,
+    ) -> Result<Option<String>, String> {
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
-        let cache_key =
-            (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES).then(|| tool_output_cache_key(text));
+        let cache_key = (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES)
+            .then(|| prompt_cache_key(text, run_plugins));
         if let Some(key) = cache_key {
             if let Some(cached) = self.prompt_cache.get(&key) {
                 if cached.masked_count > 0 {
@@ -749,7 +832,11 @@ impl ActiveToolOutputMasker {
                 return Ok(Some(cached.masked.clone()));
             }
         }
-        let masked = masker.mask_prompt_text(text)?;
+        let masked = if run_plugins {
+            masker.mask_prompt_text(text)?
+        } else {
+            masker.mask_prompt_text_without_plugins(text)?
+        };
         masker.flush_activity();
         let total = masker.masked_count();
         let delta = total.saturating_sub(self.reported_masked_count);
@@ -813,11 +900,20 @@ fn remember_cached_output(
     order.push_back(key);
 }
 
-fn tool_output_cache_key(text: &str) -> [u8; 32] {
-    let digest = Sha256::digest(text.as_bytes());
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&digest);
-    key
+fn tool_output_cache_key(text: &str, run_plugins: bool) -> [u8; 32] {
+    masking_cache_key(b"pentect-tool-output-cache-v1", text, run_plugins)
+}
+
+fn prompt_cache_key(text: &str, run_plugins: bool) -> [u8; 32] {
+    masking_cache_key(b"pentect-prompt-cache-v1", text, run_plugins)
+}
+
+fn masking_cache_key(domain: &[u8], text: &str, run_plugins: bool) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update([u8::from(run_plugins)]);
+    digest.update(text.as_bytes());
+    digest.finalize().into()
 }
 
 pub fn mask_tool_output_into_active_memory_store(text: &str) -> Result<Option<String>, String> {
@@ -837,7 +933,7 @@ fn usage() {
          pentect exec \"<command>\"\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
-         pentect log [--json | --path]\n\
+         pentect log [--json] [--once [--tail N] | --follow | --path]\n\
          pentect metrics [--json]\n\
          \n\
          exec: masked output\n\
@@ -849,15 +945,54 @@ fn usage() {
 }
 
 fn cmd_log(args: &[String]) -> i32 {
-    if args.get(2).map(String::as_str) == Some("--path") && args.len() == 3 {
+    const DEFAULT_TAIL: usize = 100;
+    const MAX_TAIL: usize = 10_000;
+
+    let mut json = false;
+    let mut once = false;
+    let mut follow = false;
+    let mut path = false;
+    let mut tail = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !json => json = true,
+            "--once" if !once => once = true,
+            "--follow" if !follow => follow = true,
+            "--path" if !path => path = true,
+            "--tail" if tail.is_none() => {
+                index += 1;
+                let Some(raw) = args.get(index) else {
+                    return die("log --tail requires a record count");
+                };
+                tail = match raw.parse::<usize>() {
+                    Ok(value) if (1..=MAX_TAIL).contains(&value) => Some(value),
+                    _ => return die("log --tail must be between 1 and 10000"),
+                };
+            }
+            _ => return die("log [--json] [--once [--tail N] | --follow | --path]"),
+        }
+        index += 1;
+    }
+    if path {
+        if json || once || follow || tail.is_some() {
+            return die("log --path cannot be combined with other options");
+        }
         println!("{}", activity_log::persistent_log_path().display());
         return 0;
     }
-    let json = match args.get(2).map(String::as_str) {
-        None => false,
-        Some("--json") if args.len() == 3 => true,
-        _ => return die("log [--json | --path]"),
-    };
+    if once && follow {
+        return die("log --once and --follow cannot be combined");
+    }
+    if tail.is_some() && !once {
+        return die("log --tail requires --once");
+    }
+    if once {
+        return match activity_log::print_tail(json, tail.unwrap_or(DEFAULT_TAIL)) {
+            Ok(()) => 0,
+            Err(error) => die(&error),
+        };
+    }
     match activity_log::follow(json) {
         Ok(()) => 0,
         Err(error) => die(&error),
@@ -1446,19 +1581,22 @@ fn run_resolved_command(
     store: &MemoryStore,
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
-    match &opts.mode {
-        ExecMode::Program(args) => {
-            if args.is_empty() {
-                return Err("exec requires a program after `--`".to_string());
-            }
-            let env = requested_env_bindings(store, &opts.mode)?;
-            let resolved_args = resolve_command_args(store, args, opts.allow_secret_argv)?;
+    let resolved = resolve_exec_inputs(store, opts)?;
+    if resolved.restored() {
+        activity_log::record_resolve("exec", None);
+    }
+    match resolved {
+        ResolvedExecInputs::Program {
+            args: resolved_args,
+            env,
+            secret_stdin,
+            ..
+        } => {
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
             let mut command = Command::new(program);
             command.args(command_args);
             apply_child_env_overlays(&mut command, &env, &opts.session);
-            let secret_stdin = resolve_secret_stdin(store, opts)?;
             if let Some(secret) = secret_stdin.as_deref() {
                 run_command_with_stdin(command, secret)
             } else {
@@ -1467,17 +1605,64 @@ fn run_resolved_command(
                     .map_err(|error| command_start_error(&error))
             }
         }
-        ExecMode::Shell(command) => {
-            let command = resolve_command_text(store, command)?;
-            register_local_file_inputs(store, &command)?;
-            let env = requested_env_bindings(store, &opts.mode)?;
-            run_shell_script(&command, &env, &opts.session, opts.script_shell)
-        }
-        ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
+        ResolvedExecInputs::Shell {
+            command, script, ..
+        } => run_shell_command(command, &script),
     }
 }
 
 fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
+    let resolved = resolve_exec_inputs(store, opts)?;
+    if resolved.restored() {
+        activity_log::record_resolve("exec", None);
+    }
+    match resolved {
+        ResolvedExecInputs::Program {
+            args: resolved_args,
+            env,
+            secret_stdin,
+            ..
+        } => {
+            let program = &resolved_args[0];
+            let command_args = &resolved_args[1..];
+            let mut command = Command::new(program);
+            command.args(command_args);
+            apply_child_env_overlays(&mut command, &env, &opts.session);
+            run_live_command(
+                command,
+                secret_stdin.as_ref().map(|value| value.as_str()),
+                store.clone(),
+            )
+        }
+        ResolvedExecInputs::Shell {
+            command, script, ..
+        } => run_live_command(command, Some(&script), store.clone()),
+    }
+}
+
+enum ResolvedExecInputs {
+    Program {
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        secret_stdin: Option<Zeroizing<String>>,
+        restored: bool,
+    },
+    Shell {
+        command: Command,
+        script: String,
+        restored: bool,
+    },
+}
+
+impl ResolvedExecInputs {
+    fn restored(&self) -> bool {
+        match self {
+            Self::Program { restored, .. } | Self::Shell { restored, .. } => *restored,
+        }
+    }
+}
+
+fn resolve_exec_inputs(store: &MemoryStore, opts: &ExecOpts) -> Result<ResolvedExecInputs, String> {
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
@@ -1485,26 +1670,27 @@ fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<Exi
             }
             let env = requested_env_bindings(store, &opts.mode)?;
             let resolved_args = resolve_command_args(store, args, opts.allow_secret_argv)?;
-            let program = &resolved_args[0];
-            let command_args = &resolved_args[1..];
-            let mut command = Command::new(program);
-            command.args(command_args);
-            apply_child_env_overlays(&mut command, &env, &opts.session);
             let secret_stdin = resolve_secret_stdin(store, opts)?;
-            run_live_command(
-                command,
-                secret_stdin.as_ref().map(|value| value.as_str()),
-                store.clone(),
-            )
+            let restored = !env.is_empty() || resolved_args != *args || secret_stdin.is_some();
+            Ok(ResolvedExecInputs::Program {
+                args: resolved_args,
+                env,
+                secret_stdin,
+                restored,
+            })
         }
         ExecMode::Shell(command) => {
-            let command = resolve_command_text(store, command)?;
-            register_local_file_inputs(store, &command)?;
+            let resolved = resolve_command_text(store, command)?;
+            register_local_file_inputs(store, &resolved)?;
             let env = requested_env_bindings(store, &opts.mode)?;
+            let restored = resolved != *command || !env.is_empty();
             let mut shell = shell_script_command(opts.script_shell)?;
             apply_child_env_overlays(&mut shell, &env, &opts.session);
-            let command = prepare_shell_script(&command, opts.script_shell);
-            run_live_command(shell, Some(&command), store.clone())
+            Ok(ResolvedExecInputs::Shell {
+                command: shell,
+                script: prepare_shell_script(&resolved, opts.script_shell),
+                restored,
+            })
         }
         ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
@@ -1557,6 +1743,7 @@ fn resolve_command_args(
         let mut resolved = resolve_command_text(store, arg)?;
         if resolved != *arg && !allow_secret_argv {
             resolved.zeroize();
+            activity_log::record_restoration_blocked("argv");
             return Err(
                 "refusing to place a restored secret in process arguments; prefer target-specific stdin, file-descriptor, or configuration support, or pass --allow-secret-argv after reviewing same-user process visibility (a shell protects the model-facing command only, not child-process arguments)"
                     .to_string(),
@@ -1570,6 +1757,7 @@ fn resolve_command_args(
 fn resolve_command_text(store: &MemoryStore, text: &str) -> Result<String, String> {
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
+        activity_log::record_restoration_blocked("command");
         return Err(
             "unknown masked handle; use it inside the same running Pentect-launched agent session or re-register it with `pentect exec`"
                 .to_string(),
@@ -1919,15 +2107,7 @@ fn command_shell_start_error(error: &std::io::Error) -> String {
     format!("could not start command shell: {reason}")
 }
 
-fn run_shell_script(
-    script: &str,
-    env: &[(String, String)],
-    session: &str,
-    script_shell: ScriptShell,
-) -> Result<std::process::Output, String> {
-    let mut command = shell_script_command(script_shell)?;
-    apply_child_env_overlays(&mut command, env, session);
-    let script = prepare_shell_script(script, script_shell);
+fn run_shell_command(mut command: Command, script: &str) -> Result<std::process::Output, String> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3127,6 +3307,20 @@ fn safe_masked_read_component(value: &str) -> String {
             out.push('_');
         }
     }
+    // Sanitizing punctuation can otherwise collapse distinct source names
+    // (`a b.env` and `a_b.env`) onto one writable masked copy. Keep the
+    // readable form for ordinary names, but make every transformed component
+    // collision-resistant by carrying a digest of its original spelling.
+    // `_external` is a reserved first-level directory for sources outside
+    // the project root. Escape a project component with that spelling so a
+    // project file cannot alias the external-source namespace.
+    if out != value || value == "_external" {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        let digest = hasher.finalize();
+        out.push('~');
+        out.push_str(&data_encoding::HEXLOWER.encode(&digest[..6]));
+    }
     out
 }
 
@@ -3306,18 +3500,23 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
 fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, String> {
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
+        activity_log::record_restoration_blocked("file-repair");
         return Err(
             "masked handle is unavailable in this running Pentect session; re-read the source and retry."
                 .to_string(),
         );
     }
     if resolved == content {
+        activity_log::record_restoration_blocked("file-repair");
         return Err("masked handle is unavailable in this running Pentect session.".to_string());
     }
     Ok(resolved)
 }
 
 pub fn contains_pentect_masked_handle(text: &str) -> bool {
+    if pentect_core::scan_recovery_views(text).is_ok_and(|tokens| !tokens.is_empty()) {
+        return true;
+    }
     let mut offset = 0usize;
     while let Some(start_rel) = text[offset..].find("<<") {
         let start = offset + start_rel;
@@ -3746,7 +3945,7 @@ fn mask_tool_text_output(
     }
     let store = MemoryStore::for_session(session);
     let mut masker = OutputMasker::new_deferred(store)?;
-    let (updated, changed) = mask_tool_json(&output, &mut masker)?;
+    let (updated, changed) = mask_tool_json(&output, &mut masker, true)?;
     masker.flush()?;
     if changed || image_changed {
         Ok(ToolTextOutput::Updated(updated))
@@ -4007,10 +4206,18 @@ fn empty_json_value(value: &Value) -> bool {
     }
 }
 
-fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
+fn mask_tool_json(
+    value: &Value,
+    masker: &mut OutputMasker,
+    run_plugins: bool,
+) -> Result<(Value, bool), String> {
     let mut scalars = Vec::new();
     collect_tool_json_scalars(value, None, None, &[], &mut scalars);
-    let masked = masker.mask_tool_result_scalars(&scalars)?;
+    let masked = if run_plugins {
+        masker.mask_tool_result_scalars(&scalars)?
+    } else {
+        masker.mask_tool_result_scalars_without_plugins(&scalars)?
+    };
     let mut cursor = 0usize;
     let out = rebuild_masked_tool_json(value, &masked, &mut cursor)?;
     if cursor != masked.len() {
@@ -4199,15 +4406,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         }
         return Ok(buf);
     }
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("could not stat '{}': {e}", path.display()))?;
-    if metadata.len() > MAX_INPUT_BYTES as u64 {
-        return Err(format!(
-            "input '{}' exceeds {MAX_INPUT_BYTES} bytes",
-            path.display()
-        ));
-    }
-    std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
+    secure_io::read_bounded_bytes(path, MAX_INPUT_BYTES as u64, "input")
 }
 
 fn read_stdin_text() -> Result<String, String> {

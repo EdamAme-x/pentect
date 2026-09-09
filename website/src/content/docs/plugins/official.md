@@ -85,6 +85,35 @@ Test with fake data:
 echo "Email Alice at alice@example.test" | pentect mask
 ```
 
+### What CI verifies
+
+Plugin-sensitive pull requests run the installed plugin lifecycle on Linux,
+macOS, and Windows. That required CI uses deterministic manifest, Command, and
+Wasm fixtures to cover installation, approval, setup, update, removal,
+required and optional failures, process cleanup, scope isolation, and
+value-free diagnostics. It also runs the OpenAI Privacy Filter bridge unit
+tests with fixture setup state.
+
+Pull-request CI does **not** download the multi-gigabyte OpenAI Privacy Filter
+checkpoint, install its real managed Python environment, run model inference,
+test CUDA, or sign in to an AI provider. A green pull request therefore does
+not claim that those heavyweight boundaries were exercised.
+
+The repository includes a separate
+[`live_e2e.py`](https://github.com/EdamAme-x/pentect/blob/main/plugins/openai-privacy-filter/tests/live_e2e.py)
+for the real model. It verifies real setup and checkpoint state, the direct
+plugin protocol including a warm second request, cold and restarted Pentect
+masking, worker cleanup, removal, and an installed Codex flow against a
+localhost recorder without sending a request to OpenAI.
+
+The `OpenAI Privacy Filter live smoke` workflow runs this test weekly with the
+CPU profile and also supports manual CPU runs. The managed Python environment
+and checkpoint are cached by the setup revision and runtime identity. Its
+bounded artifact contains timing evidence and persistent logs only after a
+fixture-plaintext scan succeeds. A manually selected CUDA profile targets a
+separately managed self-hosted Linux runner labeled `gpu` and `nvidia`; CUDA is
+not a pull-request or scheduled-release gate.
+
 ### How it connects
 
 ```text

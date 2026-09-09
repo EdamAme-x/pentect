@@ -104,9 +104,7 @@ impl CloudCodeHttpProxyGuard {
         });
         let base_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| {
-                "Google Cloud Code gateway did not start within 30 seconds".to_string()
-            })??;
+            .map_err(|_| "Google Cloud Code gateway initialization timed out".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -277,6 +275,7 @@ async fn proxy_request_inner(
         );
     }
     let is_stream = endpoint == CloudCodeEndpoint::StreamGenerateContent;
+    let mut request_coverage = None;
     let upstream_url =
         crate::upstream::join_url(&state.upstream, path_and_query, "Google Cloud Code")?;
     let request_headers = request.headers().clone();
@@ -303,6 +302,7 @@ async fn proxy_request_inner(
             &state.plugins,
             state.block_unknown_formats,
         )?;
+        request_coverage = Some(protected.coverage);
         if let Some(response) = protected.local_response {
             if is_stream {
                 return Ok(text_response(
@@ -373,7 +373,9 @@ async fn proxy_request_inner(
     }
     builder = builder.header(
         "x-pentect-coverage",
-        if protected { "full" } else { "none" },
+        request_coverage
+            .unwrap_or(crate::http_files::Coverage::None)
+            .as_header(),
     );
     if event_stream && endpoint == CloudCodeEndpoint::StreamGenerateContent && status.is_success() {
         return builder
@@ -563,6 +565,7 @@ fn enforce_known_endpoint(
 #[derive(Debug)]
 struct ProtectedRequest {
     body: Bytes,
+    coverage: crate::http_files::Coverage,
     local_response: Option<Bytes>,
 }
 
@@ -584,6 +587,7 @@ fn protect_request_body(
             proxy_diagnostic("request-invalid-json");
             return Ok(ProtectedRequest {
                 body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
                 local_response: None,
             });
         }
@@ -596,6 +600,7 @@ fn protect_request_body(
             value,
             Some(serde_json::json!({"provider": "google-cloud-code", "transport": "http"})),
         )?;
+    let mut plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",
@@ -609,6 +614,7 @@ fn protect_request_body(
             .map_err(|error| format!("could not encode plugin response: {error}"))?;
         return Ok(ProtectedRequest {
             body: Bytes::new(),
+            coverage: crate::http_files::Coverage::Full,
             local_response: Some(body),
         });
     }
@@ -629,6 +635,7 @@ fn protect_request_body(
             "http_json",
         )
     }?;
+    plugin_partial |= inline_file_partial;
     if block_unknown_formats && inline_file_partial {
         return Err(
             "unknown format blocked: a file plugin reported partial Google Cloud Code inline-file coverage"
@@ -648,6 +655,7 @@ fn protect_request_body(
             proxy_diagnostic("request-protection-skipped");
             return Ok(ProtectedRequest {
                 body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
                 local_response: None,
             });
         }
@@ -666,6 +674,11 @@ fn protect_request_body(
         })?;
     Ok(ProtectedRequest {
         body,
+        coverage: if plugin_partial {
+            crate::http_files::Coverage::Partial
+        } else {
+            crate::http_files::Coverage::Full
+        },
         local_response: None,
     })
 }
@@ -924,16 +937,19 @@ fn rewrite_response_body(
     let mut value: Value = serde_json::from_slice(body).map_err(|error| {
         format!("unknown format blocked: Google Cloud Code response is not valid JSON ({error})")
     })?;
-    rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Google Cloud Code response: {error}"))
+    let restored_tools = rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
+    let encoded = serde_json::to_vec(&value).map_err(|error| {
+        format!("could not encode restored Google Cloud Code response: {error}")
+    })?;
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 fn rewrite_response_value(
     value: &mut Value,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     block_unknown_formats: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     validate_response_value(value, block_unknown_formats)?;
     let mut run = plugins
         .lock()
@@ -963,9 +979,9 @@ fn rewrite_response_value(
     run_tool_plugins(&mut payload, &plugins)?;
     drop(plugins);
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    resolve_function_calls(&mut payload, &mut resolve)?;
+    let restored_tools = resolve_function_calls(&mut payload, &mut resolve)?;
     *value = payload;
-    Ok(())
+    Ok(restored_tools)
 }
 
 fn validate_response_value(value: &Value, block_unknown_formats: bool) -> Result<(), String> {
@@ -1081,14 +1097,16 @@ fn run_tool_plugins(
     Ok(())
 }
 
-pub(crate) fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+pub(crate) fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<u64, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     match value {
         Value::Array(values) => {
             for value in values {
-                resolve_function_calls(value, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_function_calls(value, resolve)?);
             }
         }
         Value::Object(object) => {
@@ -1098,23 +1116,26 @@ where
                     let encoded = serde_json::to_string(args).map_err(|error| {
                         format!("could not encode Google tool arguments: {error}")
                     })?;
-                    let restored = crate::claude_http_proxy::resolve_tool_input_json(
-                        &encoded,
-                        name.as_deref(),
-                        resolve,
-                    )?;
+                    let (restored, changed) =
+                        crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                            &encoded,
+                            name.as_deref(),
+                            resolve,
+                        )?;
                     *args = serde_json::from_str(&restored).map_err(|error| {
                         format!("restored Google tool arguments are invalid: {error}")
                     })?;
+                    restored_tools = restored_tools.saturating_add(u64::from(changed));
                 }
             }
             for child in object.values_mut() {
-                resolve_function_calls(child, resolve)?;
+                restored_tools =
+                    restored_tools.saturating_add(resolve_function_calls(child, resolve)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
 struct StreamState {
@@ -1221,8 +1242,7 @@ fn rewrite_sse_block(
             return Ok(Bytes::copy_from_slice(block));
         }
     };
-    let data = text
-        .lines()
+    let data = crate::sse::lines(text)
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
         .collect::<Vec<_>>();
     if data.is_empty() || data == ["[DONE]"] {
@@ -1240,17 +1260,24 @@ fn rewrite_sse_block(
             return Ok(Bytes::copy_from_slice(block));
         }
     };
-    rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
+    let restored_tools = rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
     let encoded = serde_json::to_string(&value)
         .map_err(|error| format!("could not encode Google Cloud Code SSE event: {error}"))?;
-    let ending = if text.ends_with("\r\n\r\n") {
+    let ending = if text.ends_with("\r\r") {
+        "\r\r"
+    } else if text.ends_with("\r\n\r\n") {
         "\r\n\r\n"
     } else {
         "\n\n"
     };
-    let line_ending = if ending == "\r\n\r\n" { "\r\n" } else { "\n" };
-    let metadata = text
-        .lines()
+    let line_ending = if ending == "\r\n\r\n" {
+        "\r\n"
+    } else if ending == "\r\r" {
+        "\r"
+    } else {
+        "\n"
+    };
+    let metadata = crate::sse::lines(text)
         .filter(|line| !line.starts_with("data:"))
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
@@ -1262,6 +1289,7 @@ fn rewrite_sse_block(
     output.push_str("data: ");
     output.push_str(&encoded);
     output.push_str(ending);
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
     Ok(Bytes::from(output))
 }
 
@@ -1290,19 +1318,7 @@ async fn read_response_capped(response: reqwest::Response) -> Result<Option<Byte
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {
@@ -1353,6 +1369,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -1496,6 +1513,24 @@ mod tests {
         Some(text[start..end].to_string())
     }
 
+    #[test]
+    fn compatible_unprotected_request_reports_partial_coverage() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let protected = protect_request_body(
+            &Bytes::from_static(b"not-json"),
+            CloudCodeEndpoint::GenerateContent,
+            &masker,
+            &plugins,
+            false,
+        )
+        .unwrap();
+        assert_eq!(protected.coverage, crate::http_files::Coverage::Partial);
+    }
+
     fn mock_cloud_code_upstream() -> (
         String,
         std::sync::mpsc::Receiver<String>,
@@ -1549,7 +1584,7 @@ mod tests {
             .to_string();
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Pentect-Coverage: forged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response.len(),
                 response
             )
@@ -1724,7 +1759,7 @@ mod tests {
             ]}}]}
         });
         let mut resolve = |text: &str| Ok(text.replace(handle, "C:/private.txt"));
-        resolve_function_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(resolve_function_calls(&mut value, &mut resolve).unwrap(), 1);
         assert_eq!(
             value["response"]["candidates"][0]["content"]["parts"][0]["text"],
             handle
@@ -1801,9 +1836,17 @@ mod tests {
             .send()
             .unwrap()
             .error_for_status()
-            .unwrap()
-            .text()
             .unwrap();
+        assert_eq!(response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
+        let response = response.text().unwrap();
         let response: Value = serde_json::from_str(&response).unwrap();
         let request = captured
             .recv_timeout(std::time::Duration::from_secs(5))

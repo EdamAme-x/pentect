@@ -36,7 +36,8 @@ pub use detect::{
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats, DecodeConfig, DecodeDetector, DecodeLimitReason, Detector,
     EnvValueDetector, ExplicitSecretDetector, KeyValueDetector, PatternMatchDetector, PatternSpec,
-    RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    PentectTempParser, RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector,
+    UrlDetector,
 };
 pub use model::{
     ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
@@ -52,7 +53,10 @@ pub use pipeline::{
 pub use placeholder::{parse_placeholder, LengthHint, PlaceholderParts};
 pub use policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use policy::{Action, MaskAll, Policy, Profile, ProfilePolicy};
-pub use recovery::{restore, Recovery, RecoveryError, RestoreError};
+pub use recovery::{
+    restore, scan_recovery_views, Recovery, RecoveryError, RecoveryStreamRemasker,
+    RecoveryViewError, RecoveryViewKind, RecoveryViewScanError, RecoveryViewToken, RestoreError,
+};
 
 /// Mask with the default engine. Build an `Engine` once for repeated calls.
 pub fn mask(input: Input, config: &Config) -> MaskResult {

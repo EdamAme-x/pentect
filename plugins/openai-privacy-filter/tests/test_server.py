@@ -123,6 +123,59 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(result["action"], "next")
         self.assertEqual(len(result["spans"]), 1)
 
+    def test_cpu_runtime_uses_bounded_moe_batches(self) -> None:
+        mlps = [SimpleNamespace(torch_ops_batch=None) for _ in range(2)]
+        runtime = SimpleNamespace(
+            model=SimpleNamespace(
+                block=[SimpleNamespace(mlp=mlp) for mlp in mlps]
+            )
+        )
+        redactor = mock.Mock()
+        redactor.get_runtime.return_value = runtime
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = SERVER.configure_runtime(redactor, "cpu")
+
+        self.assertIs(result, runtime)
+        self.assertEqual(
+            [mlp.torch_ops_batch for mlp in mlps],
+            [SERVER.DEFAULT_CPU_MOE_BATCH_SIZE] * 2,
+        )
+
+    def test_cpu_batch_override_can_disable_chunking(self) -> None:
+        mlp = SimpleNamespace(torch_ops_batch=32)
+        runtime = SimpleNamespace(
+            model=SimpleNamespace(block=[SimpleNamespace(mlp=mlp)])
+        )
+        redactor = mock.Mock()
+        redactor.get_runtime.return_value = runtime
+
+        with mock.patch.dict(
+            os.environ, {"PENTECT_OPF_CPU_MOE_BATCH_SIZE": "0"}, clear=True
+        ):
+            SERVER.configure_runtime(redactor, "cpu")
+
+        self.assertEqual(mlp.torch_ops_batch, 32)
+
+    def test_gpu_runtime_is_not_modified(self) -> None:
+        mlp = SimpleNamespace(torch_ops_batch=32)
+        runtime = SimpleNamespace(
+            model=SimpleNamespace(block=[SimpleNamespace(mlp=mlp)])
+        )
+        redactor = mock.Mock()
+        redactor.get_runtime.return_value = runtime
+
+        SERVER.configure_runtime(redactor, "cuda")
+
+        self.assertEqual(mlp.torch_ops_batch, 32)
+
+    def test_invalid_cpu_batch_override_is_rejected(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"PENTECT_OPF_CPU_MOE_BATCH_SIZE": "many"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "non-negative integer"):
+                SERVER._cpu_moe_batch_size()
+
 
 if __name__ == "__main__":
     unittest.main()

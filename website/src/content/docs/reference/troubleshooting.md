@@ -115,6 +115,21 @@ Pentect also uses this error for an unknown nested server-history shape, even in
 unknown-format compatibility mode. Pentect cannot safely rewrite or inspect an
 unrecognized provider-owned block while preserving resumable history.
 
+## Codex logs an initial HTTP 426 error
+
+With Codex CLI 0.153.0, an initial Responses WebSocket attempt can receive HTTP
+426 from Pentect and be logged by Codex as an error before Codex retries the
+same turn through protected HTTP/SSE. This negotiation message is expected when
+the retry succeeds. Pentect keeps Codex's built-in provider identity so saved
+threads remain resumable; that verified client version does not expose a
+working built-in-provider setting to suppress only the initial attempt.
+
+Do not ignore a failed `POST /responses`, a turn that never retries, or a final
+gateway error. Those indicate a genuine request failure and still need the
+normal diagnostics from `pentect doctor` and `pentect log --once --tail 100`.
+Future Codex versions may add a supported HTTP-only control, so check current
+Pentect compatibility guidance after upgrading.
+
 ## A plugin does not run
 
 ```sh
@@ -190,13 +205,21 @@ attach a request sample.
 ```sh
 pentect log
 pentect log --json
+pentect log --once --tail 100
+pentect log --json --once --tail 100
 pentect log --path
 ```
 
 Pentect persists process starts, exit codes, gateway activity, and panic
 diagnostics to `~/.pentect/logs/pentect.log`. `pentect log` reads that history
-before following live events, `--json` keeps the JSONL representation, and
-`--path` prints the exact file location. Panic entries include the Pentect
+before following live events, `--once` prints a bounded snapshot and exits,
+`--tail` selects 1 to 10,000 records (`--once` defaults to 100), `--json` keeps
+the JSONL representation, and `--path` prints the exact file location. Use
+`--follow` to request the existing live-follow behavior explicitly. A bounded
+read is best effort during concurrent writes or rotation; it can omit or repeat
+an event across files rather than claiming an atomic multi-file snapshot. Human
+follow output marks the transition to waiting for live events; JSONL contains
+events only. Panic entries include the Pentect
 version, OS, architecture, PID, source location, and a backtrace so a crash can
 be investigated after the process exits.
 

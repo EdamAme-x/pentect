@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +33,8 @@ use crate::handle_contract::HANDLE_CONTRACT;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAT_TOOL_CALLS: usize = 1024;
+const CHAT_TOOL_INPUT_REJECTED: &str = "openai-chat-tool-input-rejected";
+const CHAT_TOOL_INPUT_ERROR_SSE: &[u8] = b"data: {\"error\":{\"message\":\"Pentect rejected a protected tool input\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"pentect_tool_input_rejected\"}}\n\n";
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
 fn proxy_diagnostic(reason: &str) {
@@ -64,7 +67,22 @@ type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
-type HandleResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
+type HandleResolver =
+    Box<dyn FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send>;
+
+fn request_scoped_bounded_resolver(limit: usize) -> HandleResolver {
+    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+    let mut resolved_bytes = 0usize;
+    Box::new(move |text, kind| {
+        let mut resolved = resolve(text, kind)?;
+        resolved_bytes = resolved_bytes.saturating_add(resolved.len());
+        if resolved_bytes > limit {
+            resolved.zeroize();
+            return Err("OpenAI restored response exceeded inspection limit".to_string());
+        }
+        Ok(resolved)
+    })
+}
 
 pub(crate) struct OpenAiHttpProxyGuard {
     base_url: String,
@@ -139,7 +157,7 @@ impl OpenAiHttpProxyGuard {
         });
         let base_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "OpenAI HTTP gateway did not start within 30 seconds".to_string())??;
+            .map_err(|_| "OpenAI HTTP gateway initialization timed out".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -288,15 +306,16 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let request_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
     let context = crate::gateway_diagnostics::RequestContext {
-        endpoint: classify_openai_endpoint(
-            request
-                .uri()
-                .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/"),
-        )
-        .diagnostic_name(),
+        endpoint: authenticated_request_path(request_path, &state.auth)
+            .map(classify_openai_endpoint)
+            .unwrap_or(OpenAiEndpoint::Unknown)
+            .diagnostic_name(),
         method: crate::gateway_diagnostics::method_name(request.method()),
     };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
@@ -1804,14 +1823,18 @@ fn mask_openai_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
+    remove_codex_request_metadata(value);
     if let Some(Value::String(instructions)) = value.get_mut("instructions") {
         // Instructions are supplied by the client or provider, not authored by
         // the current user. Prompt-only unmask markers must never take effect
         // here.
-        mask_text(instructions, true, masker)?;
+        let masked = masker
+            .mask_tool_output_without_plugins(instructions)?
+            .ok_or_else(|| "content inspection is unavailable".to_string())?;
+        *instructions = masked;
     }
     if let Some(input) = value.get_mut("input") {
-        mask_openai_input(input, false, masker, files)?;
+        mask_openai_responses_input(input, masker, files)?;
     }
     if let Some(messages) = value.get_mut("messages") {
         mask_chat_messages(messages, masker, files)?;
@@ -1831,14 +1854,66 @@ fn mask_openai_request(
     // Standalone search commands are derived from the current user request.
     // Scan every string because queries and location/filter values do not use
     // Responses content blocks.
-    for (field, external_content) in [
-        ("commands", false),
-        ("settings", false),
-        ("reasoning", true),
-    ] {
+    for (field, external_content) in [("commands", false), ("settings", false)] {
         if let Some(search_value) = value.get_mut(field) {
             let mut nodes = 0_usize;
             mask_search_value(search_value, external_content, 0, &mut nodes, masker)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_codex_request_metadata(value: &mut Value) {
+    let Some(client_metadata) = value
+        .get_mut("client_metadata")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    client_metadata.remove("x-codex-turn-metadata");
+}
+
+fn mask_openai_responses_input(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    let Value::Array(items) = value else {
+        return mask_openai_input(value, false, masker, files);
+    };
+    let current_user_index = items.iter().rposition(|item| {
+        item.as_object().is_some_and(|object| {
+            object.get("type").and_then(Value::as_str) == Some("message")
+                && object.get("role").and_then(Value::as_str) == Some("user")
+        })
+    });
+    let original = std::mem::take(items);
+    for (index, mut item) in original.into_iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let external_content = Some(index) != current_user_index;
+        let (note, computer_output) = match item_type {
+            "input_image" => (
+                match item.as_object_mut() {
+                    Some(object) => inspect_openai_image(object)?,
+                    None => None,
+                },
+                false,
+            ),
+            "computer_call_output" => (
+                match item.as_object_mut() {
+                    Some(object) => inspect_computer_call_output(object, files)?,
+                    None => None,
+                },
+                true,
+            ),
+            _ => {
+                mask_openai_input(&mut item, external_content, masker, files)?;
+                (None, false)
+            }
+        };
+        items.push(item);
+        if let Some(text) = note {
+            items.push(openai_image_mask_note(text, computer_output));
         }
     }
     Ok(())
@@ -2097,7 +2172,10 @@ fn mask_openai_input(
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     match value {
-        Value::String(text) => mask_text(text, tool_result, masker),
+        Value::String(text) => {
+            log_large_openai_plugin_input("responses-string", text, tool_result);
+            mask_text(text, tool_result, masker)
+        }
         Value::Array(items) => {
             let original = std::mem::take(items);
             for mut item in original {
@@ -2153,6 +2231,7 @@ fn mask_openai_input(
                 }
                 "input_text" | "output_text" => {
                     if let Some(Value::String(text)) = object.get_mut("text") {
+                        log_large_openai_plugin_input(item_type.as_str(), text, tool_result);
                         mask_text(text, tool_result, masker)?;
                     }
                 }
@@ -2169,7 +2248,7 @@ fn mask_openai_input(
                 "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
                 "message" => {
                     let external_content =
-                        object.get("role").and_then(Value::as_str) != Some("user");
+                        tool_result || object.get("role").and_then(Value::as_str) != Some("user");
                     if let Some(content) = object.get_mut("content") {
                         mask_openai_input(content, external_content, masker, files)?;
                     }
@@ -2185,6 +2264,15 @@ fn mask_openai_input(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn log_large_openai_plugin_input(source: &str, text: &str, external_content: bool) {
+    if !external_content && text.len() >= 1024 {
+        eprintln!(
+            "[pentect] inspecting large OpenAI user input with plugins; source={source} input_bytes={}",
+            text.len()
+        );
     }
 }
 
@@ -2323,13 +2411,20 @@ fn mask_text(
 fn rewrite_openai_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))?;
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    rewrite_function_calls(&mut value, &mut resolve)?;
+    let original = value.clone();
+    let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
+    let restored_tools = ToolRestorationDedup::default()
+        .commit_nonstream(rewrite_function_calls(&mut value, &mut resolve)?);
     if restore_output {
         restore_openai_output_text(&mut value, &mut resolve)?;
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored OpenAI response: {error}"))
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    if value == original {
+        Ok(body.to_vec())
+    } else {
+        serde_json::to_vec(&value)
+            .map_err(|error| format!("could not encode restored OpenAI response: {error}"))
+    }
 }
 
 fn rewrite_chat_completions_json_response(
@@ -2338,36 +2433,48 @@ fn rewrite_chat_completions_json_response(
 ) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI Chat Completions response was not valid JSON: {error}"))?;
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    rewrite_chat_tool_calls(&mut value, &mut resolve)?;
+    let original = value.clone();
+    let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
+    let restored_tools = rewrite_chat_tool_calls(&mut value, &mut resolve)?;
     if restore_output {
         restore_chat_output_text(&mut value, &mut resolve)?;
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Chat Completions response: {error}"))
+    crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
+    if value == original {
+        Ok(body.to_vec())
+    } else {
+        serde_json::to_vec(&value).map_err(|error| {
+            format!("could not encode restored Chat Completions response: {error}")
+        })
+    }
 }
 
 fn rewrite_completions_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI Completions response was not valid JSON: {error}"))?;
+    let original = value.clone();
     if restore_output {
-        let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+        let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
         restore_completion_output_text(&mut value, &mut resolve)?;
     }
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Completions response: {error}"))
+    if value == original {
+        Ok(body.to_vec())
+    } else {
+        serde_json::to_vec(&value)
+            .map_err(|error| format!("could not encode restored Completions response: {error}"))
+    }
 }
 
 fn restore_completion_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
         return Ok(());
     };
     for choice in choices {
         if let Some(Value::String(text)) = choice.get_mut("text") {
-            *text = resolve(text)?;
+            *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
         }
     }
     Ok(())
@@ -2375,7 +2482,7 @@ where
 
 fn restore_openai_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     match value {
         Value::Array(values) => {
@@ -2390,7 +2497,7 @@ where
             );
             if restores_text {
                 if let Some(Value::String(text)) = object.get_mut("text") {
-                    *text = resolve(text)?;
+                    *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
                 }
             }
             for key in ["output", "content", "summary", "response", "item"] {
@@ -2406,7 +2513,7 @@ where
 
 fn restore_chat_output_text<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
         return Ok(());
@@ -2417,12 +2524,12 @@ where
         };
         if let Some(content) = message.get_mut("content") {
             match content {
-                Value::String(text) => *text = resolve(text)?,
+                Value::String(text) => *text = resolve(text, pentect_agent::ToolInputKind::Data)?,
                 Value::Array(parts) => {
                     for part in parts {
                         if part.get("type").and_then(Value::as_str) == Some("text") {
                             if let Some(Value::String(text)) = part.get_mut("text") {
-                                *text = resolve(text)?;
+                                *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
                             }
                         }
                     }
@@ -2432,19 +2539,20 @@ where
         }
         for field in ["reasoning_content", "reasoning"] {
             if let Some(Value::String(text)) = message.get_mut(field) {
-                *text = resolve(text)?;
+                *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
             }
         }
     }
     Ok(())
 }
 
-fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<u64, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
     let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
-        return Ok(());
+        return Ok(0);
     };
     for choice in choices {
         let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
@@ -2468,25 +2576,28 @@ where
             else {
                 continue;
             };
-            let restored = crate::claude_http_proxy::resolve_tool_input_json(
-                &arguments,
-                tool_name.as_deref(),
-                resolve,
-            )?;
+            let (restored, changed) =
+                crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
+                    &arguments,
+                    tool_name.as_deref(),
+                    resolve,
+                )?;
             call["function"]["arguments"] = Value::String(restored);
+            restored_tools = restored_tools.saturating_add(u64::from(changed));
         }
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
-fn rewrite_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+fn rewrite_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<Vec<Vec<String>>, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
+    let mut restored_tools = Vec::new();
     match value {
         Value::Array(values) => {
             for value in values {
-                rewrite_function_calls(value, resolve)?;
+                restored_tools.extend(rewrite_function_calls(value, resolve)?);
             }
         }
         Value::Object(object) => {
@@ -2503,6 +2614,8 @@ where
                     )
                 });
             if is_function_call {
+                let mut call_changed = false;
+                let call_identities = function_call_identities(object);
                 let is_custom_call =
                     object
                         .get("type")
@@ -2524,33 +2637,108 @@ where
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     });
+                let event_kind = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let required_payload = if matches!(
+                    event_kind,
+                    "function_call" | "response.function_call_arguments.done"
+                ) {
+                    Some("arguments")
+                } else if matches!(
+                    event_kind,
+                    "custom_tool_call" | "response.custom_tool_call_input.done"
+                ) && tool_name.as_deref().is_some_and(|name| {
+                    classify_openai_custom_tool_input(name) != pentect_agent::ToolInputKind::Unknown
+                }) {
+                    Some("input")
+                } else {
+                    None
+                };
+                if required_payload
+                    .is_some_and(|key| !object.get(key).is_some_and(Value::is_string))
+                {
+                    return Err(
+                        "OpenAI completed tool call is missing its input payload".to_string()
+                    );
+                }
                 for key in ["arguments", "input"] {
                     if let Some(Value::String(arguments)) = object.get_mut(key) {
-                        *arguments = if is_custom_call && key == "input" {
-                            resolve(arguments)?
+                        let (resolved, changed) = if is_custom_call && key == "input" {
+                            let kind = tool_name
+                                .as_deref()
+                                .map(classify_openai_custom_tool_input)
+                                .unwrap_or(pentect_agent::ToolInputKind::Unknown);
+                            if kind == pentect_agent::ToolInputKind::Unknown {
+                                (arguments.clone(), false)
+                            } else {
+                                let resolved = resolve(arguments, kind)?;
+                                let changed = resolved != *arguments;
+                                (resolved, changed)
+                            }
                         } else {
-                            crate::claude_http_proxy::resolve_tool_input_json(
+                            crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
                                 arguments,
                                 tool_name.as_deref(),
                                 resolve,
                             )?
                         };
+                        *arguments = resolved;
+                        call_changed |= changed;
                     }
+                }
+                if call_changed {
+                    restored_tools.push(call_identities);
                 }
             }
             if let Some(item) = object.get_mut("item") {
-                rewrite_function_calls(item, resolve)?;
+                restored_tools.extend(rewrite_function_calls(item, resolve)?);
             }
             if let Some(response) = object.get_mut("response") {
-                rewrite_function_calls(response, resolve)?;
+                restored_tools.extend(rewrite_function_calls(response, resolve)?);
             }
             if let Some(output) = object.get_mut("output") {
-                rewrite_function_calls(output, resolve)?;
+                restored_tools.extend(rewrite_function_calls(output, resolve)?);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(restored_tools)
+}
+
+fn classify_openai_custom_tool_input(tool_name: &str) -> pentect_agent::ToolInputKind {
+    match tool_name {
+        "exec" | "functions.exec" | "exec_command" | "shell" | "bash" | "PowerShell" => {
+            pentect_agent::ToolInputKind::Code
+        }
+        "apply_patch" => pentect_agent::ToolInputKind::Patch,
+        _ => pentect_agent::ToolInputKind::Unknown,
+    }
+}
+
+fn function_call_identities(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut identities = Vec::new();
+    for key in ["item_id", "id", "call_id"] {
+        if let Some(identity) = object.get(key).and_then(Value::as_str) {
+            if identity.is_empty() || identity.len() > 256 {
+                continue;
+            }
+            let namespace = if key == "call_id" { "call" } else { "item" };
+            let identity = format!("{namespace}:{identity}");
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+    }
+    if let Some(item) = object.get("item").and_then(Value::as_object) {
+        for identity in function_call_identities(item) {
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+    }
+    identities
 }
 
 async fn read_response_capped(response: reqwest::Response) -> Result<Option<Bytes>, String> {
@@ -2580,6 +2768,81 @@ struct StreamState {
     block_unknown_formats: bool,
     output_text: HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     output_resolve: HandleResolver,
+    restored_tools: ToolRestorationDedup,
+    responses_tool_pending: VecDeque<Bytes>,
+    responses_tool_pending_bytes: usize,
+    responses_tool_started: HashSet<String>,
+    responses_tool_completed: HashSet<String>,
+}
+
+#[derive(Default)]
+struct ToolRestorationDedup {
+    identities: HashSet<u64>,
+    calls: usize,
+    full: bool,
+}
+
+impl ToolRestorationDedup {
+    fn commit_nonstream(&mut self, restored: Vec<Vec<String>>) -> u64 {
+        let mut count = 0u64;
+        let mut identified = Vec::new();
+        for identities in restored {
+            if identities.is_empty() {
+                count = count.saturating_add(1);
+            } else {
+                identified.push(identities);
+            }
+        }
+        count.saturating_add(self.commit(identified))
+    }
+
+    fn commit(&mut self, restored: Vec<Vec<String>>) -> u64 {
+        let mut count = 0u64;
+        for identities in restored {
+            if self.full {
+                break;
+            }
+            if identities.is_empty() {
+                continue;
+            }
+            let identities = identities
+                .iter()
+                .map(|identity| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    identity.hash(&mut hasher);
+                    hasher.finish()
+                })
+                .collect::<Vec<_>>();
+            let already_known = identities
+                .iter()
+                .any(|identity| self.identities.contains(identity));
+            let new_identities = identities
+                .into_iter()
+                .filter(|identity| !self.identities.contains(identity))
+                .collect::<Vec<_>>();
+            if already_known {
+                if self.identities.len().saturating_add(new_identities.len())
+                    > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+                {
+                    self.full = true;
+                    break;
+                }
+                self.identities.extend(new_identities);
+                continue;
+            }
+            if self.calls >= MAX_CHAT_TOOL_CALLS
+                || self.identities.len().saturating_add(new_identities.len())
+                    > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+            {
+                self.full = true;
+                break;
+            }
+            self.identities.extend(new_identities);
+            self.calls = self.calls.saturating_add(1);
+            count = count.saturating_add(1);
+        }
+        count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2592,13 +2855,43 @@ enum StreamTransform {
 
 fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), String> {
     let block = run_sse_response_plugins(&block, &state.plugins, state.block_unknown_formats)?;
+    let responses_tool_event =
+        state.transform == StreamTransform::Responses && sse_block_contains_tool_call(&block);
+    let responses_completed =
+        state.transform == StreamTransform::Responses && sse_block_is_completed_response(&block);
+    if state.transform == StreamTransform::Responses {
+        record_responses_tool_progress(
+            &block,
+            &mut state.responses_tool_started,
+            &mut state.responses_tool_completed,
+        );
+        if state.responses_tool_started.len() > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+            || state.responses_tool_completed.len() > MAX_CHAT_TOOL_CALLS.saturating_mul(3)
+            || state
+                .responses_tool_started
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(
+                    state
+                        .responses_tool_completed
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>(),
+                )
+                > MAX_PENDING_SSE_BYTES
+        {
+            return Err("OpenAI Responses produced too many tool call identities".to_string());
+        }
+    }
     let rewritten = match state.transform {
-        StreamTransform::Responses => rewrite_openai_sse_block(
+        StreamTransform::Responses => rewrite_openai_sse_block_tracked(
             &block,
             &state.plugins,
             state.restore_output,
             &mut state.output_text,
             &mut state.output_resolve,
+            &mut state.restored_tools,
         ),
         StreamTransform::ChatCompletions => state.chat.rewrite_block(
             &block,
@@ -2615,18 +2908,180 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
     }?;
     for block in rewritten {
         if !block.is_empty() {
+            if responses_tool_event || !state.responses_tool_pending.is_empty() {
+                state.responses_tool_pending_bytes = state
+                    .responses_tool_pending_bytes
+                    .saturating_add(block.len());
+                if state.responses_tool_pending_bytes > MAX_PENDING_SSE_BYTES {
+                    return Err(
+                        "OpenAI Responses tool stream exceeded inspection limit".to_string()
+                    );
+                }
+                state.responses_tool_pending.push_back(block);
+            } else {
+                state.ready.push_back(Ok(Frame::data(block)));
+            }
+        }
+    }
+    if responses_completed && !state.responses_tool_pending.is_empty() {
+        if !state
+            .responses_tool_started
+            .is_subset(&state.responses_tool_completed)
+        {
+            return Err("OpenAI Responses completed with an incomplete tool call".to_string());
+        }
+        while let Some(block) = state.responses_tool_pending.pop_front() {
             state.ready.push_back(Ok(Frame::data(block)));
         }
+        state.responses_tool_pending_bytes = 0;
     }
     Ok(())
 }
 
+fn sse_block_is_completed_response(block: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return false;
+    };
+    let Some(data) = sse_data(text) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(data.as_ref()) else {
+        return false;
+    };
+    value.get("type").and_then(Value::as_str) == Some("response.completed")
+        && value
+            .get("response")
+            .and_then(|response| response.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed")
+}
+
+fn sse_block_contains_tool_call(block: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return false;
+    };
+    let Some(data) = sse_data(text) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(data.as_ref()) else {
+        return false;
+    };
+    contains_any_function_call(&value)
+        || matches!(
+            value.get("type").and_then(Value::as_str),
+            Some(
+                "response.function_call_arguments.delta"
+                    | "response.function_call_arguments.done"
+                    | "response.custom_tool_call_input.delta"
+                    | "response.custom_tool_call_input.done"
+            )
+        )
+}
+
+fn contains_any_function_call(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_any_function_call),
+        Value::Object(object) => {
+            matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) || object.values().any(contains_any_function_call)
+        }
+        _ => false,
+    }
+}
+
+fn record_responses_tool_progress(
+    block: &[u8],
+    started: &mut HashSet<String>,
+    completed: &mut HashSet<String>,
+) {
+    let Some(data) = std::str::from_utf8(block).ok().and_then(sse_data) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(data.as_ref()) else {
+        return;
+    };
+    fn visit(
+        value: &Value,
+        completion_envelope: bool,
+        started: &mut HashSet<String>,
+        completed: &mut HashSet<String>,
+    ) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, completion_envelope, started, completed);
+                }
+            }
+            Value::Object(object) => {
+                let call = matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("function_call" | "custom_tool_call")
+                );
+                if call {
+                    for identity in function_call_identities(object) {
+                        started.insert(identity.clone());
+                        let has_payload = match object.get("type").and_then(Value::as_str) {
+                            Some("function_call") => {
+                                object.get("arguments").is_some_and(Value::is_string)
+                            }
+                            Some("custom_tool_call") => {
+                                object.get("input").is_some_and(Value::is_string)
+                            }
+                            _ => false,
+                        };
+                        if completion_envelope && has_payload {
+                            completed.insert(identity);
+                        }
+                    }
+                }
+                for value in object.values() {
+                    visit(value, completion_envelope, started, completed);
+                }
+            }
+            _ => {}
+        }
+    }
+    let event_type = value.get("type").and_then(Value::as_str);
+    let completion_envelope = matches!(
+        event_type,
+        Some("response.output_item.done" | "response.completed")
+    );
+    visit(&value, completion_envelope, started, completed);
+    if matches!(
+        event_type,
+        Some(
+            "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+                | "response.custom_tool_call_input.delta"
+                | "response.custom_tool_call_input.done"
+        )
+    ) {
+        let payload_is_complete = match event_type {
+            Some("response.function_call_arguments.done") => {
+                value.get("arguments").is_some_and(Value::is_string)
+            }
+            Some("response.custom_tool_call_input.done") => {
+                value.get("input").is_some_and(Value::is_string)
+            }
+            _ => false,
+        };
+        for identity in function_call_identities(value.as_object().unwrap()) {
+            started.insert(identity.clone());
+            if payload_is_complete {
+                completed.insert(identity);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn process_pending_stream_block(state: &mut StreamState) -> Result<(), String> {
     if state.pending.is_empty() {
         return Ok(());
     }
-    let pending = std::mem::take(&mut state.pending);
-    process_stream_block(state, pending)
+    Err("OpenAI SSE stream ended with an incomplete event".to_string())
 }
 
 fn streaming_response_body(
@@ -2648,7 +3103,12 @@ fn streaming_response_body(
         restore_output,
         block_unknown_formats,
         output_text: HashMap::new(),
-        output_resolve: Box::new(crate::claude_http_proxy::request_scoped_resolver()),
+        output_resolve: request_scoped_bounded_resolver(MAX_PENDING_SSE_BYTES),
+        restored_tools: ToolRestorationDedup::default(),
+        responses_tool_pending: VecDeque::new(),
+        responses_tool_pending_bytes: 0,
+        responses_tool_started: HashSet::new(),
+        responses_tool_completed: HashSet::new(),
     };
     let stream = stream::unfold(state, |mut state| async move {
         loop {
@@ -2676,6 +3136,9 @@ fn streaming_response_body(
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
                         if let Err(error) = process_stream_block(&mut state, block) {
+                            if handle_chat_tool_input_rejection(&mut state, &error) {
+                                break;
+                            }
                             state.finished = true;
                             state.ready.push_back(Err(Box::new(io::Error::new(
                                 io::ErrorKind::PermissionDenied,
@@ -2694,10 +3157,31 @@ fn streaming_response_body(
                 }
                 None => {
                     state.finished = true;
-                    if let Err(error) = process_pending_stream_block(&mut state) {
+                    if !state.pending.is_empty() {
+                        state.pending.clear();
                         state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            error,
+                            io::ErrorKind::UnexpectedEof,
+                            "OpenAI SSE stream ended with an incomplete event",
+                        ))));
+                        continue;
+                    }
+                    if !state.responses_tool_pending.is_empty() {
+                        state.responses_tool_pending.clear();
+                        state.responses_tool_pending_bytes = 0;
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "OpenAI Responses stream ended before a completed response",
+                        ))));
+                        continue;
+                    }
+                    if state.transform == StreamTransform::ChatCompletions
+                        && !state.chat.calls.is_empty()
+                    {
+                        state.chat.calls.clear();
+                        state.chat.buffered_bytes = 0;
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "OpenAI Chat Completions stream ended before [DONE]",
                         ))));
                         continue;
                     }
@@ -2731,6 +3215,20 @@ fn streaming_response_body(
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+fn handle_chat_tool_input_rejection(state: &mut StreamState, error: &str) -> bool {
+    if state.transform != StreamTransform::ChatCompletions || error != CHAT_TOOL_INPUT_REJECTED {
+        return false;
+    }
+    state.finished = true;
+    state.pending.clear();
+    state.chat.calls.clear();
+    state.chat.buffered_bytes = 0;
+    state.ready.push_back(Ok(Frame::data(Bytes::from_static(
+        CHAT_TOOL_INPUT_ERROR_SSE,
+    ))));
+    true
 }
 
 #[derive(Default)]
@@ -2768,11 +3266,13 @@ impl CompletionStreamState {
                     };
                     let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
                     if let Some(Value::String(text)) = choice.get_mut("text") {
+                        let mut data_resolve =
+                            |text: &str| resolve(text, pentect_agent::ToolInputKind::Data);
                         *text = self
                             .output_text
                             .entry(index)
                             .or_default()
-                            .push(text, resolve)?;
+                            .push(text, &mut data_resolve)?;
                     }
                     if choice
                         .get("finish_reason")
@@ -2873,6 +3373,8 @@ impl ChatStreamState {
         };
         if data == "[DONE]" {
             let mut output = self.finish_output_text(text)?;
+            let mut output_bytes = output.iter().map(Bytes::len).sum::<usize>();
+            let mut restored_tools = 0u64;
             if !self.calls.is_empty() {
                 let envelope = self.last_envelope.take().ok_or_else(|| {
                     "OpenAI Chat Completions stream ended without a tool call envelope".to_string()
@@ -2885,9 +3387,20 @@ impl ChatStreamState {
                 choices.sort_unstable();
                 choices.dedup();
                 for choice in choices {
-                    output.push(self.completed_tool_block(text, &envelope, choice, plugins)?);
+                    let (block, count) =
+                        self.completed_tool_block(text, &envelope, choice, plugins, resolve)?;
+                    output_bytes = output_bytes.saturating_add(block.len());
+                    if output_bytes > MAX_PENDING_SSE_BYTES {
+                        return Err(
+                            "OpenAI Chat Completions tool output exceeded inspection limit"
+                                .to_string(),
+                        );
+                    }
+                    output.push(block);
+                    restored_tools = restored_tools.saturating_add(count);
                 }
             }
+            crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
             output.push(Bytes::copy_from_slice(block));
             return Ok(output);
         }
@@ -2895,27 +3408,25 @@ impl ChatStreamState {
             return Ok(vec![Bytes::copy_from_slice(block)]);
         };
         let mut has_tool_delta = false;
-        let mut completed_choices = Vec::new();
         if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
             for choice in choices {
                 let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let choice_finished = choice
                     .get("finish_reason")
                     .is_some_and(|reason| !reason.is_null());
-                if choice_finished {
-                    completed_choices.push(choice_index);
-                }
                 let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
                     continue;
                 };
                 if restore_output {
                     for field in ["content", "reasoning_content", "reasoning"] {
                         if let Some(Value::String(content)) = delta.get_mut(field) {
+                            let mut data_resolve =
+                                |text: &str| resolve(text, pentect_agent::ToolInputKind::Data);
                             *content = self
                                 .output_text
                                 .entry((choice_index, field))
                                 .or_default()
-                                .push(content, resolve)?;
+                                .push(content, &mut data_resolve)?;
                         }
                     }
                     if choice_finished {
@@ -2986,11 +3497,6 @@ impl ChatStreamState {
         }
 
         let mut output = Vec::new();
-        for choice_index in completed_choices {
-            if self.calls.keys().any(|(choice, _)| *choice == choice_index) {
-                output.push(self.completed_tool_block(text, &value, choice_index, plugins)?);
-            }
-        }
         let keep_original = !has_tool_delta || chat_chunk_has_visible_delta(&value);
         self.last_envelope = Some(value.clone());
         if keep_original {
@@ -3028,7 +3534,8 @@ impl ChatStreamState {
         envelope: &Value,
         choice_index: u64,
         plugins: &Mutex<pentect_agent::PluginMiddleware>,
-    ) -> Result<Bytes, String> {
+        resolve: &mut HandleResolver,
+    ) -> Result<(Bytes, u64), String> {
         let mut indexes = self
             .calls
             .keys()
@@ -3039,7 +3546,7 @@ impl ChatStreamState {
         let plugins = plugins
             .lock()
             .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
-        let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+        let mut restored_tools = 0u64;
         for index in indexes {
             let call = self
                 .calls
@@ -3060,11 +3567,14 @@ impl ChatStreamState {
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let arguments = crate::claude_http_proxy::resolve_tool_input_json(
-                arguments,
-                Some(name),
-                &mut resolve,
-            )?;
+            let (arguments, changed) =
+                crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
+                    arguments,
+                    Some(name),
+                    resolve,
+                )
+                .map_err(|_| CHAT_TOOL_INPUT_REJECTED.to_string())?;
+            restored_tools = restored_tools.saturating_add(u64::from(changed));
             calls.push(serde_json::json!({
                 "index": index,
                 "id": call.id,
@@ -3078,7 +3588,8 @@ impl ChatStreamState {
             "delta": {"tool_calls": calls},
             "finish_reason": null
         }]);
-        encode_sse_value(template, &completed)
+        let encoded = encode_sse_value(template, &completed)?;
+        Ok((encoded, restored_tools))
     }
 }
 
@@ -3100,9 +3611,8 @@ fn chat_chunk_has_visible_delta(value: &Value) -> bool {
 }
 
 fn sse_data(text: &str) -> Option<Cow<'_, str>> {
-    let mut lines = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start));
+    let mut lines =
+        crate::sse::lines(text).filter_map(|line| line.strip_prefix("data:").map(str::trim_start));
     let first = lines.next()?;
     let Some(second) = lines.next() else {
         return Some(Cow::Borrowed(first));
@@ -3152,40 +3662,51 @@ fn encode_sse_value_for_event(
         .map_err(|error| format!("could not encode OpenAI SSE event: {error}"))?;
     let mut replaced = false;
     let mut output = String::with_capacity(template.len() + encoded.len());
-    for line in template.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+    for (trimmed, ending) in crate::sse::lines_with_endings(template) {
         if let Some(event) = event.filter(|_| trimmed.starts_with("event:")) {
             output.push_str("event: ");
             output.push_str(event);
-            if line.ends_with("\r\n") {
-                output.push_str("\r\n");
-            } else if line.ends_with('\n') {
-                output.push('\n');
-            }
+            output.push_str(ending);
         } else if trimmed.starts_with("data:") {
             if !replaced {
                 output.push_str("data: ");
                 output.push_str(&encoded);
-                if line.ends_with("\r\n") {
-                    output.push_str("\r\n");
-                } else if line.ends_with('\n') {
-                    output.push('\n');
-                }
+                output.push_str(ending);
                 replaced = true;
             }
         } else {
-            output.push_str(line);
+            output.push_str(trimmed);
+            output.push_str(ending);
         }
     }
     Ok(Bytes::from(output))
 }
 
+#[cfg(test)]
 fn rewrite_openai_sse_block(
     block: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     restore_output: bool,
     output_text: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     resolve: &mut HandleResolver,
+) -> Result<Vec<Bytes>, String> {
+    rewrite_openai_sse_block_tracked(
+        block,
+        plugins,
+        restore_output,
+        output_text,
+        resolve,
+        &mut ToolRestorationDedup::default(),
+    )
+}
+
+fn rewrite_openai_sse_block_tracked(
+    block: &[u8],
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    restore_output: bool,
+    output_text: &mut HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
+    resolve: &mut HandleResolver,
+    restored_tool_ids: &mut ToolRestorationDedup,
 ) -> Result<Vec<Bytes>, String> {
     let Ok(text) = std::str::from_utf8(block) else {
         return Ok(vec![Bytes::copy_from_slice(block)]);
@@ -3199,13 +3720,37 @@ fn rewrite_openai_sse_block(
     let Ok(mut value) = serde_json::from_str::<Value>(data.as_ref()) else {
         return Ok(vec![Bytes::copy_from_slice(block)]);
     };
+    if value.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+        && contains_any_function_call(&value)
+    {
+        return Ok(vec![Bytes::copy_from_slice(block)]);
+    }
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.function_call_arguments.done" | "response.custom_tool_call_input.done")
+    ) && value.get("name").and_then(Value::as_str).is_none()
+        && value
+            .get("item")
+            .and_then(|item| item.get("name"))
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        // These delta-completion events do not carry enough schema context to
+        // authorize execution. The later output_item.done/response.completed
+        // envelope contains the tool name and is the releasable representation.
+        return Ok(Vec::new());
+    }
     if matches!(
         value.get("type").and_then(Value::as_str),
         Some("response.function_call_arguments.delta" | "response.custom_tool_call_input.delta")
     ) {
         return Ok(Vec::new());
     }
-    let completed_function_call = contains_completed_function_call(&value);
+    let completed_function_call = contains_completed_function_call(&value)
+        || (matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("response.output_item.done" | "response.completed")
+        ) && contains_any_function_call(&value));
     let output_event = restore_output && contains_openai_output_text(&value);
     if !completed_function_call && !output_event {
         return Ok(vec![Bytes::copy_from_slice(block)]);
@@ -3216,11 +3761,7 @@ fn rewrite_openai_sse_block(
             .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
         run_openai_tool_plugins(&mut value, &plugins)?;
     }
-    if let Err(error) = rewrite_function_calls(&mut value, resolve) {
-        let _ = error;
-        proxy_diagnostic("sse-restore-skipped");
-        return Ok(vec![Bytes::copy_from_slice(block)]);
-    }
+    let restored_tools = rewrite_function_calls(&mut value, resolve)?;
     let mut output = Vec::new();
     if let Some(delta) = completed_openai_call_delta(&value) {
         let event = delta.get("type").and_then(Value::as_str);
@@ -3233,6 +3774,8 @@ fn rewrite_openai_sse_block(
         }
     }
     output.push(encode_sse_value(text, &value)?);
+    let count = restored_tool_ids.commit(restored_tools);
+    crate::claude_http_proxy::record_completed_tool_restorations(count);
     Ok(output)
 }
 
@@ -3297,7 +3840,7 @@ fn restore_openai_sse_output_text<R>(
     resolve: &mut R,
 ) -> Result<Vec<Value>, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut prefixes = Vec::new();
     let event_type = value.get("type").and_then(Value::as_str).map(str::to_owned);
@@ -3305,7 +3848,12 @@ where
         Some("response.output_text.delta") => {
             let key = openai_output_stream_key(value);
             if let Some(Value::String(delta)) = value.get_mut("delta") {
-                *delta = streams.entry(key).or_default().push(delta, resolve)?;
+                let mut data_resolve =
+                    |text: &str| resolve(text, pentect_agent::ToolInputKind::Data);
+                *delta = streams
+                    .entry(key)
+                    .or_default()
+                    .push(delta, &mut data_resolve)?;
             }
         }
         Some("response.output_text.done") => {
@@ -3326,7 +3874,7 @@ where
                 }
             }
             if let Some(Value::String(text)) = value.get_mut("text") {
-                *text = resolve(text)?;
+                *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
             }
         }
         Some("response.completed") => {
@@ -3372,19 +3920,7 @@ fn contains_completed_function_call(value: &Value) -> bool {
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3440,7 +3976,15 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         OpenAiEndpoint::InputTokens
     } else if matches!(
         segments.as_slice(),
-        ["v1", "alpha", "search"] | ["backend-api", "codex", "alpha", "search"]
+        // Codex resolves `alpha/search` relative to its configured base URL.
+        // Pentect replaces that base with the authenticated local gateway, so
+        // the gateway receives the bare form even though the final ChatGPT URL
+        // is /backend-api/codex/alpha/search. Keep the fully rooted forms for
+        // custom providers and already released Codex clients.
+        ["alpha", "search"]
+            | ["v1", "alpha", "search"]
+            | ["api", "codex", "alpha", "search"]
+            | ["backend-api", "codex", "alpha", "search"]
     ) {
         OpenAiEndpoint::StandaloneSearch
     } else if path.ends_with("/responses") {
@@ -3542,7 +4086,7 @@ fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Optio
     }
 }
 
-fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
+pub(crate) fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
     crate::upstream::parse_base(value, "OpenAI Responses")
 }
 
@@ -3565,6 +4109,7 @@ fn should_forward_request_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "accept-encoding"
+            | "x-codex-turn-metadata"
     )
 }
 
@@ -3582,6 +4127,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -3653,6 +4199,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_turn_metadata_is_not_forwarded() {
+        assert!(!should_forward_request_header("x-codex-turn-metadata"));
+        assert!(!should_forward_request_header("X-Codex-Turn-Metadata"));
+
+        let mut request = serde_json::json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "cwd": "/synthetic/private/workspace",
+                    "origin": "https://synthetic.invalid/repository"
+                },
+                "protocol_field": "preserved"
+            }
+        });
+        remove_codex_request_metadata(&mut request);
+
+        assert_eq!(request["client_metadata"]["protocol_field"], "preserved");
+        assert!(request["client_metadata"]
+            .get("x-codex-turn-metadata")
+            .is_none());
+    }
+
+    #[test]
     fn openai_response_partial_coverage_obeys_strict_and_ignore_policy() {
         let strict_error = run_openai_response_plugin_with(
             serde_json::json!({"id": "response"}),
@@ -3721,20 +4289,30 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = "<<KEYED_SECRET_a2c25e122d2e002f>>";
-        let secret = "fixture key with @ and 'quote'";
+        let secret = "fixture_key_with-safe.characters";
         let input = serde_json::json!({
             "command": format!(
                 "Invoke-WebRequest -UseBasicParsing http://{address}/check -Headers @{{ Authorization = \"Bearer {handle}\" }} | Out-Null"
             )
         })
         .to_string();
-        let mut resolve = |text: &str| Ok(text.replace(handle, secret));
-        let restored = crate::claude_http_proxy::resolve_tool_input_json(
+        let recovery = pentect_core::Recovery::seal(
+            std::collections::HashMap::from([(handle.to_string(), secret.to_string())]),
+            &[7u8; 32],
+        );
+        let mut resolve = |text: &str, kind| {
+            assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+            pentect_agent::process_recovery_tool_input(text, kind, &recovery)
+                .map(|input| input.text)
+                .map_err(|error| error.to_string())
+        };
+        let restored = crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
             &input,
             Some("PowerShell"),
             &mut resolve,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let command = serde_json::from_str::<Value>(&restored).unwrap()["command"]
             .as_str()
             .unwrap()
@@ -3902,6 +4480,48 @@ mod tests {
     }
 
     #[test]
+    fn only_final_responses_user_message_is_current_input() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = ["rpa_", "HISTORYONLY", "ZYXWVUTS", "1234567890"].concat();
+        let keyed_secret = format!("RUNPOD_API_KEY={secret}");
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let mut input = serde_json::json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("unmask({keyed_secret})")
+                }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("unmask({keyed_secret})")
+                }]
+            },
+            {
+                "type": "agent_message",
+                "text": format!("unmask({keyed_secret})")
+            }
+        ]);
+
+        mask_openai_responses_input(&mut input, &mut masker, &HashMap::new()).unwrap();
+
+        let history = input[0]["content"][0]["text"].as_str().unwrap();
+        assert!(!history.contains(&secret));
+        assert!(history.contains("<<"));
+        assert_eq!(input[1]["content"][0]["text"], keyed_secret);
+        let trailing_agent = input[2]["text"].as_str().unwrap();
+        assert!(!trailing_agent.contains(&secret));
+        assert!(trailing_agent.contains("<<"));
+    }
+
+    #[test]
     fn chat_history_masks_legacy_function_and_custom_tool_payloads() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -4050,7 +4670,7 @@ mod tests {
             .to_string();
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Pentect-Coverage: forged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response.len(),
                 response
             )
@@ -4122,9 +4742,16 @@ mod tests {
         let response = reqwest::blocking::Client::new()
             .post(format!("{}/v1/chat/completions", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("X-Codex-Turn-Metadata", "synthetic-header-metadata")
             .body(
                 serde_json::to_vec(&serde_json::json!({
                     "model": "test",
+                    "client_metadata": {
+                        "x-codex-turn-metadata": {
+                            "cwd": "/synthetic/chat/workspace"
+                        },
+                        "protocol_field": "preserved"
+                    },
                     "messages": [{
                         "role": "user",
                         "content": format!("Use RUNPOD_API_KEY={secret}")
@@ -4166,10 +4793,20 @@ mod tests {
                 .any(|line| line.eq_ignore_ascii_case("authorization: Bearer provider-test-key")),
             "provider bearer header did not reach the upstream"
         );
+        assert!(!headers
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-metadata:"));
         assert!(!request.contains(&secret), "{request}");
         let handle = first_handle(&request).unwrap();
         assert!(request.matches(&handle).count() >= 3);
         let protected_request: Value = serde_json::from_str(&request).unwrap();
+        assert!(protected_request["client_metadata"]
+            .get("x-codex-turn-metadata")
+            .is_none());
+        assert_eq!(
+            protected_request["client_metadata"]["protocol_field"],
+            "preserved"
+        );
         assert_eq!(protected_request["messages"][0]["content"], HANDLE_CONTRACT);
         assert_eq!(response["choices"][0]["message"]["content"], secret);
         let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
@@ -4358,6 +4995,12 @@ mod tests {
         let payload = serde_json::to_vec(&serde_json::json!({
             "model": "test",
             "input": format!("Use RUNPOD_API_KEY={secret}"),
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "cwd": "/synthetic/compressed/workspace"
+                },
+                "protocol_field": "preserved"
+            },
             "stream": false
         }))
         .unwrap();
@@ -4369,6 +5012,7 @@ mod tests {
             .post(format!("{}/responses", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::CONTENT_ENCODING, "zstd")
+            .header("x-codex-turn-metadata", "synthetic-compressed-metadata")
             .body(compressed)
             .send()
             .unwrap()
@@ -4380,9 +5024,16 @@ mod tests {
             .unwrap();
         thread.join().unwrap();
         assert!(!headers.to_ascii_lowercase().contains("content-encoding:"));
+        assert!(!headers
+            .to_ascii_lowercase()
+            .contains("x-codex-turn-metadata:"));
         assert!(!request.contains(&secret));
         assert!(first_handle(&request).is_some());
-        serde_json::from_str::<Value>(&request).unwrap();
+        let protected: Value = serde_json::from_str(&request).unwrap();
+        assert!(protected["client_metadata"]
+            .get("x-codex-turn-metadata")
+            .is_none());
+        assert_eq!(protected["client_metadata"]["protocol_field"], "preserved");
     }
 
     #[tokio::test]
@@ -4456,7 +5107,15 @@ mod tests {
             OpenAiEndpoint::InputTokens
         );
         assert_eq!(
+            classify_openai_endpoint("/alpha/search"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/alpha/search"),
+            OpenAiEndpoint::StandaloneSearch
+        );
+        assert_eq!(
+            classify_openai_endpoint("/api/codex/alpha/search"),
             OpenAiEndpoint::StandaloneSearch
         );
         assert_eq!(
@@ -4524,6 +5183,7 @@ mod tests {
             "/v1/unknown/files/file_123",
             "/v1/unknown/models/model_123",
             "/v1/unknown/alpha/search",
+            "/api/unknown/alpha/search",
             "/backend-api/unknown/alpha/search",
         ] {
             assert_eq!(
@@ -4742,7 +5402,7 @@ mod tests {
         let mut response = serde_json::json!({
             "choices": [{"index": 0, "text": "before <<KEYED_SECRET_test>> after"}]
         });
-        restore_completion_output_text(&mut response, &mut |text| {
+        restore_completion_output_text(&mut response, &mut |text, _kind| {
             Ok(text.replace("<<KEYED_SECRET_test>>", "restored"))
         })
         .unwrap();
@@ -4753,7 +5413,7 @@ mod tests {
     fn legacy_completion_stream_restores_handles_split_across_deltas() {
         let mut state = CompletionStreamState::default();
         let mut resolve: HandleResolver =
-            Box::new(|text| Ok(text.replace("<<KEYED_SECRET_split>>", "restored")));
+            Box::new(|text, _kind| Ok(text.replace("<<KEYED_SECRET_split>>", "restored")));
         let first = state
             .rewrite_block(
                 b"data: {\"choices\":[{\"index\":0,\"text\":\"before <<KEYED_\",\"finish_reason\":null}]}\n\n",
@@ -4821,8 +5481,9 @@ mod tests {
     fn response_function_arguments_are_restored() {
         let input = br#"{"output":[{"type":"function_call","name":"shell","arguments":"{\"command\":\"echo <<SECRET_0123456789abcdef>>\"}"}]}"#;
         let mut value: Value = serde_json::from_slice(input).unwrap();
-        let mut resolve =
-            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"));
+        let mut resolve = |text: &str, _kind| {
+            Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"))
+        };
         rewrite_function_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(
             value["output"][0]["arguments"],
@@ -4845,8 +5506,9 @@ mod tests {
                 }]
             }}]
         });
-        let mut resolve =
-            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"));
+        let mut resolve = |text: &str, _kind| {
+            Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"))
+        };
         rewrite_chat_tool_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(
             value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
@@ -4856,6 +5518,216 @@ mod tests {
             value["choices"][0]["message"]["content"],
             "keep <<SECRET_0123456789abcdef>>"
         );
+    }
+
+    #[test]
+    fn openai_tool_fields_use_schema_classification_and_unknown_fields_are_inert() {
+        let mut value = serde_json::json!({
+            "output": [
+                {"type": "function_call", "name": "exec_command", "arguments":
+                    "{\"cmd\":\"echo <<SECRET_0123456789abcdef>>\",\"future\":\"<<SECRET_0123456789abcdef>>\"}"},
+                {"type": "custom_tool_call", "name": "apply_patch", "input":
+                    "*** Begin Patch\n<<SECRET_0123456789abcdef>>\n*** End Patch"},
+                {"type": "custom_tool_call", "name": "future_tool", "input":
+                    "<<SECRET_0123456789abcdef>>"}
+            ]
+        });
+        let mut observed = Vec::new();
+        let mut resolve = |text: &str, kind| {
+            observed.push(kind);
+            if kind == pentect_agent::ToolInputKind::Unknown {
+                Ok(text.to_string())
+            } else {
+                Ok(text.replace("<<SECRET_0123456789abcdef>>", "local-value"))
+            }
+        };
+        rewrite_function_calls(&mut value, &mut resolve).unwrap();
+
+        assert!(observed.contains(&pentect_agent::ToolInputKind::Code));
+        assert!(observed.contains(&pentect_agent::ToolInputKind::Patch));
+        assert!(!observed.contains(&pentect_agent::ToolInputKind::Unknown));
+        assert_eq!(
+            classify_openai_custom_tool_input("exec"),
+            pentect_agent::ToolInputKind::Code
+        );
+        assert!(value["output"][0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("local-value"));
+        assert!(value["output"][1]["input"]
+            .as_str()
+            .unwrap()
+            .contains("local-value"));
+        assert_eq!(value["output"][2]["input"], "<<SECRET_0123456789abcdef>>");
+    }
+
+    #[test]
+    fn openai_raw_file_accepts_ordinary_handles_and_explicit_base64_views() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let masked = masker
+            .mask_prompt_text("pentect(local-value)")
+            .unwrap()
+            .unwrap();
+        let handle = first_handle(&masked).unwrap();
+        let base64_handle = handle.replacen(">>", "|base64>>", 1);
+        let mut value = serde_json::json!({
+            "output": [
+                {"type": "function_call", "name": "read_file",
+                    "arguments": serde_json::json!({"path": handle}).to_string()},
+                {"type": "function_call", "name": "read_file",
+                    "arguments": serde_json::json!({"path": base64_handle}).to_string()}
+            ]
+        });
+        let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+        rewrite_function_calls(&mut value, &mut resolve).unwrap();
+        let arguments: Value =
+            serde_json::from_str(value["output"][0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["path"], "local-value");
+        let base64_arguments: Value =
+            serde_json::from_str(value["output"][1]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(base64_arguments["path"], "bG9jYWwtdmFsdWU=");
+    }
+
+    #[test]
+    fn unchanged_openai_responses_preserve_original_json_bytes() {
+        let body = b"{ \"id\" : \"resp_1\", \"output\" : [] }\n";
+        assert_eq!(rewrite_openai_json_response(body, false).unwrap(), body);
+
+        let chat = b"{ \"choices\" : [{\"message\":{\"content\":\"plain\"}}] }\n";
+        assert_eq!(
+            rewrite_chat_completions_json_response(chat, false).unwrap(),
+            chat
+        );
+    }
+
+    #[test]
+    fn responses_sse_validation_denial_never_forwards_completed_tool_input() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut output_text = HashMap::new();
+        let mut resolve: HandleResolver = Box::new(|_text, _kind| Err("blocked".to_string()));
+        let event = b"data: {\"type\":\"response.function_call_arguments.done\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"denied\\\"}\"}\n\n";
+        let error =
+            rewrite_openai_sse_block(event, &plugins, false, &mut output_text, &mut resolve)
+                .unwrap_err();
+        assert_eq!(error, "blocked");
+    }
+
+    fn responses_stream_test_state(resolve: HandleResolver) -> StreamState {
+        StreamState {
+            upstream: Box::pin(stream::empty::<Result<Bytes, reqwest::Error>>()),
+            pending: Vec::new(),
+            ready: VecDeque::new(),
+            transform: StreamTransform::Responses,
+            chat: ChatStreamState::default(),
+            completions: CompletionStreamState::default(),
+            finished: false,
+            plugins: Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            restore_output: false,
+            block_unknown_formats: true,
+            output_text: HashMap::new(),
+            output_resolve: resolve,
+            restored_tools: ToolRestorationDedup::default(),
+            responses_tool_pending: VecDeque::new(),
+            responses_tool_pending_bytes: 0,
+            responses_tool_started: HashSet::new(),
+            responses_tool_completed: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn responses_stream_late_invalid_call_releases_no_earlier_tool_call() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| {
+            if text.contains("denied") {
+                Err("blocked".to_string())
+            } else {
+                Ok(text.to_string())
+            }
+        }));
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert!(state.ready.is_empty());
+        let error = process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_2\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"denied\\\"}\"}\n\n".to_vec(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "blocked");
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn responses_stream_rejects_completed_terminal_with_missing_tool_done() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"\"}}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert!(state.ready.is_empty());
+        let error = process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".to_vec(),
+        )
+        .unwrap_err();
+        assert!(error.contains("incomplete tool call"), "{error}");
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn responses_stream_late_missing_known_payload_releases_no_prior_call() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}}\n\n".to_vec(),
+        )
+        .unwrap();
+        let error = process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_2\",\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":null}}\n\n".to_vec(),
+        )
+        .unwrap_err();
+        assert!(error.contains("missing its input payload"), "{error}");
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn every_completed_known_openai_call_shape_requires_a_string_payload() {
+        let cases = [
+            serde_json::json!({"type": "function_call", "name": "exec_command"}),
+            serde_json::json!({"type": "function_call", "name": "exec_command", "arguments": null}),
+            serde_json::json!({"type": "response.function_call_arguments.done", "name": "exec_command"}),
+            serde_json::json!({"type": "response.function_call_arguments.done", "name": "exec_command", "arguments": null}),
+            serde_json::json!({"type": "custom_tool_call", "name": "exec"}),
+            serde_json::json!({"type": "custom_tool_call", "name": "exec", "input": null}),
+            serde_json::json!({"type": "response.custom_tool_call_input.done", "name": "exec"}),
+            serde_json::json!({"type": "response.custom_tool_call_input.done", "name": "exec", "input": null}),
+        ];
+        for mut case in cases {
+            let mut resolve = |_text: &str, _kind| Ok("must-not-run".to_string());
+            let error = rewrite_function_calls(&mut case, &mut resolve).unwrap_err();
+            assert!(
+                error.contains("missing its input payload"),
+                "{case}: {error}"
+            );
+        }
+
+        let mut unknown = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "future_tool",
+            "input": null
+        });
+        let mut resolve = |_text: &str, _kind| -> Result<String, String> {
+            panic!("unknown custom tool must remain inert")
+        };
+        assert!(rewrite_function_calls(&mut unknown, &mut resolve)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -4869,7 +5741,7 @@ mod tests {
                 "content": [{"type": "reasoning_text", "text": handle}]
             }]
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let mut resolve = |text: &str, _kind| Ok(text.replace(handle, "local-value"));
         restore_openai_output_text(&mut response, &mut resolve).unwrap();
         assert_eq!(response["output"][0]["summary"][0]["text"], "local-value");
         assert_eq!(response["output"][0]["content"][0]["text"], "local-value");
@@ -4917,7 +5789,7 @@ mod tests {
                 "id": "chat_1", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
             })
         );
-        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| Ok(text.to_string()));
         let first_out = state
             .rewrite_block(first.as_bytes(), &plugins, false, &mut resolve)
             .unwrap();
@@ -4930,8 +5802,13 @@ mod tests {
         let finished = state
             .rewrite_block(finish.as_bytes(), &plugins, false, &mut resolve)
             .unwrap();
-        assert_eq!(finished.len(), 2);
-        let completed = String::from_utf8_lossy(&finished[0]);
+        assert_eq!(finished.len(), 1);
+        assert!(!String::from_utf8_lossy(&finished[0]).contains("call_1"));
+        let done = state
+            .rewrite_block(b"data: [DONE]\n\n", &plugins, false, &mut resolve)
+            .unwrap();
+        assert_eq!(done.len(), 2);
+        let completed = String::from_utf8_lossy(&done[0]);
         assert!(completed.contains("call_1"), "{completed}");
         assert!(!completed.contains("call_1call_1"), "{completed}");
         assert!(!completed.contains("shellshell"), "{completed}");
@@ -4956,7 +5833,7 @@ mod tests {
                 }, "finish_reason": null}]
             })
         );
-        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| Ok(text.to_string()));
         assert!(state
             .rewrite_block(chunk.as_bytes(), &plugins, false, &mut resolve)
             .unwrap()
@@ -4976,7 +5853,50 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_final_chat_event_is_processed_at_eof() {
+    fn chat_validation_rejection_emits_one_native_error_and_no_tool_bytes() {
+        let mut state = StreamState {
+            upstream: Box::pin(stream::empty::<Result<Bytes, reqwest::Error>>()),
+            pending: Vec::new(),
+            ready: VecDeque::new(),
+            transform: StreamTransform::ChatCompletions,
+            chat: ChatStreamState::default(),
+            completions: CompletionStreamState::default(),
+            finished: false,
+            plugins: Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())),
+            restore_output: false,
+            block_unknown_formats: true,
+            output_text: HashMap::new(),
+            output_resolve: Box::new(|_text, _kind| Err("synthetic secret detail".to_string())),
+            restored_tools: ToolRestorationDedup::default(),
+            responses_tool_pending: VecDeque::new(),
+            responses_tool_pending_bytes: 0,
+            responses_tool_started: HashSet::new(),
+            responses_tool_completed: HashSet::new(),
+        };
+        process_stream_block(
+            &mut state,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"<<SECRET_0123456789abcdef>>\\\"}\"}}]},\"finish_reason\":null}]}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert!(state.ready.is_empty(), "tool deltas must remain buffered");
+
+        let error = process_stream_block(&mut state, b"data: [DONE]\n\n".to_vec()).unwrap_err();
+        assert_eq!(error, CHAT_TOOL_INPUT_REJECTED);
+        assert!(handle_chat_tool_input_rejection(&mut state, &error));
+        assert!(state.finished);
+        assert!(state.chat.calls.is_empty());
+        assert_eq!(state.ready.len(), 1);
+        let frame = state.ready.pop_front().unwrap().unwrap();
+        let bytes = frame.into_data().unwrap();
+        assert_eq!(bytes.as_ref(), CHAT_TOOL_INPUT_ERROR_SSE);
+        assert!(!bytes.windows(6).any(|window| window == b"call_1"));
+        assert!(!bytes.windows(6).any(|window| window == b"secret"));
+        assert!(!bytes.windows(9).any(|window| window == b"<<SECRET_"));
+        assert!(!bytes.windows(6).any(|window| window == b"[DONE]"));
+    }
+
+    #[test]
+    fn unterminated_final_chat_event_is_rejected_at_eof() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = ProviderBoundaryTestEnv::install(&store);
@@ -5019,28 +5939,26 @@ mod tests {
             restore_output: false,
             block_unknown_formats: true,
             output_text: HashMap::new(),
-            output_resolve: Box::new(|text| Ok(text.to_string())),
+            output_resolve: Box::new(|text, _kind| Ok(text.to_string())),
+            restored_tools: ToolRestorationDedup::default(),
+            responses_tool_pending: VecDeque::new(),
+            responses_tool_pending_bytes: 0,
+            responses_tool_started: HashSet::new(),
+            responses_tool_completed: HashSet::new(),
         };
 
-        process_pending_stream_block(&mut state).unwrap();
-        assert!(state.pending.is_empty());
-        let mut output = Vec::new();
-        while let Some(frame) = state.ready.pop_front() {
-            if let Ok(data) = frame.unwrap().into_data() {
-                output.extend_from_slice(&data);
-            }
-        }
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("local-value"), "{output}");
-        assert!(!output.contains(&handle), "{output}");
+        let error = process_pending_stream_block(&mut state).unwrap_err();
+        assert!(error.contains("incomplete event"), "{error}");
+        assert!(state.ready.is_empty());
     }
 
     #[test]
     fn chat_stream_restores_reasoning_and_flushes_it_on_finish() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut state = ChatStreamState::default();
-        let mut resolve: HandleResolver =
-            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| {
+            Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"))
+        });
         let blocks = [
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"before <<CHAR\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"GE_0123456789abcdef>> after\"},\"finish_reason\":null}]}\n\n",
@@ -5064,7 +5982,7 @@ mod tests {
     fn chat_stream_done_flushes_buffered_trailing_text() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut state = ChatStreamState::default();
-        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| Ok(text.to_string()));
         let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"trailing text\"},\"finish_reason\":null}]}\n\n";
         let first = state
             .rewrite_block(chunk, &plugins, true, &mut resolve)
@@ -5079,6 +5997,18 @@ mod tests {
             .collect::<String>();
         assert!(output.contains("trailing text"), "{output}");
         assert!(output.ends_with("data: [DONE]\n\n"), "{output:?}");
+    }
+
+    #[test]
+    fn sse_parser_accepts_bare_cr_event_boundaries() {
+        let event = "data: {\"type\":\"response.completed\"}\r\r";
+        let chunk = format!("{event}event:");
+        let end = first_sse_block_end(chunk.as_bytes()).expect("complete SSE event");
+        assert_eq!(end, event.len());
+        assert_eq!(
+            sse_data(&chunk[..end]).as_deref(),
+            Some("{\"type\":\"response.completed\"}")
+        );
     }
 
     #[test]
@@ -5123,11 +6053,219 @@ mod tests {
             "visible_text": "keep <<SECRET_0123456789abcdef>>"
         });
         assert!(contains_completed_function_call(&value));
-        let mut resolve =
-            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"));
+        let mut resolve = |text: &str, _kind| {
+            Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"))
+        };
         rewrite_function_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["item"]["input"], "python hash.py safe-secret-token");
         assert_eq!(value["visible_text"], "keep <<SECRET_0123456789abcdef>>");
+    }
+
+    #[test]
+    fn streaming_tool_metrics_deduplicate_mirrored_completion_envelopes() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let item = serde_json::json!({
+            "id": "item_1",
+            "type": "custom_tool_call",
+            "call_id": "call_1",
+            "name": "exec",
+            "input": handle,
+        });
+        let mut events = [
+            serde_json::json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": "item_1",
+                "name": "exec",
+                "input": handle,
+            }),
+            serde_json::json!({"type": "response.output_item.done", "item": item.clone()}),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"output": [item]},
+            }),
+        ];
+        let stream_events = events.clone();
+        let mut dedup = ToolRestorationDedup::default();
+        let mut resolve = |text: &str, _kind| Ok(text.replace(handle, "local-value"));
+        let counts = events
+            .iter_mut()
+            .map(|event| {
+                let restored = rewrite_function_calls(event, &mut resolve).unwrap();
+                dedup.commit(restored)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [1, 0, 0]);
+
+        let mut call_only = serde_json::json!({
+            "type": "response.custom_tool_call_input.done",
+            "call_id": "call_alias",
+            "name": "exec",
+            "input": handle,
+        });
+        let mut nested_alias = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "item_alias",
+                "call_id": "call_alias",
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": handle,
+            }
+        });
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut call_only, &mut resolve).unwrap()),
+            1
+        );
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut nested_alias, &mut resolve).unwrap()),
+            0
+        );
+        let mut item_only_replay = serde_json::json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "item_alias",
+            "name": "exec",
+            "input": handle,
+        });
+        assert_eq!(
+            dedup.commit(rewrite_function_calls(&mut item_only_replay, &mut resolve).unwrap()),
+            0,
+            "aliases learned from duplicate envelopes must remain deduplicated"
+        );
+
+        let mut separate_namespaces = ToolRestorationDedup::default();
+        let mut call_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "shared",
+            "input": handle,
+        });
+        let mut item_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "item_id": "shared",
+            "input": handle,
+        });
+        assert_eq!(
+            separate_namespaces
+                .commit(rewrite_function_calls(&mut call_identity, &mut resolve).unwrap()),
+            1
+        );
+        assert_eq!(
+            separate_namespaces
+                .commit(rewrite_function_calls(&mut item_identity, &mut resolve).unwrap()),
+            1,
+            "call and item identifier namespaces must not collide"
+        );
+
+        let mut empty_identity = serde_json::json!({
+            "type": "custom_tool_call",
+            "item_id": "",
+            "call_id": "",
+            "input": handle,
+        });
+        assert_eq!(
+            ToolRestorationDedup::default()
+                .commit(rewrite_function_calls(&mut empty_identity, &mut resolve).unwrap()),
+            0,
+            "empty identifiers are not stable streaming identities"
+        );
+
+        let mut distinct = serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "call_2",
+            "name": "exec",
+            "input": handle,
+        });
+        let restored = rewrite_function_calls(&mut distinct, &mut resolve).unwrap();
+        assert_eq!(dedup.commit(restored), 1);
+
+        let mirrored_item = serde_json::json!({
+            "id": "item_nonstream_1",
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": handle,
+        });
+        let mut mirrored = serde_json::json!({
+            "item": mirrored_item.clone(),
+            "response": {"output": [mirrored_item]},
+        });
+        let restored = rewrite_function_calls(&mut mirrored, &mut resolve).unwrap();
+        assert_eq!(
+            ToolRestorationDedup::default().commit_nonstream(restored),
+            1
+        );
+
+        let mut distinct = serde_json::json!({
+            "output": [
+                {"id": "item_nonstream_2", "type": "custom_tool_call", "name": "exec", "input": handle},
+                {"id": "item_nonstream_3", "type": "custom_tool_call", "name": "exec", "input": handle}
+            ]
+        });
+        let restored = rewrite_function_calls(&mut distinct, &mut resolve).unwrap();
+        assert_eq!(
+            ToolRestorationDedup::default().commit_nonstream(restored),
+            2
+        );
+
+        let mut identityless = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": handle,
+        });
+        let restored = rewrite_function_calls(&mut identityless, &mut resolve).unwrap();
+        assert_eq!(
+            ToolRestorationDedup::default().commit_nonstream(restored),
+            1
+        );
+
+        crate::claude_http_proxy::take_test_completed_tool_restorations();
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut output_text = HashMap::new();
+        let mut resolve: HandleResolver =
+            Box::new(move |text: &str, _kind| Ok(text.replace(handle, "local-value")));
+        let mut dedup = ToolRestorationDedup::default();
+        let delta = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": "item_1",
+                "delta": handle,
+            })
+        );
+        assert!(rewrite_openai_sse_block_tracked(
+            delta.as_bytes(),
+            &plugins,
+            false,
+            &mut output_text,
+            &mut resolve,
+            &mut dedup,
+        )
+        .unwrap()
+        .is_empty());
+        assert!(crate::claude_http_proxy::take_test_completed_tool_restorations().is_empty());
+        for event in stream_events {
+            let block = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+            rewrite_openai_sse_block_tracked(
+                block.as_bytes(),
+                &plugins,
+                false,
+                &mut output_text,
+                &mut resolve,
+                &mut dedup,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            crate::claude_http_proxy::take_test_completed_tool_restorations(),
+            [1]
+        );
+
+        let mut bounded = ToolRestorationDedup::default();
+        for index in 0..MAX_CHAT_TOOL_CALLS {
+            assert_eq!(bounded.commit(vec![vec![format!("call_{index}")]]), 1);
+        }
+        assert_eq!(bounded.commit(vec![vec!["overflow".to_string()]]), 0);
+        assert!(bounded.full);
     }
 
     #[test]
@@ -5143,7 +6281,7 @@ mod tests {
                 "input": input
             }
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, secret));
+        let mut resolve = |text: &str, _kind| Ok(text.replace(handle, secret));
         rewrite_function_calls(&mut value, &mut resolve).unwrap();
         let restored = value["item"]["input"].as_str().unwrap();
         assert_eq!(restored.matches(secret).count(), 2, "{restored}");
@@ -5267,7 +6405,7 @@ mod tests {
                     }],
                     "response_length": "short"
                 },
-                "reasoning": {"summary": format!("unmask({secret})")},
+                "reasoning": {"summary": "auto", "context": "all_turns"},
                 "settings": {"search_context_size": "low"},
                 "max_output_tokens": 2500
             }))
@@ -5290,9 +6428,8 @@ mod tests {
             .unwrap();
         assert!(!query.contains(&secret), "{query}");
         assert!(query.contains("<<KEYED_SECRET_"), "{query}");
-        let reasoning = protected["reasoning"]["summary"].as_str().unwrap();
-        assert!(!reasoning.contains(&secret), "{reasoning}");
-        assert!(reasoning.contains("<<KEYED_SECRET_"), "{reasoning}");
+        assert_eq!(protected["reasoning"]["summary"], "auto");
+        assert_eq!(protected["reasoning"]["context"], "all_turns");
         assert!(protected.get("instructions").is_none());
     }
 
@@ -5308,13 +6445,10 @@ mod tests {
         ]
         .concat();
         let (upstream, captured, thread) = mock_chat_upstream();
-        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+        let proxy = OpenAiHttpProxyGuard::start(format!("{upstream}/backend-api/codex")).unwrap();
 
         let response = reqwest::blocking::Client::new()
-            .post(format!(
-                "{}/backend-api/codex/alpha/search",
-                proxy.base_url()
-            ))
+            .post(format!("{}/alpha/search", proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(
                 serde_json::to_vec(&serde_json::json!({
@@ -5331,6 +6465,14 @@ mod tests {
             .error_for_status()
             .unwrap();
         assert_eq!(response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
 
         let (headers, request) = captured
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -5734,7 +6876,8 @@ mod tests {
                 "content": [{"type": "output_text", "text": "<<SECRET_0123456789abcdef>>"}]
             }]
         });
-        let mut resolve = |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "secret"));
+        let mut resolve =
+            |text: &str, _kind| Ok(text.replace("<<SECRET_0123456789abcdef>>", "secret"));
         rewrite_function_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(
             value["output"][0]["content"][0]["text"],
@@ -5754,7 +6897,7 @@ mod tests {
             }]
         });
         let mut resolve =
-            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"));
+            |text: &str, _kind| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"));
         restore_openai_output_text(&mut value, &mut resolve).unwrap();
         assert_eq!(
             value["output"][0]["content"][0]["text"],
@@ -5766,8 +6909,9 @@ mod tests {
     fn enabled_openai_stream_restores_a_handle_split_across_events() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut streams = HashMap::new();
-        let mut resolve: HandleResolver =
-            Box::new(|text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| {
+            Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"))
+        });
         let first = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"before <<CHAR\"}\n\n";
         let second = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"GE_0123456789abcdef>> after\"}\n\n";
         let first =
@@ -5785,10 +6929,88 @@ mod tests {
     }
 
     #[test]
+    fn live_openai_stream_restores_handle_with_bare_cr_and_byte_chunks() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| {
+            Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"))
+        });
+        let input = concat!(
+            "event: response.output_text.delta\r",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"before <<CHAR\"}\r\r",
+            "event: response.output_text.delta\r",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"GE_0123456789abcdef>> after\"}\r\r",
+            "event: response.output_text.done\r",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m\",\"content_index\":0,\"text\":\"before <<CHARGE_0123456789abcdef>> after\"}\r\r"
+        );
+        let mut pending = Vec::new();
+        let mut output = Vec::new();
+        for byte in input.as_bytes() {
+            pending.push(*byte);
+            while let Some(end) = first_sse_block_end(&pending) {
+                let block = pending.drain(..end).collect::<Vec<_>>();
+                output.extend(
+                    rewrite_openai_sse_block(&block, &plugins, true, &mut streams, &mut resolve)
+                        .unwrap(),
+                );
+            }
+        }
+        let text = output
+            .into_iter()
+            .flat_map(|block| block.to_vec())
+            .collect::<Vec<_>>();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("local-value"), "{text}");
+        assert!(!text.contains("<<CHARGE_"), "{text}");
+    }
+
+    #[test]
+    fn live_openai_stream_handles_crlf_split_at_every_byte_boundary() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut streams = HashMap::new();
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| {
+            Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value"))
+        });
+        let input = concat!(
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"<<CHAR\"}\r\n\r\n",
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"GE_0123456789abcdef>>\"}\r\n\r\n",
+            "event: response.output_text.done\r\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m\",\"content_index\":0,\"text\":\"<<CHARGE_0123456789abcdef>>\"}\r\n\r\n"
+        );
+        let mut pending = Vec::new();
+        let mut output = Vec::new();
+        for byte in input.as_bytes() {
+            pending.push(*byte);
+            while let Some(end) = first_sse_block_end(&pending) {
+                let block = pending.drain(..end).collect::<Vec<_>>();
+                output.extend(
+                    rewrite_openai_sse_block(&block, &plugins, true, &mut streams, &mut resolve)
+                        .unwrap(),
+                );
+            }
+        }
+        assert!(
+            pending.as_slice() == b"\n",
+            "unexpected SSE tail at EOF: {pending:?}"
+        );
+        let text = String::from_utf8(
+            output
+                .into_iter()
+                .flat_map(|block| block.to_vec())
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(text.matches("local-value").count(), 2, "{text}");
+        assert!(!text.contains("<<CHARGE_"), "{text}");
+    }
+
+    #[test]
     fn openai_output_text_done_flushes_buffered_delta_text() {
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut streams = HashMap::new();
-        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| Ok(text.to_string()));
         let first = rewrite_openai_sse_block(
             b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"trailing text\"}\n\n",
             &plugins,
@@ -5848,22 +7070,23 @@ mod tests {
     fn multiline_sse_data_is_joined_and_reencoded_once() {
         let input = concat!(
             "event: response.function_call_arguments.done\r\n",
-            "data: {\"type\":\"response.function_call_arguments.done\",\r\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"name\":\"shell\",\r\n",
             "data: \"arguments\":\"{\\\"command\\\":\\\"echo <<SECRET_0123456789abcdef>>\\\"}\"}\r\n",
             "\r\n",
         );
         assert_eq!(
             sse_data(input).unwrap(),
             concat!(
-                "{\"type\":\"response.function_call_arguments.done\",\n",
+                "{\"type\":\"response.function_call_arguments.done\",\"name\":\"shell\",\n",
                 "\"arguments\":\"{\\\"command\\\":\\\"echo <<SECRET_0123456789abcdef>>\\\"}\"}",
             )
         );
 
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut streams = HashMap::new();
-        let mut resolve: HandleResolver =
-            Box::new(|text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "local-value")));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| {
+            Ok(text.replace("<<SECRET_0123456789abcdef>>", "local-value"))
+        });
         let delta = rewrite_openai_sse_block(
             b"event: response.function_call_arguments.delta\r\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"untrusted\"}\r\n\r\n",
             &plugins,
@@ -5905,7 +7128,7 @@ mod tests {
         let input = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\r\n\r\n";
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
         let mut streams = HashMap::new();
-        let mut resolve: HandleResolver = Box::new(|text: &str| Ok(text.to_string()));
+        let mut resolve: HandleResolver = Box::new(|text: &str, _kind| Ok(text.to_string()));
         assert_eq!(
             rewrite_openai_sse_block(input, &plugins, false, &mut streams, &mut resolve,)
                 .unwrap()

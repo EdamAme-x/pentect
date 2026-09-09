@@ -17,18 +17,49 @@ pentect claude app
 
 Pentect protects the Claude session it starts. Normal Claude Code arguments
 pass through, and `app` opens Claude Desktop without changing the official app.
+Cloud sessions, self-hosted cloud environments, Remote Control, teleport, and
+cloud-hosted ultrareview run outside this local gateway and are rejected.
 
 Prerequisites:
 
 - Claude Code or Claude Desktop is already installed and starts normally.
-- The selected Anthropic or managed-provider login already works.
+- An Anthropic login/API key, or credentials for an Anthropic
+  Messages-compatible custom gateway, already works.
 - Run `pentect doctor` after installing or updating Claude.
+
+`pentect claude` does not currently route Claude Code's Bedrock, Vertex AI,
+Foundry, or Mantle transports. Pentect rejects those switches before launch.
+A centrally managed policy is supported when it leaves the Anthropic Messages
+route available; "managed policy" does not mean that managed cloud-provider
+transports are supported. If your organization requires one of those
+transports, use Claude Code without `pentect claude` and do not assume that the
+remote session passes through Pentect's local gateway.
 
 | Launch | Scope |
 | --- | --- |
 | `pentect claude` | One Claude Code process and its children |
 | `pentect claude app` | One supported Claude Desktop launch |
 | `pentect claude --plugins NAME` | One launch with the selected plugin set |
+
+For the `pentect claude` CLI launch on Linux, if the shell-facing Pentect
+process is forcibly killed, its guardian uses subreaper support, pidfds, and
+`/proc` child discovery, when available, to stop ordinary descendants across
+process groups before releasing generated settings. If those facilities are
+unavailable, Pentect warns and falls back to the original process group. On
+macOS, CLI supervision is process-group based; an ordinary child such as an MCP
+server can create another group outside that boundary. See
+[Compatibility](/reference/compatibility/) for the current lifecycle limits.
+If the CLI guardian itself is also forcibly killed, Pentect preserves the
+unreleased private settings session rather than risking deletion while its
+Claude process might still be active. Claude Desktop has the separate lifecycle
+contract described below.
+
+On Windows, a protected launch ties the helper and Claude process tree to a
+kill-on-close job owned by the shell-facing Pentect process. Generated settings
+are held with delete-on-close and are removed after their handles close; the
+caller-owned settings input is never modified. Forced termination can leave an
+empty private temporary directory behind. This does not claim recovery for a
+deliberately detached process or an independently terminated helper.
 
 ## Use a clickable App launcher
 
@@ -94,6 +125,13 @@ pentect claude --upstream http://127.0.0.1:8080/anthropic
 The selected provider manages login and model routing. Pentect keeps the
 Anthropic Messages API format and protects supported requests, response events,
 and completed tool calls.
+
+Supported combinations are Anthropic's Messages endpoint with normal Claude
+login/API-key authentication, or a custom upstream that implements the same
+Messages and streaming contract with credentials supplied as described in the
+custom-upstream guide. Native Bedrock, Vertex AI, Foundry, and Mantle protocols
+are different transports and are rejected even when Claude Code can authenticate
+to them directly.
 
 An endpoint that accepts similar JSON but does not implement Anthropic Messages
 and its streaming events is not supported. Put a compatible adapter in front of

@@ -216,7 +216,7 @@ impl ClaudeHttpProxyGuard {
         });
         let base_url = ready_rx
             .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Claude HTTP proxy did not start within 30 seconds".to_string())??;
+            .map_err(|_| "Claude HTTP proxy initialization timed out".to_string())??;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -1293,7 +1293,8 @@ pub(crate) fn request_contains_masked_handle(value: &Value) -> bool {
 
 type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
-type HandleResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
+type HandleResolver =
+    Box<dyn FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send>;
 
 async fn read_response_capped(response: reqwest::Response) -> Result<Option<Bytes>, String> {
     let mut stream = response.bytes_stream();
@@ -1353,12 +1354,12 @@ fn streaming_response_body(
                     Ok(chunks) => state
                         .ready
                         .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                    Err(error) => {
+                    Err(_error) => {
                         state.finished = true;
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            error,
-                        ))));
+                        diagnostic("sse-tool-rejected", "validation", "messages", false);
+                        state
+                            .ready
+                            .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
                     }
                 },
                 Some(Err(error)) => {
@@ -1373,16 +1374,24 @@ fn streaming_response_body(
                         Ok(chunks) => state
                             .ready
                             .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                        Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            error,
-                        )))),
+                        Err(_error) => {
+                            diagnostic("sse-tool-rejected", "validation", "messages", false);
+                            state
+                                .ready
+                                .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
+                        }
                     }
                 }
             }
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+pub(crate) fn anthropic_tool_rejection_sse() -> Bytes {
+    Bytes::from_static(
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Pentect rejected an unsafe or invalid protected tool input. Use a supported handle representation and try again.\"}}\n\n",
+    )
 }
 
 pub(crate) struct SseStreamTransformer<R> {
@@ -1430,7 +1439,7 @@ enum SseToolBoundary {
 
 impl<R> SseStreamTransformer<R>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     fn new(
         resolve: R,
@@ -1587,12 +1596,12 @@ where
                 SseToolBoundary::Other => {}
             }
             tools.bytes.extend_from_slice(&block);
-            if tools.active.is_empty() {
+            if tools.active.is_empty() && sse_is_message_stop(&block) {
                 let tools = self.tool_buffer.take().expect("tool buffer exists");
-                let rewritten = std::str::from_utf8(&tools.bytes)
+                let (rewritten, restored_tools) = std::str::from_utf8(&tools.bytes)
                     .map_err(|error| format!("Claude tool SSE was not UTF-8: {error}"))
                     .and_then(|text| {
-                        rewrite_anthropic_sse_with_tool_context(
+                        rewrite_anthropic_sse_with_tool_context_tracked(
                             text,
                             None,
                             &mut self.resolve,
@@ -1600,7 +1609,14 @@ where
                             self.plugin_context,
                         )
                     })?;
+                if rewritten.len() > self.max_pending_bytes {
+                    return Err(
+                        "restored Anthropic SSE response exceeded inspection limit".to_string()
+                    );
+                }
                 output.push(Bytes::from(rewritten));
+                record_completed_tool_restorations(restored_tools);
+                self.terminated = true;
             }
             return Ok(());
         }
@@ -1626,6 +1642,22 @@ where
         }
         Ok(())
     }
+}
+
+fn sse_is_message_stop(block: &[u8]) -> bool {
+    std::str::from_utf8(block)
+        .ok()
+        .map(parse_sse)
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("message_stop")
+            })
+        })
 }
 
 fn run_anthropic_sse_response_plugins(
@@ -1681,21 +1713,17 @@ fn encode_anthropic_sse_value(template: &str, value: &Value) -> Result<Vec<u8>, 
         .map_err(|error| format!("could not encode Anthropic SSE event: {error}"))?;
     let mut replaced = false;
     let mut output = String::with_capacity(template.len() + encoded.len());
-    for line in template.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+    for (trimmed, ending) in crate::sse::lines_with_endings(template) {
         if trimmed.starts_with("data:") {
             if !replaced {
                 output.push_str("data: ");
                 output.push_str(&encoded);
-                if line.ends_with("\r\n") {
-                    output.push_str("\r\n");
-                } else if line.ends_with('\n') {
-                    output.push('\n');
-                }
+                output.push_str(ending);
                 replaced = true;
             }
         } else {
-            output.push_str(line);
+            output.push_str(trimmed);
+            output.push_str(ending);
         }
     }
     replaced
@@ -1709,7 +1737,7 @@ fn rewrite_anthropic_output_sse_block<R>(
     resolve: &mut R,
 ) -> Result<Option<Vec<u8>>, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let Ok(text) = std::str::from_utf8(block) else {
         return Ok(None);
@@ -1739,7 +1767,9 @@ where
                 *value = streams
                     .entry((index, field))
                     .or_default()
-                    .push(value, resolve)?;
+                    .push(value, &mut |text| {
+                        resolve(text, pentect_agent::ToolInputKind::Data)
+                    })?;
             }
         }
         Some("content_block_delta") => {
@@ -1755,7 +1785,9 @@ where
                 *value = streams
                     .entry((index, field))
                     .or_default()
-                    .push(value, resolve)?;
+                    .push(value, &mut |text| {
+                        resolve(text, pentect_agent::ToolInputKind::Data)
+                    })?;
             }
         }
         Some("content_block_stop") => {
@@ -1808,7 +1840,7 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
     let Ok(text) = std::str::from_utf8(block) else {
         return SseControlEvent::Other;
     };
-    let event = text.lines().find_map(|line| {
+    let event = crate::sse::lines(text).find_map(|line| {
         line.trim_end_matches('\r')
             .strip_prefix("event:")
             .map(str::trim)
@@ -1823,19 +1855,7 @@ fn sse_control_event(block: &[u8]) -> SseControlEvent {
 }
 
 fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(end), None) | (None, Some(end)) => Some(end),
-        (None, None) => None,
-    }
+    crate::sse::first_block_end(bytes)
 }
 
 fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
@@ -2485,7 +2505,10 @@ pub(crate) fn mask_string(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
 ) -> Result<(), String> {
     let masked = if tool_result {
-        masker.mask_tool_output(text)?
+        // Provider/client history and tool output still pass the deterministic
+        // engine and Alcatraz, but do not run heavyweight context plugins.
+        // Current user-authored text takes the full plugin path below.
+        masker.mask_tool_output_without_plugins(text)?
     } else {
         masker.mask_prompt_text(text)?
     };
@@ -2521,29 +2544,47 @@ fn rewrite_anthropic_json_response<R>(
     resolve: &mut R,
 ) -> Result<Vec<u8>, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
-    restore_anthropic_json_value(&mut value, restore_output, resolve)?;
-    serde_json::to_vec(&value)
-        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+    let restored_tools = restore_anthropic_json_value(&mut value, restore_output, resolve)?;
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Claude response: {error}"))?;
+    record_completed_tool_restorations(restored_tools);
+    Ok(encoded)
 }
 
 pub(crate) fn restore_anthropic_json_value<R>(
     value: &mut Value,
     restore_output: bool,
     resolve: &mut R,
-) -> Result<(), String>
+) -> Result<u64, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
+    let mut restored_tools = 0u64;
+    let mut restored_bytes = 0usize;
+    let mut budgeted_resolve = |text: &str, kind| {
+        let mut restored = resolve(text, kind)?;
+        if restored_bytes.saturating_add(restored.len()) > MAX_PENDING_SSE_BYTES {
+            restored.zeroize();
+            return Err("restored Claude response exceeded inspection limit".to_string());
+        }
+        restored_bytes += restored.len();
+        Ok(restored)
+    };
     if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 let tool_name = block.get("name").and_then(Value::as_str).map(str::to_owned);
                 if let Some(input) = block.get_mut("input") {
-                    resolve_tool_input_value(input, tool_name.as_deref(), resolve)?;
+                    let changed = resolve_tool_input_value_with_change(
+                        input,
+                        tool_name.as_deref(),
+                        &mut budgeted_resolve,
+                    )?;
+                    restored_tools = restored_tools.saturating_add(u64::from(changed));
                 }
             } else if restore_output {
                 let field = match block.get("type").and_then(Value::as_str) {
@@ -2552,12 +2593,12 @@ where
                     _ => continue,
                 };
                 if let Some(Value::String(text)) = block.get_mut(field) {
-                    *text = resolve(text)?;
+                    *text = budgeted_resolve(text, pentect_agent::ToolInputKind::Data)?;
                 }
             }
         }
     }
-    Ok(())
+    Ok(restored_tools)
 }
 
 #[derive(Default)]
@@ -2575,13 +2616,13 @@ struct PendingToolInput {
 
 #[cfg(test)]
 fn rewrite_anthropic_sse(input: &str) -> Result<String, String> {
-    rewrite_anthropic_sse_with(input, &mut resolve_known_text)
+    rewrite_anthropic_sse_with(input, &mut |text, _| resolve_known_text(text))
 }
 
 #[cfg(test)]
 fn rewrite_anthropic_sse_with<R>(input: &str, resolve: &mut R) -> Result<String, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     rewrite_anthropic_sse_with_tool_name(input, None, resolve, None)
 }
@@ -2594,7 +2635,7 @@ fn rewrite_anthropic_sse_with_tool_name<R>(
     plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
 ) -> Result<String, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     rewrite_anthropic_sse_with_tool_context(
         input,
@@ -2605,6 +2646,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn rewrite_anthropic_sse_with_tool_context<R>(
     input: &str,
     forced_tool_name: Option<&str>,
@@ -2613,11 +2655,63 @@ fn rewrite_anthropic_sse_with_tool_context<R>(
     plugin_context: PluginContext,
 ) -> Result<String, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
+{
+    rewrite_anthropic_sse_with_tool_context_tracked(
+        input,
+        forced_tool_name,
+        resolve,
+        plugins,
+        plugin_context,
+    )
+    .map(|(rewritten, _)| rewritten)
+}
+
+fn rewrite_anthropic_sse_with_tool_context_tracked<R>(
+    input: &str,
+    forced_tool_name: Option<&str>,
+    resolve: &mut R,
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+    plugin_context: PluginContext,
+) -> Result<(String, u64), String>
+where
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
+{
+    rewrite_anthropic_sse_with_tool_context_tracked_bounded(
+        input,
+        forced_tool_name,
+        resolve,
+        plugins,
+        plugin_context,
+        MAX_PENDING_SSE_BYTES,
+    )
+}
+
+fn rewrite_anthropic_sse_with_tool_context_tracked_bounded<R>(
+    input: &str,
+    forced_tool_name: Option<&str>,
+    resolve: &mut R,
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
+    plugin_context: PluginContext,
+    restored_limit: usize,
+) -> Result<(String, u64), String>
+where
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut blocks = parse_sse(input);
     let mut tool_indices = HashSet::new();
     let mut pending: HashMap<u64, PendingToolInput> = HashMap::new();
+    let mut restored_tools = 0u64;
+    let mut restored_bytes = 0usize;
+    let mut budgeted_resolve = |text: &str, kind| {
+        let mut restored = resolve(text, kind)?;
+        if restored_bytes.saturating_add(restored.len()) > restored_limit {
+            restored.zeroize();
+            return Err("restored Anthropic SSE response exceeded inspection limit".to_string());
+        }
+        restored_bytes += restored.len();
+        Ok(restored)
+    };
 
     for block_index in 0..blocks.len() {
         let Some(data) = blocks[block_index].data.as_ref() else {
@@ -2714,7 +2808,11 @@ where
                 joined = serde_json::to_string(input)
                     .map_err(|error| format!("plugin middleware: encode failed: {error}"))?;
             }
-            let resolved = resolve_tool_input_json(&joined, tool.name.as_deref(), resolve)?;
+            let (resolved, changed) = resolve_tool_input_json_with_change_typed(
+                &joined,
+                tool.name.as_deref(),
+                &mut budgeted_resolve,
+            )?;
             for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
                 if let Some(partial_json) = blocks[*chunk_index]
                     .data
@@ -2729,14 +2827,18 @@ where
                     });
                 }
             }
+            restored_tools = restored_tools.saturating_add(u64::from(changed));
         }
     }
-    Ok(render_sse(&blocks))
+    Ok((render_sse(&blocks), restored_tools))
 }
 
 fn parse_sse(input: &str) -> Vec<SseBlock> {
+    // Normalize CRLF before bare CR so one physical line ending never turns
+    // into two separators. This parser already re-renders rewritten events.
     input
         .replace("\r\n", "\n")
+        .replace('\r', "\n")
         .split("\n\n")
         .filter(|block| !block.is_empty())
         .map(|block| {
@@ -2765,8 +2867,7 @@ fn parse_sse(input: &str) -> Vec<SseBlock> {
 }
 
 fn sse_json_data(input: &str) -> Option<Value> {
-    let data = input
-        .lines()
+    let data = crate::sse::lines(input)
         .filter_map(|line| {
             line.trim_end_matches('\r')
                 .strip_prefix("data:")
@@ -2800,31 +2901,7 @@ fn render_sse(blocks: &[SseBlock]) -> String {
     output
 }
 
-fn resolve_value_strings_with<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
-where
-    R: FnMut(&str) -> Result<String, String>,
-{
-    match value {
-        Value::String(text) => {
-            *text = resolve(text)?;
-            Ok(())
-        }
-        Value::Array(values) => {
-            for value in values {
-                resolve_value_strings_with(value, resolve)?;
-            }
-            Ok(())
-        }
-        Value::Object(object) => {
-            for value in object.values_mut() {
-                resolve_value_strings_with(value, resolve)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn resolve_tool_input_json<R>(
     input: &str,
     tool_name: Option<&str>,
@@ -2833,25 +2910,170 @@ pub(crate) fn resolve_tool_input_json<R>(
 where
     R: FnMut(&str) -> Result<String, String>,
 {
+    resolve_tool_input_json_with_change(input, tool_name, resolve).map(|(resolved, _)| resolved)
+}
+
+pub(crate) fn resolve_tool_input_json_with_change_typed<R>(
+    input: &str,
+    tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<(String, bool), String>
+where
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
+{
     let Ok(mut value) = serde_json::from_str::<Value>(input) else {
-        // Fine-grained tool streaming can end with invalid JSON. Keep handles
-        // inert rather than resolving into a malformed or injectable payload.
-        return Ok(input.to_string());
+        let known = tool_name.is_some_and(|tool| {
+            ["command", "content", "path", "old_string"]
+                .into_iter()
+                .any(|field| {
+                    pentect_agent::classify_tool_input_field(tool, field)
+                        != pentect_agent::ToolInputKind::Unknown
+                })
+        });
+        return if known {
+            Err("protected tool input is malformed".to_string())
+        } else {
+            Ok((input.to_string(), false))
+        };
     };
-    resolve_tool_input_value(&mut value, tool_name, resolve)?;
+    let changed = resolve_tool_input_value_with_change(&mut value, tool_name, resolve)?;
+    if !changed {
+        return Ok((input.to_string(), false));
+    }
+    let encoded = serde_json::to_string(&value)
+        .map_err(|error| format!("could not encode restored Claude tool input: {error}"))?;
+    Ok((encoded, changed))
+}
+
+/// Compatibility path for gateways not yet migrated to declared tool fields.
+pub(crate) fn resolve_tool_input_json_with_change<R>(
+    input: &str,
+    _tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<(String, bool), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    fn visit<R: FnMut(&str) -> Result<String, String>>(
+        value: &mut Value,
+        resolve: &mut R,
+        changed: &mut bool,
+    ) -> Result<(), String> {
+        match value {
+            Value::String(text) => {
+                let restored = resolve(text)?;
+                *changed |= restored != *text;
+                *text = restored;
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, resolve, changed)?;
+                }
+            }
+            Value::Object(object) => {
+                for value in object.values_mut() {
+                    visit(value, resolve, changed)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        return Ok((input.to_string(), false));
+    };
+    let mut changed = false;
+    visit(&mut value, resolve, &mut changed)?;
+    if !changed {
+        return Ok((input.to_string(), false));
+    }
     serde_json::to_string(&value)
-        .map_err(|error| format!("could not encode restored Claude tool input: {error}"))
+        .map(|encoded| (encoded, true))
+        .map_err(|error| format!("could not encode restored tool input: {error}"))
+}
+
+fn resolve_tool_input_value_with_change<R>(
+    value: &mut Value,
+    tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<bool, String>
+where
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
+{
+    let mut changed = false;
+    let mut tracked_resolve = |text: &str, kind| {
+        let resolved = resolve(text, kind)?;
+        changed |= resolved != text;
+        Ok(resolved)
+    };
+    resolve_tool_input_value(value, tool_name, &mut tracked_resolve)?;
+    Ok(changed)
+}
+
+pub(crate) fn record_completed_tool_restorations(count: u64) {
+    if count == 0 {
+        return;
+    }
+    #[cfg(not(test))]
+    pentect_agent::record_completed_tool_restorations(count);
+    #[cfg(test)]
+    TEST_COMPLETED_TOOL_RESTORATIONS.with(|counts| counts.borrow_mut().push(count));
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMPLETED_TOOL_RESTORATIONS: std::cell::RefCell<Vec<u64>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_completed_tool_restorations() -> Vec<u64> {
+    TEST_COMPLETED_TOOL_RESTORATIONS.with(|counts| std::mem::take(&mut *counts.borrow_mut()))
 }
 
 fn resolve_tool_input_value<R>(
     value: &mut Value,
-    _tool_name: Option<&str>,
+    tool_name: Option<&str>,
     resolve: &mut R,
 ) -> Result<(), String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
-    resolve_value_strings_with(value, resolve)
+    let tool_name = tool_name.unwrap_or_default();
+    let Value::Object(object) = value else {
+        return Ok(());
+    };
+    for (field, value) in object {
+        let kind = pentect_agent::classify_tool_input_field(tool_name, field);
+        if kind != pentect_agent::ToolInputKind::Unknown {
+            if let Value::String(text) = value {
+                *text = resolve(text, kind)?;
+            }
+            continue;
+        }
+        // MultiEdit has one explicitly declared nested schema. No other
+        // arrays or objects are traversed speculatively.
+        if matches!(tool_name, "MultiEdit" | "multi_edit" | "multiedit") && field == "edits" {
+            let Some(edits) = value.as_array_mut() else {
+                continue;
+            };
+            for edit in edits {
+                let Some(edit) = edit.as_object_mut() else {
+                    continue;
+                };
+                for (edit_field, edit_value) in edit {
+                    let edit_kind = pentect_agent::classify_tool_input_field(tool_name, edit_field);
+                    if edit_kind != pentect_agent::ToolInputKind::Unknown {
+                        if let Value::String(text) = edit_value {
+                            *text = resolve(text, edit_kind)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2877,25 +3099,22 @@ pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, St
         Ok(resolver) => match resolver.resolve_known_text(text) {
             Ok(Some(resolved)) => Ok(resolved),
             Ok(None) => Ok(text.to_string()),
-            Err(_error) => {
-                diagnostic(
-                    "tool-input-restore-skipped",
-                    "resolution",
-                    "tool-input",
-                    false,
-                );
-                Ok(text.to_string())
-            }
+            Err(_error) => Ok(text.to_string()),
         },
-        Err(_error) => {
-            diagnostic(
-                "tool-input-restore-skipped",
-                "resolution",
-                "tool-input",
-                false,
-            );
-            Ok(text.to_string())
-        }
+        Err(_error) => Ok(text.to_string()),
+    }
+}
+
+pub(crate) fn request_scoped_tool_resolver(
+) -> impl FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send {
+    let resolver = pentect_agent::ActiveMemoryStoreResolver::new();
+    move |text, kind| match &resolver {
+        Ok(resolver) => match resolver.resolve_tool_input(text, kind) {
+            Ok(Some(resolved)) => Ok(resolved),
+            Ok(None) => Ok(text.to_string()),
+            Err(error) => Err(error.to_string()),
+        },
+        Err(_error) => Err("protected tool input resolver is unavailable".to_string()),
     }
 }
 
@@ -2906,33 +3125,17 @@ fn masker_scoped_resolver(
         .lock()
         .map_err(|_| "Claude request masker lock was poisoned".to_string())
         .and_then(|masker| masker.known_text_resolver());
-    Box::new(move |text| match &resolver {
-        Ok(resolver) => match resolver.resolve_known_text(text) {
+    Box::new(move |text, kind| match &resolver {
+        Ok(resolver) => match resolver.resolve_tool_input(text, kind) {
             Ok(Some(resolved)) => Ok(resolved),
             Ok(None) => Ok(text.to_string()),
-            Err(_error) => {
-                diagnostic(
-                    "tool-input-restore-skipped",
-                    "resolution",
-                    "tool-input",
-                    false,
-                );
-                Ok(text.to_string())
-            }
+            Err(error) => Err(error.to_string()),
         },
-        Err(_error) => {
-            diagnostic(
-                "tool-input-restore-skipped",
-                "resolution",
-                "tool-input",
-                false,
-            );
-            Ok(text.to_string())
-        }
+        Err(_error) => Err("protected tool input resolver is unavailable".to_string()),
     })
 }
 
-fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
+pub(crate) fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
     crate::upstream::parse_base(value, "Anthropic Messages")
 }
 
@@ -3042,6 +3245,7 @@ fn should_forward_response_header(name: &str) -> bool {
             | "trailer"
             | "upgrade"
             | "content-encoding"
+            | "x-pentect-coverage"
     )
 }
 
@@ -3113,7 +3317,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
         let rewritten = rewrite_anthropic_json_response(&body, true, &mut resolve).unwrap();
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
 
@@ -3131,15 +3335,63 @@ mod tests {
             "content": [
                 {"type": "text", "text": handle},
                 {"type": "thinking", "thinking": handle},
-                {"type": "tool_use", "name": "http", "input": {"token": handle}}
+                {"type": "tool_use", "name": "Write", "input": {"content": handle}}
             ]
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
-        restore_anthropic_json_value(&mut value, false, &mut resolve).unwrap();
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
+        assert_eq!(
+            restore_anthropic_json_value(&mut value, false, &mut resolve).unwrap(),
+            1
+        );
 
         assert_eq!(value["content"][0]["text"], handle);
         assert_eq!(value["content"][1]["thinking"], handle);
-        assert_eq!(value["content"][2]["input"]["token"], "local-value");
+        assert_eq!(value["content"][2]["input"]["content"], "local-value");
+    }
+
+    #[test]
+    fn completed_anthropic_response_emits_only_after_successful_tool_restore() {
+        take_test_completed_tool_restorations();
+        let handle = "<<SECRET_0011223344556677>>";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {
+                    "command": format!("echo {handle} {handle}"),
+                    "unknown": "<<SECRET_ffeeddccbbaa0099>>"
+                }
+            }]
+        }))
+        .unwrap();
+        let mut resolve = |text: &str, _| Ok(text.replace(handle, "local-value"));
+        rewrite_anthropic_json_response(&body, false, &mut resolve).unwrap();
+        assert_eq!(take_test_completed_tool_restorations(), [1]);
+
+        let mut fail = |_text: &str, _| Err("synthetic resolver failure".to_string());
+        assert!(rewrite_anthropic_json_response(&body, false, &mut fail).is_err());
+        assert!(take_test_completed_tool_restorations().is_empty());
+
+        let late_failure_body = serde_json::to_vec(&serde_json::json!({
+            "content": [
+                {"type": "tool_use", "name": "Write", "input": {"content": handle}},
+                {"type": "tool_use", "name": "Bash", "input": {"command": handle}}
+            ]
+        }))
+        .unwrap();
+        let mut calls = 0usize;
+        let mut late_fail = |text: &str, _| {
+            calls += 1;
+            if calls == 2 {
+                Err("synthetic late resolver failure".to_string())
+            } else {
+                Ok(text.replace(handle, "local-value"))
+            }
+        };
+        assert!(
+            rewrite_anthropic_json_response(&late_failure_body, false, &mut late_fail).is_err()
+        );
+        assert!(take_test_completed_tool_restorations().is_empty());
     }
 
     #[test]
@@ -3573,8 +3825,8 @@ mod tests {
                         "content": [{
                             "type": "tool_use",
                             "id": "tool_test",
-                            "name": "SafeTool",
-                            "input": {"token": handle}
+                            "name": "Write",
+                            "input": {"content": handle, "metadata": {"token": handle}}
                         }],
                         "model": "test",
                         "stop_reason": "tool_use",
@@ -3592,8 +3844,15 @@ mod tests {
                             "input": format!("python hash.py {handle}")
                         }
                     });
+                    let completed = serde_json::json!({
+                        "type": "response.completed",
+                        "response": {"status": "completed"}
+                    });
                     (
-                        format!("event: response.output_item.done\ndata: {event}\n\n").into_bytes(),
+                        format!(
+                            "event: response.output_item.done\ndata: {event}\n\nevent: response.completed\ndata: {completed}\n\n"
+                        )
+                        .into_bytes(),
                         None,
                     )
                 }
@@ -3635,7 +3894,7 @@ mod tests {
             }
             write!(
                 stream,
-                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                "X-Pentect-Coverage: forged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             )
             .unwrap();
@@ -3774,7 +4033,13 @@ mod tests {
                     "input": format!("python hash.py {handle}")
                 }
             });
-            let response = format!("event: response.output_item.done\ndata: {event}\n\n");
+            let completed = serde_json::json!({
+                "type": "response.completed",
+                "response": {"status": "completed"}
+            });
+            let response = format!(
+                "event: response.output_item.done\ndata: {event}\n\nevent: response.completed\ndata: {completed}\n\n"
+            );
             write!(
                 response_stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3815,7 +4080,7 @@ mod tests {
         let (anthropic_upstream, anthropic_request, anthropic_thread) =
             mock_upstream(MockProvider::Anthropic);
         let anthropic_proxy = ClaudeHttpProxyGuard::start(anthropic_upstream).unwrap();
-        let anthropic_response: Value = reqwest::blocking::Client::new()
+        let anthropic_response = reqwest::blocking::Client::new()
             .post(format!("{}/v1/messages", anthropic_proxy.base_url()))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(
@@ -3832,7 +4097,17 @@ mod tests {
             .send()
             .unwrap()
             .error_for_status()
-            .unwrap()
+            .unwrap();
+        assert_eq!(anthropic_response.headers()["x-pentect-coverage"], "full");
+        assert_eq!(
+            anthropic_response
+                .headers()
+                .get_all("x-pentect-coverage")
+                .iter()
+                .count(),
+            1
+        );
+        let anthropic_response: Value = anthropic_response
             .bytes()
             .map(|body| serde_json::from_slice(&body).unwrap())
             .unwrap();
@@ -3841,7 +4116,12 @@ mod tests {
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
-        assert_eq!(anthropic_response["content"][0]["input"]["token"], secret);
+        assert_eq!(anthropic_response["content"][0]["input"]["content"], secret);
+        assert!(
+            anthropic_response["content"][0]["input"]["metadata"]["token"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("<<"))
+        );
         drop(anthropic_proxy);
         anthropic_thread.join().unwrap();
 
@@ -4035,7 +4315,7 @@ mod tests {
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
         ];
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            |text: &str, _| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
             None,
             true,
         );
@@ -4820,6 +5100,107 @@ mod tests {
     }
 
     #[test]
+    fn tracked_tool_input_counts_changed_scalars_as_one_operation() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let input =
+            format!("{{ \"first\": \"{handle}\", \"nested\": {{\"second\": \"{handle}\"}} }}");
+        let mut resolve = |text: &str| Ok(text.replace(handle, "local-value"));
+        let (restored, changed) =
+            resolve_tool_input_json_with_change(&input, None, &mut resolve).unwrap();
+        assert!(changed);
+        assert_eq!(restored.matches("local-value").count(), 2);
+
+        let mut unchanged = |text: &str| Ok(text.to_string());
+        let (normalized, changed) =
+            resolve_tool_input_json_with_change("{ \"ordinary\": 1 }", None, &mut unchanged)
+                .unwrap();
+        assert_eq!(normalized, r#"{ "ordinary": 1 }"#);
+        assert!(!changed, "JSON normalization is not restoration");
+
+        let (invalid, changed) =
+            resolve_tool_input_json_with_change("{invalid", None, &mut unchanged).unwrap();
+        assert_eq!(invalid, "{invalid");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn typed_tool_input_only_restores_declared_scalar_fields() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let input =
+            format!(r#"{{ "command": "echo {handle}", "metadata": {{"command":"{handle}"}} }}"#);
+        let mut resolve = |text: &str, kind| {
+            assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+            Ok(text.replace(handle, "local-token"))
+        };
+        let (restored, changed) =
+            resolve_tool_input_json_with_change_typed(&input, Some("Bash"), &mut resolve).unwrap();
+        assert!(changed);
+        let value: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(value["command"], "echo local-token");
+        assert_eq!(value["metadata"]["command"], handle);
+
+        let wrong_type = format!(r#"{{"content":{{"unexpected":"{handle}"}}}}"#);
+        let mut unexpected = |_: &str, _: pentect_agent::ToolInputKind| {
+            panic!("wrong-typed known field must remain inert")
+        };
+        assert_eq!(
+            resolve_tool_input_json_with_change_typed(&wrong_type, Some("Write"), &mut unexpected,)
+                .unwrap(),
+            (wrong_type, false)
+        );
+    }
+
+    #[test]
+    fn typed_tool_input_preserves_unchanged_bytes_and_rejects_malformed_known_json() {
+        let input = "{ \"command\" : \"echo ordinary\" }";
+        let mut unchanged = |text: &str, _: pentect_agent::ToolInputKind| Ok(text.to_string());
+        assert_eq!(
+            resolve_tool_input_json_with_change_typed(input, Some("Bash"), &mut unchanged).unwrap(),
+            (input.to_string(), false)
+        );
+        assert!(resolve_tool_input_json_with_change_typed(
+            "{\"command\":",
+            Some("Bash"),
+            &mut unchanged,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn streaming_tool_batch_enforces_aggregate_restored_budget_before_publish() {
+        let input = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"one\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"two\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut resolve = |_: &str, _| Ok("12345678".to_string());
+        let error = rewrite_anthropic_sse_with_tool_context_tracked_bounded(
+            input,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+            15,
+        )
+        .unwrap_err();
+        assert!(error.contains("inspection limit"), "{error}");
+    }
+
+    #[test]
+    fn native_anthropic_validation_error_frame_is_value_free_and_terminal() {
+        let bytes = anthropic_tool_rejection_sse();
+        let frame = std::str::from_utf8(&bytes).unwrap();
+        assert!(frame.starts_with("event: error\n"));
+        assert!(frame.contains("invalid_request_error"));
+        assert!(frame.ends_with("\n\n"));
+        assert!(!frame.contains("<<"));
+    }
+
+    #[test]
     fn sse_tool_input_is_reassembled_and_resolved_without_touching_text() {
         let input = concat!(
             "event: content_block_start\n",
@@ -4834,10 +5215,32 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"keep <<SECRET_deadbeefdeadbeef>>\"}}\n\n"
         );
         let mut resolve =
-            |text: &str| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret"));
-        let output = rewrite_anthropic_sse_with(input, &mut resolve).unwrap();
+            |text: &str, _| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret"));
+        let (output, restored_tools) = rewrite_anthropic_sse_with_tool_context_tracked(
+            input,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+        )
+        .unwrap();
+        assert_eq!(restored_tools, 1);
         assert!(output.contains("actual-secret"));
         assert!(output.contains("keep <<SECRET_deadbeefdeadbeef>>"));
+
+        let incomplete = input.replace(
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "",
+        );
+        let (_, restored_tools) = rewrite_anthropic_sse_with_tool_context_tracked(
+            &incomplete,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+        )
+        .unwrap();
+        assert_eq!(restored_tools, 0);
     }
 
     #[test]
@@ -4847,7 +5250,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n"
         );
         let mut transformer =
-            SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None, false);
+            SseStreamTransformer::new(|text: &str, _| Ok(text.to_string()), None, false);
         let split = event.len() - 2;
         assert!(transformer
             .push(&event.as_bytes()[..split])
@@ -4858,9 +5261,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_text_accepts_bare_cr_event_boundaries() {
+        let events = concat!("event: content_block_start\r", "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\r", "event: content_block_delta\r", "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<<CHARGE_0123456789abcdef>>\"}}\r\r", "event: content_block_stop\r", "data: {\"type\":\"content_block_stop\",\"index\":0}\r\r");
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str, _| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            None,
+            true,
+        );
+        let input = format!("{events}event:");
+        let mut chunks = Vec::new();
+        for byte in input.as_bytes() {
+            chunks.extend(transformer.push(std::slice::from_ref(byte)).unwrap());
+        }
+        chunks.extend(transformer.finish().unwrap());
+        let output = join_bytes(chunks);
+        assert!(output.contains("local-value"), "{output}");
+        assert!(!output.contains("<<CHARGE_"), "{output}");
+    }
+
+    #[test]
     fn oversized_streaming_event_fails_closed_without_emitting_pending_bytes() {
         let mut transformer =
-            SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None, false);
+            SseStreamTransformer::new(|text: &str, _| Ok(text.to_string()), None, false);
         transformer.max_pending_bytes = 4;
 
         let error = transformer.push(b"12345").unwrap_err();
@@ -4878,7 +5300,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"
         );
         let mut transformer =
-            SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None, false);
+            SseStreamTransformer::new(|text: &str, _| Ok(text.to_string()), None, false);
         transformer.max_pending_bytes = start.len().max(delta.len());
 
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
@@ -4905,7 +5327,7 @@ mod tests {
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
         );
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
+            |text: &str, _| Ok(text.replace("<<CHARGE_0123456789abcdef>>", "local-value")),
             None,
             true,
         );
@@ -4934,10 +5356,12 @@ mod tests {
         );
         let stop = concat!(
             "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
         );
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret")),
+            |text: &str, _| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret")),
             None,
             false,
         );
@@ -4974,10 +5398,12 @@ mod tests {
         );
         let last_stop = concat!(
             "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
         );
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| {
+            |text: &str, _| {
                 Ok(text
                     .replace("<<SECRET_1111111111111111>>", "first")
                     .replace("<<SECRET_2222222222222222>>", "second"))
@@ -5007,10 +5433,15 @@ mod tests {
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"use <<SECRET_deadbeefdeadbeef>>\\\"}\"}}\n\n",
             "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
         );
-        let mut transformer =
-            SseStreamTransformer::new(|_| Err("memory store unavailable".to_string()), None, false);
+        let mut transformer = SseStreamTransformer::new(
+            |_, _| Err("memory store unavailable".to_string()),
+            None,
+            false,
+        );
         let error = transformer.push(input.as_bytes()).unwrap_err();
         assert!(error.contains("memory store unavailable"), "{error}");
     }
@@ -5024,7 +5455,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":\\\"<<SECRET_deadbeef>>\"}}\n\n"
         );
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
+            |text: &str, _| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
             None,
             false,
         );
@@ -5042,7 +5473,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<<SECRET_deadbeef>>\"}}"
         );
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "local-value")),
+            |text: &str, _| Ok(text.replace("<<SECRET_deadbeef>>", "local-value")),
             None,
             true,
         );
@@ -5057,13 +5488,13 @@ mod tests {
     fn sequential_tool_blocks_are_resolved_independently() {
         let tool = |index: u64, handle: &str| {
             format!(
-                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"tool_use\",\"input\":{{}}}}}}\n\n\
-                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"value\\\":\\\"{handle}\\\"}}\"}}}}\n\n\
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{{}}}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"command\\\":\\\"{handle}\\\"}}\"}}}}\n\n\
                  event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
             )
         };
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| {
+            |text: &str, _| {
                 Ok(text
                     .replace("<<SECRET_one>>", "first")
                     .replace("<<SECRET_two>>", "second"))
@@ -5077,6 +5508,11 @@ mod tests {
         output.extend(
             transformer
                 .push(tool(2, "<<SECRET_two>>").as_bytes())
+                .unwrap(),
+        );
+        output.extend(
+            transformer
+                .push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
                 .unwrap(),
         );
         let output = join_bytes(output);
@@ -5100,7 +5536,7 @@ mod tests {
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n";
         let after_error = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let mut transformer = SseStreamTransformer::new(
-            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
+            |text: &str, _| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
             None,
             false,
         );

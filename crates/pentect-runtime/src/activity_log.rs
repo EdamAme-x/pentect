@@ -4,8 +4,9 @@ use pentect_core::{model::labels, MaskResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
@@ -83,10 +84,14 @@ struct PrivacyMetrics {
     redacted_image_occurrences: u64,
     blocked_image_occurrences: u64,
     restoration_operations: u64,
+    blocked_restoration_occurrences: u64,
     blocked_occurrences: u64,
     warning_occurrences: u64,
+    plugin_failure_occurrences: u64,
+    plugin_timeout_occurrences: u64,
     by_secret_type: BTreeMap<String, u64>,
     by_surface: BTreeMap<String, u64>,
+    by_warning_reason: BTreeMap<String, u64>,
     records_read: u64,
     records_skipped: u64,
 }
@@ -386,35 +391,111 @@ pub(crate) fn print_metrics(json: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("Pentect privacy metrics (retained local logs)");
-    println!("Masked occurrences: {}", metrics.masked_text_occurrences);
-    println!("Redacted images: {}", metrics.redacted_image_occurrences);
-    println!("Blocked images: {}", metrics.blocked_image_occurrences);
-    println!(
-        "Local restoration operations: {}",
-        metrics.restoration_operations
-    );
-    println!("Blocked operations: {}", metrics.blocked_occurrences);
-    println!("Warnings: {}", metrics.warning_occurrences);
-    print_metric_group(
-        "Secret types (text masks and image redactions)",
-        &metrics.by_secret_type,
-    );
-    print_metric_group("Protection surfaces", &metrics.by_surface);
-    if metrics.records_skipped > 0 {
-        println!(
-            "Skipped unreadable records: {} (counts may be incomplete)",
-            metrics.records_skipped
-        );
-    }
-    println!("No secret values, handles, paths, URLs, or account identifiers are included.");
+    print!("{}", format_metrics_human(&metrics));
     Ok(())
 }
 
-fn print_metric_group(title: &str, values: &BTreeMap<String, u64>) {
-    println!("{title}:");
+fn format_metrics_human(metrics: &PrivacyMetrics) -> String {
+    let mut output = String::new();
+    writeln!(output, "Pentect privacy metrics (retained local logs)").unwrap();
+    writeln!(
+        output,
+        "Masked occurrences: {}",
+        metrics.masked_text_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Redacted images: {}",
+        metrics.redacted_image_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Blocked images: {}",
+        metrics.blocked_image_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Local restoration operations: {}",
+        metrics.restoration_operations
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Blocked restoration attempts: {}",
+        metrics.blocked_restoration_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Blocked operations: {}",
+        metrics.blocked_occurrences
+    )
+    .unwrap();
+    writeln!(output, "Warnings: {}", metrics.warning_occurrences).unwrap();
+    writeln!(
+        output,
+        "Plugin failures (including timeouts): {}",
+        metrics.plugin_failure_occurrences
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "Plugin timeouts: {}",
+        metrics.plugin_timeout_occurrences
+    )
+    .unwrap();
+    format_metric_group(
+        &mut output,
+        "Secret types (text masks and image redactions)",
+        &metrics.by_secret_type,
+        |name| {
+            (safe_metric_secret_type(name) == name).then(|| {
+                labels::description(name)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| readable_metric_name(name))
+            })
+        },
+    );
+    format_metric_group(
+        &mut output,
+        "Protection surfaces",
+        &metrics.by_surface,
+        metric_surface_description,
+    );
+    format_metric_group(
+        &mut output,
+        "Warning reasons",
+        &metrics.by_warning_reason,
+        warning_reason_description,
+    );
+    if metrics.records_skipped > 0 {
+        writeln!(
+            output,
+            "Skipped unreadable records: {} (counts may be incomplete)",
+            metrics.records_skipped
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "No secret values, handles, paths, URLs, or account identifiers are included."
+    )
+    .unwrap();
+    output
+}
+
+fn format_metric_group(
+    output: &mut String,
+    title: &str,
+    values: &BTreeMap<String, u64>,
+    description: fn(&str) -> Option<String>,
+) {
+    writeln!(output, "{title}:").unwrap();
     if values.is_empty() {
-        println!("  (none)");
+        writeln!(output, "  (none)").unwrap();
         return;
     }
     let mut values = values.iter().collect::<Vec<_>>();
@@ -424,8 +505,84 @@ fn print_metric_group(title: &str, values: &BTreeMap<String, u64>) {
             .then_with(|| left_name.cmp(right_name))
     });
     for (name, count) in values {
-        println!("  {name}: {count}");
+        let (safe_name, readable) = description(name)
+            .map(|readable| (name.as_str(), readable))
+            .unwrap_or_else(|| ("unknown", "Unknown or unclassified value".to_string()));
+        writeln!(output, "  {safe_name} ({readable}): {count}").unwrap();
     }
+}
+
+fn metric_surface_description(name: &str) -> Option<String> {
+    Some(
+        match name {
+            "prompt" => "Text sent to a model",
+            "output" => "Masked tool or command output",
+            "tool" => "Local tool input or output",
+            "read" => "Content read from a local file",
+            "image" => "Image or OCR content",
+            "OTHER" => "Other protected surface",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+fn readable_metric_name(name: &str) -> String {
+    let mut output = String::new();
+    for (index, word) in name
+        .split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .enumerate()
+    {
+        if index > 0 {
+            output.push(' ');
+        }
+        if is_metric_acronym(word) {
+            output.push_str(&word.to_ascii_uppercase());
+            continue;
+        }
+        let normalized = word.to_ascii_lowercase();
+        if index == 0 {
+            let mut chars = normalized.chars();
+            if let Some(first) = chars.next() {
+                output.extend(first.to_uppercase());
+                output.push_str(chars.as_str());
+            }
+        } else {
+            output.push_str(&normalized);
+        }
+    }
+    if output.is_empty() {
+        "Unknown".to_string()
+    } else {
+        output
+    }
+}
+
+fn is_metric_acronym(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "API"
+            | "AWS"
+            | "CLI"
+            | "CMD"
+            | "GPS"
+            | "HTTP"
+            | "IBAN"
+            | "JSON"
+            | "JWT"
+            | "MCP"
+            | "NINO"
+            | "OCR"
+            | "OPENAI"
+            | "OTP"
+            | "PII"
+            | "S3"
+            | "SSE"
+            | "UK"
+            | "URL"
+            | "UUID"
+    )
 }
 
 fn read_metrics(path: &Path) -> Result<PrivacyMetrics, String> {
@@ -499,6 +656,11 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
             metrics.restoration_operations =
                 metrics.restoration_operations.saturating_add(event.count);
         }
+        "restoration-blocked" => {
+            metrics.blocked_restoration_occurrences = metrics
+                .blocked_restoration_occurrences
+                .saturating_add(event.count);
+        }
         "block" => {
             metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
         }
@@ -509,6 +671,11 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
         }
         "warning" => {
             metrics.warning_occurrences = metrics.warning_occurrences.saturating_add(event.count);
+            increment_metric(
+                &mut metrics.by_warning_reason,
+                diagnostic_event(event.event.as_deref().unwrap_or("unknown")),
+                event.count,
+            );
             if is_block_event(event.event.as_deref()) {
                 metrics.blocked_occurrences =
                     metrics.blocked_occurrences.saturating_add(event.count);
@@ -516,6 +683,16 @@ fn aggregate_metric_event(event: &ActivityEvent, metrics: &mut PrivacyMetrics) {
         }
         "diagnostic" if is_block_event(event.event.as_deref()) => {
             metrics.blocked_occurrences = metrics.blocked_occurrences.saturating_add(event.count);
+        }
+        "plugin-failure" => {
+            metrics.plugin_failure_occurrences = metrics
+                .plugin_failure_occurrences
+                .saturating_add(event.count);
+            if event.labels.iter().any(|label| label.name == "timeout") {
+                metrics.plugin_timeout_occurrences = metrics
+                    .plugin_timeout_occurrences
+                    .saturating_add(event.count);
+            }
         }
         _ => {}
     }
@@ -618,6 +795,23 @@ pub(crate) fn record_summary(
     ));
 }
 
+pub(crate) fn record_restoration_blocked(surface: &str) {
+    record_summary(
+        "restoration-blocked",
+        restoration_block_surface(surface),
+        1,
+        BTreeMap::new(),
+        None,
+    );
+}
+
+fn restoration_block_surface(surface: &str) -> &str {
+    match surface {
+        "argv" | "command" | "exec-server" | "file-repair" => surface,
+        _ => "other",
+    }
+}
+
 pub(crate) fn record_image(secret_images: usize, detected_labels: &BTreeMap<String, u64>) {
     if secret_images == 0 {
         return;
@@ -637,6 +831,7 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
     let mut lifecycle = LifecycleSource::open();
     let mut persistent = LifecycleSource::open_at(persistent_log_path());
     let mut seen = SeenActivity::default();
+    let mut following_announced = false;
 
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -698,6 +893,12 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
                 continue;
             }
         }
+        if !json && !following_announced {
+            writeln!(output, "-- following live events; press Ctrl-C to stop --")
+                .map_err(|error| format!("could not write activity log: {error}"))?;
+            following_announced = true;
+            wrote = true;
+        }
         if wrote {
             output
                 .flush()
@@ -705,6 +906,118 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+pub(crate) fn print_tail(json: bool, limit: usize) -> Result<(), String> {
+    let path = persistent_log_path();
+    let mut payloads = Vec::with_capacity(limit);
+    for generation in 0..=LOG_ROTATIONS {
+        if payloads.len() == limit {
+            break;
+        }
+        let path = if generation == 0 {
+            path.clone()
+        } else {
+            rotated_log_path(&path, generation)
+        };
+        let remaining = limit - payloads.len();
+        payloads.extend(read_lines_newest_first(&path, remaining)?);
+    }
+    payloads.reverse();
+
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    for payload in payloads {
+        let event: ActivityEvent = serde_json::from_str(&payload)
+            .map_err(|error| format!("invalid persistent log event: {error}"))?;
+        if json {
+            writeln!(output, "{payload}")
+                .map_err(|error| format!("could not write persistent log: {error}"))?;
+        } else {
+            writeln!(output, "{}", format_event(&event))
+                .map_err(|error| format!("could not write persistent log: {error}"))?;
+        }
+    }
+    output
+        .flush()
+        .map_err(|error| format!("could not flush persistent log: {error}"))
+}
+
+fn read_lines_newest_first(path: &Path, limit: usize) -> Result<Vec<String>, String> {
+    const READ_CHUNK: usize = 16 * 1024;
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
+    const MAX_SCAN_BYTES: u64 = LOG_MAX_BYTES;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not open persistent activity log: {error}")),
+    };
+    let mut position = file
+        .metadata()
+        .map_err(|error| format!("could not inspect persistent activity log: {error}"))?
+        .len();
+    if position == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(position - 1))
+        .map_err(|error| format!("could not seek persistent activity log: {error}"))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|error| format!("could not read persistent activity log: {error}"))?;
+    let mut skip_incomplete_tail = last[0] != b'\n';
+    let mut pending = Vec::new();
+    let mut lines = Vec::with_capacity(limit);
+    let mut scanned = 0_u64;
+
+    while position > 0 && lines.len() < limit {
+        let start = position.saturating_sub(READ_CHUNK as u64);
+        let length = (position - start) as usize;
+        scanned = scanned.saturating_add(length as u64);
+        if scanned > MAX_SCAN_BYTES {
+            return Err("persistent activity log tail exceeds the read limit".to_string());
+        }
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| format!("could not seek persistent activity log: {error}"))?;
+        let mut combined = vec![0_u8; length];
+        file.read_exact(&mut combined)
+            .map_err(|error| format!("could not read persistent activity log: {error}"))?;
+        combined.extend_from_slice(&pending);
+
+        let mut segments = combined.split(|byte| *byte == b'\n');
+        pending = segments.next().unwrap_or_default().to_vec();
+        if pending.len() > MAX_LINE_BYTES {
+            return Err("persistent activity log event exceeds the line limit".to_string());
+        }
+        let complete = segments.collect::<Vec<_>>();
+        for segment in complete.into_iter().rev() {
+            if skip_incomplete_tail {
+                skip_incomplete_tail = false;
+                continue;
+            }
+            if segment.is_empty() {
+                continue;
+            }
+            if segment.len() > MAX_LINE_BYTES {
+                return Err("persistent activity log event exceeds the line limit".to_string());
+            }
+            lines.push(
+                String::from_utf8(segment.to_vec())
+                    .map_err(|_| "persistent activity log is not valid UTF-8".to_string())?,
+            );
+            if lines.len() == limit {
+                break;
+            }
+        }
+        position = start;
+    }
+    if position == 0 && lines.len() < limit && !pending.is_empty() && !skip_incomplete_tail {
+        lines.push(
+            String::from_utf8(pending)
+                .map_err(|_| "persistent activity log is not valid UTF-8".to_string())?,
+        );
+    }
+    Ok(lines)
 }
 
 impl LifecycleSource {
@@ -1264,6 +1577,7 @@ fn diagnostic_surface(value: &str) -> String {
         value,
         &[
             "claude",
+            "claude-app",
             "cloud-code",
             "decode",
             "gemini",
@@ -1274,47 +1588,150 @@ fn diagnostic_surface(value: &str) -> String {
     )
 }
 
+const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "cmd-binding-skipped",
+        "Shell command binding could not be inspected",
+    ),
+    (
+        "connection-failed",
+        "A protected connection could not be established",
+    ),
+    (
+        "candidate-limit",
+        "Inspection reached the configured candidate limit",
+    ),
+    (
+        "decoded-byte-limit",
+        "Inspection reached the decoded-data limit",
+    ),
+    (
+        "diagnostic-queue-overflow",
+        "Some diagnostic records could not be queued",
+    ),
+    ("elapsed-limit", "Inspection reached the time limit"),
+    (
+        "expansion-limit",
+        "Inspection reached the decoded-expansion limit",
+    ),
+    (
+        "file-attestation-unavailable",
+        "Local file identity could not be verified",
+    ),
+    (
+        "file-registry-unavailable",
+        "Protected local file tracking was unavailable",
+    ),
+    (
+        "gateway-busy",
+        "The local protection gateway was at capacity",
+    ),
+    ("gateway-stopped", "The local protection gateway stopped"),
+    (
+        "no-protected-connection",
+        "No protected client connection was observed",
+    ),
+    (
+        "provider-mcp-credential-forwarded",
+        "A configured provider MCP credential was forwarded",
+    ),
+    (
+        "request-content-encoding-skipped",
+        "Request content encoding could not be inspected",
+    ),
+    (
+        "request-encode-skipped",
+        "A protected request could not be encoded",
+    ),
+    ("request-failed", "A protected provider request failed"),
+    ("request-invalid-json", "Request content was not valid JSON"),
+    (
+        "request-protection-skipped",
+        "Request content protection was skipped",
+    ),
+    (
+        "request-rejected",
+        "A request was rejected to preserve protection",
+    ),
+    (
+        "response-protection-skipped",
+        "Response content protection was skipped",
+    ),
+    (
+        "response-restore-skipped",
+        "Local response-handle restoration was skipped",
+    ),
+    ("scan-complete", "Image inspection completed"),
+    ("scan-failed", "Image inspection failed"),
+    (
+        "scan-failure-allowed",
+        "Policy allowed image content after OCR inspection failed",
+    ),
+    (
+        "scan-failure-blocked",
+        "Affected image content was blocked after OCR inspection failed",
+    ),
+    (
+        "scan-unavailable-allowed",
+        "Policy allowed image content without OCR inspection",
+    ),
+    (
+        "scan-unavailable-blocked",
+        "Affected image content was blocked because OCR inspection was unavailable",
+    ),
+    (
+        "shell-secret-unresolved",
+        "A protected value could not be restored for a local shell",
+    ),
+    (
+        "sse-event-limit",
+        "A stream event exceeded the inspection size limit",
+    ),
+    (
+        "sse-restore-skipped",
+        "Local stream-handle restoration was skipped",
+    ),
+    (
+        "sse-tool-limit",
+        "Stream tool input exceeded the inspection size limit",
+    ),
+    (
+        "stream-event-protection-skipped",
+        "Stream event content protection was skipped",
+    ),
+    (
+        "tool-input-restore-skipped",
+        "Local tool-input handle restoration was skipped",
+    ),
+    (
+        "unknown-content-block",
+        "Unrecognized content was blocked because it could not be inspected",
+    ),
+    ("unknown-endpoint", "A provider endpoint was not recognized"),
+    (
+        "upstream-response",
+        "A provider response status was observed",
+    ),
+];
+
 fn diagnostic_event(value: &str) -> String {
-    allowed_diagnostic_identifier(
-        value,
-        &[
-            "cmd-binding-skipped",
-            "connection-failed",
-            "candidate-limit",
-            "decoded-byte-limit",
-            "diagnostic-queue-overflow",
-            "elapsed-limit",
-            "expansion-limit",
-            "file-attestation-unavailable",
-            "file-registry-unavailable",
-            "gateway-busy",
-            "gateway-stopped",
-            "provider-mcp-credential-forwarded",
-            "request-content-encoding-skipped",
-            "request-encode-skipped",
-            "request-failed",
-            "request-invalid-json",
-            "request-protection-skipped",
-            "request-rejected",
-            "response-protection-skipped",
-            "response-restore-skipped",
-            "scan-complete",
-            "scan-failed",
-            "scan-failure-allowed",
-            "scan-failure-blocked",
-            "scan-unavailable-allowed",
-            "scan-unavailable-blocked",
-            "shell-secret-unresolved",
-            "sse-event-limit",
-            "sse-restore-skipped",
-            "sse-tool-limit",
-            "stream-event-protection-skipped",
-            "tool-input-restore-skipped",
-            "unknown-content-block",
-            "unknown-endpoint",
-            "upstream-response",
-        ],
-    )
+    if WARNING_REASON_DESCRIPTIONS
+        .iter()
+        .any(|(code, _)| *code == value)
+    {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn warning_reason_description(name: &str) -> Option<String> {
+    if name == "unknown" {
+        return Some("Unknown or unclassified warning".to_string());
+    }
+    WARNING_REASON_DESCRIPTIONS
+        .iter()
+        .find_map(|(code, description)| (*code == name).then(|| (*description).to_string()))
 }
 
 fn diagnostic_kind(value: &str) -> String {
@@ -1334,6 +1751,7 @@ fn diagnostic_kind(value: &str) -> String {
             "internal",
             "limit",
             "model-load",
+            "plugin",
             "policy",
             "preprocess",
             "protection",
@@ -1363,23 +1781,34 @@ fn diagnostic_endpoint(value: &str) -> String {
     allowed_diagnostic_identifier(
         value,
         &[
+            "audio-speech",
+            "audio-transcription",
+            "audio-translation",
+            "batch-embed-contents",
             "bundled",
             "chat-completions",
+            "complete",
+            "completions",
             "control",
             "count-tokens",
             "disabled",
+            "embed-content",
+            "embeddings",
             "files",
             "files-collection",
             "gateway",
             "generate-content",
             "health",
             "image",
+            "image-generation",
             "input-tokens",
             "macos",
             "messages",
+            "message-batches",
             "models",
             "responses",
             "responses-resource",
+            "standalone-search",
             "stream-generate-content",
             "telemetry",
             "tool-input",
@@ -1463,11 +1892,27 @@ fn basename_source_location(value: &str) -> String {
 
 fn safe_target(path: &Path) -> String {
     if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(relative) = path.strip_prefix(&cwd) {
+        let cwd = normalize_path_lexically(&cwd);
+        let absolute = if path.is_absolute() {
+            normalize_path_lexically(path)
+        } else {
+            normalize_path_lexically(&cwd.join(path))
+        };
+        if let Ok(relative) = absolute.strip_prefix(&cwd) {
             return display_path(relative);
         }
+        return absolute
+            .file_name()
+            .map(PathBuf::from)
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_else(|| "external".to_string());
     }
-    if path.is_relative() {
+    if path.is_relative()
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
         return display_path(path);
     }
     path.file_name()
@@ -1475,6 +1920,28 @@ fn safe_target(path: &Path) -> String {
         .as_deref()
         .map(display_path)
         .unwrap_or_else(|| "external".to_string())
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let anchored = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !anchored {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn display_path(path: &Path) -> String {
@@ -1521,6 +1988,13 @@ mod tests {
             None,
         );
         let restored = ActivityEvent::new("resolve", "tool", 2, BTreeMap::new(), None);
+        let restoration_blocked = ActivityEvent::new(
+            "restoration-blocked",
+            "command",
+            4,
+            BTreeMap::new(),
+            Some("private-restoration-target".to_string()),
+        );
         let warning = ActivityEvent::diagnostic(
             "openai",
             "request-failed",
@@ -1531,6 +2005,22 @@ mod tests {
             Some(true),
             None,
         );
+        let mut untrusted_warning = warning.clone();
+        untrusted_warning.event = Some("private-account-warning".to_string());
+        let plugin_failure = ActivityEvent::new(
+            "plugin-failure",
+            "plugin",
+            2,
+            BTreeMap::from([("failure".to_string(), 2)]),
+            Some("private-plugin-name".to_string()),
+        );
+        let plugin_timeout = ActivityEvent::new(
+            "plugin-failure",
+            "plugin",
+            3,
+            BTreeMap::from([("timeout".to_string(), 3)]),
+            None,
+        );
         std::fs::write(
             rotated_log_path(&path, 1),
             format!("{}\n", serde_json::to_string(&masked).unwrap()),
@@ -1538,11 +2028,19 @@ mod tests {
         .unwrap();
         std::fs::write(
             &path,
-            [redacted, restored, warning]
-                .iter()
-                .map(|event| serde_json::to_string(event).unwrap())
-                .collect::<Vec<_>>()
-                .join("\n")
+            [
+                redacted,
+                restored,
+                restoration_blocked,
+                warning,
+                untrusted_warning,
+                plugin_failure,
+                plugin_timeout,
+            ]
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
                 + "\nnot-json\n",
         )
         .unwrap();
@@ -1552,17 +2050,99 @@ mod tests {
         assert_eq!(metrics.masked_text_occurrences, 3);
         assert_eq!(metrics.redacted_image_occurrences, 1);
         assert_eq!(metrics.restoration_operations, 2);
-        assert_eq!(metrics.warning_occurrences, 1);
+        assert_eq!(metrics.blocked_restoration_occurrences, 4);
+        assert_eq!(metrics.warning_occurrences, 2);
+        assert_eq!(metrics.plugin_failure_occurrences, 5);
+        assert_eq!(metrics.plugin_timeout_occurrences, 3);
         assert_eq!(metrics.by_secret_type["AWS_AKID"], 3);
         assert_eq!(metrics.by_secret_type["EMAIL_ADDRESS"], 1);
         assert_eq!(metrics.by_surface["prompt"], 3);
         assert_eq!(metrics.by_surface["image"], 1);
+        assert_eq!(metrics.by_warning_reason["request-failed"], 1);
+        assert_eq!(metrics.by_warning_reason["unknown"], 1);
         assert_eq!(metrics.records_skipped, 1);
 
         let output = serde_json::to_string(&metrics).unwrap();
         assert!(!output.contains("private-project"));
+        assert!(!output.contains("private-account"));
+        assert!(!output.contains("private-plugin"));
+        assert!(!output.contains("private-restoration"));
         assert!(!output.contains(".env"));
+        assert!(output.contains("\"by_surface\":{\"image\":1,\"prompt\":3}"));
+        assert!(output.contains("\"by_warning_reason\":{\"request-failed\":1,\"unknown\":1}"));
+        assert!(!output.contains("A protected provider request failed"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restoration_block_surfaces_are_bounded() {
+        assert_eq!(restoration_block_surface("argv"), "argv");
+        assert_eq!(restoration_block_surface("private-project-name"), "other");
+    }
+
+    #[test]
+    fn metric_names_are_readable_without_changing_the_stable_key() {
+        assert_eq!(readable_metric_name("AWS_S3_BUCKET"), "AWS S3 bucket");
+        assert_eq!(readable_metric_name("OPENAI_API_KEY"), "OPENAI API key");
+        assert_eq!(readable_metric_name("request-failed"), "Request failed");
+        assert_eq!(readable_metric_name("PII"), "PII");
+        assert_eq!(readable_metric_name(""), "Unknown");
+    }
+
+    #[test]
+    fn human_metrics_explain_bounded_codes_without_exposing_untrusted_dimensions() {
+        let private = "https://private.example/account/alice";
+        let metrics = PrivacyMetrics {
+            masked_text_occurrences: 2,
+            by_secret_type: BTreeMap::from([("AWS_AKID".to_string(), 1), (private.to_string(), 1)]),
+            by_surface: BTreeMap::from([("tool".to_string(), 1), (private.to_string(), 1)]),
+            by_warning_reason: BTreeMap::from([
+                ("scan-unavailable-allowed".to_string(), 1),
+                ("request-rejected".to_string(), 2),
+                (private.to_string(), 1),
+            ]),
+            ..PrivacyMetrics::default()
+        };
+
+        let output = format_metrics_human(&metrics);
+        assert!(output.contains("AWS_AKID (AWS akid): 1"), "{output}");
+        assert!(
+            output.contains("tool (Local tool input or output): 1"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "scan-unavailable-allowed (Policy allowed image content without OCR inspection): 1"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("request-rejected (A request was rejected to preserve protection): 2"),
+            "{output}"
+        );
+        assert!(!output.contains(private), "{output}");
+        assert_eq!(
+            output.matches("unknown (Unknown or unclassified").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn warning_reason_allowlist_and_descriptions_share_one_complete_source() {
+        for (code, description) in WARNING_REASON_DESCRIPTIONS {
+            assert_eq!(diagnostic_event(code), *code);
+            assert_eq!(
+                warning_reason_description(code).as_deref(),
+                Some(*description)
+            );
+            assert!(!description.is_empty());
+        }
+        assert_eq!(diagnostic_event("private-error-/home/alice"), "unknown");
+        assert_eq!(
+            warning_reason_description("unknown").as_deref(),
+            Some("Unknown or unclassified warning")
+        );
+        assert!(warning_reason_description("private-error-/home/alice").is_none());
     }
 
     #[test]
@@ -1626,6 +2206,30 @@ mod tests {
             Path::new("/home/name/secret/.env")
         };
         assert_eq!(safe_target(path), ".env");
+        assert_eq!(
+            safe_target(Path::new("../../outside/secret.env")),
+            "secret.env"
+        );
+    }
+
+    #[test]
+    fn safe_target_preserves_only_normalized_project_relative_paths() {
+        assert_eq!(
+            safe_target(Path::new("config/../secrets.env")),
+            "secrets.env"
+        );
+        assert_eq!(
+            safe_target(Path::new("config/nested.env")),
+            "config/nested.env"
+        );
+    }
+
+    #[test]
+    fn lexical_normalization_preserves_consecutive_leading_parent_components() {
+        assert_eq!(
+            normalize_path_lexically(Path::new("../../secret.env")),
+            PathBuf::from("../../secret.env")
+        );
     }
 
     #[test]
@@ -1910,5 +2514,31 @@ mod tests {
         assert_eq!(event.endpoint.as_deref(), Some("unknown"));
         assert_eq!(event.method.as_deref(), Some("unknown"));
         assert_eq!(event.version, None);
+    }
+
+    #[test]
+    fn emitted_http_diagnostic_identifiers_are_preserved() {
+        assert_eq!(diagnostic_surface("claude-app"), "claude-app");
+        assert_eq!(
+            diagnostic_event("no-protected-connection"),
+            "no-protected-connection"
+        );
+        assert_eq!(diagnostic_kind("plugin"), "plugin");
+        for endpoint in [
+            "audio-speech",
+            "audio-transcription",
+            "audio-translation",
+            "batch-embed-contents",
+            "complete",
+            "completions",
+            "embed-content",
+            "embeddings",
+            "image-generation",
+            "message-batches",
+            "standalone-search",
+        ] {
+            assert_eq!(diagnostic_endpoint(endpoint), endpoint);
+        }
+        assert_eq!(diagnostic_kind("response"), "unknown");
     }
 }

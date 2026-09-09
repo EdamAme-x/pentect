@@ -171,6 +171,24 @@ enabled = true
 `true`. Metrics are calculated on demand from retained diagnostic logs and are
 never sent externally. Setting it to `false` disables the summary; diagnostic
 logging and rotation continue independently so crashes remain diagnosable.
+The summary includes masked occurrence counts, completed local restoration
+operation counts, blocked restoration attempts, blocked operations, plugin
+failures and timeouts, and warnings grouped by a bounded reason code. Restoration
+operations currently cover changed `pentect resolve` inputs/files, completed
+HTTP tool-call inputs, and successfully prepared `pentect exec` inputs. Multiple
+restored values in one completed tool call or one `pentect exec` invocation count
+as one operation. An exec restoration is counted after all command inputs are
+prepared; it does not assert that the process subsequently started or exited
+successfully. OpenAI streaming events without a bounded stable call identity,
+or after the bounded identity tracker is exhausted, are conservatively omitted
+from metrics without affecting restoration. Other automatic restoration paths
+are not yet included.
+The human-readable summary explains those fixed codes in plain language. The
+`--json` form keeps the stable reason, surface, and detector code values for
+scripts and local analysis.
+Plugin names, error text, values, handles, paths, URLs, and account identifiers
+are not metric dimensions. Plugin timeout counts are a subset of plugin failure
+counts, not an additional failure total.
 
 For `activity.share` and `metrics.enabled`, `false` in either the user config or
 the project config disables the feature. A project cannot re-enable a feature

@@ -8,6 +8,30 @@ installs and starts every public client launcher with the release binary. A
 daily workflow installs current upstream client versions so compatibility
 drift is visible before the next release.
 
+Pentect currently supports four core AI coding clients: **Codex CLI, Claude
+Code, OpenCode, and Pi**. Compatibility work is focused on these four rather
+than on adding more client launchers. Codex App and Claude Desktop entries are
+separate desktop surfaces within those client families, not additional core
+clients.
+
+The four protected CLI launchers supervise their native client processes while
+preserving normal exit status and terminal job control. On Linux, the guardian
+uses subreaper support, pidfds, and `/proc` child discovery, when available, to
+stop ordinary descendants even when a client gives them another process group.
+If those facilities are unavailable, Pentect warns and falls back to managing
+only the original process group; this does not impose a new minimum kernel
+version. On macOS, supervision is process-group based, so a client or ordinary
+child such as an MCP server can create another group outside that boundary.
+
+On Windows, a kill-on-close job contains ordinary descendants of protected
+Codex, Claude Code, OpenCode, and Pi launches; this path must pass its Windows
+CI lifecycle gate before release. These are lifecycle boundaries, not a
+sandbox or a universal cleanup mechanism. Killing the guardian itself, an
+unkillable kernel wait, or an intentional OS-level containment escape can
+remain outside the guarantee, and cleanup of temporary files owned by the
+wrapper or client is not universal. Desktop launchers have separate lifecycle
+contracts.
+
 | Client | Test | Protected launch |
 | --- | --- | --- |
 | Codex CLI `0.149.0` | Real launch on Linux and all installer platforms | `pentect codex` |
@@ -16,6 +40,21 @@ drift is visible before the next release.
 | Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
 | ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests, including computer-use screenshots | `pentect codex app` |
 | Claude Desktop | Protocol tests; Windows current-user trust-store launch path awaiting real-account release verification | `pentect claude app` with explicit certificate confirmation |
+
+Release pins are separate from the daily current-client monitor. The latest
+successful monitor on 2026-09-03 exercised the published Pentect binary on
+Windows, macOS, and Linux:
+
+| Client | Current-client evidence | Installed handle path |
+| --- | --- | --- |
+| Codex CLI `0.153.0` | Passed on all three platforms | OpenAI Responses, local shell tool arguments, cancellation recovery, and image redaction |
+| Claude Code `2.1.259` | Passed on all three platforms | Anthropic Messages and local Bash tool arguments |
+| OpenCode `1.18.27` | Passed on all three platforms | Configured OpenAI Chat and local tool arguments |
+| Pi `0.84.4` | Passed on all three platforms | Configured OpenAI Chat and local Bash tool arguments |
+
+These are compatibility observations, not retroactive changes to a release's
+pinned gate. The installed test uses real client binaries and a localhost
+provider fixture; it does not make a paid provider request.
 
 ## Not implemented
 
@@ -45,6 +84,8 @@ links, broken data, custom gateway paths, and Codex zstd-compressed requests.
 | --- | --- | --- |
 | `pentect codex` | OpenAI Responses | Includes streaming events and completed tool calls |
 | `pentect claude` | Anthropic Messages | Includes streaming content blocks and tool use |
+| `pentect opencode` | Selected OpenAI Responses, OpenAI Chat, or Anthropic Messages adapter | The current installed-client E2E uses OpenAI Chat; unrelated OpenCode providers are not implied |
+| `pentect pi` | Selected OpenAI Responses, OpenAI Chat, or Anthropic Messages adapter | The current installed-client E2E uses OpenAI Chat; other Pi API adapters are not implied |
 | `pentect codex app` | Responses routes used by supported Codex mode, including documented `computer_call_output` screenshots | Other ChatGPT modes are outside this claim |
 | `pentect claude app` | Supported Claude Chat and attachment routes on a compatible app build | Claude Code should use `pentect claude`; Cowork and Voice are outside this claim |
 
@@ -110,9 +151,14 @@ not acceptable.
 ## Not covered
 
 - ChatGPT Chat, Work, and Voice routes outside supported Codex mode
+- Codex cloud tasks and the Codex Remote control channel; a Remote task is
+  covered only if its connected-computer worker actually uses a separately
+  verified local Pentect path
 - Remote Claude Cowork execution; Claude Voice content is not inspected (the
   exact Voice WebSocket can only be relayed after the user enables unknown
   format pass-through)
+- Independent web-search, hosted-tool, browser, and MCP connections that do
+  not pass through a listed provider contract
 - Copilot, VS Code inline suggestions, and private traffic from other extensions
 - Test binary formats
 - Unknown future routes

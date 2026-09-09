@@ -49,6 +49,14 @@ If a custom model has different limits, set `PENTECT_PI_CONTEXT_WINDOW` and
 `PENTECT_PI_REASONING=true` or `false` when API type alone cannot describe it.
 Pentect rejects invalid values instead of telling Pi the wrong capabilities.
 
+## Session sharing and export
+
+`pentect pi` rejects Pi's top-level `--export` option because the generated
+local HTML can contain restored values. Pi's interactive `/export` and `/share`
+commands run inside Pi before its extension hooks; the current Pentect
+integration cannot intercept them. Treat interactive exports as sensitive and
+do not use `/share` in a protected session.
+
 ## Custom gateways
 
 Custom and local providers can be reached through an OpenAI-compatible
