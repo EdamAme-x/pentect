@@ -4,7 +4,7 @@ use chacha20::{ChaCha20, Key, KeyIvInit, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MEMORY_KEY_DOMAIN: &[u8] = b"pentect-recovery-memory-key-v1";
 const MEMORY_NONCE_DOMAIN: &[u8] = b"pentect-recovery-memory-nonce-v1";
@@ -46,6 +46,7 @@ impl Recovery {
         let map = plaintext
             .into_iter()
             .map(|(ph, val)| {
+                let val = Zeroizing::new(val);
                 let ciphertext = crypt_memory_value(&memory_key, ph.as_bytes(), val.as_bytes());
                 (ph, ciphertext)
             })

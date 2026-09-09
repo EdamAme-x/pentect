@@ -90,9 +90,10 @@ Two different things have different lifetimes:
 - **Recovery data** lets the active local flow restore the value.
 
 With the default `handles.scope = "device"`, the same value normally gets the
-same ID on the same device. This does not store the value forever. After the
-protected session ends, a later session must read the source again before it
-can restore that handle.
+same ID on the same device. The file-pointer index does not persist secret
+values. When `files.remember = true`, an explicit trusted file read can retain
+a local pointer that lets a later session verify and reread an unchanged source
+file.
 
 | Scope | ID behavior |
 | --- | --- |
@@ -105,9 +106,9 @@ scope.
 
 ## Known and unknown handles
 
-Pentect restores only handles present in the active recovery store. Text that
-looks like a handle but was invented, copied from another device, or created by
-an old session stays inert.
+Pentect restores only handles present in the active recovery store or recovered
+from a verified trusted-file pointer. Text that looks like a handle but was
+invented or belongs to another identity scope stays inert.
 
 If an old handle no longer works, read the original file or input again inside
 the current protected client. Do not replace its ID by hand.
@@ -123,9 +124,26 @@ the real value.
 
 ## Files and recovery
 
-With `files.remember = true`, Pentect can remember where a handle came from and
-recover it only if the file still matches the recorded location and content.
-This is local metadata, not a copy of every secret.
+With `files.remember = true`, `pentect read PATH` can remember where a handle
+came from. A later Claude Code, Codex, OpenCode, or Pi HTTP client session may
+then use that old handle in a completed, recognized tool input.
+Pentect restores it only when the registered path is still a regular readable
+file, its complete size and content hash are unchanged, and the current device
+or project identity reproduces the handle. The index contains encrypted local
+file metadata and byte ranges, not secret values.
+
+With `handles.scope = "session"`, a restarted session has a different identity,
+so an old handle is not recovered even when the file is unchanged.
+
+Standard input (`pentect read -`), image input, arbitrary paths named by a
+model, and generic native-tool output are not registered. Read the file through
+an explicit trusted entry point first. Missing, changed, inaccessible,
+out-of-scope, malformed, or oversized recovery sources reject the complete tool
+response before any buffered call is released.
+
+The same completed-tool validation applies after recovery: ordinary handles are
+the primary representation, `|base64` is explicit and optional, and unsupported
+Code or Patch representations remain rejected rather than guessed or escaped.
 
 Supported protected clients restore handles in completed tool calls
 automatically. `pentect exec` remains available for manual terminal workflows.

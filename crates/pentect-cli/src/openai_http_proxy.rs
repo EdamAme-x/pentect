@@ -69,19 +69,38 @@ type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 type HandleResolver =
     Box<dyn FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send>;
+type CommitHook = Box<dyn FnMut() -> Result<(), String> + Send>;
 
-fn request_scoped_bounded_resolver(limit: usize) -> HandleResolver {
-    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
+fn request_scoped_bounded_resolver(limit: usize) -> (HandleResolver, CommitHook) {
+    bounded_resolver_for_transaction(pentect_agent::ActiveToolInputTransaction::new(), limit)
+}
+
+fn bounded_resolver_for_transaction(
+    transaction: Result<pentect_agent::ActiveToolInputTransaction, String>,
+    limit: usize,
+) -> (HandleResolver, CommitHook) {
+    let resolve_transaction = transaction.clone();
     let mut resolved_bytes = 0usize;
-    Box::new(move |text, kind| {
-        let mut resolved = resolve(text, kind)?;
+    let resolve = Box::new(move |text: &str, kind| {
+        let mut resolved = match &resolve_transaction {
+            Ok(transaction) => transaction.resolve(text, kind)?,
+            Err(_) => return Err("protected tool input resolver is unavailable".to_string()),
+        };
         resolved_bytes = resolved_bytes.saturating_add(resolved.len());
         if resolved_bytes > limit {
             resolved.zeroize();
             return Err("OpenAI restored response exceeded inspection limit".to_string());
         }
         Ok(resolved)
-    })
+    });
+    let commit = Box::new(move || match &transaction {
+        Ok(transaction) => transaction
+            .commit()
+            .map(|_| ())
+            .map_err(|_| CHAT_TOOL_INPUT_REJECTED.to_string()),
+        Err(_) => Err("protected tool input resolver is unavailable".to_string()),
+    });
+    (resolve, commit)
 }
 
 pub(crate) struct OpenAiHttpProxyGuard {
@@ -684,6 +703,11 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
+    let response_transaction = state
+        .masker
+        .lock()
+        .map_err(|_| "OpenAI request masker lock was poisoned".to_string())
+        .and_then(|masker| masker.tool_input_transaction());
     if is_event_stream
         || (!(responses_response || chat_response || completions_response) && !files_upload)
     {
@@ -702,6 +726,7 @@ async fn proxy_request_inner(
                 Arc::clone(&state.plugins),
                 restore_output,
                 state.block_unknown_formats,
+                response_transaction.clone(),
             ))
             .map_err(|error| format!("could not build OpenAI streaming response: {error}"));
     }
@@ -755,18 +780,26 @@ async fn proxy_request_inner(
             state.block_unknown_formats,
         )?;
         let rewritten = if chat_response {
-            rewrite_chat_completions_json_response(&response_body, restore_output)
+            rewrite_chat_completions_json_response_with_transaction(
+                &response_body,
+                restore_output,
+                response_transaction,
+            )
         } else if completions_response {
             rewrite_completions_json_response(&response_body, restore_output)
         } else {
-            rewrite_openai_json_response(&response_body, restore_output)
+            rewrite_openai_json_response_with_transaction(
+                &response_body,
+                restore_output,
+                response_transaction,
+            )
         };
         match rewritten {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(error) => {
                 let _ = error;
                 proxy_diagnostic("response-restore-skipped");
-                response_body
+                return Err("OpenAI protected tool response was rejected".to_string());
             }
         }
     } else {
@@ -2408,16 +2441,31 @@ fn mask_text(
     crate::claude_http_proxy::mask_string(text, tool_result, masker)
 }
 
+#[cfg(test)]
 fn rewrite_openai_json_response(body: &[u8], restore_output: bool) -> Result<Vec<u8>, String> {
+    rewrite_openai_json_response_with_transaction(
+        body,
+        restore_output,
+        pentect_agent::ActiveToolInputTransaction::new(),
+    )
+}
+
+fn rewrite_openai_json_response_with_transaction(
+    body: &[u8],
+    restore_output: bool,
+    transaction: Result<pentect_agent::ActiveToolInputTransaction, String>,
+) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))?;
     let original = value.clone();
-    let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
+    let (mut resolve, mut commit) =
+        bounded_resolver_for_transaction(transaction, MAX_HTTP_BODY_BYTES);
     let restored_tools = ToolRestorationDedup::default()
         .commit_nonstream(rewrite_function_calls(&mut value, &mut resolve)?);
     if restore_output {
         restore_openai_output_text(&mut value, &mut resolve)?;
     }
+    commit()?;
     crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
     if value == original {
         Ok(body.to_vec())
@@ -2427,18 +2475,33 @@ fn rewrite_openai_json_response(body: &[u8], restore_output: bool) -> Result<Vec
     }
 }
 
+#[cfg(test)]
 fn rewrite_chat_completions_json_response(
     body: &[u8],
     restore_output: bool,
 ) -> Result<Vec<u8>, String> {
+    rewrite_chat_completions_json_response_with_transaction(
+        body,
+        restore_output,
+        pentect_agent::ActiveToolInputTransaction::new(),
+    )
+}
+
+fn rewrite_chat_completions_json_response_with_transaction(
+    body: &[u8],
+    restore_output: bool,
+    transaction: Result<pentect_agent::ActiveToolInputTransaction, String>,
+) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("OpenAI Chat Completions response was not valid JSON: {error}"))?;
     let original = value.clone();
-    let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
+    let (mut resolve, mut commit) =
+        bounded_resolver_for_transaction(transaction, MAX_HTTP_BODY_BYTES);
     let restored_tools = rewrite_chat_tool_calls(&mut value, &mut resolve)?;
     if restore_output {
         restore_chat_output_text(&mut value, &mut resolve)?;
     }
+    commit()?;
     crate::claude_http_proxy::record_completed_tool_restorations(restored_tools);
     if value == original {
         Ok(body.to_vec())
@@ -2454,7 +2517,7 @@ fn rewrite_completions_json_response(body: &[u8], restore_output: bool) -> Resul
         .map_err(|error| format!("OpenAI Completions response was not valid JSON: {error}"))?;
     let original = value.clone();
     if restore_output {
-        let mut resolve = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
+        let (mut resolve, _) = request_scoped_bounded_resolver(MAX_HTTP_BODY_BYTES);
         restore_completion_output_text(&mut value, &mut resolve)?;
     }
     if value == original {
@@ -2474,7 +2537,7 @@ where
     };
     for choice in choices {
         if let Some(Value::String(text)) = choice.get_mut("text") {
-            *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
+            *text = resolve(text, pentect_agent::ToolInputKind::PassiveData)?;
         }
     }
     Ok(())
@@ -2497,7 +2560,7 @@ where
             );
             if restores_text {
                 if let Some(Value::String(text)) = object.get_mut("text") {
-                    *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
+                    *text = resolve(text, pentect_agent::ToolInputKind::PassiveData)?;
                 }
             }
             for key in ["output", "content", "summary", "response", "item"] {
@@ -2524,12 +2587,14 @@ where
         };
         if let Some(content) = message.get_mut("content") {
             match content {
-                Value::String(text) => *text = resolve(text, pentect_agent::ToolInputKind::Data)?,
+                Value::String(text) => {
+                    *text = resolve(text, pentect_agent::ToolInputKind::PassiveData)?
+                }
                 Value::Array(parts) => {
                     for part in parts {
                         if part.get("type").and_then(Value::as_str) == Some("text") {
                             if let Some(Value::String(text)) = part.get_mut("text") {
-                                *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
+                                *text = resolve(text, pentect_agent::ToolInputKind::PassiveData)?;
                             }
                         }
                     }
@@ -2539,7 +2604,7 @@ where
         }
         for field in ["reasoning_content", "reasoning"] {
             if let Some(Value::String(text)) = message.get_mut(field) {
-                *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
+                *text = resolve(text, pentect_agent::ToolInputKind::PassiveData)?;
             }
         }
     }
@@ -2768,6 +2833,7 @@ struct StreamState {
     block_unknown_formats: bool,
     output_text: HashMap<String, crate::claude_http_proxy::OutputTextRestorer>,
     output_resolve: HandleResolver,
+    commit: CommitHook,
     restored_tools: ToolRestorationDedup,
     responses_tool_pending: VecDeque<Bytes>,
     responses_tool_pending_bytes: usize,
@@ -2859,6 +2925,8 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
         state.transform == StreamTransform::Responses && sse_block_contains_tool_call(&block);
     let responses_completed =
         state.transform == StreamTransform::Responses && sse_block_is_completed_response(&block);
+    let chat_completed = state.transform == StreamTransform::ChatCompletions
+        && sse_data(std::str::from_utf8(&block).unwrap_or_default()).as_deref() == Some("[DONE]");
     if state.transform == StreamTransform::Responses {
         record_responses_tool_progress(
             &block,
@@ -2906,6 +2974,9 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
         }
         StreamTransform::None => Ok(vec![Bytes::from(block)]),
     }?;
+    if chat_completed {
+        (state.commit)()?;
+    }
     for block in rewritten {
         if !block.is_empty() {
             if responses_tool_event || !state.responses_tool_pending.is_empty() {
@@ -2930,6 +3001,7 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
         {
             return Err("OpenAI Responses completed with an incomplete tool call".to_string());
         }
+        (state.commit)()?;
         while let Some(block) = state.responses_tool_pending.pop_front() {
             state.ready.push_back(Ok(Frame::data(block)));
         }
@@ -3090,7 +3162,10 @@ fn streaming_response_body(
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     restore_output: bool,
     block_unknown_formats: bool,
+    transaction: Result<pentect_agent::ActiveToolInputTransaction, String>,
 ) -> ProxyBody {
+    let (output_resolve, commit) =
+        bounded_resolver_for_transaction(transaction, MAX_PENDING_SSE_BYTES);
     let state = StreamState {
         upstream: Box::pin(response.bytes_stream()),
         pending: Vec::new(),
@@ -3103,7 +3178,8 @@ fn streaming_response_body(
         restore_output,
         block_unknown_formats,
         output_text: HashMap::new(),
-        output_resolve: request_scoped_bounded_resolver(MAX_PENDING_SSE_BYTES),
+        output_resolve,
+        commit,
         restored_tools: ToolRestorationDedup::default(),
         responses_tool_pending: VecDeque::new(),
         responses_tool_pending_bytes: 0,
@@ -3267,7 +3343,7 @@ impl CompletionStreamState {
                     let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
                     if let Some(Value::String(text)) = choice.get_mut("text") {
                         let mut data_resolve =
-                            |text: &str| resolve(text, pentect_agent::ToolInputKind::Data);
+                            |text: &str| resolve(text, pentect_agent::ToolInputKind::PassiveData);
                         *text = self
                             .output_text
                             .entry(index)
@@ -3420,8 +3496,9 @@ impl ChatStreamState {
                 if restore_output {
                     for field in ["content", "reasoning_content", "reasoning"] {
                         if let Some(Value::String(content)) = delta.get_mut(field) {
-                            let mut data_resolve =
-                                |text: &str| resolve(text, pentect_agent::ToolInputKind::Data);
+                            let mut data_resolve = |text: &str| {
+                                resolve(text, pentect_agent::ToolInputKind::PassiveData)
+                            };
                             *content = self
                                 .output_text
                                 .entry((choice_index, field))
@@ -3849,7 +3926,7 @@ where
             let key = openai_output_stream_key(value);
             if let Some(Value::String(delta)) = value.get_mut("delta") {
                 let mut data_resolve =
-                    |text: &str| resolve(text, pentect_agent::ToolInputKind::Data);
+                    |text: &str| resolve(text, pentect_agent::ToolInputKind::PassiveData);
                 *delta = streams
                     .entry(key)
                     .or_default()
@@ -3874,7 +3951,7 @@ where
                 }
             }
             if let Some(Value::String(text)) = value.get_mut("text") {
-                *text = resolve(text, pentect_agent::ToolInputKind::Data)?;
+                *text = resolve(text, pentect_agent::ToolInputKind::PassiveData)?;
             }
         }
         Some("response.completed") => {
@@ -5629,6 +5706,7 @@ mod tests {
             block_unknown_formats: true,
             output_text: HashMap::new(),
             output_resolve: resolve,
+            commit: Box::new(|| Ok(())),
             restored_tools: ToolRestorationDedup::default(),
             responses_tool_pending: VecDeque::new(),
             responses_tool_pending_bytes: 0,
@@ -5664,6 +5742,12 @@ mod tests {
     #[test]
     fn responses_stream_rejects_completed_terminal_with_missing_tool_done() {
         let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits_for_hook = Arc::clone(&commits);
+        state.commit = Box::new(move || {
+            commits_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
         process_stream_block(
             &mut state,
             b"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"\"}}\n\n".to_vec(),
@@ -5676,6 +5760,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("incomplete tool call"), "{error}");
+        assert!(state.ready.is_empty());
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn responses_stream_commits_once_only_after_valid_terminal() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits_for_hook = Arc::clone(&commits);
+        state.commit = Box::new(move || {
+            commits_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(state.ready.is_empty());
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!state.ready.is_empty());
+    }
+
+    #[test]
+    fn responses_stream_commit_failure_releases_no_tool_bytes() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        state.commit = Box::new(|| Err(CHAT_TOOL_INPUT_REJECTED.to_string()));
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}}\n\n".to_vec(),
+        )
+        .unwrap();
+        let error = process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".to_vec(),
+        )
+        .unwrap_err();
+        assert_eq!(error, CHAT_TOOL_INPUT_REJECTED);
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn responses_stream_pending_limit_fails_before_commit() {
+        let mut state = responses_stream_test_state(Box::new(|text, _kind| Ok(text.to_string())));
+        state.responses_tool_pending_bytes = MAX_PENDING_SSE_BYTES;
+        state
+            .responses_tool_pending
+            .push_back(Bytes::from_static(b"held"));
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits_for_hook = Arc::clone(&commits);
+        state.commit = Box::new(move || {
+            commits_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let error = process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"safe\\\"}\"}}\n\n".to_vec(),
+        )
+        .unwrap_err();
+        assert!(error.contains("inspection limit"), "{error}");
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(state.ready.is_empty());
     }
 
@@ -5867,6 +6018,7 @@ mod tests {
             block_unknown_formats: true,
             output_text: HashMap::new(),
             output_resolve: Box::new(|_text, _kind| Err("synthetic secret detail".to_string())),
+            commit: Box::new(|| Ok(())),
             restored_tools: ToolRestorationDedup::default(),
             responses_tool_pending: VecDeque::new(),
             responses_tool_pending_bytes: 0,
@@ -5940,6 +6092,7 @@ mod tests {
             block_unknown_formats: true,
             output_text: HashMap::new(),
             output_resolve: Box::new(|text, _kind| Ok(text.to_string())),
+            commit: Box::new(|| Ok(())),
             restored_tools: ToolRestorationDedup::default(),
             responses_tool_pending: VecDeque::new(),
             responses_tool_pending_bytes: 0,

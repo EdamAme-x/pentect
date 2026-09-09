@@ -200,6 +200,29 @@ pub fn mask_input_for_read(
     masking::mask_read_input_with_profile(key, input, profile, packs)
 }
 
+/// Mask and register an explicit trusted file read without an active memory store.
+pub fn mask_and_remember_file_for_read(
+    path: &Path,
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<(MaskResult, bool), String> {
+    if path == Path::new("-") {
+        return Err("standard input cannot be registered as a trusted file".to_string());
+    }
+    let key = Config::generate().key;
+    let identity_key = config::handle_identity_key()?;
+    let result = masking::mask_read_input_with_profile_and_identity(
+        key,
+        identity_key,
+        input.clone(),
+        profile,
+        packs,
+    )?;
+    let remembered = file_pointer_manager::register_file_pointers(path, &input.data, &result);
+    Ok((result, remembered))
+}
+
 pub fn mask_input_with_engine_for_read(
     key: [u8; 32],
     engine: &Engine,
@@ -210,6 +233,13 @@ pub fn mask_input_with_engine_for_read(
 
 pub fn record_read_activity(result: &MaskResult, path: &Path) {
     activity_log::record_mask_result("read", result, Some(path));
+}
+
+pub fn remember_read_file(path: &Path, source: &str, result: &MaskResult) -> bool {
+    if path == Path::new("-") {
+        return false;
+    }
+    file_pointer_manager::register_file_pointers(path, source, result)
 }
 
 pub fn record_diagnostic_activity(surface: &str, reason: &str) {
@@ -467,21 +497,64 @@ pub fn resolve_known_text_from_active_memory_store(text: &str) -> Result<Option<
 pub struct ActiveMemoryStoreResolver {
     recovery: Option<pentect_core::Recovery>,
     env_bindings: BTreeMap<String, String>,
+    store: Option<MemoryStore>,
+    transaction: std::sync::Mutex<ToolInputTransactionState>,
+    recovery_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+enum ToolInputTransactionState {
+    Active(Option<file_pointer_manager::FileRecoveryBatch>),
+    Failed,
+    Committed,
+}
+
+#[derive(Clone)]
+pub struct ActiveToolInputTransaction {
+    resolver: std::sync::Arc<ActiveMemoryStoreResolver>,
+}
+
+impl ActiveToolInputTransaction {
+    pub fn new() -> Result<Self, String> {
+        ActiveMemoryStoreResolver::new().map(|resolver| Self {
+            resolver: std::sync::Arc::new(resolver),
+        })
+    }
+    pub fn resolve(&self, text: &str, kind: ToolInputKind) -> Result<String, String> {
+        self.resolver
+            .resolve_tool_input(text, kind)
+            .map(|value| value.unwrap_or_else(|| text.to_string()))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn commit(&self) -> Result<bool, String> {
+        self.resolver.commit_file_recoveries()
+    }
 }
 
 impl ActiveMemoryStoreResolver {
     pub fn new() -> Result<Self, String> {
-        let Some(client) = MemoryStoreClient::from_env() else {
+        let Some(_client) = MemoryStoreClient::from_env() else {
             return Ok(Self {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
+                store: None,
+                transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
+                recovery_revision: Default::default(),
             });
         };
-        let snapshot = client.snapshot().map_err(|e| e.to_string())?;
-        let env_bindings = environment_bindings_from_recovery(&snapshot.recovery);
+        let session = Session::open_capability("default").map_err(|e| e.to_string())?;
+        let store = MemoryStore::for_session(&session);
+        let mut recovery = pentect_core::Recovery::empty_for_key(&session.key);
+        for item in store.snapshot().map_err(|e| e.to_string())? {
+            recovery.extend_same_key(item);
+        }
+        let env_bindings = environment_bindings_from_recovery(&recovery);
         Ok(Self {
-            recovery: Some(snapshot.recovery),
+            recovery: Some(recovery),
             env_bindings,
+            store: Some(store),
+            transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
+            recovery_revision: Default::default(),
         })
     }
 
@@ -494,6 +567,75 @@ impl ActiveMemoryStoreResolver {
 
     /// Validate and resolve one complete string on a known tool surface.
     pub fn resolve_tool_input(
+        &self,
+        text: &str,
+        kind: ToolInputKind,
+    ) -> Result<Option<String>, ToolInputError> {
+        let mut transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| ToolInputError::RecoveryStoreUnavailable)?;
+        let batch = match &mut *transaction {
+            ToolInputTransactionState::Active(batch) => batch,
+            ToolInputTransactionState::Failed | ToolInputTransactionState::Committed => {
+                return Err(ToolInputError::RecoveryTransactionFinalized)
+            }
+        };
+        if kind == ToolInputKind::PassiveData {
+            let result = match &self.recovery {
+                Some(recovery) => {
+                    match process_recovery_tool_input(text, ToolInputKind::Data, recovery) {
+                        Ok(value) => Ok(Some(value.text)),
+                        Err(ToolInputError::UnknownHandle) => Ok(Some(text.to_string())),
+                        Err(error) => Err(error),
+                    }
+                }
+                None => Ok(None),
+            };
+            if result.is_err() {
+                *transaction = ToolInputTransactionState::Failed;
+            }
+            return result;
+        }
+        let result = (|| match &self.recovery {
+            Some(recovery) => match process_recovery_tool_input(text, kind, recovery) {
+                Ok(value) => Ok(Some(value.text)),
+                Err(ToolInputError::UnknownHandle) => {
+                    let store = self
+                        .store
+                        .as_ref()
+                        .ok_or(ToolInputError::RecoveryStoreUnavailable)?;
+                    let batch = match batch.as_mut() {
+                        Some(batch) => batch,
+                        None => batch.insert(file_pointer_manager::FileRecoveryBatch::new()?),
+                    };
+                    let recovered = batch.recover(
+                        text,
+                        recovery,
+                        &store.session.key,
+                        &store.session.identity_key,
+                    )?;
+                    let mut combined = recovery.clone();
+                    combined.extend_same_key(recovered);
+                    process_recovery_tool_input(text, kind, &combined).map(|value| Some(value.text))
+                }
+                Err(error) => Err(error),
+            },
+            None if pentect_core::scan_recovery_views(text)
+                .map_err(|_| ToolInputError::MalformedView)?
+                .is_empty() =>
+            {
+                Ok(None)
+            }
+            None => Err(ToolInputError::UnknownHandle),
+        })();
+        if result.is_err() {
+            *transaction = ToolInputTransactionState::Failed;
+        }
+        result
+    }
+
+    pub fn resolve_tool_input_snapshot(
         &self,
         text: &str,
         kind: ToolInputKind,
@@ -512,12 +654,55 @@ impl ActiveMemoryStoreResolver {
         }
     }
 
-    fn from_recovery(recovery: pentect_core::Recovery) -> Self {
+    fn from_recovery(
+        recovery: pentect_core::Recovery,
+        store: MemoryStore,
+        recovery_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         let env_bindings = environment_bindings_from_recovery(&recovery);
         Self {
             recovery: Some(recovery),
             env_bindings,
+            store: Some(store),
+            transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
+            recovery_revision,
         }
+    }
+
+    /// Publish file-backed recoveries only after the complete response passed validation.
+    pub fn commit_file_recoveries(&self) -> Result<bool, String> {
+        let mut transaction = self
+            .transaction
+            .lock()
+            .map_err(|_| "file recovery transaction lock poisoned".to_string())?;
+        let staged = match &*transaction {
+            ToolInputTransactionState::Active(batch) => match (&self.store, batch.as_ref()) {
+                (Some(store), Some(batch)) => {
+                    Some((store.clone(), batch.staged(&store.session.key)))
+                }
+                _ => None,
+            },
+            ToolInputTransactionState::Failed => {
+                return Err("file recovery transaction was rejected".to_string())
+            }
+            ToolInputTransactionState::Committed => return Ok(false),
+        };
+        let Some((store, recovery)) = staged else {
+            *transaction = ToolInputTransactionState::Committed;
+            return Ok(false);
+        };
+        if recovery.is_empty() {
+            *transaction = ToolInputTransactionState::Committed;
+            return Ok(false);
+        }
+        if store.add_recovery(recovery).is_err() {
+            *transaction = ToolInputTransactionState::Failed;
+            return Err("file recovery could not be committed".to_string());
+        }
+        *transaction = ToolInputTransactionState::Committed;
+        self.recovery_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(true)
     }
 }
 
@@ -681,6 +866,8 @@ pub struct ActiveToolOutputMasker {
     cache_order: VecDeque<[u8; 32]>,
     prompt_cache: HashMap<[u8; 32], CachedToolOutput>,
     prompt_cache_order: VecDeque<[u8; 32]>,
+    recovery_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    observed_recovery_revision: u64,
 }
 
 struct CachedToolOutput {
@@ -703,6 +890,8 @@ impl ActiveToolOutputMasker {
                 cache_order: VecDeque::new(),
                 prompt_cache: HashMap::new(),
                 prompt_cache_order: VecDeque::new(),
+                recovery_revision: Default::default(),
+                observed_recovery_revision: 0,
             });
         };
         let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -715,6 +904,8 @@ impl ActiveToolOutputMasker {
             cache_order: VecDeque::new(),
             prompt_cache: HashMap::new(),
             prompt_cache_order: VecDeque::new(),
+            recovery_revision: Default::default(),
+            observed_recovery_revision: 0,
         })
     }
 
@@ -723,14 +914,28 @@ impl ActiveToolOutputMasker {
     /// after masking a request to restore completed local tool inputs.
     pub fn known_text_resolver(&self) -> Result<ActiveMemoryStoreResolver, String> {
         match &self.masker {
-            Some(masker) => masker
-                .recovery_snapshot()
-                .map(ActiveMemoryStoreResolver::from_recovery),
+            Some(masker) => masker.recovery_snapshot().map(|recovery| {
+                ActiveMemoryStoreResolver::from_recovery(
+                    recovery,
+                    masker.recovery_store(),
+                    self.recovery_revision.clone(),
+                )
+            }),
             None => Ok(ActiveMemoryStoreResolver {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
+                store: None,
+                transaction: std::sync::Mutex::new(ToolInputTransactionState::Active(None)),
+                recovery_revision: Default::default(),
             }),
         }
+    }
+
+    pub fn tool_input_transaction(&self) -> Result<ActiveToolInputTransaction, String> {
+        self.known_text_resolver()
+            .map(|resolver| ActiveToolInputTransaction {
+                resolver: std::sync::Arc::new(resolver),
+            })
     }
 
     pub fn mask_tool_output(&mut self, text: &str) -> Result<Option<String>, String> {
@@ -749,6 +954,7 @@ impl ActiveToolOutputMasker {
         text: &str,
         run_plugins: bool,
     ) -> Result<Option<String>, String> {
+        self.invalidate_recovery_caches();
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
@@ -815,6 +1021,7 @@ impl ActiveToolOutputMasker {
         text: &str,
         run_plugins: bool,
     ) -> Result<Option<String>, String> {
+        self.invalidate_recovery_caches();
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
@@ -870,6 +1077,19 @@ impl ActiveToolOutputMasker {
             masked,
             masked_count,
         );
+    }
+
+    fn invalidate_recovery_caches(&mut self) {
+        let revision = self
+            .recovery_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        if revision != self.observed_recovery_revision {
+            self.cache.clear();
+            self.cache_order.clear();
+            self.prompt_cache.clear();
+            self.prompt_cache_order.clear();
+            self.observed_recovery_revision = revision;
+        }
     }
 }
 
@@ -1066,11 +1286,10 @@ fn register_read_file_pointers(
     result: &MaskResult,
     input_format: InputFormat,
 ) -> bool {
-    if input_format != InputFormat::Text {
+    if input_format != InputFormat::Text || path == Path::new("-") {
         return false;
     }
-    file_pointer_manager::register_file_pointers(path, source, result);
-    true
+    file_pointer_manager::register_file_pointers(path, source, result)
 }
 
 fn print_read_result(result: MaskResult, emit_meta: bool) {

@@ -18,6 +18,8 @@ const MAX_RESTORED_TOOL_INPUT_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolInputKind {
     Data,
+    /// Provider prose/output: current snapshot only, with no trusted-file reads.
+    PassiveData,
     RawFile,
     Code,
     Patch,
@@ -39,6 +41,13 @@ pub enum ToolInputError {
     MalformedView,
     UnsupportedView,
     UnknownHandle,
+    RecoveryDisabled,
+    RecoverySourceChanged,
+    RecoverySourceUnavailable,
+    RecoveryScopeChanged,
+    RecoveryStoreUnavailable,
+    RecoveryLimitExceeded,
+    RecoveryTransactionFinalized,
     OutputTooLarge,
 }
 
@@ -48,7 +57,14 @@ impl fmt::Display for ToolInputError {
             Self::UnknownSurface => "protected handle use is unsupported for this tool surface",
             Self::MalformedView => "protected handle view is malformed",
             Self::UnsupportedView => "protected handle view is unsupported for this operation",
-            Self::UnknownHandle => "protected handle is unavailable in this session",
+            Self::UnknownHandle => "protected handle is unavailable in this session; reread the original input",
+            Self::RecoveryDisabled => "file recovery is disabled; reread the original input in this session",
+            Self::RecoverySourceChanged => "protected handle source has changed; reread it to obtain a new handle",
+            Self::RecoverySourceUnavailable => "protected handle source cannot be read; restore access or reread the original input",
+            Self::RecoveryScopeChanged => "protected handle belongs to a different identity scope; reread the original input in this session",
+            Self::RecoveryStoreUnavailable => "protected handle recovery store is unavailable; restart the protected session and reread the original input",
+            Self::RecoveryLimitExceeded => "protected handle recovery exceeds this response's read limit; reread only the required sources",
+            Self::RecoveryTransactionFinalized => "protected tool input recovery transaction is already finalized",
             Self::OutputTooLarge => "protected tool input is too large after restoration",
         })
     }
@@ -190,7 +206,7 @@ fn validate_surface(
 ) -> Result<(), ToolInputError> {
     for span in spans {
         let supported = match kind {
-            ToolInputKind::Data | ToolInputKind::RawFile => {
+            ToolInputKind::Data | ToolInputKind::PassiveData | ToolInputKind::RawFile => {
                 matches!(span.kind, RecoveryViewKind::Raw | RecoveryViewKind::Base64)
             }
             ToolInputKind::Code | ToolInputKind::Patch => {
