@@ -1113,7 +1113,7 @@ fn anthropic_content_unknown_block_kind_at(
         if !known {
             return Some(kind);
         }
-        if kind == "tool_reference" && !block.get("tool_name").is_some_and(Value::is_string) {
+        if kind == "tool_reference" && !valid_tool_reference(block) {
             return Some("<invalid tool reference>");
         }
         if matches!(kind, "tool_result" | "mcp_tool_result") {
@@ -1129,6 +1129,39 @@ fn anthropic_content_unknown_block_kind_at(
         }
         None
     })
+}
+
+fn valid_tool_reference(value: &Value) -> bool {
+    let Some(reference) = value.as_object() else {
+        return false;
+    };
+    if reference
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "tool_name" | "cache_control"))
+        || reference.get("type").and_then(Value::as_str) != Some("tool_reference")
+        || !reference.get("tool_name").is_some_and(Value::is_string)
+    {
+        return false;
+    }
+    let Some(cache_control) = reference.get("cache_control") else {
+        return true;
+    };
+    if cache_control.is_null() {
+        return true;
+    }
+    let Some(cache_control) = cache_control.as_object() else {
+        return false;
+    };
+    if cache_control
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "ttl"))
+        || cache_control.get("type").and_then(Value::as_str) != Some("ephemeral")
+    {
+        return false;
+    }
+    cache_control
+        .get("ttl")
+        .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m" | "1h")))
 }
 
 fn provider_history_unknown_kind<'a>(block: &'a Value, kind: &str) -> Option<&'a str> {
@@ -2186,7 +2219,11 @@ fn mask_content(
                     // A tool reference is protocol metadata returned by the
                     // tool-search feature. In particular, `tool_name` is an
                     // identifier and must remain byte-stable.
-                    "tool_reference" => {}
+                    "tool_reference" => {
+                        if !valid_tool_reference(block) {
+                            return Err(unsupported_provider_history_shape("tool_reference"));
+                        }
+                    }
                     _ => {
                         if !WARNED_UNKNOWN_CONTENT_BLOCK.swap(true, Ordering::Relaxed) {
                             diagnostic("unknown-content-block", "protocol", "messages", false);
@@ -4642,7 +4679,8 @@ mod tests {
         let secret = ["AKIA", "IOSFODNN7", "EXAMPLE"].concat();
         let reference = serde_json::json!({
             "type": "tool_reference",
-            "tool_name": "weather_lookup_20260909"
+            "tool_name": "weather_lookup_20260909",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
         });
         let messages = serde_json::json!([
             {"role": "user", "content": "What is the weather?"},
@@ -4747,6 +4785,10 @@ mod tests {
             serde_json::json!([{"type": "tool_result", "content": [
                 {"type": "tool_reference", "tool_name": 7}
             ]}]),
+            serde_json::json!([{"type": "tool_result", "content": [
+                {"type": "tool_reference", "tool_name": "lookup",
+                    "cache_control": {"type": "ephemeral", "ttl": "2h"}}
+            ]}]),
         ] {
             let invalid = serde_json::json!({
                 "messages": [{"role": "user", "content": invalid_content}]
@@ -4765,6 +4807,57 @@ mod tests {
             anthropic_request_unknown_content_kind(&mcp, AnthropicEndpoint::Messages),
             None
         );
+
+        for cache_control in [
+            Value::Null,
+            serde_json::json!({"type": "ephemeral"}),
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        ] {
+            let valid = serde_json::json!({"messages": [{"role": "user", "content": [{
+                "type": "tool_result", "content": [{
+                    "type": "tool_reference", "tool_name": "lookup",
+                    "cache_control": cache_control
+                }]
+            }]}]});
+            assert_eq!(
+                anthropic_request_unknown_content_kind(&valid, AnthropicEndpoint::Messages),
+                None
+            );
+        }
+
+        for invalid_reference in [
+            serde_json::json!({"type": "tool_reference", "tool_name": "lookup",
+                "payload": secret.clone()}),
+            serde_json::json!({"type": "tool_reference", "tool_name": "lookup",
+                "cache_control": {"type": "ephemeral", "ttl": secret.clone()}}),
+        ] {
+            let body = serde_json::json!({"messages": [{"role": "user", "content": [{
+                "type": "tool_result", "content": [invalid_reference]
+            }]}]});
+            let body = Bytes::from(serde_json::to_vec(&body).unwrap());
+            for block_unknown_formats in [true, false] {
+                let error = protect_anthropic_request_body(
+                    &body,
+                    &masker,
+                    &plugins,
+                    &HashMap::new(),
+                    AnthropicEndpoint::Messages,
+                    block_unknown_formats,
+                )
+                .err()
+                .expect("undocumented tool reference fields must remain blocked");
+                assert!(!error.contains(&secret));
+                if block_unknown_formats {
+                    assert!(error.starts_with("unknown format blocked:"), "{error}");
+                } else {
+                    assert_eq!(
+                        error,
+                        "provider history blocked: tool_reference has an unsupported shape and must remain unchanged"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
