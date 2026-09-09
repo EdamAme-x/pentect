@@ -253,6 +253,7 @@ enum SpecialMatcher {
     AwsMulti,
     AlibabaMulti,
     GoogleMulti,
+    TwilioMulti,
     Jwk,
     PemPrivateKey,
     Base64PrivateKey,
@@ -2842,7 +2843,11 @@ struct CandidateLineData<'a> {
 impl SpecialMatcher {
     fn find<'a>(&self, line: &'a str) -> Vec<Candidate<'a>> {
         match self {
-            Self::AwsMulti | Self::AlibabaMulti | Self::GoogleMulti | Self::Jwk => Vec::new(),
+            Self::AwsMulti
+            | Self::AlibabaMulti
+            | Self::GoogleMulti
+            | Self::TwilioMulti
+            | Self::Jwk => Vec::new(),
             Self::PemPrivateKey => pem_private_key_candidates(line),
             Self::Base64PrivateKey => base64_private_key_candidates(line),
             Self::Uuid => uuid_candidates(line),
@@ -2855,6 +2860,7 @@ impl SpecialMatcher {
             Self::AwsMulti
                 | Self::AlibabaMulti
                 | Self::GoogleMulti
+                | Self::TwilioMulti
                 | Self::Jwk
                 | Self::PemPrivateKey
         )
@@ -2865,6 +2871,7 @@ impl SpecialMatcher {
             Self::AwsMulti => aws_multi_candidates(text),
             Self::AlibabaMulti => alibaba_multi_candidates(text),
             Self::GoogleMulti => google_multi_candidates(text),
+            Self::TwilioMulti => twilio_multi_candidates(text),
             Self::Jwk => jwk_multi_candidates(text),
             Self::PemPrivateKey => pem_private_key_block_candidates(text),
             _ => Vec::new(),
@@ -2942,6 +2949,7 @@ fn translated_rule(raw: &RawRule) -> Option<SpecialMatcher> {
             "AWS Multi" => Some(SpecialMatcher::AwsMulti),
             "Alibaba Multi" => Some(SpecialMatcher::AlibabaMulti),
             "Google Multi" => Some(SpecialMatcher::GoogleMulti),
+            "Twilio Multi" => Some(SpecialMatcher::TwilioMulti),
             "JWK" => Some(SpecialMatcher::Jwk),
             _ => None,
         },
@@ -3117,6 +3125,47 @@ fn google_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
                     (part.value.starts_with("GOCSPX-")
                         || has_upper_lower_digit_or_google_symbol(part.value))
                         && !multi_value_filtered(line, part, anchor.value, local_start, local_end)
+                })
+                .collect()
+        },
+    )
+}
+
+fn twilio_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
+    static TWILIO_ID: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:^|/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)(?P<value>(?:AC|SK)(?:[0-9A-F]{32}|[0-9a-f]{32}))",
+        )
+        .expect("twilio multi id regex")
+    });
+    static TWILIO_SECRET: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:^|/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)(?P<value>[0-9a-f]{32})",
+        )
+        .expect("twilio multi secret regex")
+    });
+
+    multi_pattern_candidates(
+        text,
+        &TWILIO_ID,
+        |line_start, line, anchor| {
+            let local_end = anchor.end - line_start;
+            !value_pattern_filtered(anchor.value, None)
+                && !morphemes_filtered(anchor.value, None)
+                && !line
+                    .as_bytes()
+                    .get(local_end)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'+' | b'-'))
+        },
+        |line_start, line, anchor| {
+            regex_line_data(line_start, line, &TWILIO_SECRET)
+                .into_iter()
+                .filter(|part| {
+                    let local_start = part.start - line_start;
+                    let local_end = part.end - line_start;
+                    !line.as_bytes().get(local_end).is_some_and(|b| {
+                        b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'+' | b'-')
+                    }) && !multi_value_filtered(line, part, anchor.value, local_start, local_end)
                 })
                 .collect()
         },
@@ -7915,6 +7964,95 @@ mod tests {
         let raw = format!("{google_id}\n{google_secret}\n");
 
         assert!(google_multi_candidates(&raw).is_empty());
+    }
+
+    #[test]
+    fn twilio_multi_matches_the_official_fixture() {
+        let account_sid = ["AC4d2f64e2a108cd72", "f648b1984c3b5a13"].concat();
+        let raw = format!(
+            "{account_sid}\n{} - NEGATIVE\n{} - POSITIVE\n",
+            "1dead71beef1392721c39fdbd4123456", "73c1a036711392721c39fdbd43537f21",
+        );
+        let candidates = twilio_multi_candidates(&raw);
+
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].value, "73c1a036711392721c39fdbd43537f21");
+        assert_eq!(candidates[0].line_data.len(), 2);
+        assert_eq!(candidates[0].line_data[0].value, account_sid);
+        assert_eq!(
+            candidates[0].line_data[1].value,
+            "73c1a036711392721c39fdbd43537f21"
+        );
+
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("tests/samples/twilio_multi".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, &raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        let twilio = findings
+            .iter()
+            .filter(|finding| finding.rule_name == "Twilio Multi")
+            .collect::<Vec<_>>();
+        assert_eq!(twilio.len(), 1, "findings={findings:?}");
+        let finding = twilio[0];
+        let secret_start = raw.find("73c1a036711392721c39fdbd43537f21").unwrap();
+        assert_eq!(finding.value, "73c1a036711392721c39fdbd43537f21");
+        assert_eq!(
+            finding.range,
+            ByteRange::new(secret_start, secret_start + 32)
+        );
+        assert_eq!(finding.value_start, 0);
+        assert_eq!(finding.value_end, 32);
+        assert_eq!(finding.severity, "critical");
+        assert_eq!(finding.confidence_name, "moderate");
+        assert_eq!(finding.line_data.len(), 2);
+        assert_eq!(finding.line_data[0].value_start, 0);
+        assert_eq!(finding.line_data[0].value_end, 34);
+        assert_eq!(finding.line_data[0].range, ByteRange::new(0, 34));
+        assert_eq!(finding.line_data[1].value_start, secret_start);
+        assert_eq!(finding.line_data[1].value_end, secret_start + 32);
+        assert_eq!(
+            finding.line_data[1].range,
+            ByteRange::new(secret_start, secret_start + 32)
+        );
+    }
+
+    #[test]
+    fn twilio_multi_rejects_invalid_boundaries_and_unpaired_values() {
+        let valid_anchor = ["AC4d2f64e2a108cd72", "f648b1984c3b5a13"].concat();
+        let valid_secret = "73c1a036711392721c39fdbd43537f21";
+        for raw in [
+            format!("without an anchor\n{valid_secret}\n"),
+            format!(
+                "{}\n{valid_secret}\n",
+                &valid_anchor[..valid_anchor.len() - 1]
+            ),
+            format!("{valid_anchor}z\n{valid_secret}\n"),
+            format!(
+                "{}B5a13\n{valid_secret}\n",
+                &valid_anchor[..valid_anchor.len() - 5]
+            ),
+            format!("{valid_anchor}\n{valid_secret}z\n"),
+        ] {
+            assert!(twilio_multi_candidates(&raw).is_empty(), "{raw:?}");
+        }
+
+        let outside_search_margin = format!(
+            "{valid_anchor}\n{}{}\n",
+            "filler\n".repeat(10),
+            valid_secret,
+        );
+        assert!(
+            twilio_multi_candidates(&outside_search_margin).is_empty(),
+            "{outside_search_margin:?}"
+        );
     }
 
     #[test]
