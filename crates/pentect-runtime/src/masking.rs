@@ -109,6 +109,10 @@ impl OutputMasker {
         Ok(combined)
     }
 
+    pub(crate) fn recovery_store(&self) -> MemoryStore {
+        self.store.clone()
+    }
+
     pub(crate) fn flush(&mut self) -> Result<(), String> {
         if !self.pending.is_empty() {
             let next = Recovery::empty_for_key(&self.store.session.key);

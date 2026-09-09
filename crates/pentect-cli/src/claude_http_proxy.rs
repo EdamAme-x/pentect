@@ -580,7 +580,7 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
-    let mut resolve = masker_scoped_resolver(&state.masker);
+    let (mut resolve, mut commit) = masker_scoped_resolver(&state.masker);
     if is_event_stream || (!messages_path && !files_upload) {
         let transform = status.is_success() && messages_path && is_event_stream;
         return builder
@@ -591,6 +591,7 @@ async fn proxy_request_inner(
                 restore_output,
                 state.block_unknown_formats,
                 resolve,
+                Some(commit),
             ))
             .map_err(|error| format!("could not build Claude streaming response: {error}"));
     }
@@ -637,10 +638,13 @@ async fn proxy_request_inner(
         let response_body =
             run_response_plugins(response_body, &state.plugins, state.block_unknown_formats)?;
         match rewrite_anthropic_json_response(&response_body, restore_output, &mut resolve) {
-            Ok(rewritten) => Bytes::from(rewritten),
+            Ok(rewritten) => {
+                commit()?;
+                Bytes::from(rewritten)
+            }
             Err(_error) => {
                 diagnostic("response-restore-skipped", "protection", "messages", false);
-                response_body
+                return Err("Claude protected tool response was rejected".to_string());
             }
         }
     } else {
@@ -1325,6 +1329,7 @@ fn streaming_response_body(
     restore_output: bool,
     block_unknown_formats: bool,
     resolve: HandleResolver,
+    commit: Option<Box<dyn FnMut() -> Result<(), String> + Send>>,
 ) -> ProxyBody {
     if !transform {
         let stream = response.bytes_stream().map(|item| {
@@ -1336,8 +1341,14 @@ fn streaming_response_body(
 
     let state = TransformedStreamState {
         upstream: Box::pin(response.bytes_stream()),
-        transformer: SseStreamTransformer::new(resolve, Some(plugins), restore_output)
-            .with_strict_response_coverage(block_unknown_formats),
+        transformer: {
+            let transformer = SseStreamTransformer::new(resolve, Some(plugins), restore_output)
+                .with_strict_response_coverage(block_unknown_formats);
+            match commit {
+                Some(commit) => transformer.with_commit(commit),
+                None => transformer,
+            }
+        },
         ready: VecDeque::new(),
         finished: false,
     };
@@ -1405,6 +1416,7 @@ pub(crate) struct SseStreamTransformer<R> {
     block_unknown_formats: bool,
     output_text: HashMap<(u64, &'static str), OutputTextRestorer>,
     plugin_context: PluginContext,
+    commit: Option<Box<dyn FnMut() -> Result<(), String> + Send>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1449,6 +1461,11 @@ where
         Self::new_with_context(resolve, plugins, restore_output, ANTHROPIC_HTTP_SSE_CONTEXT)
     }
 
+    fn with_commit(mut self, commit: Box<dyn FnMut() -> Result<(), String> + Send>) -> Self {
+        self.commit = Some(commit);
+        self
+    }
+
     pub(crate) fn new_for_claude_app(
         resolve: R,
         plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
@@ -1482,6 +1499,7 @@ where
             block_unknown_formats: false,
             output_text: HashMap::new(),
             plugin_context,
+            commit: None,
         }
     }
 
@@ -1613,6 +1631,9 @@ where
                     return Err(
                         "restored Anthropic SSE response exceeded inspection limit".to_string()
                     );
+                }
+                if let Some(commit) = &mut self.commit {
+                    commit()?;
                 }
                 output.push(Bytes::from(rewritten));
                 record_completed_tool_restorations(restored_tools);
@@ -1768,7 +1789,7 @@ where
                     .entry((index, field))
                     .or_default()
                     .push(value, &mut |text| {
-                        resolve(text, pentect_agent::ToolInputKind::Data)
+                        resolve(text, pentect_agent::ToolInputKind::PassiveData)
                     })?;
             }
         }
@@ -1786,7 +1807,7 @@ where
                     .entry((index, field))
                     .or_default()
                     .push(value, &mut |text| {
-                        resolve(text, pentect_agent::ToolInputKind::Data)
+                        resolve(text, pentect_agent::ToolInputKind::PassiveData)
                     })?;
             }
         }
@@ -2593,7 +2614,7 @@ where
                     _ => continue,
                 };
                 if let Some(Value::String(text)) = block.get_mut(field) {
-                    *text = budgeted_resolve(text, pentect_agent::ToolInputKind::Data)?;
+                    *text = budgeted_resolve(text, pentect_agent::ToolInputKind::PassiveData)?;
                 }
             }
         }
@@ -3109,7 +3130,7 @@ pub(crate) fn request_scoped_tool_resolver(
 ) -> impl FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String> + Send {
     let resolver = pentect_agent::ActiveMemoryStoreResolver::new();
     move |text, kind| match &resolver {
-        Ok(resolver) => match resolver.resolve_tool_input(text, kind) {
+        Ok(resolver) => match resolver.resolve_tool_input_snapshot(text, kind) {
             Ok(Some(resolved)) => Ok(resolved),
             Ok(None) => Ok(text.to_string()),
             Err(error) => Err(error.to_string()),
@@ -3120,19 +3141,24 @@ pub(crate) fn request_scoped_tool_resolver(
 
 fn masker_scoped_resolver(
     masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
-) -> HandleResolver {
-    let resolver = masker
+) -> (
+    HandleResolver,
+    Box<dyn FnMut() -> Result<(), String> + Send>,
+) {
+    let transaction = masker
         .lock()
         .map_err(|_| "Claude request masker lock was poisoned".to_string())
-        .and_then(|masker| masker.known_text_resolver());
-    Box::new(move |text, kind| match &resolver {
-        Ok(resolver) => match resolver.resolve_tool_input(text, kind) {
-            Ok(Some(resolved)) => Ok(resolved),
-            Ok(None) => Ok(text.to_string()),
-            Err(error) => Err(error.to_string()),
-        },
+        .and_then(|masker| masker.tool_input_transaction());
+    let resolve_transaction = transaction.clone();
+    let resolve = Box::new(move |text: &str, kind| match &resolve_transaction {
+        Ok(transaction) => transaction.resolve(text, kind),
         Err(_error) => Err("protected tool input resolver is unavailable".to_string()),
-    })
+    });
+    let commit = Box::new(move || match &transaction {
+        Ok(transaction) => transaction.commit().map(|_| ()),
+        Err(_error) => Err("protected tool input resolver is unavailable".to_string()),
+    });
+    (resolve, commit)
 }
 
 pub(crate) fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
@@ -5342,6 +5368,8 @@ mod tests {
 
     #[test]
     fn streaming_tool_is_held_then_resolved_across_http_chunks() {
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits_for_hook = Arc::clone(&commits);
         let start = concat!(
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{}}}\n\n"
@@ -5364,7 +5392,11 @@ mod tests {
             |text: &str, _| Ok(text.replace("<<SECRET_deadbeefdeadbeef>>", "actual-secret")),
             None,
             false,
-        );
+        )
+        .with_commit(Box::new(move || {
+            commits_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }));
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
         assert!(transformer.push(delta_one.as_bytes()).unwrap().is_empty());
         let split = delta_two.len() / 2;
@@ -5380,6 +5412,7 @@ mod tests {
         let output = join_bytes(output);
         assert!(output.contains("actual-secret"));
         assert!(!output.contains("<<SECRET_deadbeefdeadbeef>>"));
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -5427,6 +5460,8 @@ mod tests {
 
     #[test]
     fn streaming_tool_restore_failure_aborts_without_emitting_unresolved_input() {
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits_for_hook = Arc::clone(&commits);
         let input = concat!(
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n",
@@ -5441,9 +5476,14 @@ mod tests {
             |_, _| Err("memory store unavailable".to_string()),
             None,
             false,
-        );
+        )
+        .with_commit(Box::new(move || {
+            commits_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }));
         let error = transformer.push(input.as_bytes()).unwrap_err();
         assert!(error.contains("memory store unavailable"), "{error}");
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

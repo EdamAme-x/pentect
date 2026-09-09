@@ -66,6 +66,16 @@ pub fn identity_hash(key: &[u8; 32], value: &str) -> String {
     IdentityHasher::new(key).hash(value)
 }
 
+/// Verify a recorded value against a compact or collision-expanded identity.
+pub fn matches_identity_hash(key: &[u8; 32], hash: &str, value: &str) -> bool {
+    let hasher = IdentityHasher::new(key);
+    match hash.len() {
+        HASH_HEX_WIDTH => hasher.hash(value) == hash,
+        64 => hasher.full_hash(value) == hash,
+        _ => false,
+    }
+}
+
 fn encode_hash(out: &[u8]) -> String {
     let mut s = String::with_capacity(HASH_HEX_WIDTH);
     for b in out.iter().take(HASH_HEX_WIDTH / 2) {
@@ -229,6 +239,19 @@ mod tests {
             identity_hash(&[1u8; 32], "x"),
             identity_hash(&[2u8; 32], "x")
         );
+    }
+
+    #[test]
+    fn recorded_identity_matches_compact_and_full_hashes_only_in_scope() {
+        let key = [7; 32];
+        let value = "synthetic-private-value";
+        let hasher = IdentityHasher::new(&key);
+        for hash in [hasher.hash(value), hasher.full_hash(value)] {
+            assert!(matches_identity_hash(&key, &hash, value));
+            assert!(!matches_identity_hash(&[8; 32], &hash, value));
+            assert!(!matches_identity_hash(&key, &hash, "changed"));
+        }
+        assert!(!matches_identity_hash(&key, "invalid", value));
     }
 
     #[test]

@@ -1409,6 +1409,470 @@ fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
 }
 
 #[test]
+fn active_tool_resolver_stages_verified_file_recovery_until_commit() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("active-resolver-file-baseline");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-resolver-file-store");
+    let source = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+
+    let session = Session::open_capability("default").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    file_pointer_manager::register_file_pointers(&path, source, &result);
+    let handle = masked_handle_from_assignment(&result.masked, "OPENAI_API_KEY");
+
+    let rejected = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        rejected.resolve_tool_input(&handle, ToolInputKind::Data),
+        Ok(Some("sk-ABCDEFGHIJKLMNOPQRSTUVWX".to_string()))
+    );
+    let client = MemoryStoreClient::from_env().unwrap();
+    assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
+    assert_eq!(
+        rejected.resolve_tool_input("<<UNKNOWN_0123456789abcdef>>", ToolInputKind::Data),
+        Err(ToolInputError::UnknownHandle)
+    );
+    assert!(rejected.commit_file_recoveries().is_err());
+    assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
+
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::PassiveData),
+        Ok(Some(handle.clone()))
+    );
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+        Ok(Some("sk-ABCDEFGHIJKLMNOPQRSTUVWX".to_string()))
+    );
+    assert!(resolver.commit_file_recoveries().unwrap());
+    assert_eq!(
+        client.snapshot().unwrap().recovery.resolve(&handle),
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+    );
+
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_recovery_commit_updates_masker_and_invalidates_low_entropy_cache() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-recovery-masker-cache");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("file-recovery-masker-cache-store");
+    let source = "PASSWORD=abc\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path, source, &result
+    ));
+    let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+
+    let mut masker = ActiveToolOutputMasker::new_with_plugins(PluginMiddleware::default()).unwrap();
+    assert_eq!(
+        masker
+            .mask_tool_output_without_plugins("abc")
+            .unwrap()
+            .as_deref(),
+        Some("abc")
+    );
+    let transaction = masker.tool_input_transaction().unwrap();
+    assert_eq!(
+        transaction.resolve(&handle, ToolInputKind::Data).unwrap(),
+        "abc"
+    );
+    assert!(transaction.commit().unwrap());
+    assert_eq!(
+        masker
+            .mask_tool_output_without_plugins("abc")
+            .unwrap()
+            .as_deref(),
+        Some(handle.as_str())
+    );
+
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn active_file_recovery_rejects_changed_deleted_and_disabled_sources_without_store_mutation() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    for (case, remove, expected) in [
+        ("changed", false, ToolInputError::RecoverySourceChanged),
+        ("deleted", true, ToolInputError::RecoverySourceUnavailable),
+    ] {
+        let root = temp_root(&format!("active-file-{case}"));
+        let cwd = enter_temp_cwd(&root);
+        write_project_config(&root, "[files]\nremember = true\n");
+        let (_active_store, _, _) =
+            ActiveMemoryStoreEnv::start(&format!("active-file-{case}-store"));
+        let source = "PASSWORD=local fixture phrase!?\n";
+        let path = root.join(".env");
+        std::fs::write(&path, source).unwrap();
+        let session = Session::open_capability("default").unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: source.to_string(),
+            },
+            &Config::new(session.key).with_identity_key(session.identity_key),
+        );
+        assert!(file_pointer_manager::register_file_pointers(
+            &path, source, &result
+        ));
+        let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+        if remove {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, "PASSWORD=LOCAL FIXTURE PHRASE!?\n").unwrap();
+        }
+        let client = MemoryStoreClient::from_env().unwrap();
+        let before = client.snapshot().unwrap().recovery;
+        let resolver = ActiveMemoryStoreResolver::new().unwrap();
+        assert_eq!(
+            resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+            Err(expected)
+        );
+        assert!(resolver.commit_file_recoveries().is_err());
+        assert!(resolver.commit_file_recoveries().is_err());
+        let after = client.snapshot().unwrap().recovery;
+        assert_eq!(before.resolve(&handle), handle);
+        assert_eq!(after.resolve(&handle), handle);
+        drop(cwd);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    let root = temp_root("active-file-disabled");
+    let cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = false\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-file-disabled-store");
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input("<<UNKNOWN_0123456789abcdef>>", ToolInputKind::Data),
+        Err(ToolInputError::RecoveryDisabled)
+    );
+    assert!(resolver.commit_file_recoveries().is_err());
+    drop(cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn passive_data_never_reads_or_stages_file_only_handles() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("passive-file-handle");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("passive-file-handle-store");
+
+    let known_raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let known_masked =
+        mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={known_raw}"))
+            .unwrap()
+            .unwrap();
+    let known_handle = masked_handle_from_assignment(&known_masked, "OPENAI_API_KEY");
+    let source = "PASSWORD=local fixture phrase!?\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let file_result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path,
+        source,
+        &file_result
+    ));
+    let file_handle = masked_handle_from_assignment(&file_result.masked, "PASSWORD");
+    let client = MemoryStoreClient::from_env().unwrap();
+    let before = client.snapshot().unwrap().recovery;
+    std::fs::remove_file(&path).unwrap();
+
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&known_handle, ToolInputKind::PassiveData),
+        Ok(Some(known_raw.to_string()))
+    );
+    let known_base64 = known_handle.replace(">>", "|base64>>");
+    assert_eq!(
+        resolver.resolve_tool_input(&known_base64, ToolInputKind::PassiveData),
+        Ok(Some(data_encoding::BASE64.encode(known_raw.as_bytes())))
+    );
+    assert_eq!(
+        resolver.resolve_tool_input(&file_handle, ToolInputKind::PassiveData),
+        Ok(Some(file_handle.clone()))
+    );
+    assert!(!resolver.commit_file_recoveries().unwrap());
+    let after = client.snapshot().unwrap().recovery;
+    assert_eq!(before.resolve(&file_handle), file_handle);
+    assert_eq!(after.resolve(&file_handle), file_handle);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn late_invalid_tool_input_discards_staged_file_recovery_and_repeated_commit_fails() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("late-invalid-file-recovery");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("late-invalid-file-recovery-store");
+    let source = "PASSWORD=local fixture phrase!?\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path, source, &result
+    ));
+    let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+    let client = MemoryStoreClient::from_env().unwrap();
+    let before = client.snapshot().unwrap().recovery;
+
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+        Ok(Some("local fixture phrase!?".to_string()))
+    );
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Code),
+        Err(ToolInputError::UnsupportedView)
+    );
+    assert_eq!(
+        resolver.resolve_tool_input("<<UNKNOWN_0123456789abcdef>>", ToolInputKind::Data),
+        Err(ToolInputError::UnknownHandle)
+    );
+    assert!(resolver.commit_file_recoveries().is_err());
+    assert!(resolver.commit_file_recoveries().is_err());
+    let after = client.snapshot().unwrap().recovery;
+    assert_eq!(before.resolve(&handle), handle);
+    assert_eq!(after.resolve(&handle), handle);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_recovery_rejects_identity_mismatch_and_malformed_late_input_without_store_mutation() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-recovery-identity-mismatch");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("file-recovery-identity-store");
+    let source = "PASSWORD=local fixture phrase!?\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let wrong_identity = Config::generate().identity_key;
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(wrong_identity),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path, source, &result
+    ));
+    let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+    let client = MemoryStoreClient::from_env().unwrap();
+    let before = client.snapshot().unwrap().recovery;
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+        Err(ToolInputError::RecoveryScopeChanged)
+    );
+    assert!(resolver.commit_file_recoveries().is_err());
+    assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
+    assert_eq!(before.resolve(&handle), handle);
+
+    let valid_result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path,
+        source,
+        &valid_result
+    ));
+    let valid_handle = masked_handle_from_assignment(&valid_result.masked, "PASSWORD");
+    let malformed = format!("{}|base64", valid_handle.trim_end_matches(">>"));
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&valid_handle, ToolInputKind::Data),
+        Ok(Some("local fixture phrase!?".to_string()))
+    );
+    assert_eq!(
+        resolver.resolve_tool_input(&malformed, ToolInputKind::Data),
+        Err(ToolInputError::MalformedView)
+    );
+    assert!(resolver.commit_file_recoveries().is_err());
+    assert_eq!(
+        client.snapshot().unwrap().recovery.resolve(&valid_handle),
+        valid_handle
+    );
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn standalone_text_read_registers_but_stdin_and_image_do_not() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("standalone-read-registration");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let source = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let input = Input {
+        kind: Kind::Env,
+        data: source.to_string(),
+    };
+    let (result, remembered) =
+        mask_and_remember_file_for_read(&path, input, Profile::Strict, Vec::new()).unwrap();
+    assert!(remembered);
+    assert!(Path::new(".pentect/file-pointer-manager/index.bin").exists());
+    assert!(!remember_read_file(Path::new("-"), source, &result));
+    assert!(!register_read_file_pointers(
+        Path::new("-"),
+        source,
+        &result,
+        InputFormat::Text
+    ));
+    assert!(!register_read_file_pointers(
+        &path,
+        source,
+        &result,
+        InputFormat::Image
+    ));
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_recovery_reuses_one_batch_for_repeated_raw_and_base64_views() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-recovery-repeated-views");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("file-recovery-repeated-views-store");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let source = format!("OPENAI_API_KEY={raw}\n");
+    let path = root.join(".env");
+    std::fs::write(&path, &source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.clone(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path, &source, &result
+    ));
+    let handle = masked_handle_from_assignment(&result.masked, "OPENAI_API_KEY");
+    let base64_handle = handle.replace(">>", "|base64>>");
+    let expected_base64 = data_encoding::BASE64.encode(raw.as_bytes());
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    for _ in 0..16 {
+        assert_eq!(
+            resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+            Ok(Some(raw.to_string()))
+        );
+        assert_eq!(
+            resolver.resolve_tool_input(&base64_handle, ToolInputKind::Data),
+            Ok(Some(expected_base64.clone()))
+        );
+    }
+    let client = MemoryStoreClient::from_env().unwrap();
+    assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
+    assert!(resolver.commit_file_recoveries().unwrap());
+    assert!(!resolver.commit_file_recoveries().unwrap());
+    let committed = client.snapshot().unwrap().recovery;
+    assert_eq!(committed.resolve(&handle), raw);
+    assert_eq!(
+        committed.resolve_with_views(&base64_handle).unwrap(),
+        expected_base64
+    );
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_recovery_rejects_permission_denied_source_without_store_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = temp_root("file-recovery-permission-denied");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[files]\nremember = true\n");
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("file-recovery-permission-store");
+    let source = "PASSWORD=local fixture phrase!?\n";
+    let path = root.join(".env");
+    std::fs::write(&path, source).unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: source.to_string(),
+        },
+        &Config::new(session.key).with_identity_key(session.identity_key),
+    );
+    assert!(file_pointer_manager::register_file_pointers(
+        &path, source, &result
+    ));
+    let handle = masked_handle_from_assignment(&result.masked, "PASSWORD");
+    let client = MemoryStoreClient::from_env().unwrap();
+    let before = client.snapshot().unwrap().recovery;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+    assert_eq!(
+        resolver.resolve_tool_input(&handle, ToolInputKind::Data),
+        Err(ToolInputError::RecoverySourceUnavailable)
+    );
+    assert!(resolver.commit_file_recoveries().is_err());
+    assert_eq!(before.resolve(&handle), handle);
+    assert_eq!(client.snapshot().unwrap().recovery.resolve(&handle), handle);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn ocr_off_obeys_block_policy_for_active_image_redaction() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("ocr-off-block-active");

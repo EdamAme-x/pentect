@@ -1238,6 +1238,9 @@ fn cmd_read(args: &[String]) {
         packs.clone(),
     ) {
         Ok(Some(result)) => {
+            if opts.input_format == ReadInputFormat::Text {
+                let _ = pentect_agent::remember_read_file(&opts.path, &input.data, &result);
+            }
             pentect_agent::record_read_activity(&result, &opts.path);
             print_read_result(result, opts.emit_meta);
             return;
@@ -1245,20 +1248,33 @@ fn cmd_read(args: &[String]) {
         Ok(None) => {}
         Err(e) => die(&e),
     }
-    let cfg = Config::generate();
-    let result = match pentect_agent::mask_input_for_read(cfg.key, input, opts.profile, packs) {
-        Ok(result) => result,
-        Err(e) => die(&e),
+    let (result, remembered) = if opts.path == Path::new("-")
+        || opts.input_format != ReadInputFormat::Text
+    {
+        let cfg = Config::generate();
+        (
+            match pentect_agent::mask_input_for_read(cfg.key, input, opts.profile, packs) {
+                Ok(result) => result,
+                Err(e) => die(&e),
+            },
+            false,
+        )
+    } else {
+        match pentect_agent::mask_and_remember_file_for_read(&opts.path, input, opts.profile, packs)
+        {
+            Ok(result) => result,
+            Err(e) => die(&e),
+        }
     };
     pentect_agent::record_read_activity(&result, &opts.path);
-    if let Some(warning) = transient_read_warning(result.summary.masked_count) {
+    if let Some(warning) = transient_read_warning(result.summary.masked_count, remembered) {
         eprintln!("{warning}");
     }
     print_read_result(result, opts.emit_meta);
 }
 
-fn transient_read_warning(masked_count: usize) -> Option<&'static str> {
-    (masked_count > 0).then_some(
+fn transient_read_warning(masked_count: usize, remembered: bool) -> Option<&'static str> {
+    (masked_count > 0 && !remembered).then_some(
         "[pentect] warning: no active memory store; handles in this output cannot be resolved later",
     )
 }
@@ -4225,8 +4241,9 @@ mod tests {
 
     #[test]
     fn transient_read_warns_only_when_it_emits_handles() {
-        assert!(transient_read_warning(0).is_none());
-        let warning = transient_read_warning(1).unwrap();
+        assert!(transient_read_warning(0, false).is_none());
+        assert!(transient_read_warning(1, true).is_none());
+        let warning = transient_read_warning(1, false).unwrap();
         assert!(warning.contains("no active memory store"));
         assert!(warning.contains("cannot be resolved later"));
     }

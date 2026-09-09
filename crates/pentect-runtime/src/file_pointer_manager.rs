@@ -4,6 +4,7 @@
 //! usable while the original file still has the exact same size and SHA-256, so
 //! stale handles fail closed instead of expanding to the wrong bytes.
 
+use crate::handle_views::ToolInputError;
 use aho_corasick::AhoCorasickBuilder;
 use chacha20::cipher::StreamCipher;
 use chacha20::{ChaCha20, Key, KeyIvInit, Nonce};
@@ -18,7 +19,10 @@ use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
+
+const MAX_RECOVERY_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_VALUE_BYTES: usize = 32 * 1024 * 1024;
 
 const MANAGER_DIR: &str = "file-pointer-manager";
 const INDEX_FILE: &str = "index.bin";
@@ -53,16 +57,16 @@ struct FilePointerRecord {
 
 /// Register only file-backed handles. Shell/MCP/browser handles do not have a
 /// stable local source file, so they remain in-memory-only.
-pub(crate) fn register_file_pointers(path: &Path, source: &str, result: &MaskResult) {
+pub(crate) fn register_file_pointers(path: &Path, source: &str, result: &MaskResult) -> bool {
     if !save_enabled() {
-        return;
+        return false;
     }
     if result.summary.masked_count == 0 {
-        return;
+        return false;
     }
     let records = records_for_result(path, source, result);
     if records.is_empty() {
-        return;
+        return false;
     }
     let mut index = load_index();
     let mut changed = false;
@@ -71,8 +75,20 @@ pub(crate) fn register_file_pointers(path: &Path, source: &str, result: &MaskRes
     }
     if changed {
         trim_index(&mut index.records);
-        let _ = save_index(&index);
+        if save_index(&index).is_err() {
+            return false;
+        }
     }
+    let persisted = load_index();
+    pentect_core::scan_recovery_views(&result.masked).is_ok_and(|handles| {
+        !handles.is_empty()
+            && handles.iter().all(|handle| {
+                persisted
+                    .records
+                    .iter()
+                    .any(|record| record.handle == handle.handle)
+            })
+    })
 }
 
 /// Rebuild a temporary recovery map from unchanged files. No value is recovered
@@ -114,6 +130,123 @@ pub(crate) fn recover_text(text: &str, key: &[u8; 32]) -> Option<Recovery> {
     } else {
         Some(Recovery::seal(recovered, key))
     }
+}
+
+pub(crate) struct FileRecoveryBatch {
+    index: FilePointerIndex,
+    files: HashMap<String, (Zeroizing<Vec<u8>>, String)>,
+    values: HashMap<String, String>,
+    source_bytes: u64,
+    value_bytes: usize,
+}
+
+impl FileRecoveryBatch {
+    pub(crate) fn new() -> Result<Self, ToolInputError> {
+        if !save_enabled() {
+            return Err(ToolInputError::RecoveryDisabled);
+        }
+        Ok(Self {
+            index: load_index(),
+            files: HashMap::new(),
+            values: HashMap::new(),
+            source_bytes: 0,
+            value_bytes: 0,
+        })
+    }
+
+    pub(crate) fn recover(
+        &mut self,
+        text: &str,
+        known: &Recovery,
+        key: &[u8; 32],
+        identity_key: &[u8; 32],
+    ) -> Result<Recovery, ToolInputError> {
+        let spans =
+            pentect_core::scan_recovery_views(text).map_err(|_| ToolInputError::MalformedView)?;
+        let known: std::collections::HashSet<_> = known.placeholders().into_iter().collect();
+        for span in spans {
+            if known.contains(&span.handle) || self.values.contains_key(&span.handle) {
+                continue;
+            }
+            let record = self
+                .index
+                .records
+                .iter()
+                .find(|record| record.handle == span.handle)
+                .ok_or(ToolInputError::UnknownHandle)?;
+            if !self.files.contains_key(&record.path) {
+                self.source_bytes = self.source_bytes.saturating_add(record.file_size);
+                if self.source_bytes > MAX_RECOVERY_SOURCE_BYTES {
+                    return Err(ToolInputError::RecoveryLimitExceeded);
+                }
+                let bytes = read_verified_file_for_tool(record)?;
+                self.files
+                    .insert(record.path.clone(), (bytes, record.file_hash.clone()));
+            }
+            let (bytes, hash) = &self.files[&record.path];
+            if hash != &record.file_hash || bytes.len() as u64 != record.file_size {
+                return Err(ToolInputError::RecoverySourceChanged);
+            }
+            self.value_bytes = self.value_bytes.saturating_add(
+                usize::try_from(record.length)
+                    .map_err(|_| ToolInputError::RecoveryLimitExceeded)?,
+            );
+            if self.value_bytes > MAX_RECOVERY_VALUE_BYTES {
+                return Err(ToolInputError::RecoveryLimitExceeded);
+            }
+            let value = Zeroizing::new(
+                slice_record_value(bytes, record).ok_or(ToolInputError::RecoverySourceChanged)?,
+            );
+            let parts =
+                parse_placeholder(&record.handle).map_err(|_| ToolInputError::UnknownHandle)?;
+            if !pentect_core::placeholder::matches_identity_hash(identity_key, &parts.hash, &value)
+            {
+                return Err(ToolInputError::RecoveryScopeChanged);
+            }
+            self.values.insert(span.handle, value.to_string());
+        }
+        Ok(Recovery::seal(self.values.clone(), key))
+    }
+
+    pub(crate) fn staged(&self, key: &[u8; 32]) -> Recovery {
+        Recovery::seal(self.values.clone(), key)
+    }
+}
+
+impl Drop for FileRecoveryBatch {
+    fn drop(&mut self) {
+        for value in self.values.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
+fn read_verified_file_for_tool(
+    record: &FilePointerRecord,
+) -> Result<Zeroizing<Vec<u8>>, ToolInputError> {
+    let metadata =
+        std::fs::metadata(&record.path).map_err(|_| ToolInputError::RecoverySourceUnavailable)?;
+    if !metadata.is_file() {
+        return Err(ToolInputError::RecoverySourceUnavailable);
+    }
+    if metadata.len() != record.file_size {
+        return Err(ToolInputError::RecoverySourceChanged);
+    }
+    if record.file_size > MAX_RECOVERY_SOURCE_BYTES {
+        return Err(ToolInputError::RecoveryLimitExceeded);
+    }
+    let bytes = Zeroizing::new(
+        crate::secure_io::read_bounded_bytes(
+            Path::new(&record.path),
+            record.file_size,
+            "recovery source",
+        )
+        .map_err(|_| ToolInputError::RecoverySourceUnavailable)?,
+    );
+    if bytes.len() as u64 != record.file_size || sha256_hex(&bytes) != record.file_hash {
+        return Err(ToolInputError::RecoverySourceChanged);
+    }
+    Ok(bytes)
 }
 
 /// `pentect view` can show length for a persisted file-backed handle without
@@ -251,19 +384,9 @@ fn recover_from_file(
 }
 
 fn read_verified_file(record: &FilePointerRecord) -> Option<Vec<u8>> {
-    let path = Path::new(&record.path);
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() != record.file_size {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() as u64 != record.file_size {
-        return None;
-    }
-    if sha256_hex(&bytes) != record.file_hash {
-        return None;
-    }
-    Some(bytes)
+    read_verified_file_for_tool(record)
+        .ok()
+        .map(|bytes| bytes.to_vec())
 }
 
 fn slice_record_value(bytes: &[u8], record: &FilePointerRecord) -> Option<String> {
@@ -595,4 +718,96 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod file_recovery_batch_tests {
+    use super::*;
+    use pentect_core::placeholder::{identity_hash, render_placeholder};
+
+    fn fixture(value: &str) -> (PathBuf, FilePointerRecord, [u8; 32]) {
+        let identity = [19; 32];
+        let path = std::env::temp_dir().join(format!(
+            "pentect-file-batch-{}-{}",
+            std::process::id(),
+            random_hex_8()
+        ));
+        std::fs::write(&path, value).unwrap();
+        let handle = render_placeholder("SECRET", &identity_hash(&identity, value), None);
+        let record = FilePointerRecord {
+            handle,
+            path: path.to_string_lossy().into_owned(),
+            file_size: value.len() as u64,
+            file_hash: sha256_hex(value.as_bytes()),
+            offset: 0,
+            length: value.len() as u64,
+            label: "SECRET".to_string(),
+            created_at: 0,
+        };
+        (path, record, identity)
+    }
+
+    #[test]
+    fn repeated_handle_reuses_source_and_value_budget() {
+        let (path, record, identity) = fixture("bounded-value");
+        let key = [23; 32];
+        let handle = record.handle.clone();
+        let mut batch = FileRecoveryBatch {
+            index: FilePointerIndex {
+                version: INDEX_VERSION,
+                records: vec![record],
+            },
+            files: HashMap::new(),
+            values: HashMap::new(),
+            source_bytes: 0,
+            value_bytes: 0,
+        };
+        let known = Recovery::empty_for_key(&key);
+        batch.recover(&handle, &known, &key, &identity).unwrap();
+        let counters = (batch.source_bytes, batch.value_bytes);
+        batch.recover(&handle, &known, &key, &identity).unwrap();
+        assert_eq!((batch.source_bytes, batch.value_bytes), counters);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn aggregate_budgets_reject_before_read_or_insert() {
+        let (path, record, identity) = fixture("next-value");
+        let key = [29; 32];
+        let handle = record.handle.clone();
+        let known = Recovery::empty_for_key(&key);
+        let mut source_limited = FileRecoveryBatch {
+            index: FilePointerIndex {
+                version: INDEX_VERSION,
+                records: vec![record.clone()],
+            },
+            files: HashMap::new(),
+            values: HashMap::new(),
+            source_bytes: MAX_RECOVERY_SOURCE_BYTES,
+            value_bytes: 0,
+        };
+        assert!(matches!(
+            source_limited.recover(&handle, &known, &key, &identity),
+            Err(ToolInputError::RecoveryLimitExceeded)
+        ));
+        assert!(source_limited.files.is_empty());
+
+        let bytes = Zeroizing::new(std::fs::read(&path).unwrap());
+        let mut value_limited = FileRecoveryBatch {
+            index: FilePointerIndex {
+                version: INDEX_VERSION,
+                records: vec![record.clone()],
+            },
+            files: HashMap::from([(record.path.clone(), (bytes, record.file_hash.clone()))]),
+            values: HashMap::new(),
+            source_bytes: record.file_size,
+            value_bytes: MAX_RECOVERY_VALUE_BYTES,
+        };
+        assert!(matches!(
+            value_limited.recover(&handle, &known, &key, &identity),
+            Err(ToolInputError::RecoveryLimitExceeded)
+        ));
+        assert!(value_limited.values.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
 }
