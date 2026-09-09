@@ -1076,6 +1076,13 @@ fn anthropic_request_unknown_content_kind(
 }
 
 fn anthropic_content_unknown_block_kind(value: &Value) -> Option<&str> {
+    anthropic_content_unknown_block_kind_at(value, false)
+}
+
+fn anthropic_content_unknown_block_kind_at(
+    value: &Value,
+    allow_tool_reference: bool,
+) -> Option<&str> {
     let blocks = value.as_array()?;
     blocks.iter().find_map(|block| {
         let Some(kind) = block.get("type").and_then(Value::as_str) else {
@@ -1102,14 +1109,17 @@ fn anthropic_content_unknown_block_kind(value: &Value) -> Option<&str> {
                 | "text_editor_code_execution_tool_result"
                 | "connector_text"
                 | "fallback"
-        );
+        ) || (allow_tool_reference && kind == "tool_reference");
         if !known {
             return Some(kind);
+        }
+        if kind == "tool_reference" && !block.get("tool_name").is_some_and(Value::is_string) {
+            return Some("<invalid tool reference>");
         }
         if matches!(kind, "tool_result" | "mcp_tool_result") {
             return block
                 .get("content")
-                .and_then(anthropic_content_unknown_block_kind);
+                .and_then(|content| anthropic_content_unknown_block_kind_at(content, true));
         }
         if matches!(
             kind,
@@ -2173,6 +2183,10 @@ fn mask_content(
                         inspect_web_search_history_plaintext(block, masker)?
                     }
                     "web_fetch_tool_result" => inspect_web_fetch_history_plaintext(block, masker)?,
+                    // A tool reference is protocol metadata returned by the
+                    // tool-search feature. In particular, `tool_name` is an
+                    // identifier and must remain byte-stable.
+                    "tool_reference" => {}
                     _ => {
                         if !WARNED_UNKNOWN_CONTENT_BLOCK.swap(true, Ordering::Relaxed) {
                             diagnostic("unknown-content-block", "protocol", "messages", false);
@@ -4618,6 +4632,235 @@ mod tests {
             anthropic_request_unknown_content_kind(&value, AnthropicEndpoint::Messages),
             None
         );
+    }
+
+    #[test]
+    fn nested_tool_references_are_preserved_while_adjacent_content_is_masked() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["AKIA", "IOSFODNN7", "EXAMPLE"].concat();
+        let reference = serde_json::json!({
+            "type": "tool_reference",
+            "tool_name": "weather_lookup_20260909"
+        });
+        let messages = serde_json::json!([
+            {"role": "user", "content": "What is the weather?"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_search", "name": "tool_search",
+                "input": {"query": "weather"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_search", "content": [
+                    reference.clone(),
+                    {"type": "text", "text": format!("credential={secret}")}
+                ]
+            }]},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_lookup", "name": "weather_lookup_20260909",
+                "input": {"token": secret.clone()}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_lookup", "content": "sunny"
+            }]}
+        ]);
+        let tools = serde_json::json!([
+            {"name": "tool_search", "description": "Search tools", "input_schema": {
+                "type": "object", "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }},
+            {
+                "name": "weather_lookup_20260909",
+                "description": "Look up weather",
+                "defer_loading": true,
+                "input_schema": {"type": "object", "properties": {"token": {"type": "string"}}}
+            }
+        ]);
+        let requests = [
+            (
+                AnthropicEndpoint::Messages,
+                serde_json::json!({"model": "test", "max_tokens": 8,
+                    "messages": messages.clone(), "tools": tools.clone()}),
+            ),
+            (
+                AnthropicEndpoint::CountTokens,
+                serde_json::json!({"model": "test",
+                    "messages": messages.clone(), "tools": tools.clone()}),
+            ),
+            (
+                AnthropicEndpoint::MessageBatches,
+                serde_json::json!({"requests": [{"custom_id": "request-1", "params": {
+                    "model": "test", "max_tokens": 8,
+                    "messages": messages.clone(), "tools": tools.clone()
+                }}]}),
+            ),
+        ];
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+
+        for (endpoint, request) in requests {
+            let body = Bytes::from(serde_json::to_vec(&request).unwrap());
+            let protected = protect_anthropic_request_body(
+                &body,
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                endpoint,
+                true,
+            )
+            .unwrap();
+            assert_eq!(protected.coverage, crate::http_files::Coverage::Full);
+            let protected: Value = serde_json::from_slice(&protected.body).unwrap();
+            let serialized = protected.to_string();
+            assert!(!serialized.contains(&secret), "{endpoint:?}");
+            assert!(serialized.contains("<<"), "{endpoint:?}");
+            let protected_content = if endpoint == AnthropicEndpoint::MessageBatches {
+                &protected["requests"][0]["params"]["messages"][2]["content"]
+            } else {
+                &protected["messages"][2]["content"]
+            };
+            assert_eq!(protected_content[0]["content"][0], reference);
+        }
+
+        let unknown = serde_json::json!({"messages": [{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_search", "content": [
+                reference, {"type": "future_reference", "data": "opaque"}
+            ]
+        }]}]});
+        let error = protect_anthropic_request_body(
+            &Bytes::from(serde_json::to_vec(&unknown).unwrap()),
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            AnthropicEndpoint::Messages,
+            true,
+        )
+        .err()
+        .expect("unknown sibling must remain blocked");
+        assert!(error.contains("future_reference"), "{error}");
+
+        for invalid_content in [
+            serde_json::json!([{"type": "tool_reference", "tool_name": "top_level"}]),
+            serde_json::json!([{"type": "tool_result", "content": [
+                {"type": "tool_reference"}
+            ]}]),
+            serde_json::json!([{"type": "tool_result", "content": [
+                {"type": "tool_reference", "tool_name": 7}
+            ]}]),
+        ] {
+            let invalid = serde_json::json!({
+                "messages": [{"role": "user", "content": invalid_content}]
+            });
+            assert!(
+                anthropic_request_unknown_content_kind(&invalid, AnthropicEndpoint::Messages)
+                    .is_some()
+            );
+        }
+        let mcp = serde_json::json!({"messages": [{"role": "user", "content": [{
+            "type": "mcp_tool_result", "tool_use_id": "mcp_1", "content": [
+                {"type": "tool_reference", "tool_name": "mcp_lookup"}
+            ]
+        }]}]});
+        assert_eq!(
+            anthropic_request_unknown_content_kind(&mcp, AnthropicEndpoint::Messages),
+            None
+        );
+    }
+
+    #[test]
+    fn http_proxy_forwards_nested_tool_reference_and_blocks_unknown_sibling() {
+        use std::io::Write;
+
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["AKIA", "IOSFODNN7", "EXAMPLE"].concat();
+        let reference = serde_json::json!({
+            "type": "tool_reference", "tool_name": "weather_lookup_20260909"
+        });
+        let request = serde_json::json!({
+            "model": "test", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_search",
+                    "name": "tool_search", "input": {"query": "weather"}}]},
+                {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "toolu_search", "content": [
+                        reference.clone(), {"type": "text", "text": format!("key={secret}")}
+                    ]}]}
+            ],
+            "tools": [
+                {"name": "tool_search", "description": "Search tools", "input_schema": {
+                    "type": "object", "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }},
+                {"name": "weather_lookup_20260909", "description": "Weather",
+                    "defer_loading": true, "input_schema": {"type": "object"}}
+            ]
+        });
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let upstream_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock upstream accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let (_, body) = read_http_request(&mut stream);
+            body_tx.send(String::from_utf8(body).unwrap()).unwrap();
+            let response = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            stream.write_all(response).unwrap();
+        });
+        let proxy = ClaudeHttpProxyGuard::start(format!("http://{address}")).unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let mut unknown = request.clone();
+        unknown["messages"][2]["content"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "future_reference"}));
+        let blocked = client
+            .post(format!("{}/v1/messages", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(unknown.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(blocked.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+        let forwarded = client
+            .post(format!("{}/v1/messages", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(forwarded.status(), reqwest::StatusCode::OK);
+        let upstream_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(!upstream_body.contains(&secret));
+        let upstream: Value = serde_json::from_str(&upstream_body).unwrap();
+        assert_eq!(
+            upstream["messages"][2]["content"][0]["content"][0],
+            reference
+        );
+        drop(proxy);
+        upstream_thread.join().unwrap();
     }
 
     #[test]
