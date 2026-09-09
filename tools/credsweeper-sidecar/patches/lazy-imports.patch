@@ -20,7 +20,7 @@ index 1cedfcf..e339c82 100644
 @@ -25,3 +14,35 @@ __all__ = [
  ]
  
- __version__ = "1.17.4"
+ __version__ = "1.18.2"
 +
 +
 +def __getattr__(name):
@@ -66,7 +66,7 @@ index 0bf5def..713efa5 100644
 +from credsweeper.paths import APP_PATH
  
  from credsweeper.scanner.scanner import Scanner
- from credsweeper.common.constants import Severity, ThresholdPreset, DiffRowType, DEFAULT_ENCODING
+ from credsweeper.common.constants import Severity, ThresholdPreset, DiffRowType, DEFAULT_ENCODING, Confidence
 diff --git a/credsweeper/common/keyword_checklist.py b/credsweeper/common/keyword_checklist.py
 index 928f140..dd21e6e 100644
 --- a/credsweeper/common/keyword_checklist.py
