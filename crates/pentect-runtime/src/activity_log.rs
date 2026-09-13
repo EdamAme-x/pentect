@@ -1696,6 +1696,10 @@ const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
         "Stream tool input exceeded the inspection size limit",
     ),
     (
+        "sse-tool-rejected",
+        "Stream tool input was rejected to preserve protection",
+    ),
+    (
         "stream-event-protection-skipped",
         "Stream event content protection was skipped",
     ),
@@ -1745,13 +1749,23 @@ fn diagnostic_kind(value: &str) -> String {
             "conflict",
             "connect",
             "credential-forwarding",
+            "delta-shape-invalid",
             "decode",
             "disabled",
+            "handle-recovery-limit",
+            "handle-source-invalid",
+            "handle-unavailable",
+            "handle-validation",
+            "handle-view-invalid",
             "initialize",
+            "input-size-limit",
             "internal",
             "limit",
             "model-load",
             "plugin",
+            "plugin-blocked",
+            "plugin-coverage",
+            "plugin-failure",
             "policy",
             "preprocess",
             "protection",
@@ -1760,17 +1774,24 @@ fn diagnostic_kind(value: &str) -> String {
             "recognition",
             "redirect",
             "resolution",
+            "resolver-unavailable",
+            "restored-size-limit",
             "response-body",
             "runtime",
             "source-or-limit",
+            "start-input-invalid",
             "storage",
             "stream",
+            "stream-incomplete",
             "timeout",
+            "tool-json-invalid",
+            "transaction-commit",
             "unclassified",
             "unexpected-status",
             "unsupported",
             "upstream-client",
             "upstream-server",
+            "validation",
             "windows",
             "macos",
         ],
@@ -2485,6 +2506,46 @@ mod tests {
     }
 
     #[test]
+    fn sse_tool_rejection_diagnostic_serializes_allowlisted_classifiers() {
+        for kind in [
+            "tool-json-invalid",
+            "start-input-invalid",
+            "delta-shape-invalid",
+            "stream-incomplete",
+            "plugin-blocked",
+            "plugin-coverage",
+            "plugin-failure",
+            "input-size-limit",
+            "restored-size-limit",
+            "resolver-unavailable",
+            "handle-unavailable",
+            "handle-view-invalid",
+            "handle-source-invalid",
+            "handle-recovery-limit",
+            "transaction-commit",
+            "handle-validation",
+        ] {
+            let event = ActivityEvent::diagnostic(
+                "claude",
+                "sse-tool-rejected",
+                Some(kind),
+                Some("messages"),
+                Some("HTTP"),
+                None,
+                Some(false),
+                Some("test"),
+            );
+            let rendered = serde_json::to_string(&event).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(parsed["surface"], "claude");
+            assert_eq!(parsed["event"], "sse-tool-rejected");
+            assert_eq!(parsed["kind"], kind);
+            assert_eq!(parsed["endpoint"], "messages");
+            assert_eq!(parsed["method"], "HTTP");
+        }
+    }
+
+    #[test]
     fn structured_diagnostics_reject_unlisted_identifier_shaped_input() {
         let event = ActivityEvent::diagnostic(
             "tenantCredential123",
@@ -2524,6 +2585,8 @@ mod tests {
             "no-protected-connection"
         );
         assert_eq!(diagnostic_kind("plugin"), "plugin");
+        assert_eq!(diagnostic_event("sse-tool-rejected"), "sse-tool-rejected");
+        assert_eq!(diagnostic_kind("validation"), "validation");
         for endpoint in [
             "audio-speech",
             "audio-transcription",

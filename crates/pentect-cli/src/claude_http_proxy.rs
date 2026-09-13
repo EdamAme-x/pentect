@@ -1408,9 +1408,14 @@ fn streaming_response_body(
                     Ok(chunks) => state
                         .ready
                         .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                    Err(_error) => {
+                    Err(error) => {
                         state.finished = true;
-                        diagnostic("sse-tool-rejected", "validation", "messages", false);
+                        diagnostic(
+                            "sse-tool-rejected",
+                            sse_tool_rejection_kind(&error),
+                            "messages",
+                            false,
+                        );
                         state
                             .ready
                             .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
@@ -1428,8 +1433,13 @@ fn streaming_response_body(
                         Ok(chunks) => state
                             .ready
                             .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                        Err(_error) => {
-                            diagnostic("sse-tool-rejected", "validation", "messages", false);
+                        Err(error) => {
+                            diagnostic(
+                                "sse-tool-rejected",
+                                sse_tool_rejection_kind(&error),
+                                "messages",
+                                false,
+                            );
                             state
                                 .ready
                                 .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
@@ -1440,6 +1450,67 @@ fn streaming_response_body(
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+fn sse_tool_rejection_kind(error: &str) -> &'static str {
+    if error == "Anthropic SSE event exceeded inspection limit"
+        || error == "Anthropic SSE tool input exceeded inspection limit"
+    {
+        "input-size-limit"
+    } else if error == "restored Anthropic SSE response exceeded inspection limit" {
+        "restored-size-limit"
+    } else if error == "Anthropic SSE tool input ended before content_block_stop" {
+        "stream-incomplete"
+    } else if error == "Anthropic SSE input_json_delta requires string partial_json" {
+        "delta-shape-invalid"
+    } else if error.starts_with("tool input is missing")
+        || error == "tool input in Anthropic SSE start event must be an object"
+    {
+        "start-input-invalid"
+    } else if error.starts_with("tool input is invalid JSON:")
+        || error == "protected tool input is malformed"
+        || error.starts_with("restored tool input is invalid JSON:")
+    {
+        "tool-json-invalid"
+    } else if error.starts_with("plugin middleware: blocked:") {
+        "plugin-blocked"
+    } else if error == "unknown format blocked: a Claude ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+        || error == "unknown format blocked: a Claude App ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+    {
+        "plugin-coverage"
+    } else if error.starts_with("plugin middleware:") {
+        "plugin-failure"
+    } else if error == "protected tool input resolver is unavailable" {
+        "resolver-unavailable"
+    } else if error.starts_with("protected handle is unavailable in this session") {
+        "handle-unavailable"
+    } else if error.starts_with("protected handle view is malformed")
+        || error.starts_with("protected handle view is unsupported")
+        || error.starts_with("protected handle use is unsupported")
+    {
+        "handle-view-invalid"
+    } else if error.starts_with("protected handle source has changed")
+        || error.starts_with("protected handle source cannot be read")
+        || error.starts_with("protected handle belongs to a different identity scope")
+        || error.starts_with("protected handle recovery store is unavailable")
+        || error.starts_with("file recovery is disabled")
+        || error.starts_with("file recovery transaction was rejected")
+    {
+        "handle-source-invalid"
+    } else if error.starts_with("protected handle recovery exceeds")
+        || error.starts_with("protected tool input is too large after restoration")
+    {
+        "handle-recovery-limit"
+    } else if error.starts_with("protected tool input recovery transaction is already finalized")
+        || error.starts_with("file recovery transaction lock poisoned")
+        || error.starts_with("file recovery could not be committed")
+    {
+        "transaction-commit"
+    } else {
+        // Unmatched failures may contain local or plugin-controlled text. Keep
+        // the category fixed and never include the error in diagnostics.
+        "handle-validation"
+    }
 }
 
 pub(crate) fn anthropic_tool_rejection_sse() -> Bytes {
@@ -2683,6 +2754,8 @@ struct SseBlock {
 #[derive(Default)]
 struct PendingToolInput {
     name: Option<String>,
+    start_block_index: Option<usize>,
+    start_input: Option<Value>,
     chunks: Vec<(usize, String)>,
 }
 
@@ -2807,6 +2880,11 @@ where
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                 });
+                entry.start_block_index = Some(block_index);
+                entry.start_input = data
+                    .get("content_block")
+                    .and_then(|block| block.get("input"))
+                    .cloned();
             }
             continue;
         }
@@ -2824,7 +2902,9 @@ where
                     .get("delta")
                     .and_then(|delta| delta.get("partial_json"))
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
+                    .ok_or_else(|| {
+                        "Anthropic SSE input_json_delta requires string partial_json".to_string()
+                    })?
                     .to_string();
                 pending
                     .entry(index)
@@ -2841,11 +2921,26 @@ where
             let Some(tool) = pending.remove(&index) else {
                 continue;
             };
-            let mut joined = tool
+            let delta_input = tool
                 .chunks
                 .iter()
                 .map(|(_, chunk)| chunk.as_str())
                 .collect::<String>();
+            let uses_start_input = delta_input.is_empty();
+            let mut joined = if uses_start_input {
+                let start_input = tool.start_input.as_ref().ok_or_else(|| {
+                    "tool input is missing from Anthropic SSE start event".to_string()
+                })?;
+                if !start_input.is_object() {
+                    return Err(
+                        "tool input in Anthropic SSE start event must be an object".to_string()
+                    );
+                }
+                serde_json::to_string(start_input)
+                    .map_err(|error| format!("could not encode Claude tool input: {error}"))?
+            } else {
+                delta_input
+            };
             if let Some(plugins) = plugins {
                 let input_value: Value = serde_json::from_str(&joined)
                     .map_err(|error| format!("tool input is invalid JSON: {error}"))?;
@@ -2885,18 +2980,35 @@ where
                 tool.name.as_deref(),
                 &mut budgeted_resolve,
             )?;
-            for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
-                if let Some(partial_json) = blocks[*chunk_index]
+            if uses_start_input {
+                let input_value = serde_json::from_str(&resolved)
+                    .map_err(|error| format!("restored tool input is invalid JSON: {error}"))?;
+                let start_block_index = tool.start_block_index.ok_or_else(|| {
+                    "tool input is missing its Anthropic SSE start event".to_string()
+                })?;
+                let input = blocks[start_block_index]
                     .data
                     .as_mut()
-                    .and_then(|data| data.get_mut("delta"))
-                    .and_then(|delta| delta.get_mut("partial_json"))
-                {
-                    *partial_json = Value::String(if position == 0 {
-                        resolved.clone()
-                    } else {
-                        String::new()
-                    });
+                    .and_then(|data| data.get_mut("content_block"))
+                    .and_then(|block| block.get_mut("input"))
+                    .ok_or_else(|| {
+                        "tool input is missing from Anthropic SSE start event".to_string()
+                    })?;
+                *input = input_value;
+            } else {
+                for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
+                    if let Some(partial_json) = blocks[*chunk_index]
+                        .data
+                        .as_mut()
+                        .and_then(|data| data.get_mut("delta"))
+                        .and_then(|delta| delta.get_mut("partial_json"))
+                    {
+                        *partial_json = Value::String(if position == 0 {
+                            resolved.clone()
+                        } else {
+                            String::new()
+                        });
+                    }
                 }
             }
             restored_tools = restored_tools.saturating_add(u64::from(changed));
@@ -5560,6 +5672,270 @@ mod tests {
         assert!(frame.contains("invalid_request_error"));
         assert!(frame.ends_with("\n\n"));
         assert!(!frame.contains("<<"));
+    }
+
+    #[test]
+    fn sse_tool_rejection_diagnostics_use_only_fixed_categories() {
+        for (error, kind) in [
+            ("tool input is invalid JSON: expected value", "tool-json-invalid"),
+            ("protected tool input is malformed", "tool-json-invalid"),
+            ("tool input is missing from Anthropic SSE start event", "start-input-invalid"),
+            ("Anthropic SSE input_json_delta requires string partial_json", "delta-shape-invalid"),
+            ("Anthropic SSE tool input ended before content_block_stop", "stream-incomplete"),
+            ("plugin middleware: blocked: fixed policy", "plugin-blocked"),
+            ("unknown format blocked: a Claude ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it", "plugin-coverage"),
+            ("plugin middleware: command failed", "plugin-failure"),
+            ("Anthropic SSE tool input exceeded inspection limit", "input-size-limit"),
+            ("restored Anthropic SSE response exceeded inspection limit", "restored-size-limit"),
+            ("protected tool input resolver is unavailable", "resolver-unavailable"),
+            ("protected handle is unavailable in this session; reread the original input", "handle-unavailable"),
+            ("protected handle view is unsupported for this operation", "handle-view-invalid"),
+            ("protected handle source has changed; reread it to obtain a new handle", "handle-source-invalid"),
+            ("protected handle recovery exceeds this response's read limit; reread only the required sources", "handle-recovery-limit"),
+            ("file recovery could not be committed", "transaction-commit"),
+        ] {
+            assert_eq!(sse_tool_rejection_kind(error), kind, "{error}");
+        }
+        let malicious_error =
+            "resolver failed for <<SECRET_deadbeefdeadbeef>> at C:\\private\\token.txt";
+        let kind = sse_tool_rejection_kind(malicious_error);
+        assert_eq!(kind, "handle-validation");
+        assert!(!kind.contains("SECRET"));
+        assert!(!kind.contains("private"));
+    }
+
+    #[test]
+    fn sse_tool_rejection_classification_tracks_runtime_tool_input_errors() {
+        use pentect_agent::ToolInputError;
+
+        for (error, kind) in [
+            (ToolInputError::UnknownHandle, "handle-unavailable"),
+            (ToolInputError::MalformedView, "handle-view-invalid"),
+            (ToolInputError::UnsupportedView, "handle-view-invalid"),
+            (ToolInputError::UnknownSurface, "handle-view-invalid"),
+            (
+                ToolInputError::RecoverySourceChanged,
+                "handle-source-invalid",
+            ),
+            (
+                ToolInputError::RecoverySourceUnavailable,
+                "handle-source-invalid",
+            ),
+            (
+                ToolInputError::RecoveryScopeChanged,
+                "handle-source-invalid",
+            ),
+            (
+                ToolInputError::RecoveryStoreUnavailable,
+                "handle-source-invalid",
+            ),
+            (ToolInputError::RecoveryDisabled, "handle-source-invalid"),
+            (
+                ToolInputError::RecoveryLimitExceeded,
+                "handle-recovery-limit",
+            ),
+            (ToolInputError::OutputTooLarge, "handle-recovery-limit"),
+            (
+                ToolInputError::RecoveryTransactionFinalized,
+                "transaction-commit",
+            ),
+        ] {
+            let rendered = error.to_string();
+            assert_eq!(sse_tool_rejection_kind(&rendered), kind, "{rendered}");
+        }
+    }
+
+    #[test]
+    fn sse_zero_argument_tool_uses_start_input_when_no_delta_arrives() {
+        let input = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"browser_snapshot\",\"input\":{}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::default());
+        let mut resolve = |_: &str, _| panic!("an empty object has no scalar fields to resolve");
+
+        let (output, restored_tools) = rewrite_anthropic_sse_with_tool_context_tracked(
+            input,
+            None,
+            &mut resolve,
+            Some(&plugins),
+            CLAUDE_APP_SSE_CONTEXT,
+        )
+        .unwrap();
+
+        assert_eq!(restored_tools, 0);
+        let blocks = parse_sse(&output);
+        assert_eq!(
+            blocks[0].data.as_ref().unwrap()["content_block"]["input"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn streaming_zero_argument_tool_accepts_empty_deltas_and_next_stream_succeeds() {
+        let start = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"tabs_context_mcp\",\"input\":{}}}\n\n"
+        );
+        let empty_delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n"
+        );
+        let stop = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+
+        for _ in 0..2 {
+            let plugins = Arc::new(StdMutex::new(pentect_agent::PluginMiddleware::default()));
+            let mut transformer = SseStreamTransformer::new_for_claude_app(
+                |_: &str, _| panic!("an empty object has no scalar fields to resolve"),
+                plugins,
+                false,
+                MAX_PENDING_SSE_BYTES,
+            );
+            assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
+            assert!(transformer.push(empty_delta.as_bytes()).unwrap().is_empty());
+            assert!(transformer.push(empty_delta.as_bytes()).unwrap().is_empty());
+            let output = join_bytes(transformer.push(stop.as_bytes()).unwrap());
+            assert!(output.contains("tabs_context_mcp"), "{output}");
+            assert!(output.contains("\"input\":{}"), "{output}");
+            assert!(output.contains("\"partial_json\":\"\""), "{output}");
+        }
+    }
+
+    #[test]
+    fn empty_delta_fallback_rejects_missing_or_non_object_start_input() {
+        for (input_fragment, expected) in [
+            ("", "tool input is missing"),
+            ("\"input\":null,", "must be an object"),
+        ] {
+            let input = format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",{input_fragment}\"name\":\"browser_snapshot\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n"
+            );
+            let mut resolve = |text: &str, _| Ok(text.to_string());
+            let error = rewrite_anthropic_sse_with_tool_context_tracked(
+                &input,
+                None,
+                &mut resolve,
+                None,
+                ANTHROPIC_HTTP_SSE_CONTEXT,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn nonempty_malformed_delta_is_not_replaced_by_start_input() {
+        let input = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"browser_snapshot\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        );
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::default());
+        let mut resolve = |text: &str, _| Ok(text.to_string());
+
+        let error = rewrite_anthropic_sse_with_tool_context_tracked(
+            input,
+            None,
+            &mut resolve,
+            Some(&plugins),
+            CLAUDE_APP_SSE_CONTEXT,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("tool input is invalid JSON"), "{error}");
+    }
+
+    #[test]
+    fn malformed_partial_json_field_is_not_treated_as_an_empty_delta() {
+        for partial_json in ["", "\"partial_json\":null,", "\"partial_json\":{},"] {
+            let input = format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"name\":\"browser_snapshot\",\"input\":{{}}}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",{partial_json}\"extra\":true}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n"
+            );
+            let mut resolve = |text: &str, _| Ok(text.to_string());
+            let error = rewrite_anthropic_sse_with_tool_context_tracked(
+                &input,
+                None,
+                &mut resolve,
+                None,
+                ANTHROPIC_HTTP_SSE_CONTEXT,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "Anthropic SSE input_json_delta requires string partial_json"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_start_input_without_deltas_is_still_validated_and_restored() {
+        let handle = "<<SECRET_deadbeefdeadbeef>>";
+        let input = format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{{\"command\":\"echo {handle}\"}}}}}}\n\n\
+             event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n"
+        );
+        let mut resolve = |text: &str, kind| {
+            assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+            Ok(text.replace(handle, "local-value"))
+        };
+
+        let (output, restored_tools) = rewrite_anthropic_sse_with_tool_context_tracked(
+            &input,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+        )
+        .unwrap();
+
+        assert_eq!(restored_tools, 1);
+        let blocks = parse_sse(&output);
+        assert_eq!(
+            blocks[0].data.as_ref().unwrap()["content_block"]["input"]["command"],
+            "echo local-value"
+        );
+        assert!(!output.contains(handle));
+    }
+
+    #[test]
+    fn sse_start_input_without_deltas_fails_closed_on_unsafe_handle() {
+        let input = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"echo <<SECRET_deadbeefdeadbeef>>\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        );
+        let mut resolve = |_: &str, kind| {
+            assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+            Err("synthetic unsafe handle rejection".to_string())
+        };
+
+        let error = rewrite_anthropic_sse_with_tool_context_tracked(
+            input,
+            None,
+            &mut resolve,
+            None,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "synthetic unsafe handle rejection");
     }
 
     #[test]

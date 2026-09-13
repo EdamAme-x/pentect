@@ -176,6 +176,18 @@ network routes, so Pentect protects only the listed features.
 Test one completed tool call as well as chat. This confirms that Claude can use
 the protected reference locally without the provider learning the value.
 
+If a streamed tool call is rejected, run `pentect log --json --once --tail 100`
+and inspect the fixed `kind` on `event=sse-tool-rejected`. `tool-json-invalid`,
+`start-input-invalid`, `delta-shape-invalid`, and `stream-incomplete` indicate a
+provider stream shape that should be retried. `resolver-unavailable` means the
+protected session should be restarted. `handle-unavailable`,
+`handle-source-invalid`, and `handle-view-invalid` mean the original input
+should be reread or the documented `|base64` representation used.
+`plugin-blocked`, `plugin-coverage`, and `plugin-failure` point to plugin policy
+or configuration. Size-limit kinds require a smaller tool input or narrower
+source read. These diagnostics contain only fixed categories, never tool input,
+paths, handles, or plugin-generated error text.
+
 ::: warning
 Pentect does not protect remote Cowork tasks, Voice, test binary formats, or
 unknown future routes. Voice remains blocked by default. With the user-level
