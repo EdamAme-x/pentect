@@ -1472,13 +1472,16 @@ fn sse_tool_rejection_kind(error: &str) -> &'static str {
         || error.starts_with("restored tool input is invalid JSON:")
     {
         "tool-json-invalid"
-    } else if error.starts_with("plugin middleware: blocked:") {
+    } else if error.starts_with("plugin middleware: blocked:")
+        || error == "response plugin blocked"
+    {
         "plugin-blocked"
-    } else if error == "unknown format blocked: a Claude ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
+    } else if error == "response plugin coverage incomplete"
+        || error == "unknown format blocked: a Claude ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
         || error == "unknown format blocked: a Claude App ToolCall plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it"
     {
         "plugin-coverage"
-    } else if error.starts_with("plugin middleware:") {
+    } else if error.starts_with("plugin middleware:") || error == "response plugin failed" {
         "plugin-failure"
     } else if error == "protected tool input resolver is unavailable" {
         "resolver-unavailable"
@@ -1806,7 +1809,7 @@ fn run_anthropic_sse_response_plugins(
     };
     let plugins = plugins
         .lock()
-        .map_err(|_| format!("{} plugin lock was poisoned", plugin_context.label))?;
+        .map_err(|_| "response plugin failed".to_string())?;
     if !plugins.has_hook(pentect_agent::MiddlewareStage::Response) {
         return Ok(block.to_vec());
     }
@@ -1816,6 +1819,21 @@ fn run_anthropic_sse_response_plugins(
         plugin_context,
         |stage, payload, context| plugins.run(stage, payload, context),
     )
+    .map_err(|error| normalize_sse_response_plugin_error(&error, plugin_context))
+}
+
+fn normalize_sse_response_plugin_error(error: &str, plugin_context: PluginContext) -> String {
+    if error.starts_with("plugin blocked:") {
+        return "response plugin blocked".to_string();
+    }
+    let coverage = format!(
+        "unknown format blocked: a {} Response plugin reported partial coverage; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to allow it",
+        plugin_context.label
+    );
+    if error == coverage {
+        return "response plugin coverage incomplete".to_string();
+    }
+    "response plugin failed".to_string()
 }
 
 fn run_anthropic_sse_response_plugin_with(
@@ -3607,6 +3625,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(strict_error.contains("Claude Response plugin reported partial coverage"));
+        let normalized =
+            normalize_sse_response_plugin_error(&strict_error, ANTHROPIC_HTTP_SSE_CONTEXT);
+        assert_eq!(normalized, "response plugin coverage incomplete");
+        assert_eq!(sse_tool_rejection_kind(&normalized), "plugin-coverage");
 
         let allowed = run_anthropic_response_plugin_with(
             serde_json::json!({"id": "message"}),
@@ -3754,6 +3776,21 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(stop_error, "plugin blocked: stream policy");
+        let normalized = normalize_sse_response_plugin_error(&stop_error, CLAUDE_APP_SSE_CONTEXT);
+        assert_eq!(normalized, "response plugin blocked");
+        assert_eq!(sse_tool_rejection_kind(&normalized), "plugin-blocked");
+
+        let failure = run_anthropic_sse_response_plugin_with(
+            input,
+            false,
+            ANTHROPIC_HTTP_SSE_CONTEXT,
+            |_stage, _payload, _context| Err("private plugin failure text".to_string()),
+        )
+        .unwrap_err();
+        let normalized = normalize_sse_response_plugin_error(&failure, ANTHROPIC_HTTP_SSE_CONTEXT);
+        assert_eq!(normalized, "response plugin failed");
+        assert_eq!(sse_tool_rejection_kind(&normalized), "plugin-failure");
+        assert!(!normalized.contains("private"));
     }
 
     #[test]

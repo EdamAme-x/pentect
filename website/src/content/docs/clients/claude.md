@@ -185,8 +185,12 @@ protected session should be restarted. `handle-unavailable`,
 should be reread or the documented `|base64` representation used.
 `plugin-blocked`, `plugin-coverage`, and `plugin-failure` point to plugin policy
 or configuration. Size-limit kinds require a smaller tool input or narrower
-source read. These diagnostics contain only fixed categories, never tool input,
-paths, handles, or plugin-generated error text.
+source read. `transaction-commit` means local file recovery could not be
+committed; retry the tool call, then restart the protected session if it
+persists. `handle-validation` is the safe fallback for an unclassified local
+validation failure; retry once and include the fixed diagnostic fields in a
+support report if it repeats. These diagnostics contain only fixed categories,
+never tool input, paths, handles, or plugin-generated error text.
 
 ::: warning
 Pentect does not protect remote Cowork tasks, Voice, test binary formats, or
