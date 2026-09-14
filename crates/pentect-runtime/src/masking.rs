@@ -159,7 +159,7 @@ impl OutputMasker {
                 return Ok(text.to_string());
             }
         }
-        let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
+        let kind = if looks_like_env_output(text) {
             Kind::Env
         } else {
             Kind::Text
@@ -209,10 +209,9 @@ impl OutputMasker {
         let (protected, unmasked_values) =
             protect_prompt_unmask_markers(text, &self.store.session.identity_key);
         let remasked = self.remask_all(&protected)?;
-        // Prompt scalars are text. Only opt into dotenv parsing when the
-        // payload actually contains assignment syntax; treating every
-        // `Label: prose` sentence as Env turns ordinary messages into secrets.
-        let env_result = prompt_contains_env_assignments(&remasked).then(|| {
+        // Promote only a whole environment document, never surrounding code
+        // or prose merely containing one sensitive assignment.
+        let env_result = looks_like_env_output(&remasked).then(|| {
             self.prompt_engine.mask(
                 Input {
                     kind: Kind::Env,
@@ -1262,55 +1261,47 @@ pub(crate) fn mask_live_output(session: &Session, text: &str) -> Result<String, 
 }
 
 pub(crate) fn live_output_kind(text: &str) -> Kind {
-    if looks_like_sensitive_env_output(text)
-        || looks_like_env_output(text)
-        || text.lines().any(|line| is_env_assignment_line(line.trim()))
-    {
+    let scalar_env = scalar_is_env_assignment(text)
+        && env_assignment_key(text.trim()).is_some_and(is_document_env_key);
+    if looks_like_env_output(text) || scalar_env {
         Kind::Env
     } else {
         Kind::Text
     }
 }
 
+fn is_document_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 fn looks_like_env_output(text: &str) -> bool {
     let mut env_lines = 0usize;
     let mut non_empty_lines = 0usize;
     let mut strong_key = false;
-    for line in text.lines().take(256) {
+    let mut sensitive_key = false;
+    // A secret-looking assignment does not make surrounding source code an
+    // environment document. Inspect every meaningful line before promoting
+    // the whole output; individual secrets still use ordinary text detection.
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         non_empty_lines += 1;
         if let Some(key) = env_assignment_key(trimmed) {
+            if !is_document_env_key(key) {
+                return false;
+            }
             env_lines += 1;
             strong_key |= is_strong_env_output_key(key);
+            sensitive_key |= is_sensitive_env_output_name(&key.to_ascii_lowercase());
         }
     }
-    env_lines >= 2 && env_lines == non_empty_lines && strong_key
-}
-
-fn looks_like_sensitive_env_output(text: &str) -> bool {
-    for line in text.lines().take(256) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some(key) = env_assignment_key(trimmed) {
-            if is_sensitive_env_output_name(&key.to_ascii_lowercase()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn prompt_contains_env_assignments(text: &str) -> bool {
-    looks_like_sensitive_env_output(text)
-        || looks_like_env_output(text)
-        || text
-            .lines()
-            .any(|line| embedded_sensitive_env_assignment_start(line).is_some())
+    env_lines == non_empty_lines && (sensitive_key || (env_lines >= 2 && strong_key))
 }
 
 #[cfg(test)]

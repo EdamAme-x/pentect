@@ -40,7 +40,8 @@ def main() -> None:
         "NODE_OPTIONS",
     )
     previous = {name: os.environ.get(name) for name in sentinel_names}
-    previous_preserved = {name: os.environ.get(name) for name in ("PATH", "SystemRoot", "COMSPEC", "PATHEXT")}
+    linker_variable = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
+    previous_preserved = {name: os.environ.get(name) for name in ("PATH", "SystemRoot", "COMSPEC", "PATHEXT", linker_variable, "LIB")}
     try:
         os.environ.update({name: "fixture-sentinel" for name in sentinel_names})
         # Exercise Windows' case-insensitive environment spelling on every
@@ -50,6 +51,8 @@ def main() -> None:
             "SystemRoot": "fixture-system-root",
             "COMSPEC": "fixture-comspec",
             "PATHEXT": "fixture-pathext",
+            linker_variable: "fixture-lld-link.exe",
+            "LIB": "fixture-msvc-libraries",
         })
         with tempfile.TemporaryDirectory() as raw:
             environment = E2E.isolated_environment(Path(raw) / "home", Path(raw) / "logs")
@@ -60,10 +63,14 @@ def main() -> None:
             "SystemRoot": "fixture-system-root",
             "COMSPEC": "fixture-comspec",
             "PATHEXT": "fixture-pathext",
+            linker_variable: "fixture-lld-link.exe",
+            "LIB": "fixture-msvc-libraries",
         }
+        # Python normalizes Windows environment names to uppercase.
+        normalized_environment = {name.upper(): value for name, value in environment.items()}
         missing_preserved = [
             name for name, value in expected_preserved.items()
-            if environment.get(name) != value
+            if normalized_environment.get(name.upper()) != value
         ]
         assert not missing_preserved, f"required OS variables were dropped: {missing_preserved}"
     finally:

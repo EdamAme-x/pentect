@@ -291,6 +291,21 @@ jobs:
         if: needs.changes.outputs.plugins == 'true' || needs.changes.outputs.detector == 'true'
         with:
           targets: wasm32-unknown-unknown
+      - name: Configure Windows plugin linking
+        if: runner.os == 'Windows' && (needs.changes.outputs.plugins == 'true' || needs.changes.outputs.detector == 'true')
+        shell: pwsh
+        run: |
+          $linker = (Get-Command lld-link.exe -ErrorAction Stop).Source
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'Visual C++ build tools were not found' }
+          $devcmd = Join-Path $installation 'Common7/Tools/VsDevCmd.bat'
+          $libraryEnvironment = & $env:COMSPEC /d /s /c "`"$devcmd`" -no_logo -arch=x64 -host_arch=x64 >nul && set LIB"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not initialize Visual C++ libraries' }
+          $libraryPath = $libraryEnvironment | Where-Object { $_ -match '^LIB=.+$' } | Select-Object -First 1
+          if (-not $libraryPath) { throw 'Visual C++ library path is empty' }
+          $libraryPath >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: needs.changes.outputs.plugins == 'true' || needs.changes.outputs.detector == 'true'
         with:
