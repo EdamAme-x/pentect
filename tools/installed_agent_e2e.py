@@ -279,6 +279,7 @@ def isolated_environment(home: Path, log_dir: Path) -> dict[str, str]:
         "PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
         "TEMP", "TMP", "TMPDIR", "LANG", "TERM", "TERMINFO", "CI",
         "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
         "CARGO_NET_OFFLINE", "SSL_CERT_FILE", "SSL_CERT_DIR",
     }
     allowed_upper = {name.upper() for name in allowed}
