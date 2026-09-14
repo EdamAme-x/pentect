@@ -1103,6 +1103,48 @@ fn prompt_masked_env_is_available_to_direct_execution() {
 }
 
 #[test]
+fn source_output_does_not_promote_to_env() {
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let source = format!("import asyncio\nAUTH_TOKEN={raw}\ndone_count = 0\nself._running = False\ntitle = str(done_count)\n");
+    for surface in ["tool", "live", "prompt", "json"] {
+        let root = temp_root(&format!("source-env-{surface}"));
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let mut masker =
+            masking::OutputMasker::new_shared(MemoryStore::for_session(&session)).unwrap();
+        let masked = match surface {
+            "tool" => masker.mask_tool_output(&source).unwrap(),
+            "live" => mask_live_output(&session, &source).unwrap(),
+            "prompt" => masker.mask_prompt_text(&source).unwrap(),
+            _ => masker
+                .mask_tool_output(&serde_json::json!({"stdout": source}).to_string())
+                .unwrap(),
+        };
+        assert!(!masked.contains(raw), "secret leaked on {surface}");
+        for ordinary in [
+            "done_count = 0",
+            "self._running = False",
+            "title = str(done_count)",
+        ] {
+            assert!(
+                masked.contains(ordinary),
+                "overmask on {surface}: {ordinary}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn source_output_after_long_env_prefix_is_not_env() {
+    let source = format!("{}import asyncio\n", "MODE=development\n".repeat(257));
+    assert_eq!(masking::live_output_kind(&source), Kind::Text);
+    assert_eq!(
+        masking::live_output_kind("API_KEY=example\nMODE=development\n"),
+        Kind::Env
+    );
+}
+
+#[test]
 fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-strict");
@@ -1218,7 +1260,7 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
             "dotenv-and-text",
             MIXED_PROMPT,
             2,
-            [("OPENAI_API_KEY", 1), ("EMAIL_ADDRESS", 1)],
+            [("KEYED_SECRET", 1), ("EMAIL_ADDRESS", 1)],
         ),
     ] {
         let session = Session::open_capability_at(&root, session_name).unwrap();
@@ -1297,7 +1339,7 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
         events[0]["labels"],
         json!([
             { "name": "EMAIL_ADDRESS", "count": 1 },
-            { "name": "OPENAI_API_KEY", "count": 1 }
+            { "name": "KEYED_SECRET", "count": 1 }
         ])
     );
     for private_value in [
@@ -4788,7 +4830,7 @@ fn mixed_env_output_still_masks_encoded_non_env_lines() {
     assert!(!masked.contains("rpa_FAKEPENTECTJAILBREAK"), "{masked}");
     assert!(!masked.contains(&b64), "{masked}");
     assert!(
-        masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+        masked.contains("RUNPOD_API_KEY=<<KEYED_SECRET_"),
         "{masked}"
     );
     assert!(masked.contains("B64_FILE:\n<<SECRET_"), "{masked}");
