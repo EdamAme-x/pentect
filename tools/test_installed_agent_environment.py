@@ -64,9 +64,11 @@ def main() -> None:
             "PATHEXT": "fixture-pathext",
             linker_variable: "fixture-lld-link.exe",
         }
+        # Python normalizes Windows environment names to uppercase.
+        normalized_environment = {name.upper(): value for name, value in environment.items()}
         missing_preserved = [
             name for name, value in expected_preserved.items()
-            if environment.get(name) != value
+            if normalized_environment.get(name.upper()) != value
         ]
         assert not missing_preserved, f"required OS variables were dropped: {missing_preserved}"
     finally:
