@@ -1136,6 +1136,9 @@ fn source_output_does_not_promote_to_env() {
 
 #[test]
 fn source_output_after_long_env_prefix_is_not_env() {
+    for source in ["self._running=False", "config-value=42", "123=42"] {
+        assert_eq!(masking::live_output_kind(source), Kind::Text);
+    }
     let source = format!("{}import asyncio\n", "MODE=development\n".repeat(257));
     assert_eq!(masking::live_output_kind(&source), Kind::Text);
     assert_eq!(

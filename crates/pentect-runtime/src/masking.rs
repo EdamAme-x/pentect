@@ -1261,11 +1261,21 @@ pub(crate) fn mask_live_output(session: &Session, text: &str) -> Result<String, 
 }
 
 pub(crate) fn live_output_kind(text: &str) -> Kind {
-    if looks_like_env_output(text) || scalar_is_env_assignment(text) {
+    let scalar_env = scalar_is_env_assignment(text)
+        && env_assignment_key(text.trim()).is_some_and(is_document_env_key);
+    if looks_like_env_output(text) || scalar_env {
         Kind::Env
     } else {
         Kind::Text
     }
+}
+
+fn is_document_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn looks_like_env_output(text: &str) -> bool {
@@ -1283,10 +1293,7 @@ fn looks_like_env_output(text: &str) -> bool {
         }
         non_empty_lines += 1;
         if let Some(key) = env_assignment_key(trimmed) {
-            if !key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            {
+            if !is_document_env_key(key) {
                 return false;
             }
             env_lines += 1;
