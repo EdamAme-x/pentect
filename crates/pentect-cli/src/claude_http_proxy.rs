@@ -524,6 +524,12 @@ async fn proxy_request_inner(
         reqwest::Body::wrap_stream(stream)
     };
 
+    // Retain only the already-protected request, never the local plaintext.
+    let recovery_body = if messages_path {
+        body.as_bytes().map(Bytes::copy_from_slice)
+    } else {
+        None
+    };
     let mut upstream_request = state.client.request(method.clone(), upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
@@ -537,6 +543,10 @@ async fn proxy_request_inner(
         }
     }
     upstream_request = state.headers.apply(upstream_request);
+    if let Some(body) = recovery_body {
+        return recoverable_messages_response(upstream_request, body, state, request_coverage)
+            .await;
+    }
     let upstream_response = upstream_request
         .body(body)
         .send()
@@ -642,9 +652,17 @@ async fn proxy_request_inner(
                 commit()?;
                 Bytes::from(rewritten)
             }
-            Err(_error) => {
-                diagnostic("response-restore-skipped", "protection", "messages", false);
-                return Err("Claude protected tool response was rejected".to_string());
+            Err(error) => {
+                diagnostic(
+                    "json-tool-rejected",
+                    sse_tool_rejection_kind(&error),
+                    "messages",
+                    false,
+                );
+                return Ok(owned_text_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    recovery_notice(&error),
+                ));
             }
         }
     } else {
@@ -653,6 +671,297 @@ async fn proxy_request_inner(
     builder
         .body(full_body(response_body))
         .map_err(|error| format!("could not build Claude proxy response: {error}"))
+}
+
+const MAX_HANDLE_RECOVERY_ATTEMPTS: usize = 2;
+
+fn recoverable_handle_failure(error: &str) -> bool {
+    // Do not retry syntax, plugin, storage, transaction or policy failures.
+    error.starts_with("protected handle is unavailable in this session")
+        || error.starts_with("protected handle source has changed")
+        || error.starts_with("protected handle source cannot be read")
+}
+
+fn recovery_notice(error: &str) -> &'static str {
+    if recoverable_handle_failure(error) {
+        "Pentect could not restore a protected handle. The proposed client tool batch was withheld; none of its client tools ran. Reread the original file or input through the current protected session to obtain a fresh handle, then retry. Do not repeat the old handle, guess its value, change its encoding, or ask for a secret to be pasted. If the source is unavailable, explain what source is needed."
+    } else {
+        "Pentect withheld the proposed client tool batch because its protected input could not be validated. None of its client tools ran. Do not bypass the protection or repeat the same operation. Consult the local Pentect diagnostics for the rejection category."
+    }
+}
+
+fn request_with_recovery_notice(body: &[u8], error: &str) -> Result<Bytes, String> {
+    let mut request: Value = serde_json::from_slice(body)
+        .map_err(|_| "Claude recovery request is invalid JSON".to_string())?;
+    let messages = request
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Claude recovery request has no messages".to_string())?;
+    // This is gateway feedback, not fabricated successful tool output. The
+    // rejected provider response never entered the client's conversation.
+    messages.push(serde_json::json!({"role":"user", "content":[{
+        "type":"text", "text":recovery_notice(error)
+    }]}));
+    // A forced tool choice could prevent the model from rereading the source.
+    if request.pointer("/tool_choice/type").and_then(Value::as_str) != Some("none") {
+        request
+            .as_object_mut()
+            .expect("request has messages")
+            .remove("tool_choice");
+    }
+    let encoded = serde_json::to_vec(&request)
+        .map_err(|_| "could not encode Claude recovery request".to_string())?;
+    if encoded.len() > MAX_HTTP_BODY_BYTES {
+        return Err("Claude recovery request exceeded limit".to_string());
+    }
+    Ok(Bytes::from(encoded))
+}
+
+fn recovery_stopped_response(streaming: bool, error: &str) -> Response<ProxyBody> {
+    let message = format!(
+        "{} Automatic recovery stopped after a bounded attempt. No rejected tool was executed.",
+        recovery_notice(error)
+    );
+    if !streaming {
+        return json_response(
+            StatusCode::OK,
+            Bytes::from(
+                serde_json::json!({
+                    "id":"msg_pentect_recovery", "type":"message", "role":"assistant",
+                    "model":"pentect-local", "content":[{"type":"text","text":message}],
+                    "stop_reason":"end_turn", "stop_sequence":null,
+                    "usage":{"input_tokens":0,"output_tokens":0}
+                })
+                .to_string(),
+            ),
+        );
+    }
+    let events = [
+        serde_json::json!({"type":"message_start","message":{
+            "id":"msg_pentect_recovery","type":"message","role":"assistant",
+            "model":"pentect-local","content":[],"stop_reason":null,"stop_sequence":null,
+            "usage":{"input_tokens":0,"output_tokens":0}}}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":message}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}),
+        serde_json::json!({"type":"message_stop"}),
+    ];
+    let text = events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+        .body(full_body(Bytes::from(text)))
+        .expect("static recovery response")
+}
+
+/// Hold a complete Messages response until validation succeeds. This prevents
+/// partial tools/prose from reaching the host before an internal recovery turn.
+/// Every retry has a fresh transaction; rejected batches are never committed.
+async fn recoverable_messages_response(
+    template: reqwest::RequestBuilder,
+    original_body: Bytes,
+    state: &ProxyState,
+    coverage: Option<crate::http_files::Coverage>,
+) -> Result<Response<ProxyBody>, String> {
+    let requested_stream = anthropic_request_streaming(AnthropicEndpoint::Messages, &original_body);
+    let restore_output = pentect_agent::output_restore_enabled()?;
+    let mut body = original_body.clone();
+    for attempt in 0..=MAX_HANDLE_RECOVERY_ATTEMPTS {
+        let response = template
+            .try_clone()
+            .ok_or_else(|| "Claude recovery request cannot be cloned".to_string())?
+            .body(body.clone())
+            .send()
+            .await
+            .map_err(|error| reqwest_error_message("could not reach Claude upstream", &error))?;
+        let status = response.status();
+        crate::gateway_diagnostics::record_upstream_status(
+            "claude",
+            crate::gateway_diagnostics::RequestContext {
+                endpoint: "messages",
+                method: "POST",
+            },
+            status,
+        );
+        let headers = response.headers().clone();
+        if headers
+            .get(hyper::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
+        {
+            return Err("Claude upstream returned an unsupported content encoding".to_string());
+        }
+        let streaming = headers
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"));
+        let raw = read_response_capped(response)
+            .await?
+            .ok_or_else(|| "Claude response exceeded limit".to_string())?;
+        let result = if status.is_success() {
+            let (resolve, mut commit) = masker_scoped_resolver(&state.masker);
+            let mut resolve = diagnostic_resolver(resolve);
+            let validated = if streaming {
+                let mut transformer = SseStreamTransformer::new(
+                    resolve,
+                    Some(Arc::clone(&state.plugins)),
+                    restore_output,
+                )
+                .with_strict_response_coverage(state.block_unknown_formats);
+                // Do not attach the commit hook: commit only after EOF validation.
+                (|| {
+                    let mut chunks = transformer.push(&raw)?;
+                    chunks.extend(transformer.finish()?);
+                    let size: usize = chunks.iter().map(Bytes::len).sum();
+                    if size > MAX_HTTP_BODY_BYTES {
+                        return Err(
+                            "restored Claude response exceeded inspection limit".to_string()
+                        );
+                    }
+                    Ok(Bytes::from(chunks.concat()))
+                })()
+            } else {
+                run_response_plugins(raw, &state.plugins, state.block_unknown_formats).and_then(
+                    |raw| {
+                        rewrite_anthropic_json_response(&raw, restore_output, &mut resolve)
+                            .map(Bytes::from)
+                    },
+                )
+            };
+            validated.and_then(|bytes| {
+                commit()?;
+                Ok(bytes)
+            })
+        } else {
+            Ok(raw)
+        };
+        match result {
+            Ok(bytes) => {
+                if attempt > 0 && status.is_success() {
+                    diagnostic("handle-recovery-completed", "validated", "messages", false);
+                }
+                let mut builder = Response::builder().status(status);
+                let connection_headers = connection_named_headers(&headers);
+                for (name, value) in &headers {
+                    if should_forward_response_header(name.as_str())
+                        && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
+                    {
+                        builder = builder.header(name, value);
+                    }
+                }
+                return builder
+                    .header(
+                        "x-pentect-coverage",
+                        coverage
+                            .unwrap_or(crate::http_files::Coverage::None)
+                            .as_header(),
+                    )
+                    .body(full_body(bytes))
+                    .map_err(|_| "could not build Claude response".to_string());
+            }
+            Err(error) => {
+                diagnostic(
+                    if streaming {
+                        "sse-tool-rejected"
+                    } else {
+                        "json-tool-rejected"
+                    },
+                    sse_tool_rejection_kind(&error),
+                    "messages",
+                    false,
+                );
+                if !recoverable_handle_failure(&error) {
+                    // Other validation failures remain fail-closed, but must not
+                    // masquerade as a transient upstream 502.
+                    return Ok(owned_text_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        recovery_notice(&error),
+                    ));
+                }
+                if attempt == MAX_HANDLE_RECOVERY_ATTEMPTS {
+                    diagnostic(
+                        "handle-recovery-exhausted",
+                        sse_tool_rejection_kind(&error),
+                        "messages",
+                        false,
+                    );
+                    return Ok(recovery_stopped_response(requested_stream, &error));
+                }
+                diagnostic(
+                    if attempt == 0 {
+                        "handle-recovery-attempt-1"
+                    } else {
+                        "handle-recovery-attempt-2"
+                    },
+                    sse_tool_rejection_kind(&error),
+                    "messages",
+                    false,
+                );
+                // Never recycle partially restored output into a provider request.
+                body = request_with_recovery_notice(&original_body, &error)?;
+            }
+        }
+    }
+    unreachable!("bounded recovery returns on its last attempt")
+}
+
+fn diagnostic_resolver(mut resolve: HandleResolver) -> HandleResolver {
+    Box::new(move |text, kind| {
+        let result = resolve(text, kind);
+        if let Err(error) = &result {
+            let event = match kind {
+                pentect_agent::ToolInputKind::Data => "restore-data-rejected",
+                pentect_agent::ToolInputKind::PassiveData => "restore-output-rejected",
+                pentect_agent::ToolInputKind::RawFile => "restore-file-rejected",
+                pentect_agent::ToolInputKind::Code => "restore-code-rejected",
+                pentect_agent::ToolInputKind::Patch => "restore-patch-rejected",
+                pentect_agent::ToolInputKind::Unknown => "restore-unknown-rejected",
+            };
+            diagnostic(event, restoration_failure_kind(error), "messages", false);
+        }
+        result
+    })
+}
+
+fn restoration_failure_kind(error: &str) -> &'static str {
+    for (prefix, kind) in [
+        (
+            "protected handle source has changed",
+            "handle-source-changed",
+        ),
+        (
+            "protected handle source cannot be read",
+            "handle-source-unreadable",
+        ),
+        (
+            "protected handle belongs to a different identity scope",
+            "handle-scope-mismatch",
+        ),
+        (
+            "protected handle recovery store is unavailable",
+            "handle-store-unavailable",
+        ),
+        ("file recovery is disabled", "handle-recovery-disabled"),
+        (
+            "file recovery transaction was rejected",
+            "transaction-rejected",
+        ),
+    ] {
+        if error.starts_with(prefix) {
+            return kind;
+        }
+    }
+    sse_tool_rejection_kind(error)
 }
 
 fn run_response_plugins(
@@ -3223,7 +3532,25 @@ where
         changed |= resolved != text;
         Ok(resolved)
     };
-    resolve_tool_input_value(value, tool_name, &mut tracked_resolve)?;
+    if let Err(error) = resolve_tool_input_value(value, tool_name, &mut tracked_resolve) {
+        // Tool names can be provider/plugin-controlled. Never log arbitrary names.
+        let endpoint = match tool_name {
+            Some("Bash" | "bash") => "tool-bash",
+            Some("Read" | "read") => "tool-read",
+            Some("Write" | "write") => "tool-write",
+            Some("Edit" | "edit") => "tool-edit",
+            Some("MultiEdit" | "multi_edit" | "multiedit") => "tool-multiedit",
+            Some(name) if name.starts_with("mcp__") => "tool-mcp",
+            _ => "tool-other",
+        };
+        diagnostic(
+            "tool-input-rejected",
+            sse_tool_rejection_kind(&error),
+            endpoint,
+            false,
+        );
+        return Err(error);
+    }
     Ok(changed)
 }
 
@@ -4034,6 +4361,136 @@ mod tests {
             headers,
             request[header_end..header_end + content_length].to_vec(),
         )
+    }
+
+    #[test]
+    fn recovery_feedback_is_value_free_and_keeps_protected_history() {
+        let request = serde_json::json!({"model":"test","max_tokens":32,
+            "tool_choice":{"type":"tool","name":"Write"},
+            "messages":[{"role":"user","content":"original protected context"}]});
+        let error = "protected handle is unavailable in this session private-resolver-detail";
+        let body =
+            request_with_recovery_notice(&serde_json::to_vec(&request).unwrap(), error).unwrap();
+        let updated: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated["messages"][0], request["messages"][0]);
+        assert!(updated.get("tool_choice").is_none());
+        let feedback = updated["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(feedback.contains("Reread"));
+        assert!(!feedback.contains("private-resolver-detail"));
+        for error in [
+            "plugin middleware: blocked: private",
+            "protected handle view is malformed",
+            "protected tool input recovery transaction is already finalized",
+            "protected handle recovery store is unavailable",
+        ] {
+            assert!(!recoverable_handle_failure(error));
+        }
+    }
+
+    fn exercise_handle_recovery(streaming: bool, exhaust: bool) {
+        use std::io::Write;
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let count = if exhaust {
+                MAX_HANDLE_RECOVERY_ATTEMPTS + 1
+            } else {
+                2
+            };
+            for attempt in 0..count {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (_, bytes) = read_http_request(&mut socket);
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                if attempt > 0 {
+                    let feedback = request["messages"].as_array().unwrap().last().unwrap()
+                        ["content"][0]["text"]
+                        .as_str()
+                        .unwrap();
+                    assert!(feedback.contains("Pentect could not restore"));
+                    assert!(!String::from_utf8_lossy(&bytes).contains("missing_value"));
+                }
+                let rejected = exhaust || attempt == 0;
+                let content = if rejected {
+                    // A syntactically valid, deliberately unissued handle.
+                    serde_json::json!({"type":"tool_use","id":"tool_missing_value","name":"Write",
+                        "input":{"file_path":"never-created.txt","content":"<<KEYED_SECRET_0123456789abcdef>>"}})
+                } else {
+                    serde_json::json!({"type":"tool_use","id":"tool_reread","name":"Read","input":{"file_path":"source.txt"}})
+                };
+                let response = if streaming {
+                    let events = [
+                        serde_json::json!({"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"test","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+                        serde_json::json!({"type":"content_block_start","index":0,"content_block":content}),
+                        serde_json::json!({"type":"content_block_stop","index":0}),
+                        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}),
+                        serde_json::json!({"type":"message_stop"}),
+                    ];
+                    events
+                        .iter()
+                        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                        .collect::<String>()
+                } else {
+                    serde_json::json!({"id":"msg_test","type":"message","role":"assistant","model":"test",
+                        "content":[content],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}).to_string()
+                };
+                let content_type = if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+            }
+        });
+        let proxy = ClaudeHttpProxyGuard::start(format!("http://{address}")).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/messages", proxy.base_url()))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({"model":"test","max_tokens":100,"stream":streaming,
+                "messages":[{"role":"user","content":"Read the source then write the result"}]})
+                .to_string(),
+            )
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().unwrap();
+        assert!(!body.contains("missing_value"));
+        assert!(!body.contains("0123456789abcdef"));
+        assert!(!body.contains("event: error"));
+        if exhaust {
+            assert!(body.contains("Automatic recovery stopped"));
+            assert!(body.contains("end_turn"));
+        } else {
+            assert!(body.contains("tool_reread"));
+            assert!(body.contains("source.txt"));
+        }
+        drop(proxy);
+        upstream.join().unwrap();
+    }
+
+    #[test]
+    fn json_missing_handle_is_reported_to_model_then_reread_is_delivered() {
+        exercise_handle_recovery(false, false);
+    }
+
+    #[test]
+    fn sse_missing_handle_is_reported_to_model_then_reread_is_delivered() {
+        exercise_handle_recovery(true, false);
+    }
+
+    #[test]
+    fn json_missing_handle_recovery_is_bounded_without_api_error() {
+        exercise_handle_recovery(false, true);
+    }
+
+    #[test]
+    fn sse_missing_handle_recovery_is_bounded_without_api_error() {
+        exercise_handle_recovery(true, true);
     }
 
     fn mock_upstream(

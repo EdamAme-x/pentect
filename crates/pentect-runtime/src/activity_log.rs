@@ -1700,6 +1700,45 @@ const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
         "Stream tool input was rejected to preserve protection",
     ),
     (
+        "json-tool-rejected",
+        "JSON response validation rejected a client tool batch",
+    ),
+    (
+        "tool-input-rejected",
+        "A client tool input failed validation",
+    ),
+    ("restore-data-rejected", "Data argument restoration failed"),
+    (
+        "restore-output-rejected",
+        "Assistant output restoration failed",
+    ),
+    ("restore-file-rejected", "File content restoration failed"),
+    ("restore-code-rejected", "Code argument restoration failed"),
+    (
+        "restore-patch-rejected",
+        "Patch argument restoration failed",
+    ),
+    (
+        "restore-unknown-rejected",
+        "Unknown input surface restoration failed",
+    ),
+    (
+        "handle-recovery-attempt-1",
+        "First recovery notice sent to the model; client tools withheld",
+    ),
+    (
+        "handle-recovery-attempt-2",
+        "Second recovery notice sent to the model; client tools withheld",
+    ),
+    (
+        "handle-recovery-completed",
+        "Recovery response validated for delivery to the client",
+    ),
+    (
+        "handle-recovery-exhausted",
+        "Automatic handle recovery reached its attempt limit",
+    ),
+    (
         "stream-event-protection-skipped",
         "Stream event content protection was skipped",
     ),
@@ -1754,6 +1793,12 @@ fn diagnostic_kind(value: &str) -> String {
             "disabled",
             "handle-recovery-limit",
             "handle-source-invalid",
+            "handle-source-changed",
+            "handle-source-unreadable",
+            "handle-scope-mismatch",
+            "handle-store-unavailable",
+            "handle-recovery-disabled",
+            "transaction-rejected",
             "handle-unavailable",
             "handle-validation",
             "handle-view-invalid",
@@ -1792,6 +1837,7 @@ fn diagnostic_kind(value: &str) -> String {
             "upstream-client",
             "upstream-server",
             "validation",
+            "validated",
             "windows",
             "macos",
         ],
@@ -1833,6 +1879,13 @@ fn diagnostic_endpoint(value: &str) -> String {
             "stream-generate-content",
             "telemetry",
             "tool-input",
+            "tool-bash",
+            "tool-read",
+            "tool-write",
+            "tool-edit",
+            "tool-multiedit",
+            "tool-mcp",
+            "tool-other",
             "unknown",
             "unsupported",
             "windows",
@@ -2575,6 +2628,53 @@ mod tests {
         assert_eq!(event.endpoint.as_deref(), Some("unknown"));
         assert_eq!(event.method.as_deref(), Some("unknown"));
         assert_eq!(event.version, None);
+    }
+
+    #[test]
+    fn claude_recovery_diagnostics_survive_persistent_serialization() {
+        for event_name in [
+            "json-tool-rejected",
+            "tool-input-rejected",
+            "restore-data-rejected",
+            "restore-output-rejected",
+            "restore-file-rejected",
+            "restore-code-rejected",
+            "restore-patch-rejected",
+            "restore-unknown-rejected",
+            "handle-recovery-attempt-1",
+            "handle-recovery-attempt-2",
+            "handle-recovery-completed",
+            "handle-recovery-exhausted",
+        ] {
+            let event = ActivityEvent::diagnostic(
+                "claude",
+                event_name,
+                Some("handle-unavailable"),
+                Some("tool-write"),
+                Some("HTTP"),
+                None,
+                Some(false),
+                Some("0.0.86"),
+            );
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["event"], event_name);
+            assert_eq!(value["kind"], "handle-unavailable");
+            assert_eq!(value["endpoint"], "tool-write");
+            assert!(value.get("target").is_none());
+        }
+        assert_eq!(diagnostic_kind("validated"), "validated");
+        for tool in [
+            "tool-bash",
+            "tool-read",
+            "tool-write",
+            "tool-edit",
+            "tool-multiedit",
+            "tool-mcp",
+            "tool-other",
+        ] {
+            assert_eq!(diagnostic_endpoint(tool), tool);
+        }
+        assert_eq!(diagnostic_endpoint("mcp__private_customer_name"), "unknown");
     }
 
     #[test]
