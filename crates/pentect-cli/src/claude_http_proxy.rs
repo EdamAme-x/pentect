@@ -1418,7 +1418,7 @@ fn streaming_response_body(
                         );
                         state
                             .ready
-                            .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
+                            .push_back(Ok(Frame::data(anthropic_tool_rejection_sse_for(&error))));
                     }
                 },
                 Some(Err(error)) => {
@@ -1440,9 +1440,9 @@ fn streaming_response_body(
                                 "messages",
                                 false,
                             );
-                            state
-                                .ready
-                                .push_back(Ok(Frame::data(anthropic_tool_rejection_sse())));
+                            state.ready.push_back(Ok(Frame::data(
+                                anthropic_tool_rejection_sse_for(&error),
+                            )));
                         }
                     }
                 }
@@ -1514,6 +1514,21 @@ fn sse_tool_rejection_kind(error: &str) -> &'static str {
         // the category fixed and never include the error in diagnostics.
         "handle-validation"
     }
+}
+
+pub(crate) fn anthropic_tool_rejection_sse_for(error: &str) -> Bytes {
+    // Never expose resolver or plugin text: it may contain credentials or paths.
+    // An unavailable value is not an unsafe representation; changing its view
+    // cannot recover it. Tell the client how to obtain a fresh handle instead.
+    let message = match sse_tool_rejection_kind(error) {
+        "handle-unavailable" => "Pentect could not restore a handle in this session (handle-unavailable). Reread the original file or input through the current protected session, then retry with the newly returned handle. Resuming a conversation does not restore every old handle. Do not guess the value or change its encoding to recover it.",
+        "handle-source-invalid" => "Pentect could not recover a handle from its source (handle-source-invalid). Reread the original file through the current protected session and retry with the newly returned handle. Do not reuse the old handle.",
+        _ => return anthropic_tool_rejection_sse(),
+    };
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
+    ))
 }
 
 pub(crate) fn anthropic_tool_rejection_sse() -> Bytes {
@@ -5709,6 +5724,35 @@ mod tests {
         assert!(frame.contains("invalid_request_error"));
         assert!(frame.ends_with("\n\n"));
         assert!(!frame.contains("<<"));
+    }
+
+    #[test]
+    fn unavailable_handle_error_explains_recovery_without_exposing_input() {
+        for (error, category) in [
+            (
+                "protected handle is unavailable in this session; private-value",
+                "handle-unavailable",
+            ),
+            (
+                "protected handle source has changed; private-value",
+                "handle-source-invalid",
+            ),
+        ] {
+            let bytes = anthropic_tool_rejection_sse_for(error);
+            let frame = std::str::from_utf8(&bytes).unwrap();
+            let data = frame.strip_prefix("event: error\ndata: ").unwrap().trim();
+            let value: serde_json::Value = serde_json::from_str(data).unwrap();
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(message.contains(category));
+            assert!(message.contains("Reread the original file"));
+            assert!(!message.contains("unsafe"));
+            assert!(!frame.contains("private-value"));
+            assert!(frame.ends_with("\n\n"));
+        }
+        assert_eq!(
+            anthropic_tool_rejection_sse_for("plugin middleware: blocked: private-value"),
+            anthropic_tool_rejection_sse()
+        );
     }
 
     #[test]

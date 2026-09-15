@@ -3198,11 +3198,11 @@ where
                         Ok(chunks) => state
                             .ready
                             .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                        Err(_error) => {
+                        Err(error) => {
                             eprintln!("[pentect] Claude App Chat response blocked by validation");
                             state.finished = true;
                             state.ready.push_back(Ok(Frame::data(
-                                crate::claude_http_proxy::anthropic_tool_rejection_sse(),
+                                crate::claude_http_proxy::anthropic_tool_rejection_sse_for(&error),
                             )));
                         }
                     }
@@ -3218,12 +3218,14 @@ where
                             Ok(chunks) => state
                                 .ready
                                 .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
-                            Err(_error) => {
+                            Err(error) => {
                                 eprintln!(
                                     "[pentect] Claude App Chat response blocked at EOF by validation"
                                 );
                                 state.ready.push_back(Ok(Frame::data(
-                                    crate::claude_http_proxy::anthropic_tool_rejection_sse(),
+                                    crate::claude_http_proxy::anthropic_tool_rejection_sse_for(
+                                        &error,
+                                    ),
                                 )));
                             }
                         }
