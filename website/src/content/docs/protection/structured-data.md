@@ -57,6 +57,15 @@ dotenv, Kubernetes, AWS, npm, PyPI, and general structured content even when a
 tool does not provide the original filename. It does not treat every line with
 an equals sign as dotenv because source code and prose can contain assignments.
 
+Since v0.0.85, inferred environment output must match across the complete
+document: every nonblank, noncomment line must be an assignment with a valid
+environment-variable name, and the keys must provide enough evidence for that
+classification. One sensitive assignment no longer makes an entire source
+file dotenv. Mixed source code still passes through ordinary secret detection.
+This distinction applies to prompts, live output, tool output, and nested
+tool-result text. Explicitly recognized configuration files retain their
+format-specific protection.
+
 ## Encoded and compressed values
 
 Pentect can decode common Base16, Base32, Base58, Base64, Base85, binary, octal,

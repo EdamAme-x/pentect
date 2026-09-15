@@ -29,19 +29,19 @@ settings of Codex or Claude.
 
 3. Work normally in the client that opens.
 
-   Ask the agent to read a local config file or do a task that needs a
-   credential. The model sees a handle such as
-   `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the real value.
+   Start with a local test file containing a fake credential. For detected
+   values, the model receives a handle such as
+   `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the original text.
 
    When the agent needs the value, it copies the complete handle into a shell,
-   file, connector, or MCP tool argument. Pentect restores known handles in the
-   completed local tool call. See [Handles](/start/handles/) for the boundary
+   file, connector, or MCP tool argument. Pentect validates the completed local
+   tool call before restoring known handles. See [Handles](/start/handles/) for the boundary
    and lifetime rules.
 
 4. Watch local protection events when you need to verify a flow.
 
    ```sh
-   pentect log
+   pentect log --once --tail 100
    ```
 
 ## What success looks like

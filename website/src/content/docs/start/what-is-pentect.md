@@ -3,16 +3,17 @@ title: What is Pentect?
 description: Protect sensitive data before an AI request leaves your computer.
 ---
 
-Pentect runs locally between an AI coding tool and its model provider. It
-replaces secrets and sensitive data with handles before a request leaves your
-computer. A handle is a safe reference such as `<<DATABASE_URL_...>>`.
+Pentect is an open-source protection layer that runs between a local AI coding
+client and its model provider. It replaces detected secrets and sensitive data
+with opaque handles before supported requests leave your computer. A handle
+is a reference such as `<<DATABASE_URL_...>>`, not the original credential.
 
 Use Pentect when an agent needs a credential or sensitive file. The agent can
 use the handle without receiving the real value.
 
-## Why normal masking is not enough
+## Why use handles instead of redaction?
 
-Normal masking hides both the value and its name:
+Plain redaction hides the value but gives a local tool nothing it can use:
 
 ```dotenv
 DATABASE_URL=[REDACTED]
