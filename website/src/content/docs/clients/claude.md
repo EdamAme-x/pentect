@@ -91,6 +91,17 @@ pentect claude --model sonnet
 pentect claude --permission-mode plan
 ```
 
+Resume a local Claude Code session through the same protected launcher:
+
+```sh
+pentect claude --resume SESSION_ID
+```
+
+If a resumed conversation contains stale handles or previously over-masked
+source, reread the original file in the protected session. A client permission
+bypass flag does not disable Pentect's validation. For excessive source-code
+masking, [update to v0.0.85 or later](/reference/troubleshooting/#source-code-is-masked-too-aggressively).
+
 ## Protected flow
 
 `pentect claude` checks supported Claude Code requests before they reach the
@@ -176,7 +187,11 @@ network routes, so Pentect protects only the listed features.
 Test one completed tool call as well as chat. This confirms that Claude can use
 the protected reference locally without the provider learning the value.
 
-If a streamed tool call is rejected, run `pentect log --json --once --tail 100`
+## Streamed tool input errors
+
+The following diagnostics apply to Claude's protected Anthropic streaming
+path, including Claude Code. If a streamed tool call is rejected, run
+`pentect log --json --once --tail 100`
 and inspect the fixed `kind` on `event=sse-tool-rejected`. `tool-json-invalid`,
 `start-input-invalid`, `delta-shape-invalid`, and `stream-incomplete` indicate a
 provider stream shape that should be retried. `resolver-unavailable` means the
@@ -191,6 +206,8 @@ persists. `handle-validation` is the safe fallback for an unclassified local
 validation failure; retry once and include the fixed diagnostic fields in a
 support report if it repeats. These diagnostics contain only fixed categories,
 never tool input, paths, handles, or plugin-generated error text.
+
+## Desktop coverage limits
 
 ::: warning
 Pentect does not protect remote Cowork tasks, Voice, test binary formats, or

@@ -2,10 +2,20 @@
 title: Docs - Pentect
 displayTitle: Docs_
 titleTemplate: false
-description: Local secret handles for supported AI tools.
+description: Keep detected secrets out of AI requests while local tools can still use them.
 pageClass: docs-hub
 aside: false
 ---
+
+Pentect is an open-source, local protection layer for AI coding agents. It
+replaces detected credentials and sensitive data with opaque handles before
+supported requests reach the model provider, then restores known values for
+supported local tool calls.
+
+Keep your usual coding workflow: launch with `pentect codex`, `pentect claude`,
+`pentect opencode`, or `pentect pi`. Detection runs locally. Pentect does not
+replace your agent's permissions or sandbox, and it cannot guarantee that every
+secret will be detected. [Understand the security boundary](/protection/security-model/).
 
 <div class="home-demo">
   <video
@@ -20,6 +30,15 @@ aside: false
 </div>
 
 <HomeInstall />
+
+::: tip Updated for v0.0.85
+[Version 0.0.85](https://github.com/EdamAme-x/pentect/releases/tag/v0.0.85)
+fixes excessive masking when source code contains a sensitive assignment.
+Ordinary code is no longer treated as an environment-variable dump for that
+reason alone; detected secrets remain protected.
+[Update Pentect](/start/install/#update) or
+[troubleshoot excessive masking](/reference/troubleshooting/#source-code-is-masked-too-aggressively).
+:::
 
 ## Clients
 

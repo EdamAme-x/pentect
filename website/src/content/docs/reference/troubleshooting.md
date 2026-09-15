@@ -25,6 +25,34 @@ codex --version
 claude --version
 ```
 
+## Source code is masked too aggressively
+
+If ordinary assignments, counters, or expressions become handles after a file
+contains a credential-like assignment, update to **v0.0.85 or later**:
+
+```sh
+pentect update
+pentect version
+```
+
+Earlier versions could classify an entire source snippet as dotenv after
+finding one sensitive assignment. Version 0.0.85 checks the complete text
+before treating it as an environment-variable dump. Mixed source code uses
+normal text detection, so a detected secret remains masked without promoting
+unrelated assignments to environment values.
+
+Restart the client through Pentect and reread the original source. Updating
+does not rewrite content already stored in a client's conversation history.
+If the problem persists, include a minimal example with fake values, the
+Pentect and client versions, and bounded diagnostics:
+
+```sh
+pentect log --json --once --tail 100
+```
+
+Do not disable protection or share a real session transcript to report this
+bug. A short synthetic example is enough to show which safe text was masked.
+
 ## A handle cannot be resolved
 
 The Pentect session that created a handle also restores it. If a handle came
@@ -49,15 +77,22 @@ live recovery data.
 
 ## A handle was not restored in a tool call
 
-Copy the complete `<<LABEL_ID>>` handle into the tool argument. Do not convert
-it to a `PENTECT_...` environment variable name. Pentect restores exact known
-handles recursively in completed local shell, file, connector, and MCP inputs.
+Copy the complete `<<LABEL_ID>>` handle into a supported local tool argument.
+Do not invent a `PENTECT_...` environment binding. Pentect validates completed
+tool inputs before restoring known values; it does not blindly substitute
+credentials into arbitrary executable text.
 
-If the value contains shell metacharacters, the surrounding command still has
-to use syntax valid for that shell. Pentect replaces the handle but does not
-parse, quote, or escape the command. Test the intended operation with a fake
-credential and inspect its ordinary status result instead of printing the
-credential.
+In code or patch text, keep the handle as one complete quoted data argument or
+string. If Pentect cannot safely represent the original value there, use the
+documented `|base64` view and decode it locally through a data API. Never use a
+handle as syntax or `eval` input. See [How a tool uses a handle](/start/handles/#how-a-tool-uses-a-handle).
+
+For Claude's “unsafe or invalid protected tool input” error, collect
+`pentect log --json --once --tail 100` and check the fixed `kind` on
+`event=sse-tool-rejected`. The [Claude troubleshooting guide](/clients/claude/#streamed-tool-input-errors)
+explains the categories. A client's “permission denied” summary alone does not
+establish whether its permissions, Pentect validation, or plugin policy caused
+the failure. Test with a fake credential; do not print the original value.
 
 ## A handle ID changed
 

@@ -17,7 +17,10 @@ permissions.
   requests leave the local process.
 - Data needed to restore a handle stays in the local Pentect session. It is not
   added to the model request.
-- Pentect restores known handles only before supported local tools run.
+- Pentect validates completed local tool inputs before restoring known handles.
+  Assistant prose can also be restored in the local client display by default;
+  set [`output.restore = false`](/reference/configuration/#assistant-output-restoration)
+  to keep handles visible there.
 - Tool output passes through the same detector configuration before it returns
   to the provider.
 - Supported MCP and connector text and structured data are checked before they

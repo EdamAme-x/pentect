@@ -66,16 +66,24 @@ balanced parentheses.
 
 ## How a tool uses a handle
 
-The model copies the complete handle into a tool argument. Before the local
-client executes the completed tool call, Pentect replaces every known handle in
-its string arguments with the original value. This applies recursively to shell
-commands, file writes and edits, connector arguments, and MCP arguments.
+The model copies the complete handle into a supported local tool argument.
+Pentect validates the completed input before restoring known values. This
+includes supported shell commands, file writes and edits, connector arguments,
+and MCP arguments; it is not unrestricted text substitution.
 
-Pentect does not parse or rewrite shell syntax. It performs exact replacement
-of known handles and leaves every other byte unchanged. The client and shell
-therefore keep their normal semantics. If a value contains shell metacharacters,
-the agent must place the handle in syntax appropriate for that command, just as
-it would for any other argument.
+In code or patch text, keep an ordinary handle as one complete quoted data
+argument or string. Never use it to create syntax, patch structure, or an
+`eval` input. Pentect accepts only values it can conservatively represent in
+that context and rejects unsupported representations instead of guessing how
+to quote or escape them. This is a conservative value check, not a full shell
+or programming-language parser; the surrounding command must still be valid
+and keep the value in a data position.
+
+If the ordinary representation is rejected, append `|base64` before the
+closing `>>`. Keep that explicit view as one complete quoted data value and
+decode it locally through argv, stdin, or another data API. Base64 is a
+transport representation, not encryption; the decoded value must still stay
+within the intended local operation. Do not print it to debug a blocked call.
 
 This boundary protects provider traffic, not the local client process. A
 restored value may be visible in local tool-call history, process arguments,
