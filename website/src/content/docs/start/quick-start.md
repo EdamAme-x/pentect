@@ -146,8 +146,10 @@ launcher starts the same local Pentect gateway as the terminal command, without
 leaving a terminal window open. The official App and its shortcut are not
 changed.
 
-Quit the official App before using the protected launcher. An App that is
-already running cannot inherit the temporary Pentect routing.
+The Codex launcher forcibly restarts an already-running Codex App so it can
+inherit the temporary Pentect routing; save your input and finish active tasks
+first. For Claude Desktop, quit the official App before using its protected
+launcher.
 
 Remove the launcher with:
 
