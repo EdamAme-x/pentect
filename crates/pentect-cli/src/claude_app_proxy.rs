@@ -2045,11 +2045,21 @@ async fn forward_inspected_inner(
         let plugins = Arc::clone(&state.plugins);
         let block_unknown_formats = state.block_unknown_formats;
         let restore_output = state.restore_output;
-        let body = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             rewrite_chat_json_response(&body, &plugins, block_unknown_formats, restore_output)
         })
         .await
-        .map_err(|_| "Claude App JSON response protection task failed".to_string())??;
+        .map_err(|_| "Claude App JSON response protection task failed".to_string())?;
+        let body = match result {
+            Ok(body) => body,
+            Err(error) if app_handle_rejection(&error) => {
+                record_app_handle_rejection(&error);
+                return Ok(crate::claude_http_proxy::recovery_stopped_response(
+                    false, &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         return builder
             .body(
                 Full::new(body)
@@ -2074,9 +2084,46 @@ async fn forward_inspected_inner(
     } else {
         BodyExt::boxed_unsync(StreamBody::new(stream))
     };
+    let body = if transform_chat_sse {
+        // App conversation requests are stateful: never replay a POST and risk
+        // duplicating a server-side turn. Hold all output, then explain locally.
+        match crate::handle_recovery::collect(body).await {
+            Ok(bytes) => Full::new(bytes)
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+            Err(error) if app_handle_rejection(&error) => {
+                record_app_handle_rejection(&error);
+                return Ok(crate::claude_http_proxy::recovery_stopped_response(
+                    true, &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        body
+    };
     builder
         .body(body)
         .map_err(|error| format!("could not build Claude App response: {error}"))
+}
+
+fn app_handle_rejection(error: &str) -> bool {
+    crate::claude_http_proxy::recoverable_handle_failure(error)
+        || error.starts_with("protected handle use is unsupported")
+}
+
+fn record_app_handle_rejection(error: &str) {
+    crate::gateway_diagnostics::record(
+        "claude-app",
+        "tool-input-rejected",
+        crate::claude_http_proxy::sse_tool_rejection_kind(error),
+        crate::gateway_diagnostics::RequestContext {
+            endpoint: "messages",
+            method: "POST",
+        },
+        None,
+        false,
+    );
 }
 
 fn is_websocket_upgrade(headers: &hyper::HeaderMap) -> bool {
@@ -3201,6 +3248,13 @@ where
                         Err(error) => {
                             eprintln!("[pentect] Claude App Chat response blocked by validation");
                             state.finished = true;
+                            if app_handle_rejection(&error) {
+                                state.ready.push_back(Err(Box::new(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    error,
+                                ))));
+                                continue;
+                            }
                             state.ready.push_back(Ok(Frame::data(
                                 crate::claude_http_proxy::anthropic_tool_rejection_sse_for(&error),
                             )));
@@ -3219,6 +3273,13 @@ where
                                 .ready
                                 .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
                             Err(error) => {
+                                if app_handle_rejection(&error) {
+                                    state.ready.push_back(Err(Box::new(io::Error::new(
+                                        io::ErrorKind::PermissionDenied,
+                                        error,
+                                    ))));
+                                    continue;
+                                }
                                 eprintln!(
                                     "[pentect] Claude App Chat response blocked at EOF by validation"
                                 );

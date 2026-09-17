@@ -18,6 +18,7 @@ mod execution_boundary;
 mod gateway_diagnostics;
 mod gemini_http_proxy;
 mod handle_contract;
+mod handle_recovery;
 mod http_files;
 mod ide_clients;
 mod input;

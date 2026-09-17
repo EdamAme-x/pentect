@@ -675,15 +675,24 @@ async fn proxy_request_inner(
 
 const MAX_HANDLE_RECOVERY_ATTEMPTS: usize = 2;
 
-fn recoverable_handle_failure(error: &str) -> bool {
-    // Do not retry syntax, plugin, storage, transaction or policy failures.
+pub(crate) fn recoverable_handle_failure(error: &str) -> bool {
+    // Retry rejected handle representations, never relax validation or retry
+    // plugin, storage, transaction or policy failures.
     error.starts_with("protected handle is unavailable in this session")
         || error.starts_with("protected handle source has changed")
         || error.starts_with("protected handle source cannot be read")
+        || error.starts_with("protected handle view is malformed")
+        || error.starts_with("protected handle view is unsupported")
 }
 
-fn recovery_notice(error: &str) -> &'static str {
-    if recoverable_handle_failure(error) {
+pub(crate) fn recovery_notice(error: &str) -> &'static str {
+    if error.starts_with("protected handle view is malformed") {
+        "Pentect could not restore a protected handle because its representation is malformed. The proposed client tool batch was withheld; none of its client tools ran. Reread the original protected input and copy the issued handle exactly as one complete quoted data value. Do not guess or repair a handle, expose its value, repeat the rejected operation, or bypass protection. If a supported representation cannot be used, explain the limitation to the user."
+    } else if error.starts_with("protected handle view is unsupported") {
+        "Pentect could not restore a protected handle because its representation is unsupported for this operation. The proposed client tool batch was withheld; none of its client tools ran. Use only the documented handle data contract: a complete quoted data value, never generated syntax or eval input. Do not repeat the rejected operation, guess or expose the value, or bypass protection. If no documented representation supports the operation, explain the limitation to the user."
+    } else if error.starts_with("protected handle use is unsupported") {
+        "Pentect could not restore a protected handle because this tool surface is unsupported. The proposed client tool batch was withheld; none of its client tools ran. Explain this limitation to the user and let the user choose a documented compatibility setting. Do not repeat the operation or bypass protection."
+    } else if recoverable_handle_failure(error) {
         "Pentect could not restore a protected handle. The proposed client tool batch was withheld; none of its client tools ran. Reread the original file or input through the current protected session to obtain a fresh handle, then retry. Do not repeat the old handle, guess its value, change its encoding, or ask for a secret to be pasted. If the source is unavailable, explain what source is needed."
     } else {
         "Pentect withheld the proposed client tool batch because its protected input could not be validated. None of its client tools ran. Do not bypass the protection or repeat the same operation. Consult the local Pentect diagnostics for the rejection category."
@@ -717,9 +726,9 @@ fn request_with_recovery_notice(body: &[u8], error: &str) -> Result<Bytes, Strin
     Ok(Bytes::from(encoded))
 }
 
-fn recovery_stopped_response(streaming: bool, error: &str) -> Response<ProxyBody> {
+pub(crate) fn recovery_stopped_response(streaming: bool, error: &str) -> Response<ProxyBody> {
     let message = format!(
-        "{} Automatic recovery stopped after a bounded attempt. No rejected tool was executed.",
+        "{} Automatic recovery stopped. No rejected tool was executed.",
         recovery_notice(error)
     );
     if !streaming {
@@ -880,6 +889,9 @@ async fn recoverable_messages_response(
                     "messages",
                     false,
                 );
+                if error.starts_with("protected handle use is unsupported") {
+                    return Ok(recovery_stopped_response(requested_stream, &error));
+                }
                 if !recoverable_handle_failure(&error) {
                     // Other validation failures remain fail-closed, but must not
                     // masquerade as a transient upstream 502.
@@ -1761,7 +1773,7 @@ fn streaming_response_body(
     StreamBody::new(stream).boxed_unsync()
 }
 
-fn sse_tool_rejection_kind(error: &str) -> &'static str {
+pub(crate) fn sse_tool_rejection_kind(error: &str) -> &'static str {
     if error == "Anthropic SSE event exceeded inspection limit"
         || error == "Anthropic SSE tool input exceeded inspection limit"
     {
@@ -1796,11 +1808,12 @@ fn sse_tool_rejection_kind(error: &str) -> &'static str {
         "resolver-unavailable"
     } else if error.starts_with("protected handle is unavailable in this session") {
         "handle-unavailable"
-    } else if error.starts_with("protected handle view is malformed")
-        || error.starts_with("protected handle view is unsupported")
-        || error.starts_with("protected handle use is unsupported")
-    {
-        "handle-view-invalid"
+    } else if error.starts_with("protected handle view is malformed") {
+        "handle-view-malformed"
+    } else if error.starts_with("protected handle view is unsupported") {
+        "handle-view-unsupported"
+    } else if error.starts_with("protected handle use is unsupported") {
+        "handle-surface-unsupported"
     } else if error.starts_with("protected handle source has changed")
         || error.starts_with("protected handle source cannot be read")
         || error.starts_with("protected handle belongs to a different identity scope")
@@ -3471,7 +3484,8 @@ where
     Ok((encoded, changed))
 }
 
-/// Compatibility path for gateways not yet migrated to declared tool fields.
+/// Legacy restoration fixture for compatibility regression tests.
+#[cfg(test)]
 pub(crate) fn resolve_tool_input_json_with_change<R>(
     input: &str,
     _tool_name: Option<&str>,
@@ -3634,18 +3648,6 @@ fn resolve_known_text(text: &str) -> Result<String, String> {
             );
             Ok(text.to_string())
         }
-    }
-}
-
-pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, String> + Send {
-    let resolver = pentect_agent::ActiveMemoryStoreResolver::new();
-    move |text| match &resolver {
-        Ok(resolver) => match resolver.resolve_known_text(text) {
-            Ok(Some(resolved)) => Ok(resolved),
-            Ok(None) => Ok(text.to_string()),
-            Err(_error) => Ok(text.to_string()),
-        },
-        Err(_error) => Ok(text.to_string()),
     }
 }
 
@@ -4381,7 +4383,6 @@ mod tests {
         assert!(!feedback.contains("private-resolver-detail"));
         for error in [
             "plugin middleware: blocked: private",
-            "protected handle view is malformed",
             "protected tool input recovery transaction is already finalized",
             "protected handle recovery store is unavailable",
         ] {
@@ -4389,7 +4390,7 @@ mod tests {
         }
     }
 
-    fn exercise_handle_recovery(streaming: bool, exhaust: bool) {
+    fn exercise_handle_recovery_case(streaming: bool, exhaust: bool, malformed: bool) {
         use std::io::Write;
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
@@ -4416,9 +4417,14 @@ mod tests {
                 }
                 let rejected = exhaust || attempt == 0;
                 let content = if rejected {
-                    // A syntactically valid, deliberately unissued handle.
-                    serde_json::json!({"type":"tool_use","id":"tool_missing_value","name":"Write",
+                    if malformed {
+                        serde_json::json!({"type":"tool_use","id":"tool_missing_value","name":"Bash",
+                            "input":{"command":"echo '<<KEYED_SECRET_0123456789abcdef|invalid>>'"}})
+                    } else {
+                        // A syntactically valid, deliberately unissued handle.
+                        serde_json::json!({"type":"tool_use","id":"tool_missing_value","name":"Write",
                         "input":{"file_path":"never-created.txt","content":"<<KEYED_SECRET_0123456789abcdef>>"}})
+                    }
                 } else {
                     serde_json::json!({"type":"tool_use","id":"tool_reread","name":"Read","input":{"file_path":"source.txt"}})
                 };
@@ -4471,6 +4477,19 @@ mod tests {
         }
         drop(proxy);
         upstream.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_handle_recovery_is_bounded_and_value_free() {
+        for streaming in [false, true] {
+            for exhaust in [false, true] {
+                exercise_handle_recovery_case(streaming, exhaust, true);
+            }
+        }
+    }
+
+    fn exercise_handle_recovery(streaming: bool, exhaust: bool) {
+        exercise_handle_recovery_case(streaming, exhaust, false);
     }
 
     #[test]
@@ -6227,7 +6246,7 @@ mod tests {
             ("restored Anthropic SSE response exceeded inspection limit", "restored-size-limit"),
             ("protected tool input resolver is unavailable", "resolver-unavailable"),
             ("protected handle is unavailable in this session; reread the original input", "handle-unavailable"),
-            ("protected handle view is unsupported for this operation", "handle-view-invalid"),
+            ("protected handle view is unsupported for this operation", "handle-view-unsupported"),
             ("protected handle source has changed; reread it to obtain a new handle", "handle-source-invalid"),
             ("protected handle recovery exceeds this response's read limit; reread only the required sources", "handle-recovery-limit"),
             ("file recovery could not be committed", "transaction-commit"),
@@ -6248,9 +6267,9 @@ mod tests {
 
         for (error, kind) in [
             (ToolInputError::UnknownHandle, "handle-unavailable"),
-            (ToolInputError::MalformedView, "handle-view-invalid"),
-            (ToolInputError::UnsupportedView, "handle-view-invalid"),
-            (ToolInputError::UnknownSurface, "handle-view-invalid"),
+            (ToolInputError::MalformedView, "handle-view-malformed"),
+            (ToolInputError::UnsupportedView, "handle-view-unsupported"),
+            (ToolInputError::UnknownSurface, "handle-surface-unsupported"),
             (
                 ToolInputError::RecoverySourceChanged,
                 "handle-source-invalid",

@@ -647,6 +647,73 @@ async fn proxy_request_inner(
         }
     }
     upstream_request = state.headers.apply(upstream_request);
+    if responses_path || chat_path {
+        if let Some(protected) = body.as_bytes() {
+            let original = Bytes::copy_from_slice(protected);
+            let dialect = if chat_path {
+                crate::handle_recovery::Dialect::Chat
+            } else {
+                crate::handle_recovery::Dialect::Responses
+            };
+            return crate::handle_recovery::run(
+                upstream_request,
+                original,
+                dialect,
+                request_streaming,
+                "openai",
+                request_coverage
+                    .unwrap_or(crate::http_files::Coverage::None)
+                    .as_header(),
+                |response, streaming| {
+                    let masker = Arc::clone(&state.masker);
+                    let plugins = Arc::clone(&state.plugins);
+                    let strict = state.block_unknown_formats;
+                    async move {
+                        let restore = pentect_agent::output_restore_enabled()?;
+                        let transaction = masker
+                            .lock()
+                            .map_err(|_| "OpenAI masker lock poisoned".to_string())
+                            .and_then(|m| m.tool_input_transaction());
+                        if streaming {
+                            crate::handle_recovery::collect(streaming_response_body(
+                                response,
+                                if chat_path {
+                                    StreamTransform::ChatCompletions
+                                } else {
+                                    StreamTransform::Responses
+                                },
+                                Arc::clone(&plugins),
+                                restore,
+                                strict,
+                                transaction,
+                            ))
+                            .await
+                        } else {
+                            let raw = read_response_capped(response)
+                                .await?
+                                .ok_or("OpenAI response exceeded limit")?;
+                            let raw = run_response_plugins(raw, &plugins, "openai", strict)?;
+                            if chat_path {
+                                rewrite_chat_completions_json_response_with_transaction(
+                                    &raw,
+                                    restore,
+                                    transaction,
+                                )
+                            } else {
+                                rewrite_openai_json_response_with_transaction(
+                                    &raw,
+                                    restore,
+                                    transaction,
+                                )
+                            }
+                            .map(Bytes::from)
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+    }
     let upstream = upstream_request
         .body(body)
         .send()
@@ -3650,7 +3717,15 @@ impl ChatStreamState {
                     Some(name),
                     resolve,
                 )
-                .map_err(|_| CHAT_TOOL_INPUT_REJECTED.to_string())?;
+                .map_err(|error| {
+                    if crate::claude_http_proxy::recoverable_handle_failure(&error)
+                        || error.starts_with("protected handle use is unsupported")
+                    {
+                        error
+                    } else {
+                        CHAT_TOOL_INPUT_REJECTED.to_string()
+                    }
+                })?;
             restored_tools = restored_tools.saturating_add(u64::from(changed));
             calls.push(serde_json::json!({
                 "index": index,
@@ -4791,6 +4866,184 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
         assert!(!proxy.protected_request_observed());
+    }
+
+    #[test]
+    fn all_provider_adapters_recover_malformed_tools_in_json_and_sse() {
+        use std::io::{Read, Write};
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        for dialect in 0..4 {
+            for streaming in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let upstream = std::thread::spawn(move || {
+                    for attempt in 0..2 {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        let mut socket = loop {
+                            if let Ok((socket, _)) = listener.accept() {
+                                break socket;
+                            }
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "recovery request not received"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        };
+                        // Accepted sockets inherit nonblocking mode on Windows
+                        // and macOS; reads below intentionally use a timeout.
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        loop {
+                            let mut buf = [0; 4096];
+                            let n = socket.read(&mut buf).unwrap();
+                            assert!(n > 0);
+                            bytes.extend_from_slice(&buf[..n]);
+                            if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&bytes[..end]);
+                                let len: usize = headers
+                                    .lines()
+                                    .find_map(|l| {
+                                        l.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|s| s.trim().parse().unwrap())
+                                    })
+                                    .unwrap();
+                                if bytes.len() >= end + 4 + len {
+                                    break;
+                                }
+                            }
+                        }
+                        if attempt > 0 {
+                            let request = String::from_utf8_lossy(&bytes);
+                            assert!(request.contains("representation is malformed"));
+                            assert!(!request.contains("0123456789abcdef"));
+                        }
+                        let bad = "<<KEYED_SECRET_0123456789abcdef|invalid>>";
+                        let response = match dialect {
+                            0 => {
+                                serde_json::json!({"id":"resp_test","object":"response","status":"completed","output": if attempt==0 {serde_json::json!([{"id":"fc_bad","type":"function_call","call_id":"call_bad","name":"Bash","arguments":serde_json::json!({"command":format!("echo '{bad}'")}).to_string()}])} else {serde_json::json!([{"id":"msg_ok","type":"message","role":"assistant","content":[{"type":"output_text","text":"validated recovery"}]}])}})
+                            }
+                            1 => {
+                                serde_json::json!({"id":"chatcmpl_test","object":"chat.completion","choices":[{"index":0,"message":if attempt==0 {serde_json::json!({"role":"assistant","tool_calls":[{"id":"call_bad","type":"function","function":{"name":"Bash","arguments":serde_json::json!({"command":format!("echo '{bad}'")}).to_string()}}]})} else {serde_json::json!({"role":"assistant","content":"validated recovery"})},"finish_reason":if attempt==0 {"tool_calls"} else {"stop"}}]})
+                            }
+                            _ => {
+                                let value = serde_json::json!({"candidates":[{"content":{"role":"model","parts":[if attempt==0 {serde_json::json!({"functionCall":{"name":"Bash","args":{"command":bad}}})} else {serde_json::json!({"text":"validated recovery"})}]},"finishReason":"STOP"}]});
+                                if dialect == 3 {
+                                    serde_json::json!({"response":value})
+                                } else {
+                                    value
+                                }
+                            }
+                        };
+                        let body = if streaming {
+                            match dialect {
+                                0 => format!(
+                                    "event: response.completed\ndata: {}\n\n",
+                                    serde_json::json!({"type":"response.completed","response":response})
+                                ),
+                                1 => {
+                                    let delta = response["choices"][0]["message"].clone();
+                                    let mut delta = delta;
+                                    if attempt == 0 {
+                                        delta["tool_calls"][0]["index"] = serde_json::json!(0);
+                                    }
+                                    format!(
+                                        "data: {}\n\ndata: [DONE]\n\n",
+                                        serde_json::json!({"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":if attempt==0 {"tool_calls"} else {"stop"}}]})
+                                    )
+                                }
+                                _ => format!("data: {response}\n\n"),
+                            }
+                        } else {
+                            response.to_string()
+                        };
+                        let media = if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        };
+                        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    }
+                });
+                let origin = format!("http://{address}");
+                let (base, _guard): (String, Box<dyn std::any::Any>) = match dialect {
+                    0 | 1 => {
+                        let g = OpenAiHttpProxyGuard::start(origin).unwrap();
+                        (g.base_url().to_owned(), Box::new(g))
+                    }
+                    2 => {
+                        let g =
+                            crate::gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
+                                origin,
+                                &[],
+                            )
+                            .unwrap();
+                        (g.base_url().to_owned(), Box::new(g))
+                    }
+                    _ => {
+                        let g =
+                            crate::cloud_code_http_proxy::CloudCodeHttpProxyGuard::start(origin)
+                                .unwrap();
+                        (g.base_url().to_owned(), Box::new(g))
+                    }
+                };
+                let (path, request) = match dialect {
+                    0 => (
+                        "/v1/responses",
+                        serde_json::json!({"model":"test","stream":streaming,"input":"Read the source"}),
+                    ),
+                    1 => (
+                        "/v1/chat/completions",
+                        serde_json::json!({"model":"test","stream":streaming,"messages":[{"role":"user","content":"Read the source"}]}),
+                    ),
+                    _ => {
+                        let value = serde_json::json!({"contents":[{"role":"user","parts":[{"text":"Read the source"}]}]});
+                        if dialect == 2 {
+                            (
+                                if streaming {
+                                    "/v1beta/models/test:streamGenerateContent?alt=sse"
+                                } else {
+                                    "/v1beta/models/test:generateContent"
+                                },
+                                value,
+                            )
+                        } else {
+                            (
+                                if streaming {
+                                    "/v1internal:streamGenerateContent?alt=sse"
+                                } else {
+                                    "/v1internal:generateContent"
+                                },
+                                serde_json::json!({"model":"test","project":"test","request":value}),
+                            )
+                        }
+                    }
+                };
+                let response = reqwest::blocking::Client::new()
+                    .post(format!("{base}{path}"))
+                    .header("content-type", "application/json")
+                    .body(request.to_string())
+                    .send()
+                    .unwrap();
+                let status = response.status();
+                let body = response.text().unwrap();
+                assert_eq!(status, 200, "dialect {dialect}: {body}");
+                assert!(
+                    body.contains("validated recovery"),
+                    "dialect {dialect}: {body}"
+                );
+                assert!(!body.contains("0123456789abcdef"));
+                assert!(!body.contains("call_bad"));
+                upstream.join().unwrap();
+            }
+        }
     }
 
     #[test]

@@ -340,6 +340,41 @@ async fn proxy_request_inner(
             upstream_request = upstream_request.header(name, value);
         }
     }
+    if endpoint.is_model_response() {
+        if let Some(protected) = body.as_bytes() {
+            return crate::handle_recovery::run(
+                state.headers.apply(upstream_request),
+                Bytes::copy_from_slice(protected),
+                crate::handle_recovery::Dialect::Gemini,
+                is_stream,
+                "gemini",
+                request_coverage
+                    .unwrap_or(crate::http_files::Coverage::None)
+                    .as_header(),
+                |response, streaming| {
+                    let plugins = Arc::clone(&state.plugins);
+                    let strict = state.block_unknown_formats;
+                    async move {
+                        if streaming {
+                            crate::handle_recovery::collect(streaming_response_body(
+                                response,
+                                Arc::clone(&plugins),
+                                strict,
+                            ))
+                            .await
+                        } else {
+                            let raw = read_response_capped(response)
+                                .await?
+                                .ok_or("Gemini response exceeded limit")?;
+                            let rewrite = rewrite_response_body(&raw, &plugins, strict);
+                            apply_response_compatibility(raw, strict, rewrite)
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+    }
     let upstream = state
         .headers
         .apply(upstream_request)
@@ -777,7 +812,7 @@ fn rewrite_response_body(
     value = run.payload;
     validate_response(&value, block_unknown_formats)?;
     run_tool_plugins(&mut value, &plugins)?;
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
     let restored_tools =
         crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve)?;
     let encoded = serde_json::to_vec(&value)
@@ -1299,7 +1334,7 @@ mod tests {
             let response = serde_json::json!({
                 "candidates": [{"content": {"role": "model", "parts": [
                     {"text": handle},
-                    {"functionCall": {"name": "shell", "args": {"token": handle}}}
+                    {"functionCall": {"name": "read_file", "args": {"path": handle}}}
                 ]}}]
             })
             .to_string();
@@ -1510,10 +1545,10 @@ mod tests {
         let mut value = serde_json::json!({
             "candidates": [{"content": {"parts": [
                 {"text": handle},
-                {"functionCall": {"name": "shell", "args": {"key": handle}}}
+                {"functionCall": {"name": "read_file", "args": {"path": handle}}}
             ]}}]
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, "sk_test_synthetic"));
+        let mut resolve = |text: &str, _kind| Ok(text.replace(handle, "sk_test_synthetic"));
         assert_eq!(
             crate::cloud_code_http_proxy::resolve_function_calls(&mut value, &mut resolve).unwrap(),
             1
@@ -1523,32 +1558,28 @@ mod tests {
             handle
         );
         assert_eq!(
-            value["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["key"],
+            value["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["path"],
             "sk_test_synthetic"
         );
     }
 
     #[test]
-    fn response_keeps_handles_when_the_memory_store_becomes_unavailable() {
+    fn response_reports_failure_when_the_memory_store_becomes_unavailable() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = TestEnv::install(&store);
         drop(store);
 
-        let handle = "<<STRIPE_SECRET_KEY_a81f42c7d93>>";
+        let handle = "<<STRIPE_SECRET_KEY_0123456789abcdef>>";
         let body = serde_json::to_vec(&serde_json::json!({
             "candidates": [{"content": {"parts": [
-                {"functionCall": {"name": "shell", "args": {"key": handle}}}
+                {"functionCall": {"name": "read_file", "args": {"path": handle}}}
             ]}}]
         }))
         .unwrap();
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
-        let rewritten = rewrite_response_body(&body, &plugins, true).unwrap();
-        let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
-        assert_eq!(
-            rewritten["candidates"][0]["content"]["parts"][0]["functionCall"]["args"]["key"],
-            handle
-        );
+        let error = rewrite_response_body(&body, &plugins, true).unwrap_err();
+        assert!(!error.contains(handle));
     }
 
     #[test]
@@ -1983,7 +2014,7 @@ mod tests {
                 handle
             );
             assert_eq!(
-                response["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["token"],
+                response["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["path"],
                 secret
             );
         }
