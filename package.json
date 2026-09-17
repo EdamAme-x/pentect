@@ -1,6 +1,6 @@
 {
   "name": "pentect",
-  "version": "0.0.87",
+  "version": "0.0.88",
   "type": "module",
   "description": "Local secret masking boundary for AI agents",
   "license": "MIT",

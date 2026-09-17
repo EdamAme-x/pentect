@@ -330,6 +330,48 @@ async fn proxy_request_inner(
             upstream_request = upstream_request.header(name, value);
         }
     }
+    if endpoint.is_model_response() {
+        if let Some(protected) = body.as_bytes() {
+            return crate::handle_recovery::run(
+                state.headers.apply(upstream_request),
+                Bytes::copy_from_slice(protected),
+                crate::handle_recovery::Dialect::CloudCode,
+                is_stream,
+                "cloud-code",
+                request_coverage
+                    .unwrap_or(crate::http_files::Coverage::None)
+                    .as_header(),
+                |response, streaming| {
+                    let plugins = Arc::clone(&state.plugins);
+                    let strict = state.block_unknown_formats;
+                    async move {
+                        if streaming {
+                            crate::handle_recovery::collect(streaming_response_body(
+                                response,
+                                Arc::clone(&plugins),
+                                strict,
+                            ))
+                            .await
+                        } else {
+                            let raw = read_response_capped(response)
+                                .await?
+                                .ok_or("Cloud Code response exceeded limit")?;
+                            match rewrite_response_body(&raw, &plugins, strict) {
+                                Ok(bytes) => Ok(Bytes::from(bytes)),
+                                Err(error)
+                                    if !strict && error.starts_with("unknown format blocked:") =>
+                                {
+                                    Ok(raw)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+    }
     let upstream = state
         .headers
         .apply(upstream_request)
@@ -978,7 +1020,7 @@ fn rewrite_response_value(
         .map_err(|_| "Google Cloud Code plugin lock was poisoned".to_string())?;
     run_tool_plugins(&mut payload, &plugins)?;
     drop(plugins);
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    let mut resolve = crate::claude_http_proxy::request_scoped_tool_resolver();
     let restored_tools = resolve_function_calls(&mut payload, &mut resolve)?;
     *value = payload;
     Ok(restored_tools)
@@ -1099,7 +1141,7 @@ fn run_tool_plugins(
 
 pub(crate) fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<u64, String>
 where
-    R: FnMut(&str) -> Result<String, String>,
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
     let mut restored_tools = 0u64;
     match value {
@@ -1117,7 +1159,7 @@ where
                         format!("could not encode Google tool arguments: {error}")
                     })?;
                     let (restored, changed) =
-                        crate::claude_http_proxy::resolve_tool_input_json_with_change(
+                        crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
                             &encoded,
                             name.as_deref(),
                             resolve,
@@ -1578,7 +1620,7 @@ mod tests {
             let response = serde_json::json!({
                 "response": {"candidates": [{"content": {"role": "model", "parts": [
                     {"text": handle},
-                    {"functionCall": {"name": "custom_tool", "args": {"token": handle}}}
+                    {"functionCall": {"name": "read_file", "args": {"path": handle}}}
                 ]}}]}
             })
             .to_string();
@@ -1645,7 +1687,7 @@ mod tests {
                 serde_json::json!({
                     "response": {"candidates": [{"content": {"parts": [
                         {"text": handle},
-                        {"functionCall": {"name": "custom_tool", "args": {"token": handle}}}
+                        {"functionCall": {"name": "read_file", "args": {"path": handle}}}
                     ]}}]}
                 })
             );
@@ -1758,7 +1800,7 @@ mod tests {
                 {"functionCall": {"name": "read_file", "args": {"path": handle}}}
             ]}}]}
         });
-        let mut resolve = |text: &str| Ok(text.replace(handle, "C:/private.txt"));
+        let mut resolve = |text: &str, _kind| Ok(text.replace(handle, "C:/private.txt"));
         assert_eq!(resolve_function_calls(&mut value, &mut resolve).unwrap(), 1);
         assert_eq!(
             value["response"]["candidates"][0]["content"]["parts"][0]["text"],
@@ -1865,7 +1907,7 @@ mod tests {
         );
         assert_eq!(
             response["response"]["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]
-                ["token"],
+                ["path"],
             secret
         );
     }
@@ -1929,7 +1971,7 @@ mod tests {
         );
         assert_eq!(
             response["response"]["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]
-                ["token"],
+                ["path"],
             secret
         );
     }
@@ -2151,7 +2193,7 @@ mod tests {
         let event = serde_json::json!({
             "response": {"candidates": [{"content": {"parts": [
                 {"text": handle},
-                {"functionCall": {"name": "custom_tool", "args": {"token": handle}}}
+                {"functionCall": {"name": "read_file", "args": {"path": handle}}}
             ]}}]}
         });
         let block = format!("event: message\ndata: {event}\n\n");

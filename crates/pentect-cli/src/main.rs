@@ -16,6 +16,7 @@ mod default_launch;
 mod doctor;
 mod execution_boundary;
 mod gateway_diagnostics;
+mod handle_recovery;
 mod gemini_http_proxy;
 mod handle_contract;
 mod http_files;

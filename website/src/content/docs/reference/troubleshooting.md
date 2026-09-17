@@ -77,23 +77,33 @@ live recovery data.
 
 ## A handle was not restored in a tool call
 
-In Claude Code, an unavailable handle or a changed/unreadable handle source
-triggers a recovery notice to the model. Pentect withholds the complete client
-tool batch and asks Claude to reread the source in the current protected session.
+In Claude Code, Codex/OpenAI Responses, OpenAI Chat Completions, Gemini, and
+Google Cloud Code model requests, an unavailable handle, a changed/unreadable
+source, or a malformed/unsupported handle representation triggers a recovery
+notice to the model. Pentect withholds the complete response and asks the model
+to reread the source or use the documented data representation.
 No rejected client tool is executed. Recovery makes at most two additional model
 requests, which may consume provider usage. If recovery keeps failing, Pentect
 returns a normal explanatory message instead of a retrying 502 API error.
 
-Messages responses are buffered until validation completes, including streaming
+These model responses are buffered until validation completes, including streaming
 responses. This prevents partial output or tools from escaping before recovery,
 but means the response is displayed after generation and validation finish.
-Malformed inputs, plugin denials and other protection failures are not retried
-as missing handles. This recovery path applies to `pentect claude`, not Claude App.
+Malformed protocol input, plugin denials and other protection failures are not
+retried as missing handles. An unsupported tool surface produces an explanatory
+message; it does not enable compatibility settings or bypass validation.
+Claude App also withholds rejected output and returns an explanatory message,
+but does not automatically replay its stateful conversation POSTs, which could
+duplicate server-side turns. It therefore does not perform the automatic
+model-feedback retry used by the stateless provider adapters.
 
 For diagnosis, run `pentect log --json --once --tail 100`. Look for
 `sse-tool-rejected` or `json-tool-rejected` and their `kind`, followed by
 `handle-recovery-attempt-1`, `handle-recovery-attempt-2`,
 `handle-recovery-completed`, or `handle-recovery-exhausted`.
+The categories `handle-view-malformed`, `handle-view-unsupported`, and
+`handle-surface-unsupported` distinguish invalid syntax, an unsupported value
+representation, and an unsupported input surface without recording the value.
 `tool-input-rejected` identifies a fixed tool category; `restore-code-rejected`,
 `restore-file-rejected` and related events identify the input surface. Events
 include timestamps, PID and version, but never handle IDs, values, file paths,
