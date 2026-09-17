@@ -1444,6 +1444,11 @@ impl CodexAppProcessProbe {
     }
 
     fn matches(&self, process: &sysinfo::Process) -> bool {
+        // An exited child may remain visible until its original parent reaps
+        // it. It cannot retain the App's routing or singleton anymore.
+        if process.status() == sysinfo::ProcessStatus::Zombie {
+            return false;
+        }
         let process_name = comparable_process_name(&process.name().to_string_lossy());
         // Windows packaged ChatGPT/Codex processes may not expose their image
         // path to a non-elevated caller. Treat ChatGPT.exe as the App in that
@@ -1810,6 +1815,45 @@ mod tests {
     fn restart_matching_excludes_unrelated_cli() {
         let probe = CodexAppProcessProbe::new(Path::new("fixture/app/ChatGPT.exe"));
         assert!(!probe.path_matches(Path::new("other/codex.exe"), "codex.exe"));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for restart_terminates_only_the_fixture_app"]
+    fn restart_child_fixture() {
+        if std::env::var_os("PENTECT_RESTART_TEST_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn restart_terminates_only_the_fixture_app() {
+        let root = test_home("codex-restart-process");
+        let app = root.join(if cfg!(windows) {
+            "fixture.exe"
+        } else {
+            "fixture"
+        });
+        std::fs::copy(std::env::current_exe().unwrap(), &app).unwrap();
+        let mut child = Command::new(&app)
+            .args([
+                "--exact",
+                "codex_app::tests::restart_child_fixture",
+                "--ignored",
+            ])
+            .env("PENTECT_RESTART_TEST_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = restart_existing_codex_app(&app);
+        // Always reap the isolated fixture, including assertion failure paths.
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(!status.success());
+        assert!(CodexAppProcessProbe::new(&std::env::current_exe().unwrap()).is_running());
     }
 
     #[test]
