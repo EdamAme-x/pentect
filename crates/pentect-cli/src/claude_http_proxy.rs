@@ -3484,7 +3484,8 @@ where
     Ok((encoded, changed))
 }
 
-/// Compatibility path for gateways not yet migrated to declared tool fields.
+/// Legacy restoration fixture for compatibility regression tests.
+#[cfg(test)]
 pub(crate) fn resolve_tool_input_json_with_change<R>(
     input: &str,
     _tool_name: Option<&str>,

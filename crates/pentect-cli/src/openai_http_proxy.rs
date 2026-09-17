@@ -4893,6 +4893,9 @@ mod tests {
                             );
                             std::thread::sleep(std::time::Duration::from_millis(5));
                         };
+                        // Accepted sockets inherit nonblocking mode on Windows
+                        // and macOS; reads below intentionally use a timeout.
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                             .unwrap();
