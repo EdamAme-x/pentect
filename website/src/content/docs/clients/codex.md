@@ -46,8 +46,11 @@ Windows adds `Codex via Pentect` under Start menu → Pentect. macOS adds it to
 starts the same `pentect codex app` gateway in the background and does not
 modify the official App.
 
-Quit ChatGPT/Codex first. If it is already running, Pentect stops and asks you
-to close it so the new process can receive the protected routing.
+If Codex App is already running, Pentect forcibly closes it and starts it again
+with protected routing. Active tasks are interrupted and unsaved input may be
+lost. Unrelated Codex CLI installations are not targeted. If termination cannot
+be verified, Pentect asks you to close the App manually instead of launching a
+second, potentially unprotected instance. `--check` never terminates the App.
 
 ```sh
 pentect codex app --remove-launcher

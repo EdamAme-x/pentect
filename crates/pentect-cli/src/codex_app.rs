@@ -2,8 +2,8 @@
 //!
 //! The app and its bundled Codex process use a loopback-only Responses API
 //! gateway. The App gets a session-only `CODEX_HOME`; Pentect never changes the
-//! user's shared Codex configuration and refuses to launch while another Codex
-//! App process is running.
+//! user's shared Codex configuration and restarts an already-running Codex App
+//! so its processes inherit the gateway.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -58,13 +58,6 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     if !app.is_file() {
         return Err(codex_app_not_found(&app, app_was_explicit));
     }
-    if codex_app_is_running(&app) {
-        return Err(
-            "Codex App is already running; quit it before `pentect codex app` so its bundled Codex process inherits the HTTP gateway"
-                .to_string(),
-        );
-    }
-
     let routing = crate::codex_app_routing(options.upstream)?;
     let proxy =
         crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env_and_bearer_env(
@@ -72,7 +65,8 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             &options.upstream_header_env,
             routing.bearer_env.as_deref(),
         )?;
-    let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
+    let restarted = restart_existing_codex_app(&app)?;
+    let config_lock = Arc::new(Mutex::new(Some(acquire_app_lock_after_restart(restarted)?)));
     let session_home = CodexSessionHome::create(&routing.provider, proxy.base_url())?;
     let lifecycle_log = match CodexAppLifecycleLog::open(session_home.source_home()) {
         Ok(log) => Some(log),
@@ -85,6 +79,9 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         record_lifecycle(&lifecycle_log, "legacy-config-restored", "completed");
     }
     record_lifecycle(&lifecycle_log, "gateway-started", "loopback");
+    if restarted {
+        record_lifecycle(&lifecycle_log, "existing-app-stopped", "restart");
+    }
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
     eprintln!(
         "[pentect] Waiting for Codex App to send a protected Responses API request; use a non-sensitive test prompt first"
@@ -1299,6 +1296,89 @@ fn codex_app_is_running(app: &Path) -> bool {
     CodexAppProcessProbe::new(app).is_running()
 }
 
+fn restart_existing_codex_app(app: &Path) -> Result<bool, String> {
+    let mut probe = CodexAppProcessProbe::new(app);
+    if !probe.is_running() {
+        return Ok(false);
+    }
+    eprintln!("[pentect] Restarting the running Codex App through Pentect; active tasks will be interrupted and unsaved input may be lost");
+    stop_app_with_retry(
+        || {
+            let pids = probe.matching_pids();
+            if pids.is_empty() {
+                return true;
+            }
+            for pid in pids {
+                // Detection can conservatively match an inaccessible package by
+                // name. Destructive operations require a verified executable.
+                if probe
+                    .system
+                    .process(sysinfo::Pid::from_u32(pid))
+                    .is_some_and(|process| {
+                        process.exe().is_some_and(|exe| {
+                            probe.path_matches(
+                                &comparable_process_path(exe),
+                                &comparable_process_name(&process.name().to_string_lossy()),
+                            )
+                        })
+                    })
+                {
+                    force_stop_app_process(pid);
+                }
+            }
+            false
+        },
+        || thread::sleep(APP_MONITOR_INTERVAL),
+        30,
+    )?;
+    Ok(true)
+}
+
+fn stop_app_with_retry(
+    mut stop_and_check: impl FnMut() -> bool,
+    mut wait: impl FnMut(),
+    attempts: usize,
+) -> Result<(), String> {
+    for _ in 0..attempts {
+        if stop_and_check() {
+            return Ok(());
+        }
+        wait();
+    }
+    Err(
+        "Could not confirm Codex App stopped; close it manually and retry. No new App was launched"
+            .to_string(),
+    )
+}
+
+#[cfg(windows)]
+fn force_stop_app_process(pid: u32) {
+    terminate_process(pid);
+}
+
+#[cfg(unix)]
+fn force_stop_app_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+fn acquire_app_lock_after_restart(restarted: bool) -> Result<CodexConfigLock, String> {
+    let started = std::time::Instant::now();
+    loop {
+        match CodexConfigLock::acquire() {
+            Err(error)
+                if restarted
+                    && error == "another `pentect codex app` session is already active"
+                    && started.elapsed() < APP_EXIT_GRACE + Duration::from_secs(5) =>
+            {
+                thread::sleep(APP_MONITOR_INTERVAL);
+            }
+            result => return result,
+        }
+    }
+}
+
 struct CodexAppProcessProbe {
     expected: PathBuf,
     install_root: Option<PathBuf>,
@@ -1694,6 +1774,42 @@ mod tests {
     fn process_probe_observes_the_current_executable() {
         let executable = std::env::current_exe().unwrap();
         assert!(CodexAppProcessProbe::new(&executable).is_running());
+    }
+
+    #[test]
+    fn restart_waits_for_confirmed_exit() {
+        let mut checks = 0;
+        let mut waits = 0;
+        stop_app_with_retry(
+            || {
+                checks += 1;
+                checks == 3
+            },
+            || waits += 1,
+            4,
+        )
+        .unwrap();
+        assert_eq!(checks, 3);
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn restart_fails_closed_when_process_does_not_exit() {
+        let mut waits = 0;
+        let error = stop_app_with_retry(|| false, || waits += 1, 3).unwrap_err();
+        assert_eq!(waits, 3);
+        assert!(error.contains("No new App was launched"));
+    }
+
+    #[test]
+    fn restart_does_not_wait_when_app_is_absent() {
+        stop_app_with_retry(|| true, || panic!("unexpected wait"), 1).unwrap();
+    }
+
+    #[test]
+    fn restart_matching_excludes_unrelated_cli() {
+        let probe = CodexAppProcessProbe::new(Path::new("fixture/app/ChatGPT.exe"));
+        assert!(!probe.path_matches(Path::new("other/codex.exe"), "codex.exe"));
     }
 
     #[test]
