@@ -1311,19 +1311,20 @@ fn restart_existing_codex_app(app: &Path) -> Result<bool, String> {
             for pid in pids {
                 // Detection can conservatively match an inaccessible package by
                 // name. Destructive operations require a verified executable.
-                if probe
-                    .system
-                    .process(sysinfo::Pid::from_u32(pid))
-                    .is_some_and(|process| {
-                        process.exe().is_some_and(|exe| {
-                            probe.path_matches(
-                                &comparable_process_path(exe),
-                                &comparable_process_name(&process.name().to_string_lossy()),
-                            )
+                if let Some(process) =
+                    probe
+                        .system
+                        .process(sysinfo::Pid::from_u32(pid))
+                        .filter(|process| {
+                            process.exe().is_some_and(|exe| {
+                                probe.path_matches(
+                                    &comparable_process_path(exe),
+                                    &comparable_process_name(&process.name().to_string_lossy()),
+                                )
+                            })
                         })
-                    })
                 {
-                    force_stop_app_process(pid);
+                    force_stop_verified_app_process(app, pid, process.start_time());
                 }
             }
             false
@@ -1351,16 +1352,29 @@ fn stop_app_with_retry(
     )
 }
 
-#[cfg(windows)]
-fn force_stop_app_process(pid: u32) {
-    terminate_process(pid);
+fn force_stop_verified_app_process(app: &Path, pid: u32, expected_start: u64) {
+    // Refresh identity immediately before signaling: a PID from the earlier
+    // enumeration may already have been reused by an unrelated process.
+    let mut fresh = CodexAppProcessProbe::new(app);
+    fresh.system.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
+    if let Some(process) = fresh.system.process(sysinfo::Pid::from_u32(pid)) {
+        let verified_path = process.exe().is_some_and(|exe| {
+            fresh.path_matches(
+                &comparable_process_path(exe),
+                &comparable_process_name(&process.name().to_string_lossy()),
+            )
+        });
+        if restart_identity_matches(expected_start, process.start_time(), verified_path) {
+            let _ = process.kill_with(sysinfo::Signal::Kill);
+        }
+    }
 }
 
-#[cfg(unix)]
-fn force_stop_app_process(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+fn restart_identity_matches(expected_start: u64, actual_start: u64, verified_path: bool) -> bool {
+    expected_start == actual_start && verified_path
 }
 
 fn acquire_app_lock_after_restart(restarted: bool) -> Result<CodexConfigLock, String> {
@@ -1815,6 +1829,13 @@ mod tests {
     fn restart_matching_excludes_unrelated_cli() {
         let probe = CodexAppProcessProbe::new(Path::new("fixture/app/ChatGPT.exe"));
         assert!(!probe.path_matches(Path::new("other/codex.exe"), "codex.exe"));
+    }
+
+    #[test]
+    fn restart_rejects_reused_pids_and_changed_executables() {
+        assert!(restart_identity_matches(100, 100, true));
+        assert!(!restart_identity_matches(100, 101, true));
+        assert!(!restart_identity_matches(100, 100, false));
     }
 
     #[test]
