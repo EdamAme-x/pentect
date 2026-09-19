@@ -31,15 +31,6 @@ secret will be detected. [Understand the security boundary](/protection/security
 
 <HomeInstall />
 
-::: tip Updated for v0.0.85
-[Version 0.0.85](https://github.com/EdamAme-x/pentect/releases/tag/v0.0.85)
-fixes excessive masking when source code contains a sensitive assignment.
-Ordinary code is no longer treated as an environment-variable dump for that
-reason alone; detected secrets remain protected.
-[Update Pentect](/start/install/#update) or
-[troubleshoot excessive masking](/reference/troubleshooting/#source-code-is-masked-too-aggressively).
-:::
-
 ## Clients
 
 Pentect currently focuses official support on four AI coding clients: Codex
