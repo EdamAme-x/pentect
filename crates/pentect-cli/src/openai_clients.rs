@@ -837,7 +837,30 @@ fn opencode_config(
                 .ok_or_else(|| {
                     format!("OPENCODE_CONFIG_CONTENT.provider.{provider}.models must be an object")
                 })?;
-            models.insert(model_id.to_string(), json!({"name": model_id}));
+            let definition = models
+                .entry(model_id.to_string())
+                .or_insert_with(|| json!({"name": model_id}))
+                .as_object_mut()
+                .ok_or_else(|| "OpenCode custom model definition must be an object".to_string())?;
+            definition.entry("name").or_insert_with(|| json!(model_id));
+            if let Ok(inputs) = std::env::var("PENTECT_OPENCODE_INPUTS") {
+                let modalities = match inputs.as_str() {
+                    "text" => json!(["text"]),
+                    "text,image" | "image,text" => json!(["text", "image"]),
+                    _ => {
+                        return Err("PENTECT_OPENCODE_INPUTS must be text or text,image".to_string())
+                    }
+                };
+                definition.insert("attachment".to_string(), json!(inputs != "text"));
+                let modality_config = definition
+                    .entry("modalities")
+                    .or_insert_with(|| json!({"output": ["text"]}))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        "OpenCode custom model modalities must be an object".to_string()
+                    })?;
+                modality_config.insert("input".to_string(), modalities);
+            }
         }
     }
     providers.insert(provider.to_string(), provider_config);
@@ -1317,6 +1340,63 @@ mod tests {
             value["provider"]["pentect-gateway"]["models"]["team/custom-model"]["name"],
             "team/custom-model"
         );
+    }
+
+    #[test]
+    fn opencode_custom_gateway_preserves_capabilities_and_validates_overrides() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let old_config = std::env::var_os("OPENCODE_CONFIG_CONTENT");
+        let old_inputs = std::env::var_os("PENTECT_OPENCODE_INPUTS");
+        std::env::set_var(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"provider":{"pentect-gateway":{"models":{"vision":{"name":"Vision","attachment":true,"modalities":{"input":["text","image"],"output":["text"]},"limit":{"context":12345},"options":{"apiKey":"must-remove"}}}}}}"#,
+        );
+        std::env::remove_var("PENTECT_OPENCODE_INPUTS");
+        let build = || {
+            opencode_config(
+                "http://127.0.0.1/token",
+                "pentect-gateway",
+                Some("pentect-gateway/vision"),
+                Some("@ai-sdk/openai-compatible"),
+            )
+        };
+        let preserved = build();
+        std::env::set_var("PENTECT_OPENCODE_INPUTS", "text");
+        let text_only = build();
+        std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        std::env::set_var("PENTECT_OPENCODE_INPUTS", "text,image");
+        let vision = build();
+        std::env::set_var("PENTECT_OPENCODE_INPUTS", "audio");
+        let invalid = build();
+        for (name, old) in [
+            ("OPENCODE_CONFIG_CONTENT", old_config),
+            ("PENTECT_OPENCODE_INPUTS", old_inputs),
+        ] {
+            match old {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let model = |result: Result<String, String>| -> Value {
+            serde_json::from_str::<Value>(&result.unwrap()).unwrap()["provider"]["pentect-gateway"]
+                ["models"]["vision"]
+                .clone()
+        };
+        let preserved = model(preserved);
+        assert_eq!(preserved["name"], "Vision");
+        assert_eq!(preserved["attachment"], true);
+        assert_eq!(preserved["modalities"]["input"], json!(["text", "image"]));
+        assert_eq!(preserved["limit"]["context"], 12345);
+        assert!(preserved["options"].get("apiKey").is_none());
+        let text_only = model(text_only);
+        assert_eq!(text_only["attachment"], false);
+        assert_eq!(text_only["modalities"]["input"], json!(["text"]));
+        assert_eq!(text_only["modalities"]["output"], json!(["text"]));
+        let vision = model(vision);
+        assert_eq!(vision["attachment"], true);
+        assert_eq!(vision["modalities"]["input"], json!(["text", "image"]));
+        assert_eq!(vision["modalities"]["output"], json!(["text"]));
+        assert!(invalid.unwrap_err().contains("PENTECT_OPENCODE_INPUTS"));
     }
 
     #[test]

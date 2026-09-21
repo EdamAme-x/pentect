@@ -2338,7 +2338,9 @@ class Handler(BaseHTTPRequestHandler):
             request = body.decode("utf-8")
             self.server.state.model_requests.append(request)
             parsed = json.loads(request)
-            if not parsed.get("tools"):
+            if "data:image/" in request:
+                payload = chat_text_response(0, "Protected image received. IMAGE_OK")
+            elif not parsed.get("tools"):
                 payload = chat_text_response(0, "Local key check")
             else:
                 sequence = sum(
@@ -3518,7 +3520,7 @@ def run_claude_parent_kill(pentect: str) -> None:
             )
 
 
-def run_image_redaction(pentect: str) -> None:
+def run_image_redaction(pentect: str, client: str = "codex") -> None:
     state = State("unused-valid", "unused-invalid")
     server = FixtureServer(state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -3559,6 +3561,22 @@ def run_image_redaction(pentect: str) -> None:
                 "--image",
                 str(image),
             ]
+            if client in ("opencode", "pi"):
+                command = [pentect, client, "--upstream",
+                           f"http://127.0.0.1:{server.server_port}/v1",
+                           "--model", "fixture-vision", "--api", "chat"]
+                if client == "opencode":
+                    environment["OPENCODE_CONFIG_CONTENT"] = json.dumps({
+                        "provider": {"pentect-gateway": {"models": {"fixture-vision": {
+                            "name": "Fixture vision", "attachment": True,
+                            "modalities": {"input": ["text", "image"], "output": ["text"]},
+                        }}}},
+                    })
+                    command += ["run", "--format", "json", "--file", str(image),
+                                "--", "Describe the protected image and finish."]
+                else:
+                    command += ["--print", "--no-session", "--no-context-files",
+                                "@" + str(image), "Describe the protected image and finish."]
             if os.name == "nt" and pentect.lower().endswith((".cmd", ".bat")):
                 command = [
                     os.environ.get("COMSPEC", "cmd.exe"),
@@ -3614,7 +3632,7 @@ def run_image_redaction(pentect: str) -> None:
                     "image secret plaintext or original payload reached persistent diagnostics"
                 )
             print(
-                "installed codex image E2E passed: original replaced, black-box note "
+                f"installed {client} image E2E passed: original replaced, black-box note "
                 "and opaque handle delivered, no model/log plaintext"
             )
     finally:
@@ -3633,6 +3651,7 @@ def main() -> int:
         dest="clients",
     )
     parser.add_argument("--skip-image", action="store_true")
+    parser.add_argument("--image-only", action="store_true")
     parser.add_argument("--codex-parent-kill", action="store_true")
     parser.add_argument("--claude-parent-kill", action="store_true")
     parser.add_argument("--tmux-cancellation", action="store_true")
@@ -3652,6 +3671,12 @@ def main() -> int:
     candidate = Path(args.pentect)
     if candidate.is_file():
         args.pentect = str(candidate.resolve())
+    if args.image_only:
+        for client in args.clients or ("codex", "opencode", "pi"):
+            if client == "claude":
+                parser.error("--image-only supports codex, opencode and pi")
+            run_image_redaction(args.pentect, client)
+        return 0
     if args.plugin_lifecycle_only:
         run_plugin_lifecycle(args.pentect)
         return 0
@@ -3685,6 +3710,10 @@ def main() -> int:
         run_cancellation(args.pentect)
         if not args.skip_image:
             run_image_redaction(args.pentect)
+    if not args.skip_image:
+        for client in ("opencode", "pi"):
+            if args.clients is None or client in args.clients:
+                run_image_redaction(args.pentect, client)
     return 0
 
 

@@ -87,3 +87,11 @@ With a custom upstream, Pentect treats the model as an OpenAI-compatible
 gateway model ID. Custom endpoint variables and gateway credentials are
 advanced options; see
 [Custom upstreams](/clients/upstreams/).
+
+For custom upstreams, Pentect preserves model capabilities supplied in
+`OPENCODE_CONFIG_CONTENT.provider["pentect-gateway"].models[MODEL_ID]`, including
+`attachment`, `modalities`, and token limits. If the custom model supports images,
+set `PENTECT_OPENCODE_INPUTS=text,image` for that launch; use `text` for a text-only
+model. Native provider routes keep OpenCode's model catalog capabilities.
+Without image capabilities, OpenCode may omit attachments before they reach
+Pentect, even when the upstream model itself supports vision.

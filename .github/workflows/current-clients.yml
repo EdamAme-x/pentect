@@ -67,6 +67,7 @@ jobs:
               - 'tools/install_client_smoke.sh'
               - 'tools/install_portable_client_smoke.py'
               - 'tools/installed_agent_e2e.py'
+              - 'tools/live_portable_client_e2e.py'
               - 'tools/test_installed_agent_environment.py'
               - 'tools/test_client_smoke_coverage.py'
               - 'tools/verify_client_smoke_log.py'
