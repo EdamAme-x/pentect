@@ -83,23 +83,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
-                self.send_response(response.status)
-                self.send_header('Content-Type', response.headers.get('Content-Type', 'application/json'))
-                self.send_header('Connection', 'close')
-                self.end_headers()
+                try:
+                    self.send_response(response.status)
+                    self.send_header('Content-Type', response.headers.get('Content-Type', 'application/json'))
+                    self.send_header('Connection', 'close')
+                    self.end_headers()
+                except ConnectionError:
+                    self.server.records[index]['client_disconnected'] = True
+                    return
                 self.close_connection = True
                 chunks = 0
                 while chunk := response.read1(4096):
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except ConnectionError:
+                        self.server.records[index]['client_disconnected'] = True
+                        self.server.records[index]['response_chunks'] = chunks
+                        return
                     chunks += 1
                 self.server.records[index]['response_chunks'] = chunks
+                self.server.records[index]['response_complete'] = True
         except urllib.error.HTTPError as error:
             self.server.failures.append('provider-http-' + str(error.code))
-            self.send_error(error.code, 'Provider request failed; details withheld')
+            self.safe_error(error.code, 'Provider request failed; details withheld')
         except (TimeoutError, OSError):
             self.server.failures.append('provider-transport')
-            self.send_error(502, 'Provider transport failed')
+            self.safe_error(502, 'Provider transport failed')
+
+    def safe_error(self, status: int, message: str):
+        try:
+            self.send_error(status, message)
+        except ConnectionError:
+            pass  # The upstream failure was recorded even if the client left.
 
 
 def run_case(pentect: str, client: str, model: str, case: str, output_root: Path,
@@ -209,9 +225,10 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
             target = project / ('resumed.txt' if case == 'resume' else 'copied.txt')
             result['exact_restore'] = target.exists() and target.read_text(encoding='utf-8').strip() == SECRET
         if case == 'image':
-            result['protected_image_seen'] = any(r['has_image'] and r['redaction_note'] and r['has_handle'] for r in relay.records)
+            result['protected_image_seen'] = any(r['has_image'] and r['redaction_note'] and r['has_handle']
+                                                  and r.get('response_complete') for r in relay.records)
         result['passed'] = (completed.returncode == 0 and result['completion_marker']
-                            and bool(relay.records) and not relay.failures
+                            and any(r.get('response_complete') for r in relay.records) and not relay.failures
                             and not result['real_key_in_output'] and result['clean_diagnostics']
                             and result.get('exact_restore', True)
                             and result.get('initial_exit_code', 0) == 0
