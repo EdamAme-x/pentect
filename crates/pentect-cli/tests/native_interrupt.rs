@@ -23,7 +23,9 @@ with tempfile.TemporaryDirectory(prefix="pentect-interrupt-") as root:
         config.write("[update]\ncheck = false\n")
     client = os.path.join(root, "client.py")
     with open(client, "w") as script:
-        script.write("#!/usr/bin/env python3\nimport signal,time\nsignal.signal(signal.SIGINT, lambda *_: print('CANCELLED', flush=True))\nprint('READY', flush=True)\nwhile True: time.sleep(1)\n")
+        # SIGINT may arrive while readiness is being written. Avoid Python's
+        # BufferedWriter lock in the signal handler (a reentrant print fails).
+        script.write("#!/usr/bin/env python3\nimport os,signal,time\nsignal.signal(signal.SIGINT, lambda *_: os.write(1, b'CANCELLED\\n'))\nos.write(1, b'READY\\n')\nwhile True: time.sleep(1)\n")
     os.chmod(client, os.stat(client).st_mode | stat.S_IXUSR)
     env = os.environ.copy()
     env["HOME"] = home

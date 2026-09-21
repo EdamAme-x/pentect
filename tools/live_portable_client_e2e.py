@@ -20,9 +20,18 @@ import threading
 import urllib.error
 import urllib.request
 
-from installed_agent_e2e import IMAGE_PNG_BASE64, IMAGE_SECRET, isolated_environment, pentect_command
+from installed_agent_e2e import IMAGE_PNG_BASE64, IMAGE_SECRET, isolated_environment
 
 SECRET = 'rpa_' + 'LIVE_PORTABLE_SYNTHETIC_0123456789abcdef'
+
+
+def client_command(command: list[str]) -> list[str] | str:
+    if os.name == 'nt' and command[0].lower().endswith(('.cmd', '.bat')):
+        # Pass the batch command as a raw command line: nesting list2cmdline
+        # inside a subprocess argument list double-escapes the prompt's quotes.
+        return (subprocess.list2cmdline([os.environ.get('COMSPEC', 'cmd.exe')])
+                + ' /d /s /c "' + subprocess.list2cmdline(command) + '"')
+    return command
 
 
 class Relay(http.server.ThreadingHTTPServer):
@@ -150,7 +159,7 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
     if pi_extension:
         result['surface'] = 'pi-extension'
     try:
-        completed = subprocess.run(pentect_command(command[0], command[1:]), cwd=project, env=environment,
+        completed = subprocess.run(client_command(command), cwd=project, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    timeout=240)
         output = completed.stdout.decode('utf-8', errors='replace')
@@ -171,7 +180,7 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
             resume_command += (['run', '--pure', '--format', 'json', '--continue', '--', resume_prompt]
                                if client == 'opencode' else
                                ['--print', '--continue', '--no-context-files', resume_prompt])
-            completed = subprocess.run(pentect_command(resume_command[0], resume_command[1:]), cwd=project, env=environment,
+            completed = subprocess.run(client_command(resume_command), cwd=project, env=environment,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)
             output += '\n' + completed.stdout.decode('utf-8', errors='replace')
         # Client-local output may legitimately contain restored synthetic data.

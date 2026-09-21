@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+
+from live_portable_client_e2e import client_command
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -84,7 +89,18 @@ def main() -> None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-    print("installed-agent environment isolation: ok")
+    if os.name == "nt":
+        with tempfile.TemporaryDirectory(prefix="pentect batch quoting ") as raw:
+            root = Path(raw)
+            script = root / "arguments.py"
+            script.write_text("import json,sys; print(json.dumps(sys.argv[1:]))", encoding="utf-8")
+            batch = root / "client.cmd"
+            batch.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+            arguments = ["a complete multi-word prompt", 'literal "quoted" text', "mask(synthetic-test-value)"]
+            completed = subprocess.run(client_command([str(batch), *arguments]),
+                                       capture_output=True, text=True, check=True, timeout=10)
+            assert json.loads(completed.stdout) == arguments, "batch launch split or changed prompt arguments"
+    print("installed-agent environment isolation and batch quoting: ok")
 
 
 if __name__ == "__main__":
