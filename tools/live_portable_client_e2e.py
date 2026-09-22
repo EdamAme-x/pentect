@@ -50,6 +50,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def do_GET(self):
+        # Codex queries its own model-catalog schema, not OpenRouter's schema.
+        # An empty catalog selects Codex's documented fallback metadata.
+        if self.path.split('?', 1)[0] not in ('/models', '/v1/models'):
+            self.send_error(404)
+            return
+        raw = b'{"models":[]}'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get('Content-Length', '0')))
         text = raw.decode('utf-8')
@@ -59,7 +72,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.records.append({
                 'model': payload.get('model'), 'bytes': len(raw),
                 'has_handle': '<<' in text,
-                'has_image': 'data:image/' in text,
+                'has_image': 'data:image/' in text or '"media_type": "image/' in text or '"media_type":"image/' in text,
                 'redaction_note': 'Pentect masked sensitive information in this image' in text,
             })
         violation = next((name for name, value in (
@@ -72,14 +85,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.failures.append(violation or 'request-budget')
             self.send_error(400, 'Local privacy assertion failed')
             return
-        if self.path not in ('/v1/chat/completions', '/chat/completions'):
+        endpoint = self.path.split('?', 1)[0]
+        endpoints = {'/v1/chat/completions': 'chat/completions',
+                     '/chat/completions': 'chat/completions',
+                     '/v1/responses': 'responses', '/responses': 'responses',
+                     '/v1/messages': 'messages'}
+        if endpoint not in endpoints:
             self.server.failures.append('unexpected-endpoint')
             self.send_error(404)
             return
         request = urllib.request.Request(
-            'https://openrouter.ai/api/v1/chat/completions', data=raw,
+            'https://openrouter.ai/api/v1/' + endpoints[endpoint], data=raw,
             headers={'Authorization': 'Bearer ' + self.server.key,
-                     'Content-Type': 'application/json'},
+                     'Content-Type': 'application/json',
+                     'anthropic-version': '2023-06-01'},
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -126,7 +145,16 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
     home.mkdir()
     project.mkdir()
     environment = isolated_environment(home, root / 'logs')
+    # Native Windows Codex resolves the profile through the OS, not USERPROFILE.
+    # Explicit client config roots are needed to avoid loading the user's apps.
+    environment['CODEX_HOME'] = str(home / '.codex')
+    environment['CLAUDE_CONFIG_DIR'] = str(home / '.claude')
+    (home / '.codex').mkdir()
+    (home / '.claude').mkdir()
     environment['OPENAI_API_KEY'] = 'local-test-only'
+    environment['ANTHROPIC_API_KEY'] = 'local-test-only'
+    if client == 'claude' and os.name == 'nt':
+        environment['CLAUDE_CODE_GIT_BASH_PATH'] = shutil.which('bash.exe') or 'bash.exe'
     environment['PENTECT_UPDATE_CHECK'] = '0'
     environment['OPENCODE_DISABLE_UPDATE_CHECK'] = 'true'
     environment['OPENCODE_CONFIG_CONTENT'] = json.dumps({
@@ -154,8 +182,11 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
     relay = Relay(key, IMAGE_PNG_BASE64 if case == 'image' else '')
     thread = threading.Thread(target=relay.serve_forever, daemon=True)
     thread.start()
-    command = [pentect, client, '--upstream', f'http://127.0.0.1:{relay.server_port}/v1',
-               '--model', model, '--api', 'chat']
+    upstream = f'http://127.0.0.1:{relay.server_port}'
+    command = [pentect, client, '--upstream', upstream + ('/v1' if client != 'claude' else ''),
+               '--model', model]
+    if client in ('opencode', 'pi'):
+        command += ['--api', 'chat']
     if pi_extension:
         environment.update(OPENAI_BASE_URL=f'http://127.0.0.1:{relay.server_port}/v1',
                            PENTECT_PI_MODEL=model, PENTECT_PI_API='chat')
@@ -166,11 +197,21 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
             command += ['--no-session']
         if case == 'image':
             command += ['@' + str(image)]
+    elif client == 'codex':
+        command += ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '--json']
+        if case == 'image':
+            command += ['--image', str(image)]
+    elif client == 'claude':
+        command += ['--bare', '--print', '--output-format', 'text',
+                    '--dangerously-skip-permissions', '--tools', 'Read,Write,Edit,Bash',
+                    '--max-turns', '10']
+        if case == 'image':
+            prompt = f'Use the Read tool to open the image {image}. ' + prompt
     else:
         command += ['run', '--format', 'json', '--pure', '--dir', str(project)]
         if case == 'image':
             command += ['--file', str(image)]
-    command += ['--', prompt] if client == 'opencode' else [prompt]
+    command += ['--', prompt] if client in ('opencode', 'codex') else [prompt]
     result = {'client': client, 'model': model, 'case': case, 'root': str(root)}
     if pi_extension:
         result['surface'] = 'pi-extension'
@@ -189,13 +230,20 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
                 'Copy its opaque representation exactly. Do not read any source files or output the value. '
                 'Finish with RESUME_OK.'
             )
-            resume_command = [pentect, client, '--upstream', f'http://127.0.0.1:{relay.server_port}/v1',
-                              '--model', model, '--api', 'chat']
+            resume_command = [pentect, client, '--upstream', upstream + ('/v1' if client != 'claude' else ''),
+                              '--model', model]
+            if client in ('opencode', 'pi'):
+                resume_command += ['--api', 'chat']
             if pi_extension:
                 resume_command = [shutil.which('pi') or 'pi', '--extension', pi_extension, '--model', 'pentect/' + model]
-            resume_command += (['run', '--pure', '--format', 'json', '--continue', '--', resume_prompt]
-                               if client == 'opencode' else
-                               ['--print', '--continue', '--no-context-files', resume_prompt])
+            resume_command += {
+                'opencode': ['run', '--pure', '--format', 'json', '--continue', '--', resume_prompt],
+                'pi': ['--print', '--continue', '--no-context-files', resume_prompt],
+                'codex': ['exec', 'resume', '--last', '--dangerously-bypass-approvals-and-sandbox',
+                          '--skip-git-repo-check', '--json', resume_prompt],
+                'claude': ['--bare', '--print', '--continue', '--dangerously-skip-permissions',
+                           '--tools', 'Read,Write,Edit,Bash', '--max-turns', '10', resume_prompt],
+            }[client]
             completed = subprocess.run(client_command(resume_command), cwd=project, env=environment,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)
             output += '\n' + completed.stdout.decode('utf-8', errors='replace')
@@ -204,7 +252,7 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
         (root / 'client-output.txt').write_text(output.replace(key, '[REDACTED]'), encoding='utf-8')
         result['exit_code'] = completed.returncode
         assistant_text = output
-        if client == 'opencode':
+        if client in ('opencode', 'codex'):
             parts = []
             for line in output.splitlines():
                 try:
@@ -213,6 +261,8 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
                     continue
                 if event.get('type') == 'text':
                     parts.append(event.get('part', {}).get('text', ''))
+                if event.get('type') == 'item.completed' and event.get('item', {}).get('type') == 'agent_message':
+                    parts.append(event['item'].get('text', ''))
             assistant_text = '\n'.join(parts)
         result['completion_marker'] = case.upper() + '_OK' in assistant_text
         result['requests'] = relay.records
@@ -248,7 +298,7 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pentect', required=True)
-    parser.add_argument('--client', choices=['opencode', 'pi'], action='append')
+    parser.add_argument('--client', choices=['opencode', 'pi', 'codex', 'claude'], action='append')
     parser.add_argument('--case', choices=['text', 'tools', 'image', 'resume'], action='append')
     parser.add_argument('--model', default='openai/gpt-4.1-mini')
     parser.add_argument('--output-root', type=Path, required=True)

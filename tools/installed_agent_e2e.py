@@ -3557,9 +3557,10 @@ def run_image_redaction(pentect: str, client: str = "codex") -> None:
                 "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--skip-git-repo-check",
-                "Describe the protected image and finish.",
                 "--image",
                 str(image),
+                "--",
+                "Describe the protected image and finish.",
             ]
             if client in ("opencode", "pi"):
                 command = [pentect, client, "--upstream",
