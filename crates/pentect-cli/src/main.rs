@@ -1784,9 +1784,8 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         eprintln!("[pentect] warning: could not recover legacy Codex App config: {error}");
     }
     let routing = codex_effective_routing(opts)?;
-    let mut args = opts.tool_args.clone();
     if opts.dry_run {
-        args.extend(routing.gateway_args("<pentect-gateway>"));
+        let args = routing.protected_args(&opts.tool_args, "<pentect-gateway>");
         print_dry_run(&opts.command, &args);
         return Ok(success_status());
     }
@@ -1798,10 +1797,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         routing.upstream.clone(),
         &opts.upstream_header_env,
     )?;
-    // These overrides are appended so a caller-supplied routing override
-    // cannot bypass the local gateway. Codex accepts global config flags after
-    // its subcommand and uses the last value for duplicate keys.
-    args.extend(routing.gateway_args(http_proxy.base_url()));
+    let args = routing.protected_args(&opts.tool_args, http_proxy.base_url());
 
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
@@ -3109,6 +3105,19 @@ struct CodexHttpRouting {
 const CODEX_GATEWAY_PROVIDER: &str = "pentect-openai-gateway";
 
 impl CodexHttpRouting {
+    fn protected_args(&self, args: &[String], gateway: &str) -> Vec<String> {
+        // Last config wins, but flags after `--` are positional prompt data.
+        // Keep the gateway override last among options, before that boundary.
+        let boundary = args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(args.len());
+        let mut protected = args[..boundary].to_vec();
+        protected.extend(self.gateway_args(gateway));
+        protected.extend_from_slice(&args[boundary..]);
+        protected
+    }
+
     fn gateway_args(&self, gateway: &str) -> Vec<String> {
         let entries = if self.provider == "openai" {
             // Keep the built-in provider ID so Codex can resume this thread without
@@ -3324,6 +3333,7 @@ fn codex_profile_arg(args: &[String]) -> Option<&str> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--" => break,
             "--profile" => {
                 profile = args.get(index + 1).map(String::as_str);
                 index += 2;
@@ -3343,6 +3353,7 @@ fn codex_cli_config_string(args: &[String], wanted: &str) -> Option<String> {
     let mut index = 0;
     while index < args.len() {
         let config = match args[index].as_str() {
+            "--" => break,
             "-c" | "--config" => {
                 index += 2;
                 args.get(index - 1).map(String::as_str)
@@ -4333,6 +4344,70 @@ mod tests {
         assert_eq!(
             opencode.tool_args,
             ["run", "--", "--model", "literal-prompt-text"]
+        );
+    }
+
+    #[test]
+    fn codex_gateway_overrides_precede_prompt_delimiter() {
+        for provider in ["openai", "team.proxy"] {
+            let routing = CodexHttpRouting {
+                upstream: "https://upstream.example/v1".into(),
+                provider: provider.into(),
+            };
+            let args = [
+                "exec",
+                "--config",
+                "openai_base_url=\"https://other.example\"",
+                "--image",
+                "synthetic.png",
+                "--",
+                "--config",
+                "literal prompt",
+            ]
+            .map(str::to_string);
+            let actual = routing.protected_args(&args, "http://127.0.0.1/gateway");
+            let boundary = actual.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(&actual[..5], &args[..5]);
+            assert_eq!(
+                &actual[5..boundary],
+                routing.gateway_args("http://127.0.0.1/gateway")
+            );
+            assert_eq!(&actual[boundary..], &args[5..]);
+        }
+    }
+
+    #[test]
+    fn codex_gateway_without_delimiter_keeps_last_override() {
+        let routing = CodexHttpRouting {
+            upstream: String::new(),
+            provider: "openai".into(),
+        };
+        let args = ["exec", "--config=openai_base_url=old", "prompt"].map(str::to_string);
+        let actual = routing.protected_args(&args, "http://127.0.0.1/gateway");
+        assert_eq!(
+            codex_cli_config_string(&actual, "openai_base_url").as_deref(),
+            Some("http://127.0.0.1/gateway")
+        );
+        assert_eq!(&actual[..args.len()], &args);
+    }
+
+    #[test]
+    fn codex_routing_ignores_flags_after_prompt_delimiter() {
+        let args = [
+            "--profile",
+            "real",
+            "--config=model_provider=real",
+            "exec",
+            "--",
+            "--profile",
+            "prompt",
+            "--config=model_provider=prompt",
+        ]
+        .map(str::to_string);
+        assert_eq!(codex_profile_arg(&args), Some("real"));
+        assert_eq!(
+            codex_cli_config_string(&args, "model_provider").as_deref(),
+            Some("real")
         );
     }
 
