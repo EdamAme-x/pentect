@@ -333,6 +333,19 @@ jobs:
           $sample = 'Contact alice@example.com or +1 415-555-2671. Card 4111 1111 1111 1111. IBAN DE89 3704 0044 0532 0130 00. NINO AB 12 34 56 C.'
           $masked = $sample | & '${{ matrix.binary }}' mask --kind text 2>$null
           if ($LASTEXITCODE -ne 0) { throw 'Pentect mask failed' }
+          if ($masked -notmatch 'alice@example.com' -or $masked -notmatch '415-555-2671') {
+            throw 'Optional PII must remain visible by default'
+          }
+          if ($masked -match '4111 1111 1111 1111') { throw 'Default card protection failed' }
+          $binary = (Resolve-Path '${{ matrix.binary }}').Path
+          $fixture = Join-Path $env:RUNNER_TEMP 'alcatraz-opt-in'
+          New-Item -ItemType Directory -Force (Join-Path $fixture '.pentect') | Out-Null
+          "[protection]`npii = true`ninternal = true" | Set-Content (Join-Path $fixture '.pentect/config.toml')
+          Push-Location $fixture
+          try {
+            $masked = $sample | & $binary mask --kind text 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'Opt-in Pentect mask failed' }
+          } finally { Pop-Location }
           if ($masked -match 'alice@example.com|415-555-2671|4111 1111 1111 1111') {
             throw "Alcatraz leaked test PII: $masked"
           }
