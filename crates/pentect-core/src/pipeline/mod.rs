@@ -2631,6 +2631,21 @@ mod tests {
     }
 
     #[test]
+    fn localized_app_password_heading_is_masked_and_reversible() {
+        let raw = "# アプリ用パスワード：\n\n# qvzr-nhdk-wpjt-bcxs\n\nサインインするアプリのパスワードフィールドに、このパスワードを入力してください。";
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Text,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(!result.masked.contains("qvzr-nhdk-wpjt-bcxs"));
+        assert!(result.masked.contains("# アプリ用パスワード：\n\n# <<"));
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
     fn env_values_under_unicode_keys_are_masked_and_reversible() {
         let raw = "パスワード=\"秘密の値123\"\n秘密鍵='鍵の値456'\nシークレット=値789\n";
         let result = Engine::with_profile(Profile::Strict).mask(

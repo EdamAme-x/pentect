@@ -1447,6 +1447,12 @@ fn optional_protection_keeps_credentials_and_explicit_masks_enabled() {
                     result.masked
                 );
             }
+            let app_password = engine.mask(
+                Input::text("# アプリ用パスワード：\n\n# qvzr-nhdk-wpjt-bcxs"),
+                &cfg,
+            );
+            assert!(!app_password.masked.contains("qvzr-nhdk-wpjt-bcxs"));
+            assert!(app_password.masked.contains("<<PASSWORD_"));
             for text in [
                 "password=alice@example.com",
                 "password=36d2c48b-94a7-47fb-9f31-9b5d0c243e71",
