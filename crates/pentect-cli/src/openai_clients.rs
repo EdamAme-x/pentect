@@ -863,6 +863,14 @@ fn opencode_config(
             }
         }
     }
+    if let Some(models) = provider_object
+        .get_mut("models")
+        .and_then(Value::as_object_mut)
+    {
+        for definition in models.values_mut() {
+            validate_opencode_model_capabilities(definition)?;
+        }
+    }
     providers.insert(provider.to_string(), provider_config);
     if let Some(model) = model {
         root_object.insert("model".to_string(), Value::String(model.to_string()));
@@ -918,6 +926,50 @@ fn is_provider_credential_key(key: &str) -> bool {
             | "secretaccesskey"
             | "sessiontoken"
     )
+}
+
+/// Check the destination schema without guessing capabilities for unknown models.
+fn validate_opencode_model_capabilities(definition: &mut Value) -> Result<(), String> {
+    let definition = definition
+        .as_object_mut()
+        .ok_or("OpenCode model definition must be an object")?;
+    if let Some(attachment) = definition.get("attachment") {
+        if !attachment.is_boolean() {
+            return Err("OpenCode model attachment must be a boolean".into());
+        }
+    }
+    let Some(modalities) = definition.get("modalities") else {
+        return Ok(());
+    };
+    let modalities = modalities
+        .as_object()
+        .ok_or("OpenCode model modalities must be an object")?;
+    for field in ["input", "output"] {
+        if let Some(values) = modalities.get(field) {
+            let values = values
+                .as_array()
+                .ok_or("OpenCode model modalities must be arrays")?;
+            if values.is_empty()
+                || values.iter().any(|value| {
+                    !matches!(
+                        value.as_str(),
+                        Some("text" | "image" | "audio" | "video" | "pdf")
+                    )
+                })
+            {
+                return Err("OpenCode model modalities contain an unsupported type".into());
+            }
+        }
+    }
+    // OpenCode requires attachment as well as modalities to enable image input.
+    // Preserve explicit false, and never infer image support from a model name.
+    if let Some(inputs) = modalities.get("input").and_then(Value::as_array) {
+        let attachment = inputs.iter().any(|value| value.as_str() != Some("text"));
+        definition
+            .entry("attachment")
+            .or_insert_with(|| json!(attachment));
+    }
+    Ok(())
 }
 
 struct PiProviderFile {
@@ -987,6 +1039,35 @@ function piInputs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_capabilities_preserve_unknown_and_explicit_disable() {
+        for (mut model, expected) in [
+            (json!({"name":"unknown"}), None),
+            (json!({"modalities":{"input":["text","image"]}}), Some(true)),
+            (json!({"modalities":{"input":["text"]}}), Some(false)),
+            (
+                json!({"attachment":false,"modalities":{"input":["image"]}}),
+                Some(false),
+            ),
+            (
+                json!({"modalities":{"input":["audio","pdf"],"output":["text"]}}),
+                Some(true),
+            ),
+        ] {
+            validate_opencode_model_capabilities(&mut model).unwrap();
+            assert_eq!(model.get("attachment").and_then(Value::as_bool), expected);
+        }
+        for mut model in [
+            json!({"modalities":{"input":["private"]}}),
+            json!({"modalities":{"input":"image"}}),
+            json!({"attachment":"true"}),
+            json!({"modalities":{"output":[null]}}),
+        ] {
+            let error = validate_opencode_model_capabilities(&mut model).unwrap_err();
+            assert!(!error.contains("private"));
+        }
+    }
 
     struct ScopedEnv {
         name: &'static str,

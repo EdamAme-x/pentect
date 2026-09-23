@@ -16,7 +16,7 @@ const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 const EXPLICIT_UNMASK_PREFIXES: [&str; 2] = ["unpentect(", "unmask("];
-static PENTECT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+static PENTECT_ENGINES: [OnceLock<Result<Engine, String>>; 4] = [const { OnceLock::new() }; 4];
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -625,7 +625,9 @@ impl OutputMasker {
     }
 
     fn track_mask_result(&mut self, surface: &'static str, result: &MaskResult) {
-        if result.summary.masked_count == 0 {
+        if result.summary.masked_count == 0
+            || !crate::metrics_replay::count_content(surface, result.masked.as_bytes())
+        {
             return;
         }
         let summary = self.activity.entry(surface).or_default();
@@ -694,6 +696,65 @@ impl OutputMasker {
                 .add_recovery(recovery)
                 .map_err(|e| e.to_string())?,
             OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(recovery),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preserve_json_scalar_type(
+        &mut self,
+        source: &serde_json::Value,
+        masked: &mut serde_json::Value,
+    ) -> Result<(), String> {
+        match (source, masked) {
+            (serde_json::Value::Array(source), serde_json::Value::Array(masked)) => {
+                for (source, masked) in source.iter().zip(masked.iter_mut()) {
+                    self.preserve_json_scalar_type(source, masked)?;
+                }
+            }
+            (serde_json::Value::Object(source), serde_json::Value::Object(masked)) => {
+                // Rebuilding can mask keys; use the existing traversal order.
+                // Match only unchanged keys rather than guessing changed ones.
+                for (key, source) in source {
+                    if let Some(masked) = masked.get_mut(key) {
+                        self.preserve_json_scalar_type(source, masked)?;
+                    }
+                }
+            }
+            (source, serde_json::Value::String(masked)) => {
+                let (label, raw) = match source {
+                    serde_json::Value::Number(_) => ("JSON_SCALAR_NUMBER", source.to_string()),
+                    serde_json::Value::Bool(_) => ("JSON_SCALAR_BOOL", source.to_string()),
+                    serde_json::Value::String(raw) => ("JSON_SCALAR_STRING", raw.clone()),
+                    _ => return Ok(()),
+                };
+                if raw == *masked || crate::contains_pentect_masked_handle(&raw) {
+                    return Ok(());
+                }
+                // Preserve composite text as text; only a whole masked scalar
+                // needs a typed identity. Numbers are always whole scalars.
+                if source.is_string()
+                    && !pentect_core::placeholder::parse_placeholder(masked).is_ok_and(|parts| {
+                        matches!(
+                            parts.label.as_str(),
+                            "JSON_SCALAR_NUMBER" | "JSON_SCALAR_BOOL"
+                        )
+                    })
+                {
+                    return Ok(());
+                }
+                let handle = render_placeholder(
+                    label,
+                    &identity_hash(&self.store.session.identity_key, &raw),
+                    None,
+                );
+                let recovery = Recovery::seal(
+                    HashMap::from([(handle.clone(), raw)]),
+                    &self.store.session.key,
+                );
+                self.record_recovery(recovery)?;
+                *masked = handle;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1012,6 +1073,97 @@ pub(crate) fn mask_read_input_with_profile_and_identity(
     mask_read_input_with_engine_and_identity(key, identity_key, &engine, input)
 }
 
+pub(crate) fn mask_ocr_read_with_identity(
+    key: [u8; 32],
+    identity_key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<MaskResult, String> {
+    let decode = config::decode_config(profile)?;
+    let engine = canonical_masking_engine(profile, packs, false, decode)?;
+    // Detect against a normalized view before plugins. OCR is not an exact
+    // source, so discard its recovery map before returning or registering it.
+    let spans = crate::image_ocr::ocr_text_spans(&input.data, &engine)?;
+    let cfg = Config {
+        disclose_length: false,
+        ..Config::new(key).with_identity_key(identity_key)
+    };
+    let mut result = engine.mask_spans(Input::text(input.data), spans, &cfg);
+    let rest = mask_read_input_with_engine_and_identity(
+        key,
+        identity_key,
+        &engine,
+        Input::text(result.masked.clone()),
+    )?;
+    merge_final_mask_result(&mut result, rest);
+    for handle in result.recovery.placeholders() {
+        result.masked = result.masked.replace(&handle, "[image value redacted]");
+    }
+    result.masked.push('\n');
+    result
+        .masked
+        .push_str(crate::image_ocr::TEXT_SOURCE_GUIDANCE);
+    result.recovery = Recovery::empty_for_key(&key);
+    result.segments = vec![pentect_core::RenderSegment::Literal {
+        text: result.masked.clone(),
+    }];
+    Ok(result)
+}
+
+#[cfg(test)]
+#[test]
+fn ocr_read_keeps_optional_email_and_does_not_publish_guessed_secret_bytes() {
+    let source =
+        "見出し\nEmail: alice\u{00a0}@ example . com\nOPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let result = mask_ocr_read_with_identity(
+        [1; 32],
+        [2; 32],
+        Input::text(source),
+        Profile::Strict,
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(
+        result.masked.contains("[image value redacted]"),
+        "{}",
+        result.masked
+    );
+    assert!(result.masked.contains("alice"));
+    assert!(!result.masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    assert!(result.recovery.placeholders().is_empty());
+    assert!(!result.masked.contains("<<"));
+    assert!(result.summary.masked_count >= 1);
+    let split = "alice @\nexample . com";
+    let result = mask_ocr_read_with_identity(
+        [1; 32],
+        [2; 32],
+        Input::text(split),
+        Profile::Strict,
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(!result.masked.contains("<<EMAIL_ADDRESS_"));
+}
+
+#[cfg(test)]
+#[test]
+fn ocr_read_masks_misrecognized_key_prefix_without_rewriting_value() {
+    let source = "OPENAI API KEY=?k-ABCDEFGHIJKLMNOPQRSTUVWX\nFmail: alice@example . com";
+    let result = mask_ocr_read_with_identity(
+        [1; 32],
+        [2; 32],
+        Input::text(source),
+        Profile::Strict,
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(!result.masked.contains("ABCDEFGHIJKLMNOPQRSTUVWX"));
+    assert!(result.masked.contains("alice"));
+    assert!(result.recovery.placeholders().is_empty());
+    assert!(result.masked.contains("Read the original text"));
+}
+
 pub(crate) fn mask_read_input_with_engine_and_identity(
     key: [u8; 32],
     identity_key: [u8; 32],
@@ -1166,7 +1318,9 @@ fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
 }
 
 pub(crate) fn pentect_engine() -> Result<&'static Engine, String> {
-    match PENTECT_ENGINE.get_or_init(build_pentect_engine) {
+    let protection = config::protection_config()?;
+    let index = usize::from(protection.pii) + 2 * usize::from(protection.internal);
+    match PENTECT_ENGINES[index].get_or_init(build_pentect_engine) {
         Ok(engine) => Ok(engine),
         Err(error) => Err(error.clone()),
     }
@@ -1191,6 +1345,22 @@ pub(crate) fn canonical_masking_engine(
     aggressive: bool,
     decode: DecodeConfig,
 ) -> Result<Engine, String> {
+    canonical_masking_engine_with_protection(
+        profile,
+        packs,
+        aggressive,
+        decode,
+        config::protection_config()?,
+    )
+}
+
+pub(crate) fn canonical_masking_engine_with_protection(
+    profile: Profile,
+    packs: Vec<Pack>,
+    aggressive: bool,
+    decode: DecodeConfig,
+    protection: config::ProtectionConfig,
+) -> Result<Engine, String> {
     let mut builder = Engine::builder()
         .standard_stack_with_decode(profile.knobs(), decode)
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
@@ -1206,9 +1376,95 @@ pub(crate) fn canonical_masking_engine(
         Box::new(ShapeGuard::builtin())
     };
     Ok(builder
-        .policy(Box::new(ProfilePolicy::new(profile)))
+        .policy(Box::new(OptionalProtectionPolicy {
+            profile: ProfilePolicy::new(profile),
+            protection,
+        }))
         .guard(guard)
         .build())
+}
+
+struct OptionalProtectionPolicy {
+    profile: ProfilePolicy,
+    protection: config::ProtectionConfig,
+}
+
+#[cfg(test)]
+#[test]
+fn optional_protection_keeps_credentials_and_explicit_masks_enabled() {
+    for pii in [false, true] {
+        for internal in [false, true] {
+            let engine = canonical_masking_engine_with_protection(
+                Profile::Strict,
+                Vec::new(),
+                false,
+                DecodeConfig::default(),
+                config::ProtectionConfig { pii, internal },
+            )
+            .unwrap();
+            let cfg = Config::new([83; 32]);
+            let email = engine.mask(Input::text("Contact alice@example.com"), &cfg);
+            assert_eq!(
+                email.masked.contains("alice@example.com"),
+                !pii,
+                "{}",
+                email.masked
+            );
+            let host = engine.mask(Input::text("https://jira.corp/tasks"), &cfg);
+            assert_eq!(
+                host.masked.contains("jira.corp"),
+                !internal,
+                "{}",
+                host.masked
+            );
+            for (source, value) in [
+                ("http://10.20.30.40/api", "10.20.30.40"),
+                (
+                    "request_id=36d2c48b-94a7-47fb-9f31-9b5d0c243e71",
+                    "36d2c48b-94a7-47fb-9f31-9b5d0c243e71",
+                ),
+            ] {
+                let result = engine.mask(Input::text(source), &cfg);
+                assert_eq!(
+                    result.masked.contains(value),
+                    !internal,
+                    "{}",
+                    result.masked
+                );
+            }
+            for text in [
+                "password=alice@example.com",
+                "password=36d2c48b-94a7-47fb-9f31-9b5d0c243e71",
+                "mask(alice@example.com)",
+                "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+                "card: 4111111111111111",
+            ] {
+                let result = engine.mask(Input::text(text), &cfg);
+                assert!(result.summary.masked_count > 0, "not protected: {text}");
+            }
+        }
+    }
+}
+
+impl pentect_core::policy::Policy for OptionalProtectionPolicy {
+    fn classify(&self, span: &pentect_core::Span) -> pentect_core::policy::Action {
+        use pentect_core::{policy::Action, DetectorId};
+        // Explicitly protected values and credentials stay protected regardless
+        // of their shape (an email can itself be a password).
+        if span.source != DetectorId::Explicit {
+            if !self.protection.pii && span.category == Category::Pii && span.label != "CREDIT_CARD"
+            {
+                return Action::Keep;
+            }
+            if !self.protection.internal
+                && (matches!(span.category, Category::Endpoint | Category::Identifier)
+                    || span.label == "UUID")
+            {
+                return Action::Keep;
+            }
+        }
+        self.profile.classify(span)
+    }
 }
 
 fn plugin_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {

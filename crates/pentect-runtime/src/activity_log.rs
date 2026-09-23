@@ -43,6 +43,8 @@ pub(crate) struct ActivityEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    shape: Option<ToolShape>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     method: Option<String>,
@@ -74,6 +76,81 @@ pub(crate) struct ActivityEvent {
 struct LabelCount {
     name: String,
     count: u64,
+}
+
+/// Only schema keys and JSON types, never input values or caller-defined keys.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
+struct ToolShape {
+    field: String,
+    value_type: String,
+    position: Option<u64>,
+    known_fields: Vec<(String, String)>,
+    has_unknown_keys: bool,
+}
+
+fn json_type(value: Option<&serde_json::Value>) -> &'static str {
+    use serde_json::Value;
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn tool_shape(field: &str, value: Option<&serde_json::Value>, position: Option<u64>) -> ToolShape {
+    const KEYS: &[&str] = &[
+        "id",
+        "index",
+        "type",
+        "name",
+        "function",
+        "arguments",
+        "input",
+        "partial_json",
+        "tool_calls",
+    ];
+    let object = value.and_then(serde_json::Value::as_object);
+    ToolShape {
+        field: allowed_diagnostic_identifier(field, KEYS),
+        value_type: json_type(value).to_string(),
+        position,
+        known_fields: KEYS
+            .iter()
+            .filter_map(|key| {
+                object
+                    .and_then(|object| object.get(*key))
+                    .map(|value| ((*key).to_string(), json_type(Some(value)).to_string()))
+            })
+            .collect(),
+        has_unknown_keys: object
+            .is_some_and(|object| object.keys().any(|key| !KEYS.contains(&key.as_str()))),
+    }
+}
+
+pub(crate) fn record_tool_shape(
+    surface: &str,
+    endpoint: &str,
+    field: &str,
+    value: Option<&serde_json::Value>,
+    position: Option<u64>,
+    version: &str,
+) {
+    let mut event = ActivityEvent::diagnostic(
+        surface,
+        "tool-input-rejected",
+        Some("protocol"),
+        Some(endpoint),
+        Some("POST"),
+        None,
+        Some(false),
+        Some(version),
+    );
+    event.shape = Some(tool_shape(field, value, position));
+    record(event);
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -130,6 +207,7 @@ struct DiagnosticKey {
     surface: String,
     event: Option<String>,
     kind: Option<String>,
+    shape: Option<ToolShape>,
     endpoint: Option<String>,
     method: Option<String>,
     status: Option<u16>,
@@ -195,6 +273,7 @@ impl ActivityEvent {
             target,
             event: None,
             kind: None,
+            shape: None,
             endpoint: None,
             method: None,
             status: None,
@@ -228,6 +307,7 @@ impl ActivityEvent {
             target: None,
             event: Some(safe_identifier(event)),
             kind: None,
+            shape: None,
             endpoint: None,
             method: None,
             status: None,
@@ -264,6 +344,7 @@ impl ActivityEvent {
             target: None,
             event: Some(diagnostic_event(event)),
             kind: kind.map(diagnostic_kind),
+            shape: None,
             endpoint: endpoint.map(diagnostic_endpoint),
             method: method.map(diagnostic_method),
             status,
@@ -750,7 +831,9 @@ fn safe_metric_labels(values: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
 }
 
 pub(crate) fn record_mask_result(surface: &str, result: &MaskResult, target: Option<&Path>) {
-    if result.summary.masked_count == 0 {
+    if result.summary.masked_count == 0
+        || !crate::metrics_replay::count_content(surface, result.masked.as_bytes())
+    {
         return;
     }
     let mut labels = BTreeMap::new();
@@ -1182,6 +1265,7 @@ impl DiagnosticBatch {
             surface: event.surface.clone(),
             event: event.event.clone(),
             kind: event.kind.clone(),
+            shape: event.shape.clone(),
             endpoint: event.endpoint.clone(),
             method: event.method.clone(),
             status: event.status,
@@ -1479,6 +1563,12 @@ fn format_event(event: &ActivityEvent) -> String {
         if let Some(kind) = &event.kind {
             details.push(format!("kind={kind}"));
         }
+        if let Some(shape) = &event.shape {
+            details.push(format!("field={} type={}", shape.field, shape.value_type));
+            if let Some(position) = shape.position {
+                details.push(format!("position={position}"));
+            }
+        }
         if let Some(endpoint) = &event.endpoint {
             details.push(format!("endpoint={endpoint}"));
         }
@@ -1589,6 +1679,7 @@ fn diagnostic_surface(value: &str) -> String {
 }
 
 const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
+    ("metrics-replay-limit", "Replay accounting capacity reached; new mask/image counts are omitted, protection continues"),
     (
         "cmd-binding-skipped",
         "Shell command binding could not be inspected",
@@ -1644,6 +1735,10 @@ const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
         "A protected request could not be encoded",
     ),
     ("request-failed", "A protected provider request failed"),
+    (
+        "stream-failed",
+        "A provider stream failed after response headers",
+    ),
     ("request-invalid-json", "Request content was not valid JSON"),
     (
         "request-protection-skipped",
@@ -1663,6 +1758,10 @@ const WARNING_REASON_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     ("scan-complete", "Image inspection completed"),
     ("scan-failed", "Image inspection failed"),
+    (
+        "latin-recognizer-unavailable",
+        "Windows Latin OCR unavailable; using bundled recognition",
+    ),
     (
         "scan-failure-allowed",
         "Policy allowed image content after OCR inspection failed",
@@ -1786,6 +1885,7 @@ fn diagnostic_kind(value: &str) -> String {
             "capacity",
             "client-connection",
             "conflict",
+            "context-limit",
             "connect",
             "credential-forwarding",
             "delta-shape-invalid",
@@ -1819,6 +1919,7 @@ fn diagnostic_kind(value: &str) -> String {
             "protection",
             "protocol",
             "rate-limit",
+            "quota",
             "recognition",
             "redirect",
             "resolution",
@@ -2033,6 +2134,46 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_shape_diagnostics_never_copy_values_or_unknown_keys() {
+        let value = serde_json::json!({"arguments":"private-value","private-key":"private-value","name":{},"function":[]});
+        let shape = tool_shape("arguments", Some(&value), Some(2));
+        let encoded = serde_json::to_string(&shape).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(shape.has_unknown_keys);
+        assert_eq!(shape.value_type, "object");
+        assert!(shape
+            .known_fields
+            .contains(&("arguments".into(), "string".into())));
+        assert_eq!(tool_shape("private-field", None, None).field, "unknown");
+        assert_eq!(tool_shape("input", None, None).value_type, "missing");
+        assert_eq!(
+            tool_shape("input", Some(&serde_json::Value::Null), None).value_type,
+            "null"
+        );
+    }
+
+    #[test]
+    fn diagnostic_batch_does_not_merge_different_schema_failures() {
+        let mut batch = DiagnosticBatch::default();
+        for field in ["input", "arguments"] {
+            let mut event = ActivityEvent::diagnostic(
+                "openai",
+                "tool-input-rejected",
+                Some("protocol"),
+                Some("responses"),
+                Some("POST"),
+                None,
+                Some(false),
+                None,
+            );
+            event.shape = Some(tool_shape(field, None, None));
+            assert!(format_event(&event).contains(&format!("field={field} type=missing")));
+            batch.push(event, Instant::now());
+        }
+        assert_eq!(batch.pending.len(), 2);
+    }
 
     #[test]
     fn privacy_metrics_count_occurrences_without_retaining_sensitive_fields() {

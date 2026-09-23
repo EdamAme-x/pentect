@@ -16,6 +16,27 @@ impl RecoveringTestMutex {
 static TEST_ENV_LOCK: RecoveringTestMutex = RecoveringTestMutex(std::sync::Mutex::new(()));
 
 #[test]
+fn new_tool_transaction_imports_image_recovery_from_shared_store() {
+    let _guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_store, _, _) = ActiveMemoryStoreEnv::start("image-recovery-refresh");
+    let masker = ActiveToolOutputMasker::new_with_plugins(PluginMiddleware::default()).unwrap();
+    let old = masker.tool_input_transaction().unwrap();
+    let session = Session::open_capability("default").unwrap();
+    let handle = "<<API_KEY_0123456789abcdef>>";
+    let recovery = pentect_core::Recovery::seal(
+        std::collections::HashMap::from([(handle.to_owned(), "synthetic-image-token".to_owned())]),
+        &session.key,
+    );
+    session.sync_recovery(&recovery).unwrap();
+    assert!(old.resolve(handle, ToolInputKind::Data).is_err());
+    let fresh = masker.tool_input_transaction().unwrap();
+    assert_eq!(
+        fresh.resolve(handle, ToolInputKind::Data).unwrap(),
+        "synthetic-image-token"
+    );
+}
+
+#[test]
 fn canonical_engine_construction_stays_off_the_warm_up_path() {
     let started = std::time::Instant::now();
     let _engine = build_masking_engine(
@@ -1262,8 +1283,8 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
         (
             "dotenv-and-text",
             MIXED_PROMPT,
-            2,
-            [("KEYED_SECRET", 1), ("EMAIL_ADDRESS", 1)],
+            1,
+            [("KEYED_SECRET", 1), ("EMAIL_ADDRESS", 0)],
         ),
     ] {
         let session = Session::open_capability_at(&root, session_name).unwrap();
@@ -1272,7 +1293,10 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
         let masked = masker.mask_prompt_text_without_plugins(prompt).unwrap();
         assert_ne!(masked, prompt);
         assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
-        assert!(!masked.contains("alice@example.com"));
+        assert_eq!(
+            masked.contains("alice@example.com"),
+            prompt.contains("alice@example.com")
+        );
         assert_eq!(
             MemoryStore::for_session(&session)
                 .resolve_all(&masked)
@@ -1337,11 +1361,10 @@ fn prompt_dotenv_activity_counts_each_finding_once() {
     assert_eq!(events.len(), 1, "{payload}");
     assert_eq!(events[0]["action"], "mask");
     assert_eq!(events[0]["surface"], "prompt");
-    assert_eq!(events[0]["count"], 2);
+    assert_eq!(events[0]["count"], 1);
     assert_eq!(
         events[0]["labels"],
         json!([
-            { "name": "EMAIL_ADDRESS", "count": 1 },
             { "name": "KEYED_SECRET", "count": 1 }
         ])
     );
@@ -2180,11 +2203,33 @@ fn active_image_byte_redaction_returns_opaque_annotation_without_plaintext() {
         protected.note
     );
     assert!(
-        protected.note.contains("<<KEYED_SECRET_"),
+        protected.note.contains("Read the original text"),
         "{}",
         protected.note
     );
     assert!(!protected.note.contains(raw), "{}", protected.note);
+    assert!(!protected.note.contains("<<"), "{}", protected.note);
+    let client = MemoryStoreClient::from_env().unwrap();
+    assert!(client
+        .snapshot()
+        .unwrap()
+        .recovery
+        .placeholders()
+        .is_empty());
+    // Reading the authoritative text after the screenshot must produce an
+    // exact, usable handle, not reuse an OCR transcription.
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let masked = masker.mask_tool_output(raw).unwrap().unwrap();
+    assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    let handle = masked.split_once('=').unwrap().1.trim();
+    assert_eq!(
+        masker
+            .tool_input_transaction()
+            .unwrap()
+            .resolve(handle, ToolInputKind::Data)
+            .unwrap(),
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+    );
 }
 
 #[test]
@@ -3955,7 +4000,8 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
         "{rendered}"
     );
     assert!(rendered.contains("Masked regions:"), "{rendered}");
-    assert!(rendered.contains("[1] <<KEYED_SECRET_"), "{rendered}");
+    assert!(rendered.contains("Read the original text"), "{rendered}");
+    assert!(!rendered.contains("<<"), "{rendered}");
     assert!(
         rendered.contains("\"mimeType\":\"image/png\""),
         "{rendered}"

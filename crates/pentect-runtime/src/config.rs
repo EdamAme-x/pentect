@@ -67,6 +67,8 @@ pub(crate) fn validate_config_file(path: &Path) -> Result<(), String> {
 }
 
 fn validate_config_value(value: &toml::Value) -> Result<(), String> {
+    protection_value(value, "pii")?;
+    protection_value(value, "internal")?;
     handle_scope_value(value)?;
     agent_require_pentect_value(value)?;
     image_ocr_config_value(value)?;
@@ -88,6 +90,94 @@ fn validate_config_value(value: &toml::Value) -> Result<(), String> {
     output_restore_value(value)?;
     unknown_format_policy_value(value)?;
     reject_removed_environment_value(value)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProtectionConfig {
+    pub(crate) pii: bool,
+    pub(crate) internal: bool,
+}
+
+pub(crate) fn protection_config() -> Result<ProtectionConfig, String> {
+    let project = parse_config_file(&project_config_path()?)?;
+    let global = parse_config_file(&global_config_path()?)?;
+    merge_protection_config(project.as_ref(), global.as_ref())
+}
+
+fn merge_protection_config(
+    project: Option<&toml::Value>,
+    global: Option<&toml::Value>,
+) -> Result<ProtectionConfig, String> {
+    let field = |name| -> Result<bool, String> {
+        let project = project
+            .as_ref()
+            .map(|v| protection_value(v, name))
+            .transpose()?
+            .flatten();
+        let global = global
+            .as_ref()
+            .map(|v| protection_value(v, name))
+            .transpose()?
+            .flatten();
+        // A repository cannot disable protection the user explicitly enabled.
+        Ok(project.unwrap_or(false) || global.unwrap_or(false))
+    };
+    Ok(ProtectionConfig {
+        pii: field("pii")?,
+        internal: field("internal")?,
+    })
+}
+
+fn protection_value(value: &toml::Value, field: &str) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("protection") else {
+        return Ok(None);
+    };
+    let table = raw.as_table().ok_or("protection config must be a table")?;
+    if table
+        .keys()
+        .any(|key| !matches!(key.as_str(), "pii" | "internal"))
+    {
+        return Err("protection supports only pii and internal".to_string());
+    }
+    table
+        .get(field)
+        .map(|raw| config_bool(raw, &format!("protection.{field}")))
+        .transpose()
+}
+
+#[test]
+fn optional_protection_defaults_off_and_user_opt_in_cannot_be_lowered() {
+    let defaults = merge_protection_config(None, None).unwrap();
+    assert_eq!(
+        defaults,
+        ProtectionConfig {
+            pii: false,
+            internal: false
+        }
+    );
+    let on: toml::Value = "[protection]\npii=true\ninternal=true".parse().unwrap();
+    let off: toml::Value = "[protection]\npii=false\ninternal=false".parse().unwrap();
+    assert_eq!(
+        merge_protection_config(Some(&off), Some(&on)).unwrap(),
+        ProtectionConfig {
+            pii: true,
+            internal: true
+        }
+    );
+    assert_eq!(
+        merge_protection_config(Some(&on), None).unwrap(),
+        ProtectionConfig {
+            pii: true,
+            internal: true
+        }
+    );
+    for text in [
+        "protection=true",
+        "[protection]\npii=5",
+        "[protection]\npil=true",
+    ] {
+        assert!(merge_protection_config(Some(&text.parse().unwrap()), None).is_err());
+    }
 }
 
 fn handle_scope_value(value: &toml::Value) -> Result<Option<HandleScope>, String> {

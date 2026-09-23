@@ -34,6 +34,8 @@ ignored.
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `handles.scope` | `device` | Choose how stable handle IDs are |
+| `protection.pii` | `false` | Opt in to personal-data masking, such as email and phone numbers |
+| `protection.internal` | `false` | Opt in to endpoint and identifier masking, such as internal hosts, IP addresses and UUIDs |
 | `compatibility.unknown_formats` | `error` | Block request formats Pentect cannot inspect |
 | `image.ocr` | `on` | Check supported images locally |
 | `image.redaction` | `black` | Cover detected image regions |
@@ -44,6 +46,23 @@ ignored.
 | `agent.required` | `false` | Require supported agents to start through Pentect |
 | `output.restore` | `true` | Restore known handles in assistant text shown by supported clients |
 | `update.check` | `true` | Check in the background for a newer Pentect release |
+
+## Optional personal and internal information
+
+```toml
+[protection]
+pii = false
+internal = false
+```
+
+Both groups are off by default. Enable either group in the user or project
+configuration when that information must stay local. An explicit `true` in
+either file enables the group; a project cannot disable a user's opt-in.
+These switches apply to the shared text and image detection policy. They do not
+disable credential protection (API keys, tokens, passwords, OTPs, private keys,
+or URL credentials), credit-card detection, or explicit `mask(...)` markers.
+A value used as a password remains protected even if it looks like an email or
+UUID. Restart the protected client after changing these settings.
 
 ## Update notification
 
@@ -171,6 +190,17 @@ enabled = true
 `true`. Metrics are calculated on demand from retained diagnostic logs and are
 never sent externally. Setting it to `false` disables the summary; diagnostic
 logging and rotation continue independently so crashes remain diagnosable.
+Within a running protected session, repeated provider-history content is excluded
+from text-mask and image-redaction totals. Identical content is tracked by an
+in-memory keyed fingerprint and its occurrence count: an additional copy in the
+same history can count, but replaying existing copies does not. Inspection and
+redaction still run on every request. Fingerprints are never written to logs.
+The in-memory ledger holds at most 65,536 distinct content fingerprints. If it
+fills, `metrics-replay-limit` reports that new counts are omitted rather than
+evicting history and counting it again; protection is unaffected.
+Separate launches start a new accounting session; old retained logs cannot be
+retroactively deduplicated. Warning and failure totals still describe actual
+inspection/request attempts, including retries.
 The summary includes masked occurrence counts, completed local restoration
 operation counts, blocked restoration attempts, blocked operations, plugin
 failures and timeouts, and warnings grouped by a bounded reason code. Restoration

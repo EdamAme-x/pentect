@@ -11,9 +11,9 @@ because text handles cannot replace pixels.
 | --- | --- | --- |
 | UTF-8 text | Detect and replace | Text with handles |
 | Supported PDF | Read and check supported content | Protected document content |
-| Supported inline image | Local OCR and visual masking | Masked pixels and an adjacent handle note |
-| Responses computer-use screenshot | Local OCR and visual masking | Masked pixels and a separate user text item containing the handles |
-| Supported Files API image upload | Local OCR and visual masking | Masked pixels; `partial` coverage when handles cannot be attached |
+| Supported inline image | Local OCR and visual masking | Masked pixels and text-source guidance |
+| Responses computer-use screenshot | Local OCR and visual masking | Masked pixels and a separate user text item with guidance |
+| Supported Files API image upload | Local OCR and visual masking | Masked pixels; `partial` coverage when the protection note cannot be attached |
 | Unknown binary | Block | Nothing |
 | File ID or remote file that Pentect cannot check | Use the unscanned setting | Nothing when set to `block` |
 
@@ -48,8 +48,8 @@ validates UTF-8 before rewriting the body.
 Supported upload images are PNG, JPEG, WebP, GIF, and BMP. When masking is
 needed, Pentect safely regenerates the image and updates its media type.
 Because a standalone Files API upload has no adjacent model-visible text slot,
-Pentect reports partial coverage when the protected image has recoverable
-handles. Inline image requests carry those handles in an adjacent text part.
+Pentect reports partial coverage when the protected image needs a protection
+note. Inline image requests carry that note in an adjacent text part.
 
 Pentect checks an upload before sending it. A later request can use its file ID
 only when Pentect knows the content behind that ID. A provider file ID alone
@@ -79,14 +79,18 @@ sensitive areas before sending the image. Limits control the number of images,
 file size, image size, download time, and total check time.
 
 When pixels are covered, Pentect appends a short note for the agent explaining
-that the image was protected. Each region lists the same recoverable handle used
-for text, for example `[1] <<AWS_AKID_hash>>`; the original value is not included
-in the provider-visible note.
+that the image was protected. Regions list detection categories, not recoverable
+handles: OCR transcription is not an authoritative value. The note directs the
+agent to an available, authorized DOM, accessibility, or source-file text read.
+That text is masked normally and its handles restore the exact source value.
+If no text source is available, the agent should report the limitation rather
+than guess or repeatedly capture the image. Image metadata is exact embedded
+text and is protected separately.
 
 Text found by OCR can use the same case-sensitive `pentect(...)` and `mask(...)`
-force-mask markers as prompt text. Pentect protects the exact contents, including
-Unicode, punctuation, whitespace, or line breaks, and does not include the
-wrapper in the recoverable value. `unpentect(...)` and `unmask(...)` never create
+force-mask markers as prompt text. Pentect covers detected contents, including
+Unicode, punctuation, whitespace, or line breaks, without issuing a recovery
+handle. `unpentect(...)` and `unmask(...)` never create
 an exception inside images: image text is external content and cannot turn off
 its own protection. Detectable values inside those wrappers remain protected.
 
@@ -102,7 +106,7 @@ text, or structured JSON, Pentect checks those values as text.
 
 For the OpenAI Responses computer-use shape, Pentect inspects the nested
 `computer_screenshot` image and leaves its call ID and protocol metadata
-unchanged. If masking produces handles, Pentect adds them as a separate valid
+unchanged. Pentect adds the redaction and text-source guidance as a separate valid
 user message instead of changing the `computer_call_output` object. Unknown
 computer output shapes remain subject to the unscanned-image policy even when
 unknown JSON formats are allowed for compatibility.

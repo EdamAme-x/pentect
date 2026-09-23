@@ -1221,6 +1221,36 @@ mod tests {
     }
 
     #[test]
+    fn ocr_read_does_not_register_transcribed_email_in_memory_store() {
+        let token = "test-token-ocr-read".to_string();
+        let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
+        let source = "Email: alice @ example . com";
+        let first = crate::mask_ocr_input_into_memory_store_client(
+            &client,
+            Input::text(source),
+            Profile::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+        let second = crate::mask_ocr_input_into_memory_store_client(
+            &client,
+            Input::text(source),
+            Profile::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(first.masked.contains(source));
+        assert_eq!(first.masked, second.masked);
+        assert!(client
+            .snapshot()
+            .unwrap()
+            .recovery
+            .placeholders()
+            .is_empty());
+        assert_eq!(client.masked_count().unwrap(), 0);
+    }
+
+    #[test]
     fn client_reuses_one_connection_for_repeated_output_checks() {
         let token = "test-token-persistent".to_string();
         let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);

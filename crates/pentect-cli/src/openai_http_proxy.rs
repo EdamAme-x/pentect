@@ -355,11 +355,7 @@ async fn proxy_request(
         Ok(response) => Ok(response),
         Err(error) => {
             let local_rejection = crate::gateway_diagnostics::is_local_rejection(&error);
-            let response_status = if local_rejection {
-                StatusCode::UNPROCESSABLE_ENTITY
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
+            let response_status = crate::gateway_diagnostics::failure_status(&error);
             crate::gateway_diagnostics::record_request_failure(
                 "openai",
                 context,
@@ -369,7 +365,7 @@ async fn proxy_request(
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
-                text_response(StatusCode::BAD_GATEWAY, "Pentect gateway request failed")
+                text_response(response_status, "Pentect gateway request failed")
             })
         }
     }
@@ -979,7 +975,9 @@ fn run_openai_tool_plugins(
                 Some("custom" | "custom_tool_call") => chat_tool_payload_exists(object, "custom"),
                 _ => false,
             };
-            let is_call = responses_call || chat_call;
+            let is_call = responses_call
+                || chat_call
+                || object.get("type").and_then(Value::as_str) == Some("computer_call");
             if is_call {
                 run_openai_tool_plugin(object, plugins)?;
             }
@@ -1110,6 +1108,7 @@ fn protect_openai_request_body(
     dialect: OpenAiRequestDialect,
     block_unknown_formats: bool,
 ) -> Result<ProtectedJsonBody, String> {
+    let _metrics_scope = pentect_agent::MetricsRequestScope::new();
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
@@ -2314,6 +2313,16 @@ fn mask_openai_input(
                 .unwrap_or_default()
                 .to_string();
             match item_type.as_str() {
+                "computer_call" => {
+                    // Locally restored UI input is included in later history,
+                    // just like function arguments. Never resend it verbatim.
+                    for key in ["action", "actions", "pending_safety_checks"] {
+                        if let Some(payload) = object.get_mut(key) {
+                            let mut nodes = 0;
+                            mask_search_value(payload, true, 0, &mut nodes, masker)?;
+                        }
+                    }
+                }
                 "function_call" | "custom_tool_call" => {
                     // Previous assistant tool calls are sent back to the model as
                     // conversation history. Their locally restored arguments can
@@ -2678,6 +2687,62 @@ where
     Ok(())
 }
 
+fn validate_chat_tool_calls(value: &Value, streaming: bool) -> Result<(), String> {
+    let reject = |field: &str, value: Option<&Value>, position| {
+        pentect_agent::record_tool_shape_activity(
+            "openai",
+            "chat-completions",
+            field,
+            value,
+            position,
+            env!("CARGO_PKG_VERSION"),
+        );
+        "OpenAI tool call has an unsupported shape".to_string()
+    };
+    let Some(calls) = value.as_array() else {
+        return Err(reject("tool_calls", Some(value), None));
+    };
+    for (position, call) in calls.iter().enumerate() {
+        let position = Some(position as u64);
+        if !call.is_object() {
+            return Err(reject("tool_calls", Some(call), position));
+        }
+        if streaming
+            && !call
+                .get("index")
+                .is_some_and(|value| value.as_u64().is_some())
+        {
+            return Err(reject("index", call.get("index"), position));
+        }
+        let function = call.get("function");
+        if !(function.is_some_and(Value::is_object)
+            || streaming && function.is_none_or(Value::is_null))
+        {
+            return Err(reject("function", function, position));
+        }
+        for (field, value) in [
+            ("id", call.get("id")),
+            ("name", function.and_then(|f| f.get("name"))),
+            ("arguments", function.and_then(|f| f.get("arguments"))),
+        ] {
+            // Null continuation padding is absent, not a malformed string delta.
+            if streaming && value.is_none_or(Value::is_null) {
+                continue;
+            }
+            if !value.is_some_and(Value::is_string)
+                || (!streaming
+                    && field != "arguments"
+                    && value
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| v.trim().is_empty()))
+            {
+                return Err(reject(field, value, position));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<u64, String>
 where
     R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
@@ -2690,6 +2755,9 @@ where
         let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
             continue;
         };
+        if let Some(calls) = message.get("tool_calls").filter(|v| !v.is_null()) {
+            validate_chat_tool_calls(calls, false)?;
+        }
         let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -2733,6 +2801,34 @@ where
             }
         }
         Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("computer_call") {
+                let field = computer_action_field(object).ok_or_else(|| {
+                    pentect_agent::record_tool_shape_activity(
+                        "openai",
+                        "responses",
+                        "computer_actions",
+                        None,
+                        None,
+                        env!("CARGO_PKG_VERSION"),
+                    );
+                    "OpenAI completed computer call has an unsupported action payload".to_string()
+                })?;
+                let input = object[field].to_string();
+                // UI typing can target a terminal or an editor. Keep the same
+                // conservative code checks as generic tools, not PassiveData.
+                let (resolved, changed) =
+                    crate::claude_http_proxy::resolve_tool_input_json_with_change_typed(
+                        &input,
+                        Some("computer"),
+                        resolve,
+                    )?;
+                let resolved: Value = serde_json::from_str(&resolved)
+                    .map_err(|_| "restored computer actions are not valid JSON".to_string())?;
+                object.insert(field.to_owned(), resolved);
+                if changed {
+                    restored_tools.push(function_call_identities(object));
+                }
+            }
             let is_function_call = object
                 .get("type")
                 .and_then(Value::as_str)
@@ -2791,6 +2887,15 @@ where
                 if required_payload
                     .is_some_and(|key| !object.get(key).is_some_and(Value::is_string))
                 {
+                    let key = required_payload.unwrap();
+                    pentect_agent::record_tool_shape_activity(
+                        "openai",
+                        "responses",
+                        key,
+                        object.get(key),
+                        None,
+                        env!("CARGO_PKG_VERSION"),
+                    );
                     return Err(
                         "OpenAI completed tool call is missing its input payload".to_string()
                     );
@@ -2803,7 +2908,19 @@ where
                                 .map(classify_openai_custom_tool_input)
                                 .unwrap_or(pentect_agent::ToolInputKind::Unknown);
                             if kind == pentect_agent::ToolInputKind::Unknown {
-                                (arguments.clone(), false)
+                                if pentect_agent::contains_pentect_masked_handle(arguments) {
+                                    let resolved =
+                                        resolve(arguments, pentect_agent::ToolInputKind::Code)?;
+                                    if resolved == *arguments
+                                        || pentect_agent::contains_pentect_masked_handle(&resolved)
+                                    {
+                                        return Err(pentect_agent::ToolInputError::UnknownHandle
+                                            .to_string());
+                                    }
+                                    (resolved, true)
+                                } else {
+                                    (arguments.clone(), false)
+                                }
                             } else {
                                 let resolved = resolve(arguments, kind)?;
                                 let changed = resolved != *arguments;
@@ -2846,6 +2963,25 @@ fn classify_openai_custom_tool_input(tool_name: &str) -> pentect_agent::ToolInpu
         }
         "apply_patch" => pentect_agent::ToolInputKind::Patch,
         _ => pentect_agent::ToolInputKind::Unknown,
+    }
+}
+
+fn computer_action_field(object: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    let valid_action = |action: &Value| {
+        action.as_object().is_some_and(|action| {
+            action.get("type").is_some_and(Value::is_string)
+                && (action.get("type").and_then(Value::as_str) != Some("type")
+                    || action.get("text").is_some_and(Value::is_string))
+        })
+    };
+    match (object.get("action"), object.get("actions")) {
+        (Some(action), None) if valid_action(action) => Some("action"),
+        (None, Some(Value::Array(actions)))
+            if !actions.is_empty() && actions.iter().all(valid_action) =>
+        {
+            Some("actions")
+        }
+        _ => None,
     }
 }
 
@@ -2987,7 +3123,48 @@ enum StreamTransform {
 }
 
 fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), String> {
+    if state.finished {
+        return Ok(());
+    }
     let block = run_sse_response_plugins(&block, &state.plugins, state.block_unknown_formats)?;
+    let event = std::str::from_utf8(&block)
+        .ok()
+        .and_then(sse_data)
+        .and_then(|data| serde_json::from_str::<Value>(&data).ok());
+    if let Some(event) = event.as_ref().filter(|event| {
+        matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("error" | "response.failed" | "response.incomplete")
+        ) || event.get("error").is_some_and(|error| !error.is_null())
+    }) {
+        let (kind, retryable) =
+            if event.get("type").and_then(Value::as_str) == Some("response.incomplete") {
+                ("stream-incomplete", false)
+            } else {
+                crate::gateway_diagnostics::upstream_error_kind(event)
+            };
+        crate::gateway_diagnostics::record_stream_failure(
+            "openai",
+            stream_endpoint(state.transform),
+            kind,
+            retryable,
+        );
+        state.responses_tool_pending.clear();
+        state.responses_tool_pending_bytes = 0;
+        state.chat.calls.clear();
+        state.chat.buffered_bytes = 0;
+        state.finished = true;
+        // A bare error is not a Responses terminal. Emit a protocol-native failure
+        // without copying provider messages (which may contain credentials).
+        if state.transform == StreamTransform::Responses {
+            state
+                .ready
+                .push_back(Ok(Frame::data(responses_failure_frame(kind, retryable))));
+        } else {
+            state.ready.push_back(Ok(Frame::data(Bytes::from(block))));
+        }
+        return Ok(());
+    }
     let responses_tool_event =
         state.transform == StreamTransform::Responses && sse_block_contains_tool_call(&block);
     let responses_completed =
@@ -3074,7 +3251,61 @@ fn process_stream_block(state: &mut StreamState, block: Vec<u8>) -> Result<(), S
         }
         state.responses_tool_pending_bytes = 0;
     }
+    if responses_completed || chat_completed {
+        state.finished = true;
+    }
     Ok(())
+}
+
+fn stream_endpoint(transform: StreamTransform) -> &'static str {
+    match transform {
+        StreamTransform::Responses => "responses",
+        StreamTransform::ChatCompletions => "chat-completions",
+        StreamTransform::Completions => "completions",
+        StreamTransform::None => "gateway",
+    }
+}
+
+fn responses_failure_frame(kind: &str, retryable: bool) -> Bytes {
+    let code = match kind {
+        "policy" => "invalid_prompt",
+        "quota" => "insufficient_quota",
+        "context-limit" => "context_length_exceeded",
+        _ if retryable => "upstream_server_error",
+        _ => "invalid_prompt",
+    };
+    let value = serde_json::json!({"type":"response.failed", "response":{"status":"failed", "output":[], "error":{"type":"upstream_error", "code":code, "message":"Pentect could not complete the provider stream. Consult local diagnostics for the failure category."}}, "retryable":retryable});
+    Bytes::from(format!("event: response.failed\ndata: {value}\n\n"))
+}
+
+fn fail_stream(state: &mut StreamState, kind: &'static str, retryable: bool) {
+    crate::gateway_diagnostics::record_stream_failure(
+        "openai",
+        stream_endpoint(state.transform),
+        kind,
+        retryable,
+    );
+    state.finished = true;
+    state.pending.clear();
+    state.responses_tool_pending.clear();
+    state.responses_tool_pending_bytes = 0;
+    state.chat.calls.clear();
+    state.chat.buffered_bytes = 0;
+    if state.transform == StreamTransform::Responses {
+        state
+            .ready
+            .push_back(Ok(Frame::data(responses_failure_frame(kind, retryable))));
+    } else if state.transform == StreamTransform::None {
+        state.ready.push_back(Err(Box::new(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "Pentect upstream stream failed",
+        ))));
+    } else {
+        let value = serde_json::json!({"error":{"type":if retryable {"api_error"} else {"invalid_request_error"}, "code":kind, "message":"Pentect could not complete the provider stream. Consult local diagnostics."}});
+        state.ready.push_back(Ok(Frame::data(Bytes::from(format!(
+            "event: error\ndata: {value}\n\n"
+        )))));
+    }
 }
 
 fn sse_block_is_completed_response(block: &[u8]) -> bool {
@@ -3123,7 +3354,7 @@ fn contains_any_function_call(value: &Value) -> bool {
         Value::Object(object) => {
             matches!(
                 object.get("type").and_then(Value::as_str),
-                Some("function_call" | "custom_tool_call")
+                Some("function_call" | "custom_tool_call" | "computer_call")
             ) || object.values().any(contains_any_function_call)
         }
         _ => false,
@@ -3156,7 +3387,7 @@ fn record_responses_tool_progress(
             Value::Object(object) => {
                 let call = matches!(
                     object.get("type").and_then(Value::as_str),
-                    Some("function_call" | "custom_tool_call")
+                    Some("function_call" | "custom_tool_call" | "computer_call")
                 );
                 if call {
                     for identity in function_call_identities(object) {
@@ -3168,6 +3399,7 @@ fn record_responses_tool_progress(
                             Some("custom_tool_call") => {
                                 object.get("input").is_some_and(Value::is_string)
                             }
+                            Some("computer_call") => computer_action_field(object).is_some(),
                             _ => false,
                         };
                         if completion_envelope && has_payload {
@@ -3268,11 +3500,7 @@ fn streaming_response_body(
                 Some(Ok(chunk)) => {
                     if state.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
                         proxy_diagnostic("sse-event-limit");
-                        state.finished = true;
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "OpenAI SSE event exceeded inspection limit",
-                        ))));
+                        fail_stream(&mut state, "input-size-limit", false);
                         continue;
                     }
                     state.pending.extend_from_slice(&chunk);
@@ -3282,65 +3510,58 @@ fn streaming_response_body(
                             if handle_chat_tool_input_rejection(&mut state, &error) {
                                 break;
                             }
-                            state.finished = true;
-                            state.ready.push_back(Err(Box::new(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                error,
-                            ))));
+                            if crate::claude_http_proxy::recoverable_handle_failure(&error)
+                                || error.starts_with("protected handle use is unsupported")
+                            {
+                                // The buffered recovery layer needs the original classified
+                                // error to send feedback and retry without releasing any tools.
+                                crate::gateway_diagnostics::record_stream_failure(
+                                    "openai",
+                                    stream_endpoint(state.transform),
+                                    crate::claude_http_proxy::sse_tool_rejection_kind(&error),
+                                    false,
+                                );
+                                state.finished = true;
+                                state.ready.push_back(Err(Box::new(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    error,
+                                ))));
+                            } else {
+                                fail_stream(&mut state, "protocol", false);
+                            }
+                            break;
+                        }
+                        if state.finished {
                             break;
                         }
                     }
                 }
                 Some(Err(error)) => {
-                    state.finished = true;
-                    state.ready.push_back(Err(Box::new(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        reqwest_error_message("OpenAI upstream stream failed", &error),
-                    ))));
+                    fail_stream(
+                        &mut state,
+                        if error.is_timeout() {
+                            "timeout"
+                        } else {
+                            "stream"
+                        },
+                        true,
+                    );
                 }
                 None => {
                     state.finished = true;
                     if !state.pending.is_empty() {
-                        state.pending.clear();
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "OpenAI SSE stream ended with an incomplete event",
-                        ))));
+                        fail_stream(&mut state, "stream-incomplete", true);
                         continue;
                     }
-                    if !state.responses_tool_pending.is_empty() {
-                        state.responses_tool_pending.clear();
-                        state.responses_tool_pending_bytes = 0;
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "OpenAI Responses stream ended before a completed response",
-                        ))));
-                        continue;
-                    }
-                    if state.transform == StreamTransform::ChatCompletions
-                        && !state.chat.calls.is_empty()
-                    {
-                        state.chat.calls.clear();
-                        state.chat.buffered_bytes = 0;
-                        state.ready.push_back(Err(Box::new(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "OpenAI Chat Completions stream ended before [DONE]",
-                        ))));
+                    if state.transform == StreamTransform::Responses {
+                        fail_stream(&mut state, "stream-incomplete", true);
                         continue;
                     }
                     if state.transform == StreamTransform::ChatCompletions {
-                        match state.chat.finish_output_text("data: {}\n\n") {
-                            Ok(blocks) => {
-                                for block in blocks {
-                                    state.ready.push_back(Ok(Frame::data(block)));
-                                }
-                            }
-                            Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                error,
-                            )))),
-                        }
-                    } else if state.transform == StreamTransform::Completions {
+                        fail_stream(&mut state, "stream-incomplete", true);
+                        continue;
+                    }
+                    if state.transform == StreamTransform::Completions {
                         match state.completions.finish_output_text("data: {}\n\n") {
                             Ok(blocks) => {
                                 for block in blocks {
@@ -3368,6 +3589,12 @@ fn handle_chat_tool_input_rejection(state: &mut StreamState, error: &str) -> boo
     state.pending.clear();
     state.chat.calls.clear();
     state.chat.buffered_bytes = 0;
+    crate::gateway_diagnostics::record_stream_failure(
+        "openai",
+        "chat-completions",
+        "handle-validation",
+        false,
+    );
     state.ready.push_back(Ok(Frame::data(Bytes::from_static(
         CHAT_TOOL_INPUT_ERROR_SSE,
     ))));
@@ -3591,6 +3818,9 @@ impl ChatStreamState {
                         }
                     }
                 }
+                if let Some(calls) = delta.get("tool_calls").filter(|v| !v.is_null()) {
+                    validate_chat_tool_calls(calls, true)?;
+                }
                 let Some(tool_calls) = delta
                     .remove("tool_calls")
                     .and_then(|calls| calls.as_array().cloned())
@@ -3697,6 +3927,10 @@ impl ChatStreamState {
                 .remove(&(choice_index, index))
                 .unwrap_or_default();
             self.buffered_bytes = self.buffered_bytes.saturating_sub(call.buffered_len());
+            validate_chat_tool_calls(
+                &serde_json::json!([{"id":call.id,"function":{"name":call.name,"arguments":call.arguments}}]),
+                false,
+            )?;
             let mut plugin_call = serde_json::json!({
                 "type": "function_call",
                 "name": call.name,
@@ -3875,7 +4109,13 @@ fn rewrite_openai_sse_block_tracked(
     if value.get("type").and_then(Value::as_str) == Some("response.output_item.added")
         && contains_any_function_call(&value)
     {
-        return Ok(vec![Bytes::copy_from_slice(block)]);
+        let computer_with_payload = value.get("item").is_some_and(|item| {
+            item.get("type").and_then(Value::as_str) == Some("computer_call")
+                && (item.get("action").is_some() || item.get("actions").is_some())
+        });
+        if !computer_with_payload {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        }
     }
     if matches!(
         value.get("type").and_then(Value::as_str),
@@ -4061,6 +4301,8 @@ fn contains_completed_function_call(value: &Value) -> bool {
                         .into_iter()
                         .any(|key| object.get(key).is_some_and(Value::is_string));
             is_completed_call
+                || (object.get("type").and_then(Value::as_str) == Some("computer_call")
+                    && computer_action_field(object).is_some())
                 || ["item", "response", "output"].into_iter().any(|key| {
                     object
                         .get(key)
@@ -5808,6 +6050,67 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_history_preserves_pairing_and_structured_output() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        for kind in ["function_call_output", "custom_tool_call_output"] {
+            let mut value = serde_json::json!({"type":kind,"call_id":"call_original","output":[
+                {"type":"input_text","text":"OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"},
+                {"type":"encrypted_content","encrypted_content":"opaque-provider-state"}
+            ]});
+            mask_openai_input(&mut value, true, &mut masker, &HashMap::new()).unwrap();
+            assert_eq!(value["type"], kind);
+            assert_eq!(value["call_id"], "call_original");
+            assert!(value.get("role").is_none());
+            assert!(value["output"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<<OPENAI_API_KEY_"));
+            assert_eq!(
+                value["output"][1]["encrypted_content"],
+                "opaque-provider-state"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "ocr", target_os = "linux"))]
+    #[test]
+    fn chrome_tool_results_mask_text_and_images_in_responses_outputs() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let image = include_str!("../../../tools/fixtures/chrome-test-secret.png.b64").trim();
+        let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        for kind in ["function_call_output", "custom_tool_call_output"] {
+            let request = serde_json::json!({"input":[{"type":kind,"call_id":"chrome_call","output":[
+                {"type":"input_text","text":format!("Browser DOM snapshot / console / network: OPENAI_API_KEY={secret}")},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{image}"),"detail":"original"},
+                {"type":"input_text","text":"ref_123 button Save"}
+            ]}]});
+            let protected = protect_openai_request_body(
+                &Bytes::from(request.to_string()),
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                OpenAiRequestDialect::Responses,
+                true,
+            )
+            .unwrap();
+            let text = std::str::from_utf8(&protected.body).unwrap();
+            assert!(!text.contains(secret), "plaintext escaped for {kind}");
+            assert!(!text.contains(image), "original image escaped for {kind}");
+            assert!(text.contains("Masked regions:"));
+            assert!(text.contains("ref_123 button Save"));
+            let value: Value = serde_json::from_slice(&protected.body).unwrap();
+            assert_eq!(value["input"][0]["call_id"], "chrome_call");
+        }
+    }
+
+    #[test]
     fn response_function_arguments_are_restored() {
         let input = br#"{"output":[{"type":"function_call","name":"shell","arguments":"{\"command\":\"echo <<SECRET_0123456789abcdef>>\"}"}]}"#;
         let mut value: Value = serde_json::from_slice(input).unwrap();
@@ -5851,7 +6154,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_tool_fields_use_schema_classification_and_unknown_fields_are_inert() {
+    fn openai_tool_fields_restore_unknown_inputs_with_conservative_validation() {
         let mut value = serde_json::json!({
             "output": [
                 {"type": "function_call", "name": "exec_command", "arguments":
@@ -5888,7 +6191,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("local-value"));
-        assert_eq!(value["output"][2]["input"], "<<SECRET_0123456789abcdef>>");
+        assert_eq!(value["output"][2]["input"], "local-value");
+        let mut missing = serde_json::json!({"type":"custom_tool_call", "name":"future_tool", "input":"<<SECRET_0123456789abcdef>>"});
+        assert!(rewrite_function_calls(&mut missing, &mut |text, _| Ok(text.to_string())).is_err());
     }
 
     #[test]
@@ -5965,6 +6270,111 @@ mod tests {
             responses_tool_pending_bytes: 0,
             responses_tool_started: HashSet::new(),
             responses_tool_completed: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn chat_schema_rejects_bad_fields_but_accepts_null_continuations() {
+        use serde_json::json;
+        validate_chat_tool_calls(
+            &json!([{"index":0,"id":null,"function":{"name":null,"arguments":null}}]),
+            true,
+        )
+        .unwrap();
+        for value in [
+            json!({}),
+            json!([null]),
+            json!([{"index":0,"function":[]}]),
+            json!([{"index":0,"function":{"arguments":{}}}]),
+            json!([{"index":"private"}]),
+        ] {
+            assert!(validate_chat_tool_calls(&value, true).is_err());
+        }
+        assert!(validate_chat_tool_calls(
+            &json!([{"id":"a","function":{"name":" ","arguments":"{}"}}]),
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn responses_failure_discards_pending_tools_and_ignores_late_completion() {
+        let mut state = responses_stream_test_state(Box::new(|text, _| Ok(text.into())));
+        state
+            .responses_tool_pending
+            .push_back(Bytes::from_static(b"never-run"));
+        process_stream_block(&mut state, b"data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"private-value\"}}\n\n".to_vec()).unwrap();
+        assert!(state.finished);
+        assert!(state.responses_tool_pending.is_empty());
+        let frame = state
+            .ready
+            .pop_front()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let text = std::str::from_utf8(&frame).unwrap();
+        assert!(text.contains("response.failed"));
+        assert!(text.contains("invalid_prompt"));
+        assert!(!text.contains("private-value"));
+        assert!(!text.contains("never-run"));
+        process_stream_block(
+            &mut state,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn stream_transport_failure_is_retryable_without_tool_commit() {
+        let mut state = responses_stream_test_state(Box::new(|_, _| panic!("must not restore")));
+        state.commit = Box::new(|| panic!("must not commit"));
+        state
+            .responses_tool_pending
+            .push_back(Bytes::from_static(b"never-run"));
+        fail_stream(&mut state, "stream-incomplete", true);
+        let frame = state
+            .ready
+            .pop_front()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let text = std::str::from_utf8(&frame).unwrap();
+        assert!(text.contains("upstream_server_error"));
+        assert!(text.contains("\"retryable\":true"));
+        assert!(!text.contains("never-run"));
+    }
+
+    #[tokio::test]
+    async fn actual_stream_body_emits_exactly_one_terminal_for_eof_and_provider_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (wire, expected, forbidden) in [
+            ("data: {\"type\":\"response.created\"}\n\n", "upstream_server_error", "response.completed"),
+            ("data: [DONE]\n\n", "upstream_server_error", "response.completed"),
+            ("data: {\"type\":\"response.completed\"", "upstream_server_error", "event: response.completed"),
+            ("data: {\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"private-value\"}}\n\n", "insufficient_quota", "private-value"),
+            ("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\"},\"output\":[{\"type\":\"function_call\",\"name\":\"never-run\"}]}}\n\n", "invalid_prompt", "never-run"),
+            ("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\ndata: {\"type\":\"error\"}\n\n", "response.completed", "response.failed"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}", wire.len()).as_bytes()).await.unwrap();
+            });
+            let response = reqwest::Client::new().get(format!("http://{address}")).send().await.unwrap();
+            let body = streaming_response_body(response, StreamTransform::Responses, Arc::new(Mutex::new(pentect_agent::PluginMiddleware::default())), false, true, Err("unused transaction".into()));
+            let bytes = body.collect().await.unwrap().to_bytes();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains(forbidden), "{text}");
+            assert_eq!(text.matches("\"type\":\"response.failed\"").count() + text.matches("\"type\":\"response.completed\"").count(), 1, "{text}");
+            server.await.unwrap();
         }
     }
 
@@ -6982,6 +7392,115 @@ mod tests {
     }
 
     #[test]
+    fn computer_actions_restore_handles_in_single_and_batch_shapes() {
+        let handle = "<<API_KEY_0123456789abcdef>>";
+        for payload in [
+            serde_json::json!({"action":{"type":"type","text":handle}}),
+            serde_json::json!({"actions":[{"type":"click","x":10,"y":20,"button":"left"},{"type":"type","text":handle}]}),
+        ] {
+            let mut call = payload;
+            call["type"] = serde_json::json!("computer_call");
+            call["call_id"] = serde_json::json!("call_computer");
+            call["status"] = serde_json::json!("completed");
+            let mut resolve = |text: &str, kind| {
+                assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+                Ok(text.replace(handle, "synthetic-token"))
+            };
+            let restored = rewrite_function_calls(&mut call, &mut resolve).unwrap();
+            assert_eq!(restored.len(), 1);
+            assert!(!call.to_string().contains(handle));
+            assert!(contains_any_function_call(&call));
+            assert!(contains_completed_function_call(&call));
+        }
+    }
+
+    #[test]
+    fn computer_unknown_handle_rejects_the_whole_action_batch() {
+        let mut call = serde_json::json!({"type":"computer_call","actions":[
+            {"type":"click","x":10,"y":20,"button":"left"},
+            {"type":"type","text":"<<API_KEY_0123456789abcdef>>"}
+        ]});
+        let original = call.clone();
+        assert!(rewrite_function_calls(&mut call, &mut |text, _| Ok(text.to_owned())).is_err());
+        assert_eq!(call, original);
+    }
+
+    #[test]
+    fn computer_history_masks_restored_input_without_changing_coordinates() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let mut history = serde_json::json!([
+            {"type":"computer_call", "call_id":"call_one", "action":{"type":"type","text":format!("OPENAI_API_KEY={secret}")}},
+            {"type":"computer_call", "call_id":"call_two", "actions":[{"type":"click","x":42,"y":75,"button":"left"},{"type":"type","text":format!("OPENAI_API_KEY={secret}")}]}
+        ]);
+        mask_openai_responses_input(&mut history, &mut masker, &HashMap::new()).unwrap();
+        assert!(!history.to_string().contains(secret));
+        assert!(history[0]["action"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<<"));
+        assert_eq!(history[1]["actions"][0]["x"], 42);
+        assert_eq!(history[1]["call_id"], "call_two");
+    }
+
+    #[test]
+    fn computer_stream_holds_early_click_when_later_typing_cannot_restore() {
+        let mut state = responses_stream_test_state(Box::new(|text, _| Ok(text.to_owned())));
+        let click = serde_json::json!({"type":"response.output_item.done","item":{
+            "type":"computer_call","id":"cu_1","action":{"type":"click","x":1,"y":2,"button":"left"}
+        }});
+        process_stream_block(&mut state, format!("data: {click}\n\n").into_bytes()).unwrap();
+        assert!(state.ready.is_empty());
+        let typing = serde_json::json!({"type":"response.output_item.done","item":{
+            "type":"computer_call","id":"cu_2","action":{"type":"type","text":"<<API_KEY_0123456789abcdef>>"}
+        }});
+        assert!(
+            process_stream_block(&mut state, format!("data: {typing}\n\n").into_bytes()).is_err()
+        );
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
+    fn computer_stream_restores_added_payload_and_commits_only_on_completion() {
+        let mut state = responses_stream_test_state(Box::new(|text, _| {
+            Ok(text.replace("<<API_KEY_0123456789abcdef>>", "synthetic-token"))
+        }));
+        let call = serde_json::json!({"type":"computer_call","id":"cu_1","status":"completed",
+            "actions":[{"type":"type","text":"<<API_KEY_0123456789abcdef>>"}]});
+        for event in ["response.output_item.added", "response.output_item.done"] {
+            let value = serde_json::json!({"type":event,"item":call});
+            process_stream_block(&mut state, format!("data: {value}\n\n").into_bytes()).unwrap();
+            assert!(state.ready.is_empty());
+        }
+        let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[call]}});
+        process_stream_block(&mut state, format!("data: {terminal}\n\n").into_bytes()).unwrap();
+        assert!(!state.ready.is_empty());
+        while let Some(frame) = state.ready.pop_front() {
+            let bytes = frame.unwrap().into_data().unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("<<API_KEY_"));
+            assert!(text.contains("synthetic-token"));
+        }
+    }
+
+    #[test]
+    fn computer_malformed_action_shapes_are_rejected() {
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"actions":[]}),
+            serde_json::json!({"action":{"type":"type","text":null}}),
+            serde_json::json!({"action":{"type":"screenshot"},"actions":[{"type":"screenshot"}]}),
+        ] {
+            let mut call = payload;
+            call["type"] = serde_json::json!("computer_call");
+            assert!(rewrite_function_calls(&mut call, &mut |text, _| Ok(text.to_owned())).is_err());
+        }
+    }
+
+    #[test]
     fn documented_computer_screenshot_shape_is_known_but_future_shapes_are_not() {
         let current = serde_json::json!({
             "input": [{
@@ -7136,7 +7655,7 @@ mod tests {
         let store = pentect_agent::start_in_process_memory_store().unwrap();
         let _env = ProviderBoundaryTestEnv::install(&store);
         // A QR image containing only a fake test credential. This exercises the
-        // real barcode/OCR, image rewrite, handle, and Responses note path.
+        // real barcode/OCR, image rewrite, and text-source guidance path.
         let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASgAAAEoAQMAAADRyf5aAAAABlBMVEUAAAD///+l2Z/dAAAAAnRSTlP//8i138cAAAAJcEhZcwAACxIAAAsSAdLdfvwAAAF8SURBVGiB7ZrLrsIwEEP9/z/tq3beSSp1gXQX9VBKgbOypo4zAL4piPKSElFSIkpK/LMSsLrfXa95ZZ+KWpVgnG+1rsNUGwBEMZTArY+pVUrltSiclKC313XxrBdFMZSx5+i3XS+Kuspc/pbFNHvyL3yesuLyeFgf8Xkqqvk95hfjDb5OwSOEmb3nL/N9UdiVYFiW61XHsC6Kops4upOnVU3/oihm+6Ap5neo9dNoMohi3mfY8kJ6nSgM/0LEVGusSBO5ZojCsj6iDL9GE5laRXHZ6bB2jqFXix6iMFMaaozTxIk1URQXJehd1SaG+RSFNbnTu6vdnO5hM7RCFLO72GNX3zP1vApR7BOvSqW1oRx+D1FZcbvlWtlCrCimEiivyqifEzBR3JSgnWuRTCM7zFchiqlSzHRO+Z6iuPySwRgVeg/NIT5EYXQOfRlM3Y79RVFXxf8Acjt5f3jwL36esqpf0TK1bvMJiHpReANRVJSUiJISUVIi6pdK/AHPECxsuaPlLgAAAABJRU5ErkJggg==";
         let body = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -7181,7 +7700,8 @@ mod tests {
         assert_eq!(note["content"][0]["type"], "input_text");
         let note_text = note["content"][0]["text"].as_str().unwrap();
         assert!(note_text.contains("Masked regions:"), "{note_text}");
-        assert!(note_text.contains("<<KEYED_SECRET_"), "{note_text}");
+        assert!(!note_text.contains("<<"), "{note_text}");
+        assert!(note_text.contains("Read the original text"), "{note_text}");
         assert!(!serde_json::to_string(&protected)
             .unwrap()
             .contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));

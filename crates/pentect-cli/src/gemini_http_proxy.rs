@@ -228,11 +228,7 @@ async fn proxy_request(
         Ok(response) => Ok(response),
         Err(error) => {
             let local = crate::gateway_diagnostics::is_local_rejection(&error);
-            let response_status = if local {
-                StatusCode::UNPROCESSABLE_ENTITY
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
+            let response_status = crate::gateway_diagnostics::failure_status(&error);
             crate::gateway_diagnostics::record_request_failure(
                 "gemini",
                 context,
@@ -242,7 +238,7 @@ async fn proxy_request(
             Ok(if local {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
-                text_response(StatusCode::BAD_GATEWAY, "Pentect gateway request failed")
+                text_response(response_status, "Pentect gateway request failed")
             })
         }
     }
@@ -559,6 +555,7 @@ fn protect_request_body(
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     block_unknown_formats: bool,
 ) -> Result<ProtectedRequest, String> {
+    let _metrics_scope = pentect_agent::MetricsRequestScope::new();
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) if block_unknown_formats => {

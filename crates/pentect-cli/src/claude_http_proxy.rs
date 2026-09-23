@@ -367,11 +367,7 @@ async fn proxy_request(
         Ok(response) => Ok(response),
         Err(error) => {
             let local_rejection = crate::gateway_diagnostics::is_local_rejection(&error);
-            let response_status = if local_rejection {
-                StatusCode::UNPROCESSABLE_ENTITY
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
+            let response_status = crate::gateway_diagnostics::failure_status(&error);
             crate::gateway_diagnostics::record_request_failure(
                 "claude",
                 context,
@@ -381,7 +377,7 @@ async fn proxy_request(
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
-                text_response(StatusCode::BAD_GATEWAY, "Pentect proxy request failed")
+                text_response(response_status, "Pentect proxy request failed")
             })
         }
     }
@@ -831,6 +827,9 @@ async fn recoverable_messages_response(
                 (|| {
                     let mut chunks = transformer.push(&raw)?;
                     chunks.extend(transformer.finish()?);
+                    if !transformer.terminated {
+                        return Err("Anthropic SSE stream ended before message_stop".into());
+                    }
                     let size: usize = chunks.iter().map(Bytes::len).sum();
                     if size > MAX_HTTP_BODY_BYTES {
                         return Err(
@@ -877,6 +876,18 @@ async fn recoverable_messages_response(
                     )
                     .body(full_body(bytes))
                     .map_err(|_| "could not build Claude response".to_string());
+            }
+            Err(error) if error == "Anthropic SSE stream ended before message_stop" => {
+                crate::gateway_diagnostics::record_stream_failure(
+                    "claude",
+                    "messages",
+                    "stream-incomplete",
+                    true,
+                );
+                return Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(full_body(anthropic_stream_failure_sse()))
+                    .map_err(|_| "could not build Claude stream failure".to_string());
             }
             Err(error) => {
                 diagnostic(
@@ -1244,6 +1255,7 @@ fn protect_anthropic_request_body(
     endpoint: AnthropicEndpoint,
     block_unknown_formats: bool,
 ) -> Result<ProtectedJsonBody, String> {
+    let _metrics_scope = pentect_agent::MetricsRequestScope::new();
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
@@ -1726,9 +1738,12 @@ fn streaming_response_body(
             }
             match state.upstream.next().await {
                 Some(Ok(chunk)) => match state.transformer.push(&chunk) {
-                    Ok(chunks) => state
-                        .ready
-                        .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
+                    Ok(chunks) => {
+                        state
+                            .ready
+                            .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk))));
+                        state.finished = state.transformer.terminated;
+                    }
                     Err(error) => {
                         state.finished = true;
                         diagnostic(
@@ -1744,16 +1759,39 @@ fn streaming_response_body(
                 },
                 Some(Err(error)) => {
                     state.finished = true;
+                    crate::gateway_diagnostics::record_stream_failure(
+                        "claude",
+                        "messages",
+                        if error.is_timeout() {
+                            "timeout"
+                        } else {
+                            "stream"
+                        },
+                        true,
+                    );
                     state
                         .ready
-                        .push_back(Err(Box::new(reqwest_stream_error(&error))));
+                        .push_back(Ok(Frame::data(anthropic_stream_failure_sse())));
                 }
                 None => {
                     state.finished = true;
                     match state.transformer.finish() {
-                        Ok(chunks) => state
-                            .ready
-                            .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
+                        Ok(chunks) => {
+                            state
+                                .ready
+                                .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk))));
+                            if !state.transformer.terminated {
+                                crate::gateway_diagnostics::record_stream_failure(
+                                    "claude",
+                                    "messages",
+                                    "stream-incomplete",
+                                    true,
+                                );
+                                state
+                                    .ready
+                                    .push_back(Ok(Frame::data(anthropic_stream_failure_sse())));
+                            }
+                        }
                         Err(error) => {
                             diagnostic(
                                 "sse-tool-rejected",
@@ -1771,6 +1809,10 @@ fn streaming_response_body(
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+fn anthropic_stream_failure_sse() -> Bytes {
+    Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Pentect could not complete the provider stream. Consult local diagnostics.\"}}\n\n")
 }
 
 pub(crate) fn sse_tool_rejection_kind(error: &str) -> &'static str {
@@ -2030,6 +2072,21 @@ where
             self.block_unknown_formats,
             self.plugin_context,
         )?;
+        if matches!(sse_control_event(&block), SseControlEvent::Error) {
+            let parsed = parse_sse(std::str::from_utf8(&block).unwrap_or_default());
+            let (kind, retryable) = parsed
+                .iter()
+                .find_map(|block| block.data.as_ref())
+                .map(crate::gateway_diagnostics::upstream_error_kind)
+                .unwrap_or(("unclassified", false));
+            crate::gateway_diagnostics::record_stream_failure(
+                "claude", "messages", kind, retryable,
+            );
+            self.tool_buffer.take();
+            self.terminated = true;
+            output.push(Bytes::from(block));
+            return Ok(());
+        }
         if self.tool_buffer.is_some() {
             match sse_control_event(&block) {
                 SseControlEvent::Ping => {
@@ -2096,6 +2153,12 @@ where
             return Ok(());
         }
 
+        if sse_is_message_stop(&block) {
+            output.extend(self.finish_output_text());
+            output.push(Bytes::from(block));
+            self.terminated = true;
+            return Ok(());
+        }
         match sse_tool_boundary(&block) {
             SseToolBoundary::Start { index } => {
                 self.tool_buffer = Some(ToolStreamBuffer {
@@ -3258,6 +3321,15 @@ where
                     .and_then(|delta| delta.get("partial_json"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
+                        pentect_agent::record_tool_shape_activity(
+                            "claude",
+                            "messages",
+                            "partial_json",
+                            data.get("delta")
+                                .and_then(|delta| delta.get("partial_json")),
+                            Some(index),
+                            env!("CARGO_PKG_VERSION"),
+                        );
                         "Anthropic SSE input_json_delta requires string partial_json".to_string()
                     })?
                     .to_string();
@@ -3469,7 +3541,7 @@ where
                         != pentect_agent::ToolInputKind::Unknown
                 })
         });
-        return if known {
+        return if known || pentect_agent::contains_pentect_masked_handle(input) {
             Err("protected tool input is malformed".to_string())
         } else {
             Ok((input.to_string(), false))
@@ -3598,42 +3670,93 @@ fn resolve_tool_input_value<R>(
 where
     R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
 {
-    let tool_name = tool_name.unwrap_or_default();
-    let Value::Object(object) = value else {
-        return Ok(());
-    };
-    for (field, value) in object {
-        let kind = pentect_agent::classify_tool_input_field(tool_name, field);
-        if kind != pentect_agent::ToolInputKind::Unknown {
-            if let Value::String(text) = value {
-                *text = resolve(text, kind)?;
-            }
-            continue;
-        }
-        // MultiEdit has one explicitly declared nested schema. No other
-        // arrays or objects are traversed speculatively.
-        if matches!(tool_name, "MultiEdit" | "multi_edit" | "multiedit") && field == "edits" {
-            let Some(edits) = value.as_array_mut() else {
-                continue;
-            };
-            for edit in edits {
-                let Some(edit) = edit.as_object_mut() else {
-                    continue;
-                };
-                for (edit_field, edit_value) in edit {
-                    let edit_kind = pentect_agent::classify_tool_input_field(tool_name, edit_field);
-                    if edit_kind != pentect_agent::ToolInputKind::Unknown {
-                        if let Value::String(text) = edit_value {
-                            *text = resolve(text, edit_kind)?;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Work on a private copy: a failed late lookup must not publish partial input.
+    let mut restored = value.clone();
+    restore_generic_tool_json(
+        &mut restored,
+        tool_name.unwrap_or_default(),
+        None,
+        resolve,
+        0,
+    )?;
+    *value = restored;
     Ok(())
 }
 
+fn restore_generic_tool_json<R>(
+    value: &mut Value,
+    tool: &str,
+    field: Option<&str>,
+    resolve: &mut R,
+    depth: usize,
+) -> Result<(), String>
+where
+    R: FnMut(&str, pentect_agent::ToolInputKind) -> Result<String, String>,
+{
+    if depth > 64 {
+        return Err(pentect_agent::ToolInputError::OutputTooLarge.to_string());
+    }
+    match value {
+        Value::String(text) => {
+            let has_handle = pentect_agent::contains_pentect_masked_handle(text);
+            let declared = pentect_agent::classify_tool_input_field(tool, field.unwrap_or(""));
+            if !has_handle && declared == pentect_agent::ToolInputKind::Unknown {
+                return Ok(());
+            }
+            let parts = pentect_core::placeholder::parse_placeholder(text)
+                .ok()
+                .filter(|parts| parts.handle == *text);
+            let kind = if declared != pentect_agent::ToolInputKind::Unknown {
+                declared
+            } else {
+                // Unknown embedded text may be code. Retain the conservative
+                // representation checks instead of blindly interpolating values.
+                pentect_agent::ToolInputKind::Code
+            };
+            let raw = resolve(text, kind)?;
+            if has_handle && (raw == *text || pentect_agent::contains_pentect_masked_handle(&raw)) {
+                return Err(pentect_agent::ToolInputError::UnknownHandle.to_string());
+            }
+            *value = match parts.as_ref().map(|parts| parts.label.as_str()) {
+                Some("JSON_SCALAR_NUMBER") => {
+                    let number = serde_json::from_str::<serde_json::Number>(&raw)
+                        .map_err(|_| pentect_agent::ToolInputError::UnsupportedView.to_string())?;
+                    Value::Number(number)
+                }
+                Some("JSON_SCALAR_BOOL") => Value::Bool(
+                    raw.parse::<bool>()
+                        .map_err(|_| pentect_agent::ToolInputError::UnsupportedView.to_string())?,
+                ),
+                _ => Value::String(raw),
+            };
+        }
+        Value::Array(items) => {
+            for item in items {
+                restore_generic_tool_json(item, tool, field, resolve, depth + 1)?;
+            }
+        }
+        Value::Object(object) => {
+            // Keys can themselves be protected. Restoring must never overwrite
+            // another argument if two keys resolve to the same text.
+            let mut output = serde_json::Map::new();
+            for (key, item) in object.iter() {
+                let mut key_value = Value::String(key.clone());
+                restore_generic_tool_json(&mut key_value, tool, None, resolve, depth + 1)?;
+                let key = key_value
+                    .as_str()
+                    .ok_or_else(|| pentect_agent::ToolInputError::UnsupportedView.to_string())?;
+                let mut item = item.clone();
+                restore_generic_tool_json(&mut item, tool, Some(key), resolve, depth + 1)?;
+                if output.insert(key.to_owned(), item).is_some() {
+                    return Err(pentect_agent::ToolInputError::UnsupportedView.to_string());
+                }
+            }
+            *object = output;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 #[cfg(test)]
 fn resolve_known_text(text: &str) -> Result<String, String> {
     match pentect_agent::resolve_known_text_from_active_memory_store(text) {
@@ -3910,7 +4033,7 @@ mod tests {
                 "name": "Bash",
                 "input": {
                     "command": format!("echo {handle} {handle}"),
-                    "unknown": "<<SECRET_ffeeddccbbaa0099>>"
+                    "unknown": handle
                 }
             }]
         }))
@@ -4390,6 +4513,85 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "ocr", target_os = "linux"))]
+    #[test]
+    fn chrome_tool_results_mask_text_and_images_in_mixed_batches() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let image = include_str!("../../../tools/fixtures/chrome-test-secret.png.b64").trim();
+        let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        for name in [
+            "read_page",
+            "get_page_text",
+            "read_console_messages",
+            "read_network_requests",
+            "computer",
+            "browser_batch",
+        ] {
+            let request = serde_json::json!({"model":"test","messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"chrome_call","name":format!("mcp__claude-in-chrome__{name}"),"input":{"tabId":1}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"chrome_call","content":[
+                    {"type":"text","text":format!("DOM / console / network: OPENAI_API_KEY={secret}")},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":image}},
+                    {"type":"text","text":"ref_123 button Save"}
+                ]}]}
+            ]});
+            let protected = protect_anthropic_request_body(
+                &Bytes::from(request.to_string()),
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                AnthropicEndpoint::Messages,
+                true,
+            )
+            .unwrap();
+            let text = std::str::from_utf8(&protected.body).unwrap();
+            assert!(!text.contains(secret), "plaintext escaped for {name}");
+            assert!(!text.contains(image), "original image escaped for {name}");
+            assert!(text.contains("Masked regions:"));
+            assert!(text.contains("ref_123 button Save"));
+            let value: Value = serde_json::from_slice(&protected.body).unwrap();
+            assert_eq!(
+                value["messages"][1]["content"][0]["tool_use_id"],
+                "chrome_call"
+            );
+        }
+    }
+
+    #[test]
+    fn messages_gateway_reports_missing_terminal_without_recovery_retry() {
+        use std::io::Write;
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            read_http_request(&mut socket);
+            let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"content\":[]}}\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let proxy = ClaudeHttpProxyGuard::start(format!("http://{address}")).unwrap();
+        let response = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap()
+            .post(format!("{}/v1/messages", proxy.base_url()))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"model":"test","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hello"}]}).to_string())
+            .send().unwrap();
+        assert_eq!(response.status(), 200);
+        let text = response.text().unwrap();
+        assert_eq!(text.matches("event: error").count(), 1, "{text}");
+        assert!(text.contains("api_error"), "{text}");
+        assert!(!text.contains("message_stop"));
+        upstream.join().unwrap();
+    }
+
     fn exercise_handle_recovery_case(streaming: bool, exhaust: bool, malformed: bool) {
         use std::io::Write;
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
@@ -4834,10 +5036,9 @@ mod tests {
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
         assert_eq!(anthropic_response["content"][0]["input"]["content"], secret);
-        assert!(
-            anthropic_response["content"][0]["input"]["metadata"]["token"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("<<"))
+        assert_eq!(
+            anthropic_response["content"][0]["input"]["metadata"]["token"],
+            secret
         );
         drop(anthropic_proxy);
         anthropic_thread.join().unwrap();
@@ -6075,6 +6276,156 @@ mod tests {
     }
 
     #[test]
+    fn generic_tool_json_round_trips_number_and_numeric_string() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let env = TestEnv::install(&store);
+        std::fs::create_dir_all(env.home.join(".pentect")).unwrap();
+        std::fs::write(
+            env.home.join(".pentect/config.toml"),
+            "[protection]\npii = true\n",
+        )
+        .unwrap();
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let source = serde_json::json!({"tabId":1234567890u32,"asString":"1234567890"});
+        let masked = masker
+            .mask_tool_output(&source.to_string())
+            .unwrap()
+            .unwrap();
+        let protected: Value = serde_json::from_str(&masked).unwrap();
+        assert!(protected["tabId"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<JSON_SCALAR_NUMBER_"));
+        assert!(!protected["asString"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<JSON_SCALAR_NUMBER_"));
+        let transaction = masker.tool_input_transaction().unwrap();
+        let forged =
+            protected["asString"]
+                .as_str()
+                .unwrap()
+                .replacen("PHONE_NUMBER", "JSON_SCALAR_BOOL", 1);
+        if forged != protected["asString"].as_str().unwrap() {
+            let transaction = masker.tool_input_transaction().unwrap();
+            // The type tag is part of the authenticated lookup; changing it
+            // cannot authorize a value under a newly invented handle.
+            assert!(transaction
+                .resolve(&forged, pentect_agent::ToolInputKind::Code)
+                .is_err());
+        }
+        for name in [
+            "mcp__claude-in-chrome__computer",
+            "mcp__codex-in-chrome__anything",
+            "future_unknown_tool",
+        ] {
+            let input = serde_json::json!({"nested":[protected.clone()]}).to_string();
+            let (restored, changed) =
+                resolve_tool_input_json_with_change_typed(&input, Some(name), &mut |text, kind| {
+                    transaction.resolve(text, kind)
+                })
+                .unwrap();
+            assert!(changed);
+            let restored: Value = serde_json::from_str(&restored).unwrap();
+            assert_eq!(restored["nested"][0], source);
+        }
+    }
+
+    #[test]
+    fn generic_tool_json_failure_is_atomic() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let mut value = serde_json::json!({"a":handle,"b":[handle]});
+        let original = value.clone();
+        let mut count = 0;
+        assert!(
+            resolve_tool_input_value_with_change(&mut value, Some("unknown"), &mut |_, _| {
+                count += 1;
+                if count == 1 {
+                    Ok("resolved".into())
+                } else {
+                    Err(pentect_agent::ToolInputError::UnknownHandle.to_string())
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(value, original);
+    }
+
+    #[test]
+    fn generic_tool_json_rejects_duplicate_restored_keys() {
+        let handle = "<<SECRET_0123456789abcdef>>";
+        let mut value = serde_json::json!({handle: 1, "same": 2});
+        let original = value.clone();
+        assert!(
+            resolve_tool_input_value_with_change(&mut value, Some("unknown"), &mut |_, _| Ok(
+                "same".into()
+            ))
+            .is_err()
+        );
+        assert_eq!(value, original);
+    }
+
+    #[test]
+    fn chrome_tab_handle_restores_numeric_id() {
+        let handle = "<<JSON_SCALAR_NUMBER_0123456789abcdef>>";
+        for name in ["navigate", "computer", "read_page"] {
+            let mut value = serde_json::json!({"tabId": handle});
+            let mut calls = 0;
+            let changed = resolve_tool_input_value_with_change(
+                &mut value,
+                Some(&format!("mcp__claude-in-chrome__{name}")),
+                &mut |_, _| {
+                    calls += 1;
+                    Ok("1234567890".to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert!(changed);
+            assert_eq!(value["tabId"], 1234567890u32);
+        }
+    }
+
+    #[test]
+    fn chrome_batch_restores_ids_and_rejects_unresolved_or_invalid_values() {
+        let handle = "<<JSON_SCALAR_NUMBER_0123456789abcdef>>";
+        let input = serde_json::json!({"actions":[
+            {"name":"navigate","input":{"tabId":handle,"url":"https://example.com"}},
+            {"name":"computer","input":{"tabId":handle,"action":"wait","duration":1}}
+        ]})
+        .to_string();
+        let (result, changed) = resolve_tool_input_json_with_change_typed(
+            &input,
+            Some("mcp__claude-in-chrome__browser_batch"),
+            &mut |_, _| Ok("1234567890".into()),
+        )
+        .unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert!(changed);
+        assert_eq!(result["actions"][0]["input"]["tabId"], 1234567890u32);
+        assert_eq!(result["actions"][1]["input"]["tabId"], 1234567890u32);
+        for invalid in [handle, "NaN", "Infinity", "01", "abc"] {
+            assert!(resolve_tool_input_json_with_change_typed(
+                &input,
+                Some("mcp__claude-in-chrome__browser_batch"),
+                &mut |_, _| Ok(invalid.into()),
+            )
+            .is_err());
+        }
+        let input = serde_json::json!({"tabId":1,"text":handle}).to_string();
+        assert!(resolve_tool_input_json_with_change_typed(
+            &input,
+            Some("mcp__claude-in-chrome__javascript_tool"),
+            &mut |_, kind| {
+                assert_eq!(kind, pentect_agent::ToolInputKind::Code);
+                Err(pentect_agent::ToolInputError::UnsupportedView.to_string())
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
     fn restored_tool_values_are_json_escaped_and_invalid_json_stays_inert() {
         let mut resolve =
             |text: &str| Ok(text.replace("<<SECRET_one>>", "quoted \" value\\with\nnewline"));
@@ -6126,7 +6477,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_tool_input_only_restores_declared_scalar_fields() {
+    fn typed_tool_input_restores_nested_scalar_fields() {
         let handle = "<<SECRET_0123456789abcdef>>";
         let input =
             format!(r#"{{ "command": "echo {handle}", "metadata": {{"command":"{handle}"}} }}"#);
@@ -6139,16 +6490,16 @@ mod tests {
         assert!(changed);
         let value: Value = serde_json::from_str(&restored).unwrap();
         assert_eq!(value["command"], "echo local-token");
-        assert_eq!(value["metadata"]["command"], handle);
+        assert_eq!(value["metadata"]["command"], "local-token");
 
         let wrong_type = format!(r#"{{"content":{{"unexpected":"{handle}"}}}}"#);
-        let mut unexpected = |_: &str, _: pentect_agent::ToolInputKind| {
-            panic!("wrong-typed known field must remain inert")
-        };
+        let (restored, changed) =
+            resolve_tool_input_json_with_change_typed(&wrong_type, Some("Write"), &mut resolve)
+                .unwrap();
+        assert!(changed);
         assert_eq!(
-            resolve_tool_input_json_with_change_typed(&wrong_type, Some("Write"), &mut unexpected,)
-                .unwrap(),
-            (wrong_type, false)
+            serde_json::from_str::<Value>(&restored).unwrap()["content"]["unexpected"],
+            "local-token"
         );
     }
 

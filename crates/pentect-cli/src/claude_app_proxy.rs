@@ -4793,7 +4793,10 @@ mod tests {
         resolve_chat_tool_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["content"][0]["text"], format!("show {handle}"));
         assert_eq!(value["content"][1]["input"]["content"], "local-value");
-        assert_eq!(value["content"][1]["input"]["metadata"]["x-token"], handle);
+        assert_eq!(
+            value["content"][1]["input"]["metadata"]["x-token"],
+            "local-value"
+        );
     }
 
     #[test]
