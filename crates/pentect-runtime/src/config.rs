@@ -28,7 +28,7 @@ pub(crate) enum HandleScope {
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
-    let project = read_handle_scope(project_config_path()?)?;
+    let project = read_project_config(read_handle_scope)?;
     let global = read_handle_scope(global_config_path()?)?;
     match project.or(global).unwrap_or_default() {
         HandleScope::Device => machine_identity_key(),
@@ -67,6 +67,8 @@ pub(crate) fn validate_config_file(path: &Path) -> Result<(), String> {
 }
 
 fn validate_config_value(value: &toml::Value) -> Result<(), String> {
+    protection_value(value, "pii")?;
+    protection_value(value, "internal")?;
     handle_scope_value(value)?;
     agent_require_pentect_value(value)?;
     image_ocr_config_value(value)?;
@@ -88,6 +90,94 @@ fn validate_config_value(value: &toml::Value) -> Result<(), String> {
     output_restore_value(value)?;
     unknown_format_policy_value(value)?;
     reject_removed_environment_value(value)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProtectionConfig {
+    pub(crate) pii: bool,
+    pub(crate) internal: bool,
+}
+
+pub(crate) fn protection_config() -> Result<ProtectionConfig, String> {
+    let project = read_project_config(|path| parse_config_file(&path))?;
+    let global = parse_config_file(&global_config_path()?)?;
+    merge_protection_config(project.as_ref(), global.as_ref())
+}
+
+fn merge_protection_config(
+    project: Option<&toml::Value>,
+    global: Option<&toml::Value>,
+) -> Result<ProtectionConfig, String> {
+    let field = |name| -> Result<bool, String> {
+        let project = project
+            .as_ref()
+            .map(|v| protection_value(v, name))
+            .transpose()?
+            .flatten();
+        let global = global
+            .as_ref()
+            .map(|v| protection_value(v, name))
+            .transpose()?
+            .flatten();
+        // A repository cannot disable protection the user explicitly enabled.
+        Ok(project.unwrap_or(false) || global.unwrap_or(false))
+    };
+    Ok(ProtectionConfig {
+        pii: field("pii")?,
+        internal: field("internal")?,
+    })
+}
+
+fn protection_value(value: &toml::Value, field: &str) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("protection") else {
+        return Ok(None);
+    };
+    let table = raw.as_table().ok_or("protection config must be a table")?;
+    if table
+        .keys()
+        .any(|key| !matches!(key.as_str(), "pii" | "internal"))
+    {
+        return Err("protection supports only pii and internal".to_string());
+    }
+    table
+        .get(field)
+        .map(|raw| config_bool(raw, &format!("protection.{field}")))
+        .transpose()
+}
+
+#[test]
+fn optional_protection_defaults_off_and_user_opt_in_cannot_be_lowered() {
+    let defaults = merge_protection_config(None, None).unwrap();
+    assert_eq!(
+        defaults,
+        ProtectionConfig {
+            pii: false,
+            internal: false
+        }
+    );
+    let on: toml::Value = "[protection]\npii=true\ninternal=true".parse().unwrap();
+    let off: toml::Value = "[protection]\npii=false\ninternal=false".parse().unwrap();
+    assert_eq!(
+        merge_protection_config(Some(&off), Some(&on)).unwrap(),
+        ProtectionConfig {
+            pii: true,
+            internal: true
+        }
+    );
+    assert_eq!(
+        merge_protection_config(Some(&on), None).unwrap(),
+        ProtectionConfig {
+            pii: true,
+            internal: true
+        }
+    );
+    for text in [
+        "protection=true",
+        "[protection]\npii=5",
+        "[protection]\npil=true",
+    ] {
+        assert!(merge_protection_config(Some(&text.parse().unwrap()), None).is_err());
+    }
 }
 
 fn handle_scope_value(value: &toml::Value) -> Result<Option<HandleScope>, String> {
@@ -337,9 +427,14 @@ fn restrict_identity_file(_: &Path) -> Result<(), String> {
 pub(crate) fn project_root() -> Result<PathBuf, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("could not read current directory: {e}"))?;
+    let home = home_dir().and_then(|path| path.canonicalize().ok());
     let root = cwd
         .ancestors()
-        .find(|candidate| candidate.join(".git").exists() || candidate.join(PENTECT_DIR).exists())
+        .find(|candidate| {
+            candidate.join(".git").exists()
+                || (candidate.join(PENTECT_DIR).exists()
+                    && candidate.canonicalize().ok().as_ref() != home.as_ref())
+        })
         .unwrap_or(&cwd);
     root.canonicalize()
         .map_err(|e| format!("could not canonicalize '{}': {e}", root.display()))
@@ -415,20 +510,20 @@ struct DecodeConfigPartial {
 }
 
 pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
-    let project = read_agent_require_pentect(project_config_path()?)?;
+    let project = read_project_config(read_agent_require_pentect)?;
     let global = read_agent_require_pentect(global_config_path()?)?;
     Ok(require_pentect_agent_effective(project, global))
 }
 
 pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
-    let project = read_image_ocr_config(project_config_path()?)?;
+    let project = read_project_config(read_image_ocr_config)?;
     let global = read_image_ocr_config(global_config_path()?)?;
     merge_image_ocr_config(project, global)
 }
 
 #[cfg(not(test))]
 pub(crate) fn environment_variable_prefix() -> Result<String, String> {
-    reject_removed_environment_config(project_config_path()?)?;
+    read_project_config(reject_removed_environment_config)?;
     reject_removed_environment_config(global_config_path()?)?;
     Ok(DEFAULT_ENVIRONMENT_PREFIX.to_string())
 }
@@ -440,7 +535,7 @@ pub(crate) fn environment_variable_prefix() -> Result<String, String> {
 
 #[cfg(not(test))]
 pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
-    let project = read_decode_config(project_config_path()?)?;
+    let project = read_project_config(read_decode_config)?;
     let global = read_decode_config(global_config_path()?)?;
     merge_decode_config(profile, project, global)?.validate()
 }
@@ -456,19 +551,19 @@ pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
 }
 
 pub(crate) fn remember_files_enabled() -> Result<bool, String> {
-    let project = read_files_remember(project_config_path()?)?;
+    let project = read_project_config(read_files_remember)?;
     let global = read_files_remember(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
 pub(crate) fn activity_share_enabled() -> Result<bool, String> {
-    let project = read_activity_share(project_config_path()?)?;
+    let project = read_project_config(read_activity_share)?;
     let global = read_activity_share(global_config_path()?)?;
     Ok(local_privacy_setting_enabled(project, global))
 }
 
 pub(crate) fn metrics_enabled() -> Result<bool, String> {
-    let project = read_metrics_enabled(project_config_path()?)?;
+    let project = read_project_config(read_metrics_enabled)?;
     let global = read_metrics_enabled(global_config_path()?)?;
     Ok(local_privacy_setting_enabled(project, global))
 }
@@ -480,13 +575,13 @@ fn local_privacy_setting_enabled(project: Option<bool>, global: Option<bool>) ->
 }
 
 pub(crate) fn update_check_enabled() -> Result<bool, String> {
-    let project = read_update_check(project_config_path()?)?;
+    let project = read_project_config(read_update_check)?;
     let global = read_update_check(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
 pub(crate) fn output_restore_enabled() -> Result<bool, String> {
-    let project = read_output_restore(project_config_path()?)?;
+    let project = read_project_config(read_output_restore)?;
     let global = read_output_restore(global_config_path()?)?;
     Ok(output_restore_effective(project, global))
 }
@@ -499,7 +594,7 @@ fn output_restore_effective(project: Option<bool>, global: Option<bool>) -> bool
 }
 
 pub(crate) fn unknown_formats_should_block() -> Result<bool, String> {
-    let project = read_unknown_format_policy(project_config_path()?)?;
+    let project = read_project_config(read_unknown_format_policy)?;
     let global = read_unknown_format_policy(global_config_path()?)?;
     unknown_formats_should_block_effective(project, global)
 }
@@ -1143,8 +1238,23 @@ fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     Err(format!("agent config {field} must be a boolean"))
 }
 
-fn project_config_path() -> Result<PathBuf, String> {
-    Ok(project_root()?.join(PENTECT_DIR).join(CONFIG_FILE))
+fn read_project_config<T: Default>(
+    read: impl FnOnce(PathBuf) -> Result<T, String>,
+) -> Result<T, String> {
+    let path = project_root()?.join(PENTECT_DIR).join(CONFIG_FILE);
+    let global = global_config_path()?;
+    // The home directory may itself be the cwd or a repository. Its config
+    // still has user scope, including when reached through a filesystem alias.
+    if path == global
+        || path
+            .canonicalize()
+            .ok()
+            .zip(global.canonicalize().ok())
+            .is_some_and(|(project, user)| project == user)
+    {
+        return Ok(T::default());
+    }
+    read(path)
 }
 
 fn global_config_path() -> Result<PathBuf, String> {

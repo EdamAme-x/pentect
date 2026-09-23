@@ -3615,8 +3615,8 @@ def run_image_redaction(pentect: str, client: str = "codex") -> None:
                 raise RuntimeError("the original unredacted PNG reached the model fixture")
             if "Pentect masked sensitive information in this image with black boxes." not in upstream:
                 raise RuntimeError("the model fixture did not receive the image-redaction explanation")
-            if "Masked regions:" not in upstream or not HANDLE.search(upstream):
-                raise RuntimeError("the model fixture did not receive an opaque image handle")
+            if "Masked regions:" not in upstream or "Read the original text" not in upstream:
+                raise RuntimeError("the model fixture did not receive text-source guidance")
             encoded_images = re.findall(
                 r"data:image/png;base64,([A-Za-z0-9+/=]+)", upstream
             )
@@ -3634,7 +3634,7 @@ def run_image_redaction(pentect: str, client: str = "codex") -> None:
                 )
             print(
                 f"installed {client} image E2E passed: original replaced, black-box note "
-                "and opaque handle delivered, no model/log plaintext"
+                "and text-source guidance delivered, no model/log plaintext"
             )
     finally:
         server.shutdown()

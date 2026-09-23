@@ -69,6 +69,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 windows = { workspace = true, optional = true, features = [
     "Foundation",
+    "Globalization",
     "Graphics_Imaging",
     "Media_Ocr",
     "Storage_Streams",
@@ -98,7 +99,7 @@ objc2-vision = { workspace = true, optional = true, default-features = false, fe
     "VNTypes",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 ocrs = { workspace = true, optional = true }
 rten = { workspace = true, optional = true }
 

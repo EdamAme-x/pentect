@@ -8,6 +8,8 @@
 //! recovery material.
 
 mod activity_log;
+mod metrics_replay;
+pub use metrics_replay::MetricsRequestScope;
 mod alcatraz;
 mod config;
 mod delegated_process_host;
@@ -106,6 +108,7 @@ pub fn agent_contract_instructions(_environment_prefix: &str) -> String {
         "- Treat files containing protected handles as usable. Preserve every handle byte-for-byte while reading, reasoning about, or editing the surrounding content; do not delete, repair, expand, guess, or reformat it.\n",
         "- Copy a protected handle unchanged into the local tool input that needs the represented value. Pentect restores known handles after the provider response returns locally, including command, file, and MCP arguments. You do not need to know or print the plaintext.\n",
         "- Once a handle exists, use it immediately. Do not reread or reparse the source file, fetch the same secret again, or claim that the secret is unavailable or inaccessible. Do not echo, print, decode, or reconstruct its value.\n",
+        "- Image redaction does not provide recoverable handles. If a needed value is hidden in an image and no text handle exists, use an available, authorized DOM, accessibility, or original-file text read. Do not transcribe or guess it from pixels, repeatedly capture the same image, or invent a handle. If no text source is available, report that limitation.\n",
         "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
     )
     .to_string()
@@ -200,6 +203,38 @@ pub fn mask_input_for_read(
     masking::mask_read_input_with_profile(key, input, profile, packs)
 }
 
+pub fn mask_ocr_input_for_read(
+    key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<MaskResult, String> {
+    masking::mask_ocr_read_with_identity(key, key, input, profile, packs)
+}
+
+pub fn mask_ocr_input_into_active_memory_store(
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<Option<MaskResult>, String> {
+    let Some(client) = MemoryStoreClient::from_env() else {
+        return Ok(None);
+    };
+    mask_ocr_input_into_memory_store_client(&client, input, profile, packs).map(Some)
+}
+
+fn mask_ocr_input_into_memory_store_client(
+    client: &MemoryStoreClient,
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<MaskResult, String> {
+    let (key, identity_key) = client.keys().map_err(|e| e.to_string())?;
+    let result = masking::mask_ocr_read_with_identity(key, identity_key, input, profile, packs)?;
+    register_read_result_in_memory_store(client, &result, &key)?;
+    Ok(result)
+}
+
 /// Mask and register an explicit trusted file read without an active memory store.
 pub fn mask_and_remember_file_for_read(
     path: &Path,
@@ -244,6 +279,18 @@ pub fn remember_read_file(path: &Path, source: &str, result: &MaskResult) -> boo
 
 pub fn record_diagnostic_activity(surface: &str, reason: &str) {
     activity_log::record_diagnostic(surface, reason, None, None, None, None, None, None);
+}
+
+/// Record a rejected schema field using only allowlisted names and JSON types.
+pub fn record_tool_shape_activity(
+    surface: &str,
+    endpoint: &str,
+    field: &str,
+    value: Option<&serde_json::Value>,
+    position: Option<u64>,
+    version: &str,
+) {
+    activity_log::record_tool_shape(surface, endpoint, field, value, position, version);
 }
 
 /// Persist a value-free, structured HTTP gateway diagnostic. Every text field
@@ -318,16 +365,25 @@ fn mask_input_into_memory_store_client(
         profile,
         packs,
     )?;
+    register_read_result_in_memory_store(client, &result, &key)?;
+    Ok(result)
+}
+
+fn register_read_result_in_memory_store(
+    client: &MemoryStoreClient,
+    result: &MaskResult,
+    key: &[u8; 32],
+) -> Result<(), String> {
     let mut recovery = result.recovery.clone();
     let prefix = config::environment_variable_prefix()?;
-    recovery.extend_same_key(env_alias_recovery(&result.masked, &key, &prefix));
+    recovery.extend_same_key(env_alias_recovery(&result.masked, key, &prefix));
     client
-        .add_recovery(&key, &recovery)
+        .add_recovery(key, &recovery)
         .map_err(|e| e.to_string())?;
     client
         .add_masked_count(result.summary.masked_count as u64)
         .map_err(|e| e.to_string())?;
-    Ok(result)
+    Ok(())
 }
 
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
@@ -361,7 +417,7 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
     session
         .sync_recovery(&redaction.recovery)
         .map_err(|error| error.to_string())?;
-    activity_log::record_image(redaction.secret_images, &redaction.labels);
+    activity_log::record_image(redaction.counted_images, &redaction.labels);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
             return Err("image blocked: image could not be fetched or scanned.".to_string());
@@ -914,13 +970,25 @@ impl ActiveToolOutputMasker {
     /// after masking a request to restore completed local tool inputs.
     pub fn known_text_resolver(&self) -> Result<ActiveMemoryStoreResolver, String> {
         match &self.masker {
-            Some(masker) => masker.recovery_snapshot().map(|recovery| {
-                ActiveMemoryStoreResolver::from_recovery(
+            Some(masker) => {
+                let mut recovery = masker.recovery_snapshot()?;
+                // Image inspection and other local helpers publish through
+                // separate Session instances. Include their completed writes
+                // when creating a NEW transaction, never during validation of
+                // an existing immutable response snapshot.
+                if let Some(client) = &self.client {
+                    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+                    if snapshot.key != masker.recovery_store().session.key {
+                        return Err("active recovery store changed its key".to_string());
+                    }
+                    recovery.extend_same_key(snapshot.recovery);
+                }
+                Ok(ActiveMemoryStoreResolver::from_recovery(
                     recovery,
                     masker.recovery_store(),
                     self.recovery_revision.clone(),
-                )
-            }),
+                ))
+            }
             None => Ok(ActiveMemoryStoreResolver {
                 recovery: None,
                 env_bindings: BTreeMap::new(),
@@ -1257,7 +1325,12 @@ fn cmd_read(args: &[String]) -> i32 {
         .unwrap_or_else(|| infer_kind_with_content(&opts.path, &data));
     let source = data.clone();
     let input = Input { kind, data };
-    match mask_input_into_active_memory_store(input.clone(), Profile::Strict, Vec::new()) {
+    let mask_active = if opts.input_format == InputFormat::Image {
+        mask_ocr_input_into_active_memory_store
+    } else {
+        mask_input_into_active_memory_store
+    };
+    match mask_active(input.clone(), Profile::Strict, Vec::new()) {
         Ok(Some(result)) => {
             register_read_file_pointers(&opts.path, &input.data, &result, opts.input_format);
             activity_log::record_mask_result("read", &result, Some(&opts.path));
@@ -1273,7 +1346,14 @@ fn cmd_read(args: &[String]) -> i32 {
     };
     let engine = Engine::with_profile_and_decode_config(Profile::Strict, decode);
     let cfg = Config::generate();
-    let result = engine.mask(input, &cfg);
+    let result = if opts.input_format == InputFormat::Image {
+        match mask_ocr_input_for_read(cfg.key, input, Profile::Strict, Vec::new()) {
+            Ok(result) => result,
+            Err(error) => return die(&error),
+        }
+    } else {
+        engine.mask(input, &cfg)
+    };
     register_read_file_pointers(&opts.path, &source, &result, opts.input_format);
     activity_log::record_mask_result("read", &result, Some(&opts.path));
     print_read_result(result, opts.emit_meta);
@@ -4197,7 +4277,7 @@ fn claude_image_tool_output(
     session
         .sync_recovery(&redaction.recovery)
         .map_err(|error| error.to_string())?;
-    activity_log::record_image(redaction.secret_images, &redaction.labels);
+    activity_log::record_image(redaction.counted_images, &redaction.labels);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
             return Ok(Some(ToolTextOutput::Block(
@@ -4250,8 +4330,9 @@ fn append_image_mask_notes(
             }
         };
         sections.push(format!(
-            "{explanation}\nMasked regions:\n{}",
-            visual_notes.join("\n")
+            "{explanation}\nMasked regions:\n{}\n{}",
+            visual_notes.join("\n"),
+            image_ocr::TEXT_SOURCE_GUIDANCE
         ));
     }
     if !metadata_notes.is_empty() {
@@ -4438,7 +4519,7 @@ fn mask_tool_json(
         masker.mask_tool_result_scalars_without_plugins(&scalars)?
     };
     let mut cursor = 0usize;
-    let out = rebuild_masked_tool_json(value, &masked, &mut cursor)?;
+    let out = rebuild_masked_tool_json(value, &masked, &mut cursor, masker)?;
     if cursor != masked.len() {
         return Err("internal error: unused batched tool-result masks".to_string());
     }
@@ -4514,6 +4595,7 @@ fn rebuild_masked_tool_json(
     value: &Value,
     masked: &[String],
     cursor: &mut usize,
+    masker: &mut OutputMasker,
 ) -> Result<Value, String> {
     match value {
         Value::String(text) if image_ocr::skip_text_masking_for_image_payload(text) => {
@@ -4521,7 +4603,9 @@ fn rebuild_masked_tool_json(
         }
         Value::String(_) => {
             let out = take_masked(masked, cursor)?;
-            Ok(Value::String(out))
+            let mut out = Value::String(out);
+            masker.preserve_json_scalar_type(value, &mut out)?;
+            Ok(out)
         }
         Value::Number(_) | Value::Bool(_) => {
             let raw = value.to_string();
@@ -4529,14 +4613,16 @@ fn rebuild_masked_tool_json(
             if out == raw {
                 Ok(value.clone())
             } else {
-                Ok(Value::String(out))
+                let mut out = Value::String(out);
+                masker.preserve_json_scalar_type(value, &mut out)?;
+                Ok(out)
             }
         }
         Value::Null => Ok(Value::Null),
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(rebuild_masked_tool_json(item, masked, cursor)?);
+                out.push(rebuild_masked_tool_json(item, masked, cursor, masker)?);
             }
             Ok(Value::Array(out))
         }
@@ -4552,7 +4638,7 @@ fn rebuild_masked_tool_json(
                 {
                     item.clone()
                 } else {
-                    rebuild_masked_tool_json(item, masked, cursor)?
+                    rebuild_masked_tool_json(item, masked, cursor, masker)?
                 };
                 out.insert(masked_key, item);
             }

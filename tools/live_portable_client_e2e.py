@@ -74,6 +74,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'has_handle': '<<' in text,
                 'has_image': 'data:image/' in text or '"media_type": "image/' in text or '"media_type":"image/' in text,
                 'redaction_note': 'Pentect masked sensitive information in this image' in text,
+                'text_source_guidance': 'No recoverable values are provided from image pixels.' in text,
             })
         violation = next((name for name, value in (
             ('synthetic-text-plaintext', SECRET),
@@ -275,7 +276,7 @@ def run_case(pentect: str, client: str, model: str, case: str, output_root: Path
             target = project / ('resumed.txt' if case == 'resume' else 'copied.txt')
             result['exact_restore'] = target.exists() and target.read_text(encoding='utf-8').strip() == SECRET
         if case == 'image':
-            result['protected_image_seen'] = any(r['has_image'] and r['redaction_note'] and r['has_handle']
+            result['protected_image_seen'] = any(r['has_image'] and r['redaction_note'] and r['text_source_guidance']
                                                   and r.get('response_complete') for r in relay.records)
         result['passed'] = (completed.returncode == 0 and result['completion_marker']
                             and any(r.get('response_complete') for r in relay.records) and not relay.failures

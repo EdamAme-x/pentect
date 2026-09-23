@@ -56,6 +56,22 @@ These are compatibility observations, not retroactive changes to a release's
 pinned gate. The installed test uses real client binaries and a localhost
 provider fixture; it does not make a paid provider request.
 
+## Anthropic mid-conversation tool changes (0.0.92)
+
+The Anthropic adapter supports `tool_addition` and `tool_removal`, including
+named tool/MCP references and inline `tool_definition.definition` objects.
+Inline definitions receive the same bounded text masking as top-level `tools`;
+reference identifiers remain unchanged, and detected secrets in identifiers
+are rejected instead of silently renaming tools. Invalid or unknown wrapper
+fields remain blocked. This applies to Messages, Count Tokens, and Message
+Batches and does not require `compatibility.unknown_formats = "ignore"`.
+
+The shapes were checked against Claude Code 2.1.280 and Anthropic's
+[mid-conversation tool documentation](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages).
+Regression tests cover reference preservation, inline description/schema/example
+masking, and invalid-shape rejection; this is not a claim of full live-provider
+compatibility for every beta feature.
+
 ## Not implemented
 
 These clients have status pages, but no public launcher in the current
@@ -100,6 +116,33 @@ it. Run `pentect update --check` after a client update.
 
 ## API format adapters
 
+### Diagnosing incompatible responses
+
+Completed JSON tool arguments are restored recursively, including nested
+objects and arrays, without a browser-tool allowlist. Numbers and booleans
+masked from structured tool results carry typed handles; digit-only strings
+remain strings. Old handles without type provenance are not guessed into
+numbers: reread the source in the updated session to obtain typed handles.
+
+Unknown text surfaces retain conservative code-representation validation.
+This is not unrestricted interpolation into arbitrary code. A missing handle,
+invalid typed value, excessive nesting, or duplicate restored argument name
+rejects the operation without publishing partially restored arguments.
+
+Run `pentect log --once --tail 100` after a failure. Rejected tool fields can
+include their schema field, JSON type, and position. Structured log records
+also include allowlisted field names and types, never tool argument values,
+unknown object keys, or provider error messages.
+
+Stream failures are recorded as `stream-failed`, with a category and a
+`retryable` flag. A dropped connection or missing terminal event is different
+from a provider refusal, exhausted quota, or invalid tool schema. The Responses
+and Messages gateways report failures in their native stream formats and
+withhold unfinished tool batches. Recoverable protected-handle failures still
+use the bounded model-feedback recovery path.
+
+### Connecting an adapter
+
 You can use an API adapter when a model provider does not offer OpenAI Responses
 or Anthropic Messages. The adapter changes the provider API into a format
 Pentect supports. Pentect then checks the normal client-side format.
@@ -117,6 +160,31 @@ every gateway release.
 See [Custom upstreams](/clients/upstreams/) for setup and recovery steps.
 
 ## Desktop testing
+
+Computer-use helpers may run in separate processes. Pentect protects their
+model-visible results only when those results pass through a protected client
+gateway; launching a helper does not make every network request on the device
+protected. The Responses gateway inspects computer screenshots, remasks restored
+computer-action history, and restores validated single-action and batched
+`computer_call` inputs. Streaming actions are withheld until the complete tool
+batch passes validation.
+
+Windows OCR uses the user's recognizer plus an English recognizer for Latin
+credentials. If the Windows English resource is unavailable, the bundled Latin
+recognizer is used without installing an OS language pack. The bundled backend
+checks overlapping native-resolution tiles as well as the whole-image overview
+so desktop downscaling does not discard small text; tile work is bounded and an
+exceeded limit is treated as a scan failure. OCR can still misread
+small, obscured, or unusual text; image redaction is not a guarantee that every
+visible secret will be detected. The `latin-recognizer-unavailable` diagnostic
+identifies this fallback without logging recognized text.
+Pixel recognition is used only for redaction, never to publish recoverable
+handles. Masked images include instructions to obtain the original text through
+an available, authorized DOM, accessibility, or source-file tool. Those text
+results follow normal masking and exact-value recovery. If no text source is
+available, the agent must report that limitation, not guess or repeatedly capture
+the image. Exact embedded image metadata is handled separately and can still
+produce protected handles.
 
 Short-lived CI machines do not sign in to or drive the official desktop user
 interfaces. Instead, Windows, Linux, and macOS execute process-contract

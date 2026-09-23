@@ -11,6 +11,8 @@ use pentect_core::ByteRange;
 use pentect_core::Recovery;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+
+pub(crate) const TEXT_SOURCE_GUIDANCE: &str = "No recoverable values are provided from image pixels. Read the original text through an available, authorized DOM, accessibility, or source-file tool; Pentect will protect that text with usable handles. Do not guess the hidden value or repeatedly capture the same image to recover it. If no text source is available, report that the value could not be obtained.";
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
 
@@ -52,6 +54,7 @@ pub(crate) struct ImageRedaction {
     pub(crate) unscanned_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
+    pub(crate) counted_images: usize,
     pub(crate) labels: BTreeMap<String, u64>,
     pub(crate) recovery: Recovery,
     pub(crate) visual_notes: Vec<String>,
@@ -63,6 +66,7 @@ struct ImageRedactionState {
     unscanned_images: usize,
     ocr_failures: usize,
     secret_images: usize,
+    counted_images: usize,
     attempted_images: usize,
     total_image_bytes: u64,
     started_at: std::time::Instant,
@@ -261,6 +265,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         unscanned_images: 0,
         ocr_failures: 0,
         secret_images: 0,
+        counted_images: 0,
         attempted_images: 0,
         total_image_bytes: 0,
         started_at: std::time::Instant::now(),
@@ -282,6 +287,7 @@ pub(crate) fn redact_tool_images_for_secrets(
         unscanned_images: state.unscanned_images,
         ocr_failures: state.ocr_failures,
         secret_images: state.secret_images,
+        counted_images: state.counted_images,
         labels: state.labels,
         recovery: Recovery::seal(state.recovery, key),
         visual_notes: state.visual_notes,
@@ -652,19 +658,19 @@ fn redact_image_bytes(
     }
 
     let mut visual_labels = Vec::new();
-    let mut visual_handles = Vec::new();
     let mut metadata_labels = Vec::new();
     let mut metadata_handles = Vec::new();
     for finding in &findings {
-        let (labels, handles) = if finding_redacts_pixels(finding) {
-            (&mut visual_labels, &mut visual_handles)
-        } else {
-            (&mut metadata_labels, &mut metadata_handles)
-        };
-        push_secret_labels(labels, &finding.labels);
+        // Pixel recognition is evidence for redaction, not authoritative bytes.
+        // Never publish OCR/barcode guesses into the recovery store.
+        if finding_redacts_pixels(finding) {
+            push_secret_labels(&mut visual_labels, &finding.labels);
+            continue;
+        }
+        push_secret_labels(&mut metadata_labels, &finding.labels);
         for (handle, value) in &finding.secrets {
-            if !handles.iter().any(|seen| seen == handle) {
-                handles.push(handle.clone());
+            if !metadata_handles.iter().any(|seen| seen == handle) {
+                metadata_handles.push(handle.clone());
             }
             state
                 .recovery
@@ -674,10 +680,13 @@ fn redact_image_bytes(
     }
     state.secret_images += 1;
     let index = state.secret_images;
-    for label in visual_labels.iter().chain(&metadata_labels) {
-        *state.labels.entry(label.clone()).or_default() += 1;
+    if crate::metrics_replay::count_content("image", bytes) {
+        state.counted_images += 1;
+        for label in visual_labels.iter().chain(&metadata_labels) {
+            *state.labels.entry(label.clone()).or_default() += 1;
+        }
     }
-    if let Some(summary) = image_note_summary(&visual_labels, &visual_handles) {
+    if let Some(summary) = image_note_summary(&visual_labels, &[]) {
         let note = format!("[{index}] {summary}");
         state.visual_notes.push(note);
     }
@@ -1635,10 +1644,17 @@ fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
 
 #[cfg(any(feature = "ocr", test))]
 fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Result<Vec<ImageTextSecretHit>, String> {
+    image_text_secret_hits_with_engine(text, image_ocr_secret_engine()?)
+}
+
+#[cfg(any(feature = "ocr", test))]
+fn image_text_secret_hits_with_engine(
+    text: &str,
+    engine: &pentect_core::Engine,
+) -> Result<Vec<ImageTextSecretHit>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let engine = image_ocr_secret_engine()?;
     let result = engine.analyze_spans(pentect_core::Input {
         kind: pentect_core::Kind::Text,
         data: text.to_string(),
@@ -1662,7 +1678,129 @@ fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Result<Vec<ImageTextSe
             hits.push(hit);
         }
     }
+    for hit in ocr_spaced_email_hits(text, engine) {
+        if !hits
+            .iter()
+            .any(|seen| seen.label == hit.label && seen.range == hit.range)
+        {
+            hits.push(hit);
+        }
+    }
     Ok(hits)
+}
+
+/// OCR may insert horizontal whitespace around email punctuation. Analyze a
+/// detection-only view, then map every hit back to the original UTF-8 bytes.
+/// Never join lines or change the text stored behind an opaque handle.
+#[cfg(any(feature = "ocr", test))]
+fn ocr_spaced_email_hits(text: &str, engine: &pentect_core::Engine) -> Vec<ImageTextSecretHit> {
+    let horizontal = |c: char| {
+        c.is_whitespace()
+            && !matches!(
+                c,
+                '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            )
+    };
+    let mut hits = Vec::new();
+    let mut line_offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.contains('@') && line.chars().any(horizontal) {
+            let chars: Vec<_> = line.char_indices().collect();
+            let mut normalized = String::with_capacity(line.len());
+            let mut source_bytes = Vec::with_capacity(line.len());
+            let mut i = 0;
+            while i < chars.len() {
+                let (offset, ch) = chars[i];
+                if horizontal(ch) {
+                    let mut end = i + 1;
+                    while end < chars.len() && horizontal(chars[end].1) {
+                        end += 1;
+                    }
+                    let left = i.checked_sub(1).map(|index| chars[index].1);
+                    let right = chars.get(end).map(|(_, ch)| *ch);
+                    let punctuation = |c| matches!(c, '@' | '.');
+                    let email_char = |c: char| {
+                        c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '+')
+                    };
+                    if left.is_some_and(email_char)
+                        && right.is_some_and(email_char)
+                        && (left.is_some_and(punctuation) || right.is_some_and(punctuation))
+                    {
+                        i = end;
+                        continue;
+                    }
+                    let byte_end = chars.get(end).map_or(line.len(), |(offset, _)| *offset);
+                    normalized.push_str(&line[offset..byte_end]);
+                    source_bytes.extend(offset..byte_end);
+                    i = end;
+                    continue;
+                }
+                normalized.push(ch);
+                source_bytes.extend(offset..offset + ch.len_utf8());
+                i += 1;
+            }
+            if normalized.len() != line.len() {
+                let result = engine.analyze_spans(pentect_core::Input {
+                    kind: pentect_core::Kind::Text,
+                    data: normalized,
+                });
+                for span in result
+                    .spans
+                    .into_iter()
+                    .filter(|span| span.label == "EMAIL_ADDRESS")
+                {
+                    if span.range.start >= span.range.end {
+                        continue;
+                    }
+                    if let (Some(start), Some(end)) = (
+                        source_bytes.get(span.range.start),
+                        source_bytes.get(span.range.end - 1),
+                    ) {
+                        hits.push(ImageTextSecretHit {
+                            label: span.label,
+                            range: Some(ByteRange {
+                                start: line_offset + start,
+                                end: line_offset + end + 1,
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+        line_offset += line.len();
+    }
+    hits
+}
+
+pub(crate) fn ocr_text_spans(
+    text: &str,
+    engine: &pentect_core::Engine,
+) -> Result<Vec<pentect_core::Span>, String> {
+    #[cfg(any(feature = "ocr", test))]
+    {
+        Ok(ocr_spaced_email_hits(text, engine)
+            .into_iter()
+            .chain(ocr_fragmented_secret_hits(text))
+            .filter_map(|hit| {
+                Some(pentect_core::Span {
+                    range: hit.range?,
+                    category: if hit.label == "EMAIL_ADDRESS" {
+                        pentect_core::Category::Pii
+                    } else {
+                        pentect_core::Category::Secret
+                    },
+                    label: hit.label,
+                    confidence: pentect_core::Confidence::High,
+                    source: pentect_core::DetectorId::Rule,
+                })
+            })
+            .collect())
+    }
+    #[cfg(not(any(feature = "ocr", test)))]
+    {
+        let _ = (text, engine);
+        Err("OCR support is not enabled".to_string())
+    }
 }
 
 #[cfg(any(feature = "ocr", test))]
@@ -1679,6 +1817,92 @@ fn labels_from_text_hits(hits: &[ImageTextSecretHit]) -> Vec<String> {
 #[cfg(test)]
 fn ocr_fragmented_secret_labels(text: &str) -> Vec<String> {
     labels_from_text_hits(&ocr_fragmented_secret_hits(text))
+}
+
+#[cfg(all(test, feature = "ocr"))]
+fn pii_test_engine() -> pentect_core::Engine {
+    crate::masking::canonical_masking_engine_with_protection(
+        pentect_core::Profile::Strict,
+        Vec::new(),
+        false,
+        pentect_core::DecodeConfig::default(),
+        crate::config::ProtectionConfig {
+            pii: true,
+            internal: true,
+        },
+    )
+    .unwrap()
+}
+
+#[cfg(all(test, feature = "ocr"))]
+#[test]
+fn chrome_ocr_spaced_email_should_be_redacted() {
+    let hits = image_text_secret_hits_with_engine("Email: alice@example . com", &pii_test_engine())
+        .unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.label == "EMAIL_ADDRESS"),
+        "OCR-spaced email has no redaction hit"
+    );
+}
+
+#[cfg(all(test, feature = "ocr"))]
+#[test]
+fn ocr_email_normalization_preserves_original_ranges_and_line_boundaries() {
+    for email in [
+        "alice@example . com",
+        "alice @ example.com",
+        "alice\t@\texample . com",
+        "alice\u{00a0}@\u{00a0}example\u{2009}.\u{2009}com",
+        "first.last+tag @ sub . example . co . jp",
+    ] {
+        let text = format!("前の行\n連絡先： {email} (end)");
+        let hits = image_text_secret_hits_with_engine(&text, &pii_test_engine()).unwrap();
+        let hit = hits
+            .iter()
+            .find(|hit| hit.label == "EMAIL_ADDRESS")
+            .expect("email hit");
+        let range = hit.range.unwrap();
+        assert_eq!(&text[range.start..range.end], email);
+        assert_eq!(
+            secret_entries(&text, std::slice::from_ref(hit), &[0; 32])[0].1,
+            email
+        );
+    }
+    for text in [
+        "alice @\nexample . com",
+        "alice @\r\nexample . com",
+        "alice @\u{2028}example . com",
+        "hello . world",
+        "alice @ example",
+        "@ example . com",
+    ] {
+        assert!(
+            ocr_spaced_email_hits(text, image_ocr_secret_engine().unwrap()).is_empty(),
+            "unexpected match: {text:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ocr"))]
+#[test]
+fn ocr_email_redaction_rectangle_uses_original_spacing() {
+    let text = "Label: alice @ example . com suffix";
+    let hits = image_text_secret_hits_with_engine(text, &pii_test_engine()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|hit| hit.label == "EMAIL_ADDRESS")
+        .unwrap();
+    let region = ImageTextRegion {
+        text: text.into(),
+        rect: NormalizedImageRect::new(0.0, 0.1, 1.0, 0.2),
+    };
+    let rect = rect_for_text_secret_hit(&region, hit).rect.unwrap();
+    let start = text.find("alice").unwrap();
+    let end = text.find(" suffix").unwrap();
+    assert_eq!(rect.left, start as f32 / text.len() as f32);
+    assert_eq!(rect.right, end as f32 / text.len() as f32);
+    assert_eq!(rect.top, 0.1);
+    assert_eq!(rect.bottom, 0.2);
 }
 
 #[cfg(any(feature = "ocr", test))]
@@ -1796,7 +2020,10 @@ fn ocr_fragmented_value_has_secret_shape(text: &str) -> bool {
             run = 0;
         }
     }
-    ascii_alnum >= 16 && ascii_alpha >= 4 && ascii_digit >= 4 && longest_run >= 6
+    ascii_alnum >= 16
+        && ascii_alpha >= 4
+        && (ascii_digit >= 4 || ascii_alnum >= 24)
+        && longest_run >= 6
 }
 
 #[cfg(any(feature = "ocr", test))]
@@ -2806,64 +3033,100 @@ fn ocr_image_regions_with_config(
         .map_err(|e| format!("could not prepare image bitmap: {e}"))?;
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()
         .map_err(|e| format!("could not initialize Windows OCR: {e}"))?;
-    let result = engine
-        .RecognizeAsync(&bitmap)
-        .map_err(|e| format!("could not start Windows OCR: {e}"))?
-        .join()
-        .map_err(|e| format!("could not OCR image: {e}"))?;
-    let lines = result
-        .Lines()
-        .map_err(|e| format!("could not read OCR lines: {e}"))?;
+    let mut engines = vec![engine];
+    // The user's default recognizer may be Japanese (or another non-Latin
+    // language). It can turn ASCII credentials into plausible local-script
+    // words, making a successful OCR pass miss secrets entirely. Scan with
+    // English as well when that Windows language resource is installed.
+    let uses_english = engines[0]
+        .RecognizerLanguage()
+        .and_then(|language| language.LanguageTag())
+        .is_ok_and(|tag| tag.to_string_lossy().starts_with("en"));
+    if !uses_english {
+        let english = windows::Globalization::Language::CreateLanguage(
+            &windows::core::HSTRING::from("en-US"),
+        )
+        .and_then(|language| OcrEngine::TryCreateFromLanguage(&language));
+        match english {
+            Ok(engine) => engines.push(engine),
+            Err(_) => crate::activity_log::record_structured(
+                "warning",
+                "ocr",
+                "latin-recognizer-unavailable",
+                Some("windows"),
+                Some("image"),
+                Some("SCAN"),
+                None,
+                Some(false),
+                None,
+                1,
+            ),
+        }
+    }
+    let needs_bundled_latin = !uses_english && engines.len() == 1;
     let mut regions = Vec::new();
-    for index in 0..lines
-        .Size()
-        .map_err(|e| format!("could not count OCR lines: {e}"))?
-    {
-        let line = lines
-            .GetAt(index)
-            .map_err(|e| format!("could not read OCR line: {e}"))?;
-        let text = line
-            .Text()
-            .map(|text| text.to_string_lossy())
-            .map_err(|e| format!("could not read OCR line text: {e}"))?;
-        if text.trim().is_empty() {
-            continue;
-        }
-        let words = line
-            .Words()
-            .map_err(|e| format!("could not read OCR words: {e}"))?;
-        let mut left = f32::MAX;
-        let mut top = f32::MAX;
-        let mut right = f32::MIN;
-        let mut bottom = f32::MIN;
-        for word_index in 0..words
+    for engine in engines {
+        let result = engine
+            .RecognizeAsync(&bitmap)
+            .map_err(|e| format!("could not start Windows OCR: {e}"))?
+            .join()
+            .map_err(|e| format!("could not OCR image: {e}"))?;
+        let lines = result
+            .Lines()
+            .map_err(|e| format!("could not read OCR lines: {e}"))?;
+        for index in 0..lines
             .Size()
-            .map_err(|e| format!("could not count OCR words: {e}"))?
+            .map_err(|e| format!("could not count OCR lines: {e}"))?
         {
-            let word = words
-                .GetAt(word_index)
-                .map_err(|e| format!("could not read OCR word: {e}"))?;
-            let rect = word
-                .BoundingRect()
-                .map_err(|e| format!("could not read OCR word bounds: {e}"))?;
-            left = left.min(rect.X);
-            top = top.min(rect.Y);
-            right = right.max(rect.X + rect.Width);
-            bottom = bottom.max(rect.Y + rect.Height);
+            let line = lines
+                .GetAt(index)
+                .map_err(|e| format!("could not read OCR line: {e}"))?;
+            let text = line
+                .Text()
+                .map(|text| text.to_string_lossy())
+                .map_err(|e| format!("could not read OCR line text: {e}"))?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            let words = line
+                .Words()
+                .map_err(|e| format!("could not read OCR words: {e}"))?;
+            let mut left = f32::MAX;
+            let mut top = f32::MAX;
+            let mut right = f32::MIN;
+            let mut bottom = f32::MIN;
+            for word_index in 0..words
+                .Size()
+                .map_err(|e| format!("could not count OCR words: {e}"))?
+            {
+                let word = words
+                    .GetAt(word_index)
+                    .map_err(|e| format!("could not read OCR word: {e}"))?;
+                let rect = word
+                    .BoundingRect()
+                    .map_err(|e| format!("could not read OCR word bounds: {e}"))?;
+                left = left.min(rect.X);
+                top = top.min(rect.Y);
+                right = right.max(rect.X + rect.Width);
+                bottom = bottom.max(rect.Y + rect.Height);
+            }
+            let rect = if right > left && bottom > top {
+                NormalizedImageRect::from_pixels(
+                    left,
+                    top,
+                    right - left,
+                    bottom - top,
+                    scaled_width,
+                    scaled_height,
+                )
+            } else {
+                None
+            };
+            regions.push(ImageTextRegion { text, rect });
         }
-        let rect = if right > left && bottom > top {
-            NormalizedImageRect::from_pixels(
-                left,
-                top,
-                right - left,
-                bottom - top,
-                scaled_width,
-                scaled_height,
-            )
-        } else {
-            None
-        };
-        regions.push(ImageTextRegion { text, rect });
+    }
+    if needs_bundled_latin {
+        regions.extend(bundled_ocr_image_regions(bytes, cfg)?);
     }
     Ok(regions)
 }
@@ -3020,6 +3283,14 @@ fn ocr_image_regions_with_config(
     bytes: &[u8],
     cfg: &ImageOcrConfig,
 ) -> Result<Vec<ImageTextRegion>, String> {
+    bundled_ocr_image_regions(bytes, cfg)
+}
+
+#[cfg(all(feature = "ocr", any(target_os = "linux", target_os = "windows")))]
+fn bundled_ocr_image_regions(
+    bytes: &[u8],
+    cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageTextRegion>, String> {
     use image::GenericImageView;
     use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem};
     use rten::Model;
@@ -3041,11 +3312,14 @@ fn ocr_image_regions_with_config(
         ));
     }
 
-    let img = resize_for_ocr(img, cfg.max_edge);
-    let (ocr_width, ocr_height) = img.dimensions();
-    let img = img.into_rgb8();
-    let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
-        .map_err(|e| format!("could not prepare image: {e}"))?;
+    // Whole-desktop downscaling destroys small UI text. Scan overlapping tiles
+    // at native resolution, keeping coordinates relative to the original image.
+    let tile_edge = cfg.max_edge.clamp(1, 1024);
+    let xs = ocr_tile_starts(width, tile_edge)?;
+    let ys = ocr_tile_starts(height, tile_edge)?;
+    if xs.len().saturating_mul(ys.len()) > 64 {
+        return Err("image OCR tile limit exceeded".to_string());
+    }
     let engine = ENGINE
         .get_or_init(|| {
             let detection_model =
@@ -3063,37 +3337,81 @@ fn ocr_image_regions_with_config(
         })
         .as_ref()
         .map_err(Clone::clone)?;
-    let input = engine
-        .prepare_input(img_source)
-        .map_err(|e| format!("could not preprocess image: {e}"))?;
-    let words = engine
-        .detect_words(&input)
-        .map_err(|e| format!("could not detect OCR words: {e}"))?;
-    let lines = engine.find_text_lines(&input, &words);
-    let recognized = engine
-        .recognize_text(&input, &lines)
-        .map_err(|e| format!("could not OCR image: {e}"))?;
     let mut regions = Vec::new();
-    for line in recognized.into_iter().flatten() {
-        let text = line.to_string();
-        if text.trim().is_empty() {
-            continue;
+    let mut passes = Vec::new();
+    if xs.len() > 1 || ys.len() > 1 {
+        // Preserve full-line context for strings crossing tile boundaries.
+        passes.push((0, 0, true));
+    }
+    for top in ys {
+        for &left in &xs {
+            passes.push((left, top, false));
         }
-        let bounds = line.bounding_rect();
-        let rect = NormalizedImageRect::from_pixels(
-            bounds.left() as f32,
-            bounds.top() as f32,
-            bounds.width() as f32,
-            bounds.height() as f32,
-            ocr_width,
-            ocr_height,
-        );
-        regions.push(ImageTextRegion { text, rect });
+    }
+    for (left, top, overview) in passes {
+        let tile = if overview {
+            resize_for_ocr(img.clone(), cfg.max_edge)
+        } else {
+            img.crop_imm(
+                left,
+                top,
+                tile_edge.min(width - left),
+                tile_edge.min(height - top),
+            )
+        }
+        .into_rgb8();
+        let (reference_width, reference_height) = if overview {
+            tile.dimensions()
+        } else {
+            (width, height)
+        };
+        let img_source = ImageSource::from_bytes(tile.as_raw(), tile.dimensions())
+            .map_err(|e| format!("could not prepare image: {e}"))?;
+        let input = engine
+            .prepare_input(img_source)
+            .map_err(|e| format!("could not preprocess image: {e}"))?;
+        let words = engine
+            .detect_words(&input)
+            .map_err(|e| format!("could not detect OCR words: {e}"))?;
+        let lines = engine.find_text_lines(&input, &words);
+        let recognized = engine
+            .recognize_text(&input, &lines)
+            .map_err(|e| format!("could not OCR image: {e}"))?;
+        for line in recognized.into_iter().flatten() {
+            let text = line.to_string();
+            if text.trim().is_empty() {
+                continue;
+            }
+            let bounds = line.bounding_rect();
+            let rect = NormalizedImageRect::from_pixels(
+                left as f32 + bounds.left() as f32,
+                top as f32 + bounds.top() as f32,
+                bounds.width() as f32,
+                bounds.height() as f32,
+                reference_width,
+                reference_height,
+            );
+            regions.push(ImageTextRegion { text, rect });
+        }
     }
     Ok(regions)
 }
 
-#[cfg(all(feature = "ocr", target_os = "linux"))]
+#[cfg(all(feature = "ocr", any(target_os = "linux", target_os = "windows")))]
+fn ocr_tile_starts(length: u32, edge: u32) -> Result<Vec<u32>, String> {
+    let mut starts = vec![0u32];
+    let step = edge.saturating_sub(128).max(1);
+    while starts.last().copied().unwrap().saturating_add(edge) < length {
+        if starts.len() >= 64 {
+            return Err("image OCR tile limit exceeded".to_string());
+        }
+        let next = (starts.last().copied().unwrap() + step).min(length - edge);
+        starts.push(next);
+    }
+    Ok(starts)
+}
+
+#[cfg(all(feature = "ocr", any(target_os = "linux", target_os = "windows")))]
 fn resize_for_ocr(img: image::DynamicImage, max_edge: u32) -> image::DynamicImage {
     use image::GenericImageView;
 
@@ -3174,6 +3492,34 @@ mod tests {
             fetch_seconds: 8,
             unscanned_images: UnscannedImagePolicy::Allow,
         }
+    }
+
+    #[cfg(all(feature = "ocr", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn bundled_latin_recognizer_finds_small_desktop_credentials() {
+        let png = data_encoding::BASE64
+            .decode(
+                include_str!("../../../tools/fixtures/computer-use-small-latin.png.b64")
+                    .trim()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let regions = bundled_ocr_image_regions(&png, &test_config()).unwrap();
+        let text = image_regions_text(&regions);
+        assert!(
+            text.contains("COMPUTER"),
+            "Latin credential line was not recognized"
+        );
+        assert!(
+            text.contains("example.com"),
+            "Latin email was not recognized"
+        );
+        let findings = image_secret_findings(&png, &[7; 32], &test_config()).unwrap();
+        assert!(findings.scan_failure.is_none());
+        assert!(findings.iter().any(|hit| hit.redact_pixels));
+        // Tiny glyphs can be misread. Verify detection here, without claiming
+        // exact credential extraction or correcting recognized bytes by guess.
+        assert!(findings.iter().any(|hit| !hit.secrets.is_empty()));
     }
 
     #[cfg(not(feature = "ocr"))]
@@ -3466,7 +3812,7 @@ mod tests {
 
     #[cfg(feature = "ocr")]
     #[test]
-    fn one_image_separates_visual_and_metadata_handles() {
+    fn one_image_only_publishes_exact_metadata_handles() {
         let visual_secret = "AKIACSVC3FV5KQHYWH8A";
         let metadata_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
         let mut metadata = b"Description\0OPENAI_API_KEY=".to_vec();
@@ -3483,15 +3829,15 @@ mod tests {
         let redaction = redact_tool_images_for_secrets(&value, &key, &key, &test_config()).unwrap();
         let visual = redaction.visual_notes.join("\n");
         let metadata = redaction.metadata_notes.join("\n");
-        assert!(visual.contains("<<AWS_CLIENT_ID_"), "{visual}");
-        assert!(!visual.contains("<<KEYED_SECRET_"), "{visual}");
+        assert!(visual.contains("AWS_CLIENT_ID"), "{visual}");
+        assert!(!visual.contains("<<"), "{visual}");
         assert!(metadata.contains("<<KEYED_SECRET_"), "{metadata}");
         assert!(!metadata.contains("<<AWS_CLIENT_ID_"), "{metadata}");
         assert_eq!(redaction.labels.get("AWS_CLIENT_ID"), Some(&1));
         assert_eq!(redaction.labels.get(labels::KEYED_SECRET), Some(&1));
         assert!(redaction.labels.keys().all(|label| !label.contains("<<")));
         assert!(
-            redaction.recovery.resolve(&visual).contains(visual_secret),
+            !redaction.recovery.resolve(&visual).contains(visual_secret),
             "{visual}"
         );
         assert!(
@@ -3505,7 +3851,7 @@ mod tests {
 
     #[cfg(feature = "ocr")]
     #[test]
-    fn qr_image_explicit_markers_are_redacted_with_recoverable_handles() {
+    fn qr_image_explicit_markers_are_redacted_without_recoverable_handles() {
         let payload = "pentect(unclosed\nmask( pa(ss), 日本語 )\npentect(alpha!\nbeta)";
         let original = qr_png(payload);
         let value = serde_json::json!({
@@ -3526,13 +3872,32 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(redaction.changed);
-        assert!(note.matches("<<KEYED_SECRET_").count() >= 2, "{note}");
+        assert!(note.contains("KEYED_SECRET"), "{note}");
+        assert!(!note.contains("<<"), "{note}");
         assert!(!note.contains("pentect("), "{note}");
         assert!(!note.contains("mask("), "{note}");
         assert!(!note.contains("日本語"), "{note}");
-        assert!(recovered.iter().any(|value| value == " pa(ss), 日本語 "));
-        assert!(recovered.iter().any(|value| value == "alpha!\nbeta"));
+        assert!(recovered.is_empty());
         assert_ne!(redaction.updated, value);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn replayed_image_is_still_redacted_but_is_not_counted_again() {
+        let value = serde_json::json!({"type":"image", "mimeType":"image/png",
+            "data":data_encoding::BASE64.encode(&qr_png("OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"))});
+        let key = [91; 32];
+        for expected in [1, 0] {
+            let _scope = crate::MetricsRequestScope::with_key(Some(key));
+            let result =
+                redact_tool_images_for_secrets(&value, &key, &key, &test_config()).unwrap();
+            assert!(result.changed);
+            assert_eq!(result.secret_images, 1);
+            assert_eq!(result.counted_images, expected);
+            assert_ne!(result.updated, value);
+            assert!(!result.visual_notes.is_empty());
+            assert_eq!(result.labels.is_empty(), expected == 0);
+        }
     }
 
     #[cfg(feature = "ocr")]
@@ -4131,6 +4496,21 @@ mod tests {
         let img = image::DynamicImage::new_rgb8(1024, 512);
         let resized = resize_for_ocr(img, 2048);
         assert_eq!(resized.dimensions(), (1024, 512));
+    }
+
+    #[cfg(all(feature = "ocr", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn ocr_tiles_cover_native_pixels_with_overlap_and_bounded_work() {
+        assert_eq!(ocr_tile_starts(2570, 1024).unwrap(), vec![0, 896, 1546]);
+        assert_eq!(ocr_tile_starts(1018, 1024).unwrap(), vec![0]);
+        assert_eq!(ocr_tile_starts(1025, 1024).unwrap(), vec![0, 1]);
+        assert!(ocr_tile_starts(1000, 1).is_err());
+        for width in [1, 1024, 1920, 2570, 4096] {
+            let starts = ocr_tile_starts(width, 1024).unwrap();
+            assert_eq!(starts[0], 0);
+            assert!(starts.last().unwrap() + 1024 >= width);
+            assert!(starts.windows(2).all(|pair| pair[1] <= pair[0] + 896));
+        }
     }
 
     #[cfg(all(feature = "ocr", target_os = "windows"))]

@@ -1330,7 +1330,7 @@ impl ClaudeAppProxyGuard {
             runtime.block_on(async move {
                 if let Err(error) = run_proxy(
                     authority,
-                    ready_tx,
+                    ready_tx.clone(),
                     shutdown_rx,
                     thread_protected_connection_observed,
                 )
@@ -1340,13 +1340,13 @@ impl ClaudeAppProxyGuard {
                         *failure = Some(error.clone());
                     }
                     proxy_diagnostic("gateway-stopped");
+                    let _ = ready_tx.send(Err(error.clone()));
                     eprintln!("[pentect] Claude App proxy stopped: {error}");
                 }
             });
         });
-        let proxy_url = ready_rx
-            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Claude App proxy initialization timed out".to_string())??;
+        let proxy_url =
+            crate::gateway_diagnostics::wait_for_startup(&ready_rx, "Claude App proxy")?;
         Ok(Self {
             proxy_url,
             #[cfg(not(windows))]
@@ -4793,7 +4793,10 @@ mod tests {
         resolve_chat_tool_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["content"][0]["text"], format!("show {handle}"));
         assert_eq!(value["content"][1]["input"]["content"], "local-value");
-        assert_eq!(value["content"][1]["input"]["metadata"]["x-token"], handle);
+        assert_eq!(
+            value["content"][1]["input"]["metadata"]["x-token"],
+            "local-value"
+        );
     }
 
     #[test]

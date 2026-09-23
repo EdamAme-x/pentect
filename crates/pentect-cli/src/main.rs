@@ -1233,11 +1233,12 @@ fn cmd_read(args: &[String]) {
         (plugins::GLOBAL_BINARY_IDS_ENV, global_binary_ids_env),
     ]);
     let input = Input { kind, data };
-    match pentect_agent::mask_input_into_active_memory_store(
-        input.clone(),
-        opts.profile,
-        packs.clone(),
-    ) {
+    let mask_active = if opts.input_format == ReadInputFormat::Image {
+        pentect_agent::mask_ocr_input_into_active_memory_store
+    } else {
+        pentect_agent::mask_input_into_active_memory_store
+    };
+    match mask_active(input.clone(), opts.profile, packs.clone()) {
         Ok(Some(result)) => {
             if opts.input_format == ReadInputFormat::Text {
                 let _ = pentect_agent::remember_read_file(&opts.path, &input.data, &result);
@@ -1254,7 +1255,11 @@ fn cmd_read(args: &[String]) {
     {
         let cfg = Config::generate();
         (
-            match pentect_agent::mask_input_for_read(cfg.key, input, opts.profile, packs) {
+            match if opts.input_format == ReadInputFormat::Image {
+                pentect_agent::mask_ocr_input_for_read(cfg.key, input, opts.profile, packs)
+            } else {
+                pentect_agent::mask_input_for_read(cfg.key, input, opts.profile, packs)
+            } {
                 Ok(result) => result,
                 Err(e) => die(&e),
             },
