@@ -56,6 +56,22 @@ These are compatibility observations, not retroactive changes to a release's
 pinned gate. The installed test uses real client binaries and a localhost
 provider fixture; it does not make a paid provider request.
 
+## Anthropic mid-conversation tool changes (0.0.92)
+
+The Anthropic adapter supports `tool_addition` and `tool_removal`, including
+named tool/MCP references and inline `tool_definition.definition` objects.
+Inline definitions receive the same bounded text masking as top-level `tools`;
+reference identifiers remain unchanged, and detected secrets in identifiers
+are rejected instead of silently renaming tools. Invalid or unknown wrapper
+fields remain blocked. This applies to Messages, Count Tokens, and Message
+Batches and does not require `compatibility.unknown_formats = "ignore"`.
+
+The shapes were checked against Claude Code 2.1.280 and Anthropic's
+[mid-conversation tool documentation](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages).
+Regression tests cover reference preservation, inline description/schema/example
+masking, and invalid-shape rejection; this is not a claim of full live-provider
+compatibility for every beta feature.
+
 ## Not implemented
 
 These clients have status pages, but no public launcher in the current

@@ -1426,6 +1426,8 @@ fn anthropic_content_unknown_block_kind_at(
             "text"
                 | "tool_result"
                 | "tool_use"
+                | "tool_addition"
+                | "tool_removal"
                 | "document"
                 | "search_result"
                 | "image"
@@ -1449,6 +1451,9 @@ fn anthropic_content_unknown_block_kind_at(
         if kind == "tool_reference" && !valid_tool_reference(block) {
             return Some("<invalid tool reference>");
         }
+        if matches!(kind, "tool_addition" | "tool_removal") && !valid_tool_change(block) {
+            return Some("<invalid tool change>");
+        }
         if matches!(kind, "tool_result" | "mcp_tool_result") {
             return block
                 .get("content")
@@ -1464,6 +1469,55 @@ fn anthropic_content_unknown_block_kind_at(
     })
 }
 
+// Mid-conversation references use `name`, unlike tool-search's `tool_name`.
+// Inline definitions use the same bounded masking traversal as top-level tools.
+fn valid_tool_change(value: &Value) -> bool {
+    let Some(block) = value.as_object() else {
+        return false;
+    };
+    if block
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "tool" | "cache_control"))
+        || !valid_content_cache_control(value)
+    {
+        return false;
+    }
+    let Some(tool) = value.get("tool").and_then(Value::as_object) else {
+        return false;
+    };
+    let nonempty = |key: &str| {
+        tool.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    match tool.get("type").and_then(Value::as_str) {
+        Some("tool_reference") => {
+            nonempty("name") && tool.keys().all(|k| matches!(k.as_str(), "type" | "name"))
+        }
+        Some("mcp_tool_reference") => {
+            nonempty("name")
+                && nonempty("server_name")
+                && tool
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "type" | "name" | "server_name"))
+        }
+        Some("mcp_toolset_reference") => {
+            nonempty("server_name")
+                && tool
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "type" | "server_name"))
+        }
+        Some("tool_definition") => {
+            value.get("type").and_then(Value::as_str) == Some("tool_addition")
+                && tool
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "type" | "definition"))
+                && tool.get("definition").is_some_and(Value::is_object)
+        }
+        _ => false,
+    }
+}
+
 fn valid_tool_reference(value: &Value) -> bool {
     let Some(reference) = value.as_object() else {
         return false;
@@ -1476,7 +1530,11 @@ fn valid_tool_reference(value: &Value) -> bool {
     {
         return false;
     }
-    let Some(cache_control) = reference.get("cache_control") else {
+    valid_content_cache_control(value)
+}
+
+fn valid_content_cache_control(value: &Value) -> bool {
+    let Some(cache_control) = value.get("cache_control") else {
         return true;
     };
     if cache_control.is_null() {
@@ -2662,6 +2720,32 @@ fn mask_content(
                     "tool_use" | "mcp_tool_use" | "server_tool_use" => {
                         if let Some(input) = block.get_mut("input") {
                             mask_value_strings(input, masker)?;
+                        }
+                    }
+                    "tool_addition" | "tool_removal" => {
+                        // Validate even under compatibility mode: do not silently
+                        // pass fields that this adapter has not inspected.
+                        if !valid_tool_change(block) {
+                            return Err(unsupported_provider_history_shape("tool_change"));
+                        }
+                        let tool = &mut block["tool"];
+                        if tool["type"] == "tool_definition" {
+                            crate::model_definition::mask_model_definition(
+                                &mut tool["definition"],
+                                "Anthropic",
+                                masker,
+                            )?;
+                        } else {
+                            // Routing identifiers must remain stable. If a name
+                            // itself is sensitive, reject instead of renaming it.
+                            for key in ["name", "server_name"] {
+                                reject_sensitive_provider_named_text(
+                                    tool,
+                                    key,
+                                    "tool_change.reference",
+                                    masker,
+                                )?;
+                            }
                         }
                     }
                     "code_execution_tool_result"
@@ -5510,6 +5594,121 @@ mod tests {
             anthropic_request_unknown_content_kind(&value, AnthropicEndpoint::Messages),
             None
         );
+    }
+
+    #[test]
+    fn tool_changes_protect_inline_definitions_and_preserve_references() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["AKIA", "IOSFODNN7", "EXAMPLE"].concat();
+        let references = serde_json::json!([
+            {"type":"tool_addition","tool":{"type":"tool_reference","name":"azure_cli"},
+             "cache_control":{"type":"ephemeral","ttl":"1h"}},
+            {"type":"tool_removal","tool":{"type":"tool_reference","name":"old_tool"}},
+            {"type":"tool_addition","tool":{"type":"mcp_tool_reference","server_name":"azure","name":"list_resources"}},
+            {"type":"tool_removal","tool":{"type":"mcp_toolset_reference","server_name":"azure"}}
+        ]);
+        let mut blocks = references.as_array().unwrap().clone();
+        blocks.push(serde_json::json!({"type":"tool_addition","tool":{
+            "type":"tool_definition","definition":{
+                "name":"new_tool", "description":format!("credential={secret}"),
+                "input_schema":{"type":"object","properties":{"token":{
+                    "type":"string","default":secret,"description":format!("unmask({secret})")
+                }}}, "input_examples":[{"token":secret}]
+            }
+        }}));
+        let request = serde_json::json!({"model":"test","max_tokens":8,
+            "messages":[{"role":"system","content":blocks}],
+            "tools":[{"name":"azure_cli","description":format!("credential={secret}"),
+                "input_schema":{"type":"object","properties":{}}}]
+        });
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        for endpoint in [
+            AnthropicEndpoint::Messages,
+            AnthropicEndpoint::CountTokens,
+            AnthropicEndpoint::MessageBatches,
+        ] {
+            let body = if endpoint == AnthropicEndpoint::MessageBatches {
+                serde_json::json!({"requests":[{"custom_id":"test","params":request.clone()}]})
+            } else {
+                request.clone()
+            };
+            let protected = protect_anthropic_request_body(
+                &Bytes::from(serde_json::to_vec(&body).unwrap()),
+                &masker,
+                &plugins,
+                &HashMap::new(),
+                endpoint,
+                true,
+            )
+            .unwrap();
+            assert_eq!(protected.coverage, crate::http_files::Coverage::Full);
+            let mut result: Value = serde_json::from_slice(&protected.body).unwrap();
+            assert!(!result.to_string().contains(&secret));
+            assert!(result.to_string().contains("<<"));
+            if endpoint == AnthropicEndpoint::MessageBatches {
+                result = result["requests"][0]["params"].clone();
+            }
+            for (index, expected) in references.as_array().unwrap().iter().enumerate() {
+                assert_eq!(&result["messages"][0]["content"][index], expected);
+            }
+            assert_eq!(
+                result["messages"][0]["content"][4]["tool"]["definition"]["name"],
+                "new_tool"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_changes_reject_uninspected_shapes_and_sensitive_routing_names() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let invalid = [
+            serde_json::json!({"type":"tool_addition"}),
+            serde_json::json!({"type":"tool_addition","tool":{"type":"future_tool","name":"x"}}),
+            serde_json::json!({"type":"tool_addition","tool":{"type":"tool_reference","name":"x","description":"uninspected"}}),
+            serde_json::json!({"type":"tool_addition","tool":{"type":"tool_reference","name":7}}),
+            serde_json::json!({"type":"tool_removal","tool":{"type":"tool_definition","definition":{}}}),
+            serde_json::json!({"type":"tool_addition","tool":{"type":"tool_definition","definition":"not an object"}}),
+            serde_json::json!({"type":"tool_addition","tool":{"type":"tool_reference","name":"x"},"cache_control":{"type":"ephemeral","unknown":"plaintext"}}),
+        ];
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        for block in invalid {
+            assert!(!valid_tool_change(&block));
+            let request = serde_json::json!({"messages":[{"role":"system","content":[block]}]});
+            assert_eq!(
+                anthropic_request_unknown_content_kind(&request, AnthropicEndpoint::Messages),
+                Some("<invalid tool change>")
+            );
+            for strict in [true, false] {
+                assert!(protect_anthropic_request_body(
+                    &Bytes::from(serde_json::to_vec(&request).unwrap()),
+                    &masker,
+                    &plugins,
+                    &HashMap::new(),
+                    AnthropicEndpoint::Messages,
+                    strict,
+                )
+                .is_err());
+            }
+        }
+        let secret = ["AKIA", "IOSFODNN7", "EXAMPLE"].concat();
+        let request = serde_json::json!({"messages":[{"role":"system","content":[{
+            "type":"tool_addition","tool":{"type":"tool_reference","name":format!("password={secret}")}
+        }]}]});
+        assert!(protect_anthropic_request_body(
+            &Bytes::from(serde_json::to_vec(&request).unwrap()),
+            &masker,
+            &plugins,
+            &HashMap::new(),
+            AnthropicEndpoint::Messages,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
