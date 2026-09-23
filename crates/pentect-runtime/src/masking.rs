@@ -1367,7 +1367,7 @@ pub(crate) fn canonical_masking_engine_with_protection(
         .detector(Box::new(crate::alcatraz::AlcatrazDetector));
     for config_pack in packs {
         builder = builder
-            .detector(Box::new(config_pack.rules))
+            .detector(Box::new(OptedInRulePack(config_pack.rules)))
             .disable_labels(config_pack.disable);
     }
     let guard: Box<dyn OverMaskGuard> = if aggressive {
@@ -1387,6 +1387,21 @@ pub(crate) fn canonical_masking_engine_with_protection(
 struct OptionalProtectionPolicy {
     profile: ProfilePolicy,
     protection: config::ProtectionConfig,
+}
+
+// Installing a rule pack is an explicit opt-in, independent of built-in groups.
+struct OptedInRulePack(pentect_core::RuleDetector);
+impl pentect_core::detect::Detector for OptedInRulePack {
+    fn detect(&self, view: &pentect_core::normalize::NormalizedView) -> Vec<pentect_core::Span> {
+        self.0
+            .detect(view)
+            .into_iter()
+            .map(|mut span| {
+                span.source = pentect_core::DetectorId::Plugin;
+                span
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1451,7 +1466,7 @@ impl pentect_core::policy::Policy for OptionalProtectionPolicy {
         use pentect_core::{policy::Action, DetectorId};
         // Explicitly protected values and credentials stay protected regardless
         // of their shape (an email can itself be a password).
-        if span.source != DetectorId::Explicit {
+        if !matches!(span.source, DetectorId::Explicit | DetectorId::Plugin) {
             if !self.protection.pii && span.category == Category::Pii && span.label != "CREDIT_CARD"
             {
                 return Action::Keep;

@@ -216,9 +216,40 @@ pub(crate) fn record_stream_failure(
     );
 }
 
+/// A disconnected startup channel means the worker exited, not that it timed out.
+pub(crate) fn wait_for_startup(
+    receiver: &std::sync::mpsc::Receiver<Result<String, String>>,
+    name: &str,
+) -> Result<String, String> {
+    match receiver.recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("{name} initialization timed out"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "{name} initialization worker exited before readiness"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_failure_is_not_reported_as_a_timeout() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err("invalid compatibility config".to_string()))
+            .unwrap();
+        assert_eq!(
+            wait_for_startup(&rx, "Test").unwrap_err(),
+            "invalid compatibility config"
+        );
+        drop(tx);
+        let error = wait_for_startup(&rx, "Test").unwrap_err();
+        assert!(error.contains("worker exited"));
+        assert!(!error.contains("timed out"));
+    }
 
     #[test]
     fn failures_are_reduced_to_fixed_safe_categories() {

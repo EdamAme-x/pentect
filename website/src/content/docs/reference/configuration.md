@@ -64,6 +64,15 @@ or URL credentials), credit-card detection, or explicit `mask(...)` markers.
 A value used as a password remains protected even if it looks like an email or
 UUID. Restart the protected client after changing these settings.
 
+These switches control built-in detection. Explicitly installed plugin and rule
+pack findings remain protected, including custom PII and identifier rules.
+
+The home directory's `.pentect/config.toml` is always user configuration, even
+when starting in the home directory or a non-repository folder beneath it.
+It is not treated as project configuration merely because it is an ancestor.
+Gateway startup reports configuration failures directly rather than calling
+every early initialization failure a timeout.
+
 ## Update notification
 
 ```toml

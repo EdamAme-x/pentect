@@ -162,21 +162,21 @@ impl OpenAiHttpProxyGuard {
                     headers,
                     thread_auth,
                     thread_protected_request_observed,
-                    ready_tx,
+                    ready_tx.clone(),
                     shutdown_rx,
                 )
                 .await
                 {
                     if let Ok(mut failure) = thread_failure.lock() {
-                        *failure = Some(error);
+                        *failure = Some(error.clone());
                     }
+                    let _ = ready_tx.send(Err(error));
                     proxy_diagnostic("gateway-stopped");
                 }
             });
         });
-        let base_url = ready_rx
-            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "OpenAI HTTP gateway initialization timed out".to_string())??;
+        let base_url =
+            crate::gateway_diagnostics::wait_for_startup(&ready_rx, "OpenAI HTTP gateway")?;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),

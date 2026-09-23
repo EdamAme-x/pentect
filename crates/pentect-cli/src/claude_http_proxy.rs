@@ -196,8 +196,14 @@ impl ClaudeHttpProxyGuard {
                 }
             };
             runtime.block_on(async move {
-                if let Err(error) =
-                    run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
+                if let Err(error) = run_proxy(
+                    upstream,
+                    headers,
+                    thread_auth,
+                    ready_tx.clone(),
+                    shutdown_rx,
+                )
+                .await
                 {
                     crate::gateway_diagnostics::record(
                         "claude",
@@ -210,13 +216,12 @@ impl ClaudeHttpProxyGuard {
                         None,
                         false,
                     );
-                    let _ = error;
+                    let _ = ready_tx.send(Err(error));
                 }
             });
         });
-        let base_url = ready_rx
-            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Claude HTTP proxy initialization timed out".to_string())??;
+        let base_url =
+            crate::gateway_diagnostics::wait_for_startup(&ready_rx, "Claude HTTP proxy")?;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
@@ -5659,6 +5664,52 @@ mod tests {
                 "new_tool"
             );
         }
+    }
+
+    #[test]
+    fn startup_respects_user_config_outside_repositories_and_reports_project_errors() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let env = TestEnv::install(&store);
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+        let _cwd = RestoreCwd(std::env::current_dir().unwrap());
+        std::fs::create_dir_all(env.home.join(".pentect")).unwrap();
+        std::fs::write(
+            env.home.join(".pentect/config.toml"),
+            "[compatibility]\nunknown_formats = \"ignore\"\n",
+        )
+        .unwrap();
+        let project = env.home.join("Documents/non-repository");
+        std::fs::create_dir_all(&project).unwrap();
+        for cwd in [&env.home, &project] {
+            std::env::set_current_dir(cwd).unwrap();
+            assert_eq!(
+                pentect_agent::project_root().unwrap(),
+                cwd.canonicalize().unwrap()
+            );
+            assert!(!pentect_agent::unknown_formats_should_block().unwrap());
+            let proxy = ClaudeHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+            drop(proxy);
+        }
+        std::fs::create_dir_all(project.join(".pentect")).unwrap();
+        std::fs::write(
+            project.join(".pentect/config.toml"),
+            "[compatibility]\nunknown_formats = \"ignore\"\n",
+        )
+        .unwrap();
+        let error = ClaudeHttpProxyGuard::start("http://127.0.0.1:9".to_string())
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("may only be set in the user config"),
+            "{error}"
+        );
+        assert!(!error.contains("timed out"));
     }
 
     #[test]

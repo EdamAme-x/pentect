@@ -91,17 +91,21 @@ impl GeminiHttpProxyGuard {
                 }
             };
             runtime.block_on(async move {
-                if run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx)
-                    .await
-                    .is_err()
+                if let Err(error) = run_proxy(
+                    upstream,
+                    headers,
+                    thread_auth,
+                    ready_tx.clone(),
+                    shutdown_rx,
+                )
+                .await
                 {
+                    let _ = ready_tx.send(Err(error));
                     diagnostic("gateway-stopped");
                 }
             });
         });
-        let base_url = ready_rx
-            .recv_timeout(crate::GATEWAY_STARTUP_TIMEOUT)
-            .map_err(|_| "Gemini gateway initialization timed out".to_string())??;
+        let base_url = crate::gateway_diagnostics::wait_for_startup(&ready_rx, "Gemini gateway")?;
         Ok(Self {
             base_url,
             shutdown: Some(shutdown_tx),
