@@ -217,7 +217,7 @@ fn specs() -> Vec<PatternSpec> {
         (r#"(?:ログイン|サインイン|認証|本人確認|二段階認証)[^\r\n]{0,120}?([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})"#, 1, &["ログイン", "サインイン", "認証", "本人確認", "二段階認証"]),
     ];
 
-    patterns
+    let mut specs: Vec<PatternSpec> = patterns
         .iter()
         .map(|&(pattern, capture, prefilter)| PatternSpec {
             pattern: pattern.to_string(),
@@ -229,7 +229,21 @@ fn specs() -> Vec<PatternSpec> {
             capture,
             prefilter: prefilter.iter().map(|s| (*s).to_string()).collect(),
         })
-        .collect()
+        .collect();
+    // App-password pages put the generated credential below a localized heading.
+    // Require the heading and a complete 16-letter value; do not classify arbitrary
+    // hyphenated words or cross unrelated prose looking for a credential.
+    specs.push(PatternSpec {
+        pattern: r#"(?i)(?:アプリ(?:用)?パスワード|app(?:lication)?(?:[- ]specific)?[- ]password)[ \t]*[:：]?[ \t*`]{0,8}(?:\r?\n[ \t]*){0,3}[#*` ]{0,8}([a-z]{4}(?:[- ][a-z]{4}){3}|[a-z]{16})(?:$|[\s*`<。])"#.to_string(),
+        category: Category::Secret,
+        label: "PASSWORD".to_string(),
+        confidence: High,
+        validator: V::None,
+        context: Default::default(),
+        capture: 1,
+        prefilter: vec!["アプリ".into(), "app".into()],
+    });
+    specs
 }
 
 #[cfg(test)]
@@ -249,6 +263,25 @@ mod tests {
 
     fn has_value(raw: &str, value: &str) -> bool {
         values_for(raw).iter().any(|got| got == value)
+    }
+
+    #[test]
+    fn app_password_headings_capture_only_the_complete_credential() {
+        for (heading, value) in [
+            ("# アプリ用パスワード：\n\n# ", "qvzr-nhdk-wpjt-bcxs"),
+            ("アプリパスワード:\r\n\r\n", "Qvzr Nhdk Wpjt Bcxs"),
+            ("**App-specific password:**\n\n`", "qvzr-nhdk-wpjt-bcxs"),
+            ("Application password: ", "qvzrnhdkwpjtbcxs"),
+        ] {
+            assert!(has_value(&format!("{heading}{value}\n"), value));
+        }
+        assert!(values_for("qvzr-nhdk-wpjt-bcxs").is_empty());
+        assert!(values_for("アプリ用パスワード：説明文\nqvzr-nhdk-wpjt-bcxs").is_empty());
+        assert!(values_for("App password: qvzr-nhdk-wpjt-bcxs-extra").is_empty());
+        assert!(has_value(
+            "**App-specific password:**\n\n`qvzr-nhdk-wpjt-bcxs`",
+            "qvzr-nhdk-wpjt-bcxs"
+        ));
     }
 
     #[test]
