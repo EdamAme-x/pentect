@@ -4753,6 +4753,7 @@ mod tests {
                 "PENTECT_AGENT_LAUNCHED",
                 "PENTECT_HOME",
                 "HOME",
+                "USERPROFILE",
                 "LOCALAPPDATA",
             ];
             let saved = names
@@ -4773,6 +4774,7 @@ mod tests {
             std::env::set_var("PENTECT_AGENT_LAUNCHED", store.token());
             std::env::set_var("PENTECT_HOME", &home);
             std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
             std::env::set_var("LOCALAPPDATA", &home);
             let mut environment = Self {
                 saved,
@@ -7153,6 +7155,7 @@ mod tests {
             "[compatibility]\nunknown_formats = \"error\"\n",
         )
         .unwrap();
+        assert!(pentect_agent::unknown_formats_should_block().unwrap());
         let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
         let secret = ["rpa_", "INSTRUCTIONS", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
 
