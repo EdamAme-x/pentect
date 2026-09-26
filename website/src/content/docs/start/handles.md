@@ -79,6 +79,18 @@ to quote or escape them. This is a conservative value check, not a full shell
 or programming-language parser; the surrounding command must still be valid
 and keep the value in a data position.
 
+### Base64 handles
+
+Base64 views are supported explicitly; Pentect does not emit a second handle
+automatically. For example, given the illustrative handle
+`<<API_KEY_0123456789abcdef>>`, its base64 view is
+`<<API_KEY_0123456789abcdef|base64>>`.
+
+The category and hash stay unchanged. Pentect restores this view to the base64
+encoding of the original value, which the local tool must decode before use.
+`<<API_KEY_0123456789abcdef_BASE64>>` is not a supported alias. An unknown or
+expired handle cannot be recovered by adding `|base64`.
+
 If the ordinary representation is rejected, append `|base64` before the
 closing `>>`. Keep that explicit view as one complete quoted data value and
 decode it locally through argv, stdin, or another data API. Base64 is a

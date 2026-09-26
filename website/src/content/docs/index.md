@@ -12,10 +12,11 @@ replaces detected credentials and sensitive data with opaque handles before
 supported requests reach the model provider, then restores known values for
 supported local tool calls.
 
-Keep your usual coding workflow: launch with `pentect codex`, `pentect claude`,
-`pentect opencode`, or `pentect pi`. Detection runs locally. Pentect does not
-replace your agent's permissions or sandbox, and it cannot guarantee that every
-secret will be detected. [Understand the security boundary](/protection/security-model/).
+Launch your agent through Pentect:<br />
+`pentect codex` · `pentect claude` · `pentect opencode` · `pentect pi`
+
+Detection runs locally, but may miss secrets.<br />
+Your agent's permissions and sandbox still apply. [Security limits](/protection/security-model/).
 
 <div class="home-demo">
   <video
@@ -52,10 +53,6 @@ CLI, Claude Code, OpenCode, and Pi.
   <a href="/clients/pi/" class="docs-grid__item">
     <small>CLI</small><strong>Pi</strong>
     <span>Run Pi through a temporary protected provider.</span><b aria-hidden="true">→</b>
-  </a>
-  <a href="/reference/compatibility/#not-implemented" class="docs-grid__item">
-    <small>Status</small><strong>Not implemented</strong>
-    <span>See clients that are documented but not currently available.</span><b aria-hidden="true">→</b>
   </a>
 </DocsGrid>
 
