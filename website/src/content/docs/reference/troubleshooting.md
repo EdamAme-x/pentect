@@ -215,6 +215,12 @@ access. For a required plugin, a plugin error stops the protected action.
 This error means Pentect does not know how to check part of the request. Pentect
 did not send the request to the provider.
 
+Unknown-format pass-through is the default. If strict blocking is reported,
+check both user and project configuration for an explicit `error` or `block`.
+Malformed supported structures, unsafe handles, and image-policy failures may
+still be rejected in pass-through mode; do not treat `ignore` as a way to disable
+those checks.
+
 ### Try the protected path first
 
 1. Run `pentect doctor`, then run `pentect update --check`. If an update is
@@ -254,12 +260,13 @@ ${EDITOR:-vi} ~/.pentect/config.toml
 
 If `[compatibility]` already exists, change its `unknown_formats` value. Do not
 add the table twice. Then close and restart the client through Pentect. A
-project cannot change this setting because only the user should make this
-choice.
+project cannot set `ignore`. An explicit project `error` still requires strict
+blocking, even when the user config says `ignore`.
 
 With `ignore`, Pentect sends an unknown request without checking or masking it.
-Known request types stay protected. To restore the default, change the value to
-`"error"` and restart the client.
+Known request types stay protected. To enable strict blocking, change the value
+to `"error"` and restart the client. Remove an explicit policy to inherit the
+default (`ignore` unless the other config requires `error`).
 
 ### Report a format Pentect should support
 

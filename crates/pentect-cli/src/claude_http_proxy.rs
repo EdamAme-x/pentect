@@ -5538,8 +5538,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_anthropic_content_blocks_by_default_and_can_be_allowed() {
+    fn unknown_anthropic_content_passes_by_default_and_blocks_in_strict_mode() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let default_blocks = pentect_agent::unknown_formats_should_block().unwrap();
+        assert!(!default_blocks);
         let body = Bytes::from_static(
             br#"{"messages":[{"role":"user","content":[{"type":"future_block","data":"opaque"}]}]}"#,
         );
@@ -5566,7 +5570,7 @@ mod tests {
             &plugins,
             &files,
             AnthropicEndpoint::Messages,
-            false,
+            default_blocks,
         )
         .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
@@ -5957,7 +5961,13 @@ mod tests {
 
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
-        let _env = TestEnv::install(&store);
+        let env = TestEnv::install(&store);
+        std::fs::create_dir_all(env.home.join(".pentect")).unwrap();
+        std::fs::write(
+            env.home.join(".pentect/config.toml"),
+            "[compatibility]\nunknown_formats = \"error\"\n",
+        )
+        .unwrap();
         let secret = ["AKIA", "IOSFODNN7", "EXAMPLE"].concat();
         let reference = serde_json::json!({
             "type": "tool_reference", "tool_name": "weather_lookup_20260909"

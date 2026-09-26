@@ -1498,6 +1498,8 @@ mod tests {
                 "PENTECT_AGENT_LAUNCHED",
                 "PENTECT_HOME",
                 "LOCALAPPDATA",
+                "HOME",
+                "USERPROFILE",
             ];
             let saved = names
                 .into_iter()
@@ -1517,6 +1519,8 @@ mod tests {
             std::env::set_var("PENTECT_AGENT_LAUNCHED", store.token());
             std::env::set_var("PENTECT_HOME", &home);
             std::env::set_var("LOCALAPPDATA", &home);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
             let process_host_candidate = Some(
                 pentect_agent::register_process_host_candidate(
                     &pentect_agent::process_host_root().unwrap(),
@@ -1982,7 +1986,13 @@ mod tests {
     fn unknown_routes_and_wrong_model_methods_are_blocked_before_upstream() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
-        let _env = TestEnv::install(&store);
+        let env = TestEnv::install(&store);
+        std::fs::create_dir_all(env.home.join(".pentect")).unwrap();
+        std::fs::write(
+            env.home.join(".pentect/config.toml"),
+            "[compatibility]\nunknown_formats = \"error\"\n",
+        )
+        .unwrap();
         let proxy = CloudCodeHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
         let client = reqwest::blocking::Client::new();
         let unknown = client

@@ -28,11 +28,11 @@ leaving protocol fields such as model, voice, size, and output format intact.
 
 Audio transcription and translation upload a binary recording. Pentect can
 check and replace their optional text `prompt`, but it cannot remove secrets
-spoken inside the recording. The default unknown-format policy therefore
-blocks these requests. With `compatibility.unknown_formats = "ignore"`, Pentect
+spoken inside the recording. Strict `compatibility.unknown_formats = "error"`
+blocks these requests. With the default `compatibility.unknown_formats = "ignore"`, Pentect
 passes a recognized FLAC, MP3, MP4, MPEG, MPGA, M4A, OGG, WAV, or WebM recording
 through unchanged, marks coverage as `partial`, and still protects the text
-prompt. This is an explicit compatibility tradeoff, not full audio inspection.
+prompt. This default compatibility tradeoff is not full audio inspection.
 
 ## Files API
 

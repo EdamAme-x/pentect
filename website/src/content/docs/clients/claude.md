@@ -211,8 +211,8 @@ never tool input, paths, handles, or plugin-generated error text.
 
 ::: warning
 Pentect does not protect remote Cowork tasks, Voice, test binary formats, or
-unknown future routes. Voice remains blocked by default. With the user-level
-`compatibility.unknown_formats = "ignore"` setting, Pentect can relay the exact
+unknown future routes. With the default
+`compatibility.unknown_formats = "ignore"` policy, Pentect can relay the exact
 `claude.ai` Voice WebSocket, but that opaque stream is **not inspected or
 masked** and is logged as `inspected=no`. See the
 [unknown-format steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)

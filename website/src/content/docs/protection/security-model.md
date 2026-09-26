@@ -26,7 +26,7 @@ permissions.
 - Supported MCP and connector text and structured data are checked before they
   enter the next provider request. Media follows the configured OCR and
   `unscanned` policy; allowing unchecked media can bypass inspection.
-- Unknown provider formats and unsupported content are blocked by default.
+- Unknown provider formats pass through by default without guaranteed inspection. Set `compatibility.unknown_formats = "error"` for strict blocking. Independent image and handle checks still apply.
 - Wasm plugins cannot directly use WASI, files, environment variables,
   processes, or network sockets.
 
@@ -102,16 +102,17 @@ not prove equivalent behavior for every possible input.
 
 ## Compatibility mode
 
-Pentect returns an error for unknown provider formats by default. Only the user
-config can change this:
+Pentect passes unknown provider formats through by default. They may contain
+secrets that Pentect cannot inspect or mask. For strict blocking, use:
 
 ```toml
 [compatibility]
-unknown_formats = "ignore"
+unknown_formats = "error"
 ```
 
-A project cannot make this setting less safe. This stops a repository from
-silently turning off the default check.
+A user or project can require `error`. Explicit `ignore` is allowed only in
+user configuration, and cannot override a project requirement for `error`.
+Existing explicit strict settings remain unchanged.
 
 See [Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
 for protected alternatives, copyable setup commands, restart instructions, and
