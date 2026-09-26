@@ -223,8 +223,8 @@ not acceptable.
   covered only if its connected-computer worker actually uses a separately
   verified local Pentect path
 - Remote Claude Cowork execution; Claude Voice content is not inspected (the
-  exact Voice WebSocket can only be relayed after the user enables unknown
-  format pass-through)
+  exact Voice WebSocket can be relayed under unknown-format pass-through,
+  which is now the default; relaying does not inspect or protect its content)
 - Independent web-search, hosted-tool, browser, and MCP connections that do
   not pass through a listed provider contract
 - Copilot, VS Code inline suggestions, and private traffic from other extensions
@@ -237,7 +237,11 @@ just because the surrounding JSON is valid. See
 [Files and images](/protection/files-and-images/) for the exact upload, URL,
 image, and PDF boundaries.
 
-Pentect blocks unknown or unsupported content by default. It does not claim to
-protect content that it cannot check. If you see this error, first try the
-default provider, then
-follow the [unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked).
+Unknown provider formats pass through by default (`compatibility.unknown_formats
+= "ignore"`). They may reach the provider without inspection or masking; Pentect
+does not claim to protect content it cannot check. To require strict blocking,
+set `unknown_formats = "error"` in the user or project config and restart the
+client. Existing explicit strict settings remain effective. Known-format checks,
+image policy, and handle validation remain enabled in pass-through mode.
+See [configuration](/reference/configuration/#unknown-provider-formats) and the
+[unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked).

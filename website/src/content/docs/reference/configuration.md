@@ -36,7 +36,7 @@ ignored.
 | `handles.scope` | `device` | Choose how stable handle IDs are |
 | `protection.pii` | `false` | Opt in to personal-data masking, such as email and phone numbers |
 | `protection.internal` | `false` | Opt in to endpoint and identifier masking, such as internal hosts, IP addresses and UUIDs |
-| `compatibility.unknown_formats` | `error` | Block request formats Pentect cannot inspect |
+| `compatibility.unknown_formats` | `ignore` | Pass unknown provider formats through without guaranteed inspection |
 | `image.ocr` | `on` | Check supported images locally |
 | `image.redaction` | `black` | Cover detected image regions |
 | `image.unscanned` | `block` | Stop when image or document content cannot be checked |
@@ -105,12 +105,23 @@ not simple fingerprints of the real value.
 
 ```toml
 [compatibility]
-unknown_formats = "error" # default
+unknown_formats = "ignore" # default when neither config specifies a policy
 ```
 
-Set `ignore` only in the user config. It sends an unknown request without
-checking it. Restart the client after changing this value. Change it back to
-`error` to restore the default.
+::: warning Unknown formats may expose secrets
+The default favors client compatibility: unknown provider formats can pass
+through without inspection or masking. Successful delivery does not mean the
+content was protected. Known supported formats still use their normal protection.
+This setting does not disable image policy, handle validation, or explicit
+rejection of malformed supported structures.
+:::
+
+For strict unknown-format blocking, set `unknown_formats = "error"` (`"block"`
+is an alias). Existing explicit `error` settings remain strict; changing the
+default does not overwrite them. Restart the client after changing the policy.
+
+Explicit `ignore` is allowed only in the user config. A project-level `error`
+still takes precedence, even when the user config says `ignore`.
 
 Project config can require `error`, but it cannot set `ignore`. See
 [Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)

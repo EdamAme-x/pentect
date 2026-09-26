@@ -120,7 +120,7 @@ limits, remote URLs, PDF behavior, and image settings.
 | MCP text or structured result | Checks supported strings and structured fields |
 | Clipboard text returned by a tool | Masks detected values |
 | Supported screenshot or inline image | Runs local OCR and covers detected regions |
-| Unknown media or result format | Blocks it by default when it cannot be checked safely |
+| Unknown media or result format | May pass through uninspected under the default `unknown_formats = "ignore"`; image and handle checks still apply |
 
 ## What is not covered
 

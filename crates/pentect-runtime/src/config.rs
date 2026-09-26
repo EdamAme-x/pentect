@@ -610,7 +610,7 @@ fn unknown_formats_should_block_effective(
         );
     }
     Ok(project == Some(UnknownFormatPolicy::Error)
-        || global.unwrap_or(UnknownFormatPolicy::Error) == UnknownFormatPolicy::Error)
+        || global.unwrap_or(UnknownFormatPolicy::Ignore) == UnknownFormatPolicy::Error)
 }
 
 fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
@@ -1414,8 +1414,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_formats_block_by_default_and_only_global_config_can_relax() {
-        assert!(unknown_formats_should_block_effective(None, None).unwrap());
+    fn unknown_formats_pass_by_default_and_explicit_strict_policy_wins() {
+        assert!(!unknown_formats_should_block_effective(None, None).unwrap());
+        assert!(
+            unknown_formats_should_block_effective(None, Some(UnknownFormatPolicy::Error)).unwrap()
+        );
+        assert!(
+            unknown_formats_should_block_effective(Some(UnknownFormatPolicy::Error), None).unwrap()
+        );
         assert!(
             !unknown_formats_should_block_effective(None, Some(UnknownFormatPolicy::Ignore))
                 .unwrap()

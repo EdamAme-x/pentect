@@ -7106,7 +7106,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_openai_content_blocks_by_default_and_can_be_allowed() {
+    fn unknown_openai_content_blocks_in_strict_mode_and_can_be_allowed() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let body = Bytes::from_static(br#"{"input":[{"type":"future_block","data":"opaque"}]}"#);
         let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
@@ -7143,10 +7143,16 @@ mod tests {
     }
 
     #[test]
-    fn non_string_response_instructions_are_rejected_before_upstream() {
+    fn strict_non_string_response_instructions_are_rejected_before_upstream() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
-        let _env = ProviderBoundaryTestEnv::install(&store);
+        let env = ProviderBoundaryTestEnv::install(&store);
+        std::fs::create_dir_all(env.home.join(".pentect")).unwrap();
+        std::fs::write(
+            env.home.join(".pentect/config.toml"),
+            "[compatibility]\nunknown_formats = \"error\"\n",
+        )
+        .unwrap();
         let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
         let secret = ["rpa_", "INSTRUCTIONS", "ZYXWVUTS", "RQPONMLK", "1234567890"].concat();
 

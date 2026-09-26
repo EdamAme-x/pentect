@@ -42,7 +42,7 @@ See [Compatibility](/reference/compatibility/) for the exact boundary.
 | Images | With OCR enabled, scans locally and covers detected areas; unchecked media follows `image.unscanned` |
 | QR codes and barcodes | Checks the text found in codes inside images |
 | Browser screenshots | Applies the configured OCR and unchecked-media policy before supported results reach the provider |
-| Unknown provider structures | Returns an error by default |
+| Unknown provider structures | Pass through by default, without guaranteed inspection; set `unknown_formats = "error"` to block |
 
 Pentect runs a documented set of secret and personal-data detectors. Supported
 config formats include dotenv, Terraform, Kubernetes Secrets, kubeconfig, AWS,
@@ -120,7 +120,7 @@ API used by Claude. It keeps the base path from your gateway URL.
 | Remember where file-based handles came from | `[files] remember = true` |
 | Share protection events between compatible local processes | `[activity] share = true` |
 | Require the agent to start through Pentect | `[agent] required = true` |
-| Allow unknown provider formats after a user choice | `[compatibility] unknown_formats = "ignore"` |
+| Block unknown provider formats instead of the pass-through default | `[compatibility] unknown_formats = "error"` |
 
 Pentect reads user settings from `~/.pentect/config.toml` and project settings
 from `.pentect/config.toml`. A project cannot lower the user's protection for
