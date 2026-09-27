@@ -1,0 +1,29 @@
+schema = "pentect.plugin.v1"
+name = "gliner-pii-small"
+description = "Experimental offline GLiNER PII detection; explicit opt-in."
+hooks = ["inspect"]
+required = true
+
+[commands]
+windows = ["py", "{plugin}/server.py"]
+macos = ["python3", "{plugin}/server.py"]
+linux = ["python3", "{plugin}/server.py"]
+
+[setup]
+profiles = ["cpu", "cuda"]
+profile_arg = "--profile"
+download = "Model and Python runtime: several GB depending on CPU/CUDA wheels"
+disk = "Allow 6 GB; CUDA requires additional runtime space"
+
+[setup.commands]
+windows = ["py", "{plugin}/setup.py"]
+macos = ["python3", "{plugin}/setup.py"]
+linux = ["python3", "{plugin}/setup.py"]
+
+[execution]
+timeout_ms = 60000
+startup_timeout_ms = 300000
+max_input_bytes = 1048576
+max_output_bytes = 1048576
+max_spans = 4096
+

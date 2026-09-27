@@ -21,6 +21,7 @@ limits. Plugins cannot disable the built-in checks.
 | --- | --- | --- |
 | `example-regex` | Manifest | Learning and fixed company patterns |
 | `openai-privacy-filter` | Command | Context-aware English PII with a local model |
+| `gliner-pii-small` | Command | Experimental lightweight local PII detection |
 
 ```sh
 pentect plugins search
@@ -35,6 +36,35 @@ pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex
 Its
 [`plugin.toml`](https://github.com/EdamAme-x/pentect/blob/main/plugins/example-regex/plugin.toml)
 is a complete one-file example.
+
+## GLiNER PII Small
+
+An experimental first-party bridge for
+[GLiNER PII small](https://huggingface.co/knowledgator/gliner-pii-small-v1.0).
+Install it explicitly to add PII detection; it is not enabled by default.
+
+```sh
+pentect plugins add github:@EdamAme-x/pentect/plugins/gliner-pii-small --profile cpu
+```
+
+Setup downloads pinned weights and a managed Python environment. Runtime
+inspection is offline, over stdin/stdout, with no model API or HTTP listener.
+Python 3.10–3.13 is required. CPU is the default; `--profile cuda` selects NVIDIA
+CUDA 12.4 wheels. macOS uses CPU. Allow several GB for the runtime and weights.
+
+The detector is primarily English and can both miss private text and mask safe
+text. Input is processed in overlapping 1,000-character windows, so long values
+or dependencies across windows remain a limitation. Built-in secret checks stay
+enabled. Installing the plugin opts into its PII detection independently of the
+built-in PII switches.
+
+This plugin is marked required: inference and protocol failures block the
+request. An empty but incorrect prediction is still a possible false negative.
+The native process has the user's OS permissions; review it before approval.
+
+Bridge unit tests cover byte offsets and response validation, not real-model
+quality. See the [integration README](https://github.com/EdamAme-x/pentect/tree/main/plugins/gliner-pii-small)
+for setup, limitations, and removal.
 
 ## OpenAI Privacy Filter
 
