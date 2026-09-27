@@ -345,6 +345,9 @@ jobs:
       - name: Test OpenAI Privacy Filter bridge
         if: needs.changes.outputs.plugins == 'true'
         run: python -m unittest discover plugins/openai-privacy-filter/tests
+      - name: Test GLiNER PII bridge
+        if: needs.changes.outputs.plugins == 'true'
+        run: python -m unittest discover plugins/gliner-pii-small/tests
       - name: No plugin changes
         if: needs.changes.outputs.plugins != 'true' && needs.changes.outputs.detector != 'true'
         run: echo "No plugin changes"
