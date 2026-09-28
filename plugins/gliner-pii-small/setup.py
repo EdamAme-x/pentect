@@ -40,7 +40,8 @@ def main():
         code = "from server import Detector; d=Detector(str(checkpoint), device=DEVICE); d.inspect('No private information here.')"
         code = code.replace("str(checkpoint)", repr(str(checkpoint)))
         code = code.replace("DEVICE", repr(args.profile))
-        run([sys.executable, "-c", code])
+        # The approved plugin directory must not gain __pycache__ files.
+        run([sys.executable, "-B", "-c", code])
         temporary = ROOT / "setup.json.tmp"
         temporary.write_text(json.dumps(state), encoding="utf-8")
         os.replace(temporary, ROOT / "setup.json")
