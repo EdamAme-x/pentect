@@ -1,6 +1,13 @@
 schema = "pentect.plugin-registry.v1"
 
 [[plugin]]
+name = "local-llm-masking"
+description = "Experimental local LLM extraction of secrets and PII."
+source = "github:@EdamAme-x/pentect-local-llm-masking-plugin/plugin.toml@5759a22be3fd8440c9e9442d6112443ef6168639"
+publisher = "EdamAme-x/pentect-local-llm-masking-plugin"
+form = "command"
+
+[[plugin]]
 name = "gliner-pii-small"
 description = "Experimental offline PII detection with GLiNER PII small."
 source = "github:@EdamAme-x/pentect/plugins/gliner-pii-small"

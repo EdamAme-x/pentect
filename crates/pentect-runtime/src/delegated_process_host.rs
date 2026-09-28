@@ -241,7 +241,7 @@ fn ensure_host_at_with_probe(
     registering_candidate: Option<&Path>,
     mut is_alive: impl FnMut(&ProcessHostEndpoint) -> bool,
 ) -> Result<ProcessHostEndpoint, String> {
-    for attempt in 0..ELECTION_ATTEMPTS {
+    for _ in 0..ELECTION_ATTEMPTS {
         if let Some(endpoint) = current_host_at(root)? {
             if is_alive(&endpoint) {
                 return Ok(endpoint);
@@ -254,8 +254,9 @@ fn ensure_host_at_with_probe(
                 // A failed short probe does not prove that a candidate is dead.
                 // Readers can race registration too: deleting its file here
                 // would prevent the registering process from retrying it.
-                // Preserve candidates until the bounded retries are exhausted.
-                if attempt + 1 == ELECTION_ATTEMPTS && registering_candidate != Some(path.as_path())
+                // Only confirmed process exit permits removing a peer's file.
+                if registering_candidate != Some(path.as_path())
+                    && process_has_exited(candidate.pid)
                 {
                     let _ = std::fs::remove_file(path);
                 }
@@ -270,6 +271,41 @@ fn ensure_host_at_with_probe(
         std::thread::sleep(ELECTION_RETRY);
     }
     Err("no running Delegated Process Host".to_string())
+}
+
+#[cfg(unix)]
+fn process_has_exited(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // Permission errors are not proof of exit. Signal zero sends no signal.
+    (unsafe { libc::kill(pid, 0) == -1 })
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_has_exited(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+        CloseHandle(handle);
+        exited
+    }
 }
 
 fn current_host_at(root: &Path) -> Result<Option<ProcessHostEndpoint>, String> {
@@ -543,7 +579,7 @@ mod tests {
             store_token_hash: store_token_hash("memory"),
             read_token: "read".to_string(),
             write_token: "write".to_string(),
-            pid: 408,
+            pid: std::process::id(),
         };
         write_endpoint(&path, &endpoint).unwrap();
         let mut probes = 0;
@@ -588,13 +624,13 @@ mod tests {
     }
 
     #[test]
-    fn registration_retry_still_removes_other_stale_candidates() {
+    fn registration_retry_preserves_a_live_peer_after_all_probes_fail() {
         let root = test_root("registration-stale-peer");
         let dir = runtime_dir(&root);
         std::fs::create_dir_all(&dir).unwrap();
         let registering_path = dir.join(format!("{CANDIDATE_PREFIX}406{CANDIDATE_SUFFIX}"));
         let stale_path = dir.join(format!("{CANDIDATE_PREFIX}407{CANDIDATE_SUFFIX}"));
-        for (path, pid) in [(&registering_path, 406), (&stale_path, 407)] {
+        for (path, pid) in [(&registering_path, 406), (&stale_path, std::process::id())] {
             write_endpoint(
                 path,
                 &ProcessHostEndpoint {
@@ -624,8 +660,52 @@ mod tests {
         assert_eq!(registering_probes, ELECTION_ATTEMPTS);
         assert_eq!(stale_probes, ELECTION_ATTEMPTS);
         assert!(registering_path.exists());
-        assert!(!stale_path.exists());
+        assert!(stale_path.exists());
         unregister_candidate(&registering_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn current_process_is_not_considered_exited() {
+        assert!(!process_has_exited(std::process::id()));
+        assert!(!process_has_exited(0));
+    }
+
+    #[test]
+    fn exited_candidate_is_removed_without_retrying_dead_process() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.arg("--list").stdout(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            child.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let mut child = child.spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(process_has_exited(pid));
+        let root = test_root("exited-peer");
+        let path = runtime_dir(&root).join(format!("{CANDIDATE_PREFIX}{pid}{CANDIDATE_SUFFIX}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_endpoint(
+            &path,
+            &ProcessHostEndpoint {
+                addr: "127.0.0.1:4080".to_string(),
+                store_token_hash: store_token_hash("memory"),
+                read_token: "read".to_string(),
+                write_token: "write".to_string(),
+                pid,
+            },
+        )
+        .unwrap();
+        let mut probes = 0;
+        assert!(ensure_host_at_with_probe(&root, None, |_| {
+            probes += 1;
+            false
+        })
+        .is_err());
+        assert_eq!(probes, 1);
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
