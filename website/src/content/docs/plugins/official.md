@@ -22,6 +22,7 @@ limits. Plugins cannot disable the built-in checks.
 | `example-regex` | Manifest | Learning and fixed company patterns |
 | `openai-privacy-filter` | Command | Context-aware English PII with a local model |
 | `gliner-pii-small` | Command | Experimental lightweight local PII detection |
+| `local-llm-masking` | Command | Experimental local LLM extraction of secrets and PII |
 
 ```sh
 pentect plugins search
@@ -65,6 +66,68 @@ The native process has the user's OS permissions; review it before approval.
 Bridge unit tests cover byte offsets and response validation, not real-model
 quality. See the [integration README](https://github.com/EdamAme-x/pentect/tree/main/plugins/gliner-pii-small)
 for setup, limitations, and removal.
+
+## Local LLM Masking
+
+An experimental first-party plugin maintained in the separate
+[Local LLM Masking repository](https://github.com/EdamAme-x/pentect-local-llm-masking-plugin).
+It supplements built-in detection with **Gemma 4 E2B IT** and is off by default.
+
+### Install
+
+Install the tested revision with Python 3.10–3.13 available:
+
+```sh
+pentect plugins add github:@EdamAme-x/pentect-local-llm-masking-plugin/plugin.toml@5759a22be3fd8440c9e9442d6112443ef6168639 --profile cpu
+```
+
+For a compatible NVIDIA GPU, replace `--profile cpu` with `--profile cuda`.
+Allow 25 GB of disk space and 24 GB of RAM for CPU inference, or roughly 11 GB
+of GPU memory for CUDA. Setup downloads pinned weights and a managed Python
+environment. Inference runs offline over stdin/stdout, without a model API or
+HTTP listener. Review the native process before approving its OS access.
+
+### How it masks
+
+The prompt asks the model to extract exact values into a JSON array, labeled
+as secrets, names, email addresses, phone numbers, addresses, or account numbers.
+It excludes public URLs, code identifiers, hashes, UUIDs, and placeholders.
+Local code validates that each extracted value occurs in the original text and
+converts it into UTF-8 byte ranges. **Pentect creates and restores the handles**;
+the model does not rewrite your text or generate handles.
+
+Built-in checks stay enabled. Installing this plugin also enables its PII
+detection independently of the built-in PII switches.
+
+### Measured performance and limits
+
+On a Windows RTX 5080, the initial 41-case synthetic test measured a median
+inference time of **1.71 seconds**, with full coverage of **30 of 31 annotated
+entities** and false positives in **2 of 10 clean cases**. Peak GPU allocation
+was about 10.4 GB. These are small synthetic tests, not a production accuracy
+guarantee. See the [benchmark report](https://github.com/EdamAme-x/pentect-local-llm-masking-plugin/blob/main/BENCHMARKS.md)
+for datasets, CPU results, and model comparisons.
+
+Input is split into 3,500-character windows with 500-character overlap. Long
+inputs need multiple inference calls and can exceed the 60-second request
+timeout; entities or context crossing windows can be missed. Exact substring
+validation does not prevent semantic mistakes or prompt injection.
+
+This plugin is required: malformed output and inference failures block the
+request. A valid but incorrect prediction, including `[]`, can still miss
+secrets. Use it as supplemental detection, not your only protection.
+
+Pentect 0.0.94 has a [Command-plugin update issue](https://github.com/EdamAme-x/pentect/issues/1506).
+Use an explicitly reviewed, pinned revision rather than relying on a moving
+branch to refresh cached files; see the repository's installation instructions.
+
+Remove the user-wide installation with:
+
+```sh
+pentect plugins remove local-llm-masking
+```
+
+Downloaded weights and environments remain in `~/.pentect/local-llm-masking`.
 
 ## OpenAI Privacy Filter
 
