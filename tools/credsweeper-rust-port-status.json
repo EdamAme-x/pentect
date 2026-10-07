@@ -1,5 +1,5 @@
 {
-  "credsweeper_version": "1.18.2",
+  "credsweeper_version": "1.19.0",
   "filters": {
     "LineGitBinaryCheck": "exact",
     "LineSpecificKeyCheck": "exact",
@@ -9,6 +9,7 @@
     "ValueAtlassianTokenCheck": "exact",
     "ValueAzureTokenCheck": "exact",
     "ValueBase32DataCheck": "exact",
+    "ValueBase64DataCheck": "exact",
     "ValueBase64EncodedPem": "exact",
     "ValueBase64KeyCheck": "exact",
     "ValueBase64PartCheck": "exact",
@@ -16,6 +17,7 @@
     "ValueBech32Check": "exact",
     "ValueBlocklistCheck": "exact",
     "ValueCamelCaseCheck": "exact",
+    "ValueCloudFlareCheck": "exact",
     "ValueDictionaryKeywordCheck": "exact",
     "ValueDiscordBotCheck": "exact",
     "ValueEntropyBase32Check": "exact",
@@ -43,6 +45,7 @@
     "ValueStringTypeCheck": "exact",
     "ValueTokenBase32Check": "exact",
     "ValueTokenBase36Check": "exact",
+    "ValueTokenBase64Check": "exact",
     "ValueTokenCheck": "exact"
   }
 }

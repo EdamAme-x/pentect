@@ -37,8 +37,11 @@ class SidecarPatchTests(unittest.TestCase):
                             content = content.replace("\n\nclass Logger:",
                                 "\nTRACE = 5\nSILENCE = 60\n\nclass Logger:")
                         elif name == "credsweeper/scanner/scanner.py":
-                            self.assertIn("Generator, Set", content)
-                            content = content.replace("Generator, Set", "Generator")
+                            if "Generator, Set" in content:
+                                content = content.replace("Generator, Set", "Generator", 1)
+                            else:
+                                self.assertIn("Dict, Generator", content)
+                                content = content.replace("Dict, Generator", "Dict, Generator, Set", 1)
                     if case == "changed_semantics" and name == "credsweeper/app.py":
                         content = content.replace("APP_PATH = Path(__file__).resolve().parent",
                             "APP_PATH = Path(__file__).resolve().parent.parent")
