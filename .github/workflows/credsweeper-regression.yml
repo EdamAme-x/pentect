@@ -167,19 +167,25 @@ jobs:
           set -euo pipefail
           target="$GITHUB_WORKSPACE/target/credsweeper-regression"
           cp -a baseline "$RUNNER_TEMP/credsweeper-baseline"
-          # The baseline source expects the pre-generic PKCS#1 API. Its bench
-          # lockfile predates this dependency, so prevent Cargo from selecting
-          # a newer release while building the historical baseline.
+          # The baseline bench lockfile may predate its PKCS#1 dependency.
+          # Pin the version declared by that revision so Cargo cannot select
+          # an incompatible later release while building the comparison.
           python - <<'PY'
           import os
+          import re
           from pathlib import Path
 
           manifest = Path(os.environ["RUNNER_TEMP"]) / "credsweeper-baseline/Cargo.toml"
           source = manifest.read_text(encoding="utf-8")
-          old = 'pkcs1 = { version = "0.8.0-rc.4", features = ["std"] }'
-          if source.count(old) != 1:
+          pattern = r'(pkcs1 = \{ version = ")([^\"]+)(", features = \["std"\] \})'
+          matches = list(re.finditer(pattern, source))
+          if len(matches) != 1:
               raise SystemExit("baseline PKCS#1 dependency changed; review the comparison build")
-          manifest.write_text(source.replace(old, old.replace('"0.8.0-rc.4"', '"=0.8.0-rc.4"')), encoding="utf-8")
+          match = matches[0]
+          version = match.group(2)
+          if not version.startswith("="):
+              source = source[:match.start(2)] + "=" + version + source[match.end(2):]
+              manifest.write_text(source, encoding="utf-8")
           PY
           cargo build --release --manifest-path tools/pentect-bench/Cargo.toml \
             --target-dir "$target"
