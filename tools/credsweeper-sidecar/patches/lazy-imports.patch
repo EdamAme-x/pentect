@@ -57,16 +57,12 @@ diff --git a/credsweeper/app.py b/credsweeper/app.py
 index 0bf5def..713efa5 100644
 --- a/credsweeper/app.py
 +++ b/credsweeper/app.py
-@@ -8,8 +8,7 @@ from typing import Any, List, Optional, Union, Dict, Sequence, Tuple
- import pandas as pd
- from colorama import Style
+@@ -11,4 +11,3 @@
  
 -# Directory of credsweeper sources MUST be placed before imports to avoid circular import error
 -APP_PATH = Path(__file__).resolve().parent
 +from credsweeper.paths import APP_PATH
  
- from credsweeper.scanner.scanner import Scanner
- from credsweeper.common.constants import Severity, ThresholdPreset, DiffRowType, DEFAULT_ENCODING, Confidence
 diff --git a/credsweeper/common/keyword_checklist.py b/credsweeper/common/keyword_checklist.py
 index 928f140..dd21e6e 100644
 --- a/credsweeper/common/keyword_checklist.py
@@ -84,28 +80,20 @@ diff --git a/credsweeper/logger/logger.py b/credsweeper/logger/logger.py
 index fad5815..1d51eda 100644
 --- a/credsweeper/logger/logger.py
 +++ b/credsweeper/logger/logger.py
-@@ -3,7 +3,7 @@ import logging.config
- from pathlib import Path
- from typing import Optional
+@@ -5,3 +5,3 @@
  
 -from credsweeper.app import APP_PATH
 +from credsweeper.paths import APP_PATH
  from credsweeper.utils.util import Util
- 
- 
 diff --git a/credsweeper/scanner/scanner.py b/credsweeper/scanner/scanner.py
 index c84e093..ea7f410 100644
 --- a/credsweeper/scanner/scanner.py
 +++ b/credsweeper/scanner/scanner.py
-@@ -3,7 +3,7 @@ import re
- from pathlib import Path
- from typing import List, Type, Tuple, Union, Dict, Generator, Set
+@@ -5,3 +5,3 @@
  
 -from credsweeper.app import APP_PATH
 +from credsweeper.paths import APP_PATH
  from credsweeper.common.constants import RuleType, MIN_VARIABLE_LENGTH, MIN_SEPARATOR_LENGTH, MIN_VALUE_LENGTH, \
-     MAX_LINE_LENGTH, PEM_BEGIN_PATTERN
- from credsweeper.config.config import Config
 diff --git a/credsweeper/utils/util.py b/credsweeper/utils/util.py
 index 77b72b2..b110d99 100644
 --- a/credsweeper/utils/util.py

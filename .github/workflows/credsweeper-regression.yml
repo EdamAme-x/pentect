@@ -167,6 +167,20 @@ jobs:
           set -euo pipefail
           target="$GITHUB_WORKSPACE/target/credsweeper-regression"
           cp -a baseline "$RUNNER_TEMP/credsweeper-baseline"
+          # The baseline source expects the pre-generic PKCS#1 API. Its bench
+          # lockfile predates this dependency, so prevent Cargo from selecting
+          # a newer release while building the historical baseline.
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          manifest = Path(os.environ["RUNNER_TEMP"]) / "credsweeper-baseline/Cargo.toml"
+          source = manifest.read_text(encoding="utf-8")
+          old = 'pkcs1 = { version = "0.8.0-rc.4", features = ["std"] }'
+          if source.count(old) != 1:
+              raise SystemExit("baseline PKCS#1 dependency changed; review the comparison build")
+          manifest.write_text(source.replace(old, old.replace('"0.8.0-rc.4"', '"=0.8.0-rc.4"')), encoding="utf-8")
+          PY
           cargo build --release --manifest-path tools/pentect-bench/Cargo.toml \
             --target-dir "$target"
           cp "$target/release/pentect-bench" "$RUNNER_TEMP/pentect-bench-candidate"

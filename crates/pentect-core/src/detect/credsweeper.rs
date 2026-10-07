@@ -11,7 +11,7 @@ use data_encoding::{BASE32, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
 use num_bigint::BigUint;
 use p12_keystore::{KeyStore, Pkcs12ImportPolicy};
-use pkcs1::{der::Decode, RsaPrivateKey};
+use pkcs1::{der::Decode, RsaPrivateKeyRef};
 use pkcs8::der::{
     asn1::{AnyRef, OctetStringRef, UintRef},
     Reader, Tag, Tagged,
@@ -3740,7 +3740,7 @@ enum CredSweeperPrivateKey {
 }
 
 fn rsa_private_key_is_valid(data: &[u8]) -> bool {
-    let Ok(key) = RsaPrivateKey::from_der(data) else {
+    let Ok(key) = RsaPrivateKeyRef::from_der(data) else {
         return false;
     };
     let one = BigUint::from(1_u8);

@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -34,14 +35,32 @@ jobs:
             > "$RUNNER_TEMP/pentect.rb"
           grep -Fq "version \"$version\"" "$RUNNER_TEMP/pentect.rb"
       - name: Verify AUR packages
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          aur_state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/aur.yml" --jq .state)
+          if [ "$aur_state" = disabled_manually ]; then
+            echo '::warning::AUR publication is manually disabled; skipping AUR availability checks.'
+            echo 'AUR: not checked because publication is manually disabled.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$aur_state" != active ]; then
+            echo "::error::Unexpected AUR workflow state: $aur_state"
+            exit 1
+          fi
           version=$(jq -r .version packaging/release.json)
           curl -fsSL --proto '=https' --tlsv1.2 \
             'https://aur.archlinux.org/rpc/v5/info?arg[]=pentect-bin&arg[]=pentect-git' \
             -o "$RUNNER_TEMP/aur.json"
-          test "$(jq -r .resultcount "$RUNNER_TEMP/aur.json")" = 2
-          test "$(jq -r '.results[] | select(.Name == "pentect-bin") | .Version' "$RUNNER_TEMP/aur.json")" = "$version-1"
-          test -n "$(jq -r '.results[] | select(.Name == "pentect-git") | .Version' "$RUNNER_TEMP/aur.json")"
+          if ! jq -e --arg version "$version-1" '
+            .resultcount == 2 and
+            any(.results[]; .Name == "pentect-bin" and .Version == $version) and
+            any(.results[]; .Name == "pentect-git" and (.Version | type == "string" and length > 0))
+          ' "$RUNNER_TEMP/aur.json" >/dev/null; then
+            echo "::error::AUR packages are missing or stale; expected pentect-bin $version-1 and pentect-git."
+            jq '{resultcount, packages: [.results[] | {Name, Version}]}' "$RUNNER_TEMP/aur.json"
+            exit 1
+          fi
       - name: Verify signed APT repository and key lifetime
         run: |
           base=https://edamame-x.github.io/pentect/apt
