@@ -35,7 +35,7 @@ data-encoding = "2"
 crypto-bigint = { version = "0.7.5", features = ["alloc"] }
 crypto-primes = "0.7.2"
 p12-keystore = "0.3.1"
-pkcs1 = { version = "0.8.0-rc.4", features = ["std"] }
+pkcs1 = { version = "=0.8.0-rc.5", features = ["std"] }
 pkcs8 = { version = "0.11", features = ["std"] }
 num-bigint = "0.4"
 sec1 = "0.8"
