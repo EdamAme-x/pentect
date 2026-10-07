@@ -28,13 +28,16 @@ class SidecarPatchTests(unittest.TestCase):
                     content = (vendor / name).read_text(encoding="utf-8")
                     if case == "changed_context":
                         if name == "credsweeper/app.py":
+                            self.assertIn("from credsweeper.scanner.scanner import Scanner", content)
                             content = content.replace("from credsweeper.scanner.scanner import Scanner",
                                 "from credsweeper.logger.logger import SILENCE, TRACE\n"
                                 "from credsweeper.scanner.scanner import Scanner")
                         elif name == "credsweeper/logger/logger.py":
+                            self.assertIn("\n\nclass Logger:", content)
                             content = content.replace("\n\nclass Logger:",
                                 "\nTRACE = 5\nSILENCE = 60\n\nclass Logger:")
                         elif name == "credsweeper/scanner/scanner.py":
+                            self.assertIn("Generator, Set", content)
                             content = content.replace("Generator, Set", "Generator")
                     if case == "changed_semantics" and name == "credsweeper/app.py":
                         content = content.replace("APP_PATH = Path(__file__).resolve().parent",
