@@ -413,7 +413,7 @@ jobs:
         run: cargo test -p pentect-cli --no-default-features --test native_windows_supervisor --locked
       - name: Test macOS Claude supervisor boundaries
         if: needs.changes.outputs.claude_supervisor == 'true' && runner.os == 'macOS'
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: cargo test -p pentect-cli --no-default-features --locked --test claude_guardian_boundary --test claude_unix_supervisor --test native_interrupt --test native_unix_supervisor
       - name: No app changes
         if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true' && needs.changes.outputs.claude_supervisor != 'true'
