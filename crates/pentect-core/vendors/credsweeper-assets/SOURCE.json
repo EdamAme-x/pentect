@@ -1,14 +1,14 @@
 {
   "upstream": "https://github.com/Samsung/CredSweeper.git",
-  "version": "v1.18.2",
-  "commit": "8d3d0dd2e7ab73cbcab0f2044e8c26b6350211bc",
+  "version": "v1.19.0",
+  "commit": "b61303c9dc780be53c633954eb3f3062c33c4921",
   "assets": {
     "LICENSE": "694ee61a304a6e644734b5575f370f74a993b41c51c033ed8df95045f37b7c58",
     "common/keyword_checklist.txt": "6bc196fb017a0fcdee54563131612c50596d87a73507f283a45f3f5e98f4984f",
     "common/morpheme_checklist.txt": "3253d37c4d8f73409afa6ead72f319af7bb8e3bdf4b1c42eed4505579d8926db",
     "ml_model/ml_config.json": "b8c76465f422420516f75b2607028d17dc3a1db82e2210d0785307e0140065b6",
     "ml_model/ml_model.onnx": "ae6155800a46c24c86b5d147c1214f775d047bc2f5c2f97b4640b8ee022fec28",
-    "rules/config.yaml": "c84a7301ea766a8bb542e905ce8ed0094947339fc937163c94d7aab711a39ca5",
-    "secret/config.json": "78b2b2862b28cb42da0a472b14dd9900fdab31dc975b21837792bcccf2709a94"
+    "rules/config.yaml": "bbb91c672797e9676e4ef5ab45116848da1ce1c1c9326df088a6fe81bca2581d",
+    "secret/config.json": "d859e6da7d481ef4cd30e0a57ac8c1b2c0bebafd92c38ba1ee829cb8c3cf5557"
   }
 }
