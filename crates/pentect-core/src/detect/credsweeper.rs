@@ -577,9 +577,11 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueBase64PartCheck"
             | "ValueAzureTokenCheck"
             | "ValueBase32DataCheck"
+            | "ValueBase64DataCheck"
             | "ValueBech32Check"
             | "ValueBasicAuthCheck"
             | "ValueBlocklistCheck"
+            | "ValueCloudFlareCheck"
             | "ValueCamelCaseCheck"
             | "ValueDictionaryKeywordCheck"
             | "ValueDiscordBotCheck"
@@ -608,6 +610,7 @@ fn filter_has_native_handler(filter: &str) -> bool {
             | "ValueSplitKeywordCheck"
             | "ValueTokenBase32Check"
             | "ValueTokenBase36Check"
+            | "ValueTokenBase64Check"
             | "ValueTokenCheck"
     )
 }
@@ -4994,10 +4997,16 @@ fn accept_filter_list(
         if filter == "ValueBase32DataCheck" && value_base32_data_filtered(value) {
             return false;
         }
+        if filter == "ValueBase64DataCheck" && value_base64_data_filtered(value) {
+            return false;
+        }
         if filter == "ValueBech32Check" && value_bech32_filtered(value) {
             return false;
         }
         if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
+            return false;
+        }
+        if filter == "ValueCloudFlareCheck" && value_cloudflare_filtered(value) {
             return false;
         }
         if filter == "ValueDiscordBotCheck" && value_discord_bot_filtered(value) {
@@ -5066,6 +5075,10 @@ fn accept_filter_list(
             return false;
         }
         if filter == "ValueTokenBase36Check" && value_token_base_filtered(value, TokenBase::Base36)
+        {
+            return false;
+        }
+        if filter == "ValueTokenBase64Check" && value_token_base_filtered(value, TokenBase::Base64)
         {
             return false;
         }
@@ -5181,6 +5194,16 @@ fn value_base32_data_filtered(value: &str) -> bool {
     CREDSWEEPER_BASE32
         .decode(padded.as_bytes())
         .map_or(true, |decoded| ascii_entropy_filtered(&decoded))
+}
+
+fn value_base64_data_filtered(value: &str) -> bool {
+    if !value.bytes().any(|byte| byte.is_ascii_digit())
+        || !value.bytes().any(|byte| byte.is_ascii_lowercase())
+        || !value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return true;
+    }
+    decode_base64_like_upstream(value).map_or(true, |decoded| ascii_entropy_filtered(&decoded))
 }
 
 fn value_bech32_filtered(value: &str) -> bool {
@@ -5552,6 +5575,19 @@ fn value_atlassian_token_filtered(value: &str) -> bool {
         return atlassian_crc32_struct_filtered(&value);
     }
     atlassian_struct_filtered(value)
+}
+
+fn value_cloudflare_filtered(value: &str) -> bool {
+    if let Some(value) = value.strip_prefix("cfk_") {
+        return atlassian_crc32_struct_filtered(value);
+    }
+    if let Some(value) = value
+        .strip_prefix("cfat_")
+        .or_else(|| value.strip_prefix("cfut_"))
+    {
+        return atlassian_crc32_struct_filtered(value);
+    }
+    true
 }
 
 fn decode_base62_integer(value: &str) -> Option<u64> {
@@ -6182,6 +6218,7 @@ fn python_word_char(ch: char) -> bool {
 enum TokenBase {
     Base32,
     Base36,
+    Base64,
 }
 
 fn value_token_base_filtered(value: &str, base: TokenBase) -> bool {
@@ -6283,6 +6320,50 @@ type TokenRange = ((f64, f64), (f64, f64));
 
 fn token_base_range(len: usize, base: TokenBase) -> Option<TokenRange> {
     Some(match (base, len) {
+        (TokenBase::Base64, 8) => (
+            (3.7627115714285715, 0.9413431166706269),
+            (2.1378378843992736, 0.6394596814295781),
+        ),
+        (TokenBase::Base64, 10) => (
+            (3.7617393333333333, 0.8327986018456262),
+            (2.168873183866972, 0.5605393324056347),
+        ),
+        (TokenBase::Base64, 15) => (
+            (3.7619624285714286, 0.6698092646328063),
+            (2.2080058406286702, 0.4447698491992352),
+        ),
+        (TokenBase::Base64, 16) => (
+            (3.7618573333333334, 0.6471500119793832),
+            (2.2116826642934453, 0.4288377928263507),
+        ),
+        (TokenBase::Base64, 20) => (
+            (3.7618887368421055, 0.575813792926031),
+            (2.224384985667721, 0.37985781543221253),
+        ),
+        (TokenBase::Base64, 24) => (
+            (3.7621449565217393, 0.5243297908608613),
+            (2.2326041329976607, 0.34397389723600613),
+        ),
+        (TokenBase::Base64, 25) => (
+            (3.762616791666667, 0.5137934920050976),
+            (2.234571917211925, 0.3366547036535176),
+        ),
+        (TokenBase::Base64, 32) => (
+            (3.761885838709677, 0.4521158322065318),
+            (2.2426375800006153, 0.29506039075960255),
+        ),
+        (TokenBase::Base64, 40) => (
+            (3.7622649487179487, 0.4031261511824518),
+            (2.2485911621253574, 0.2622954601051068),
+        ),
+        (TokenBase::Base64, 50) => (
+            (3.762087693877551, 0.3597404118023357),
+            (2.2533774425872956, 0.23384524947332655),
+        ),
+        (TokenBase::Base64, 64) => (
+            (3.7625271746031745, 0.31733579704946846),
+            (2.257532519514275, 0.20571908142867643),
+        ),
         (TokenBase::Base32, 8) => (
             (3.480934, 0.8482364556537906),
             (1.9280820731422028, 0.5833143826506801),
@@ -9806,6 +9887,42 @@ mod tests {
         ] {
             assert!(
                 value_token_base_filtered(value, TokenBase::Base36),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn newly_ported_base64_filters_match_upstream_examples() {
+        for value in ["0DiwN2M1NTeGd6S6jU", "o9LN618aEaH32KhF7e_L"] {
+            assert!(!value_base64_data_filtered(value), "{value:?}");
+        }
+        for value in [
+            "eyJ0eXAiOiJKV1QiLC",
+            "2AA219GG746F88F6DDA0D852A0FD3211",
+            "!@#$%^&*(_)0aA",
+        ] {
+            assert!(value_base64_data_filtered(value), "{value:?}");
+        }
+        for value in [
+            "oXIO7p2R4Sx5UcHmUacu0-ojM8ELvCeskmyPuu4yaexoh5ExL4AFOWWI08G-IBVZ",
+            "9BlYTo-Fcthl_75PKfKQIWlYA6alA2uy",
+            "23OY2aMY4U3ubsQwBPvdyfYr",
+            "wSpv1jq9xwaXbn3n",
+        ] {
+            assert!(
+                !value_token_base_filtered(value, TokenBase::Base64),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "0oKiLoKkjUIhbYygVfcrTt6Dree3dSsBnJjiJKklLpMbV71X1QaSwDe23-9O_o01",
+            "09uulkjhbmnbvft565d4ddxvcvswq232",
+            "21WEasdVCfGGyrY6Ui8LkLpO",
+            "100x200x3S00x400",
+        ] {
+            assert!(
+                value_token_base_filtered(value, TokenBase::Base64),
                 "{value:?}"
             );
         }
