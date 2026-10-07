@@ -5203,7 +5203,7 @@ fn value_base64_data_filtered(value: &str) -> bool {
     {
         return true;
     }
-    decode_base64_like_upstream(value).map_or(true, |decoded| ascii_entropy_filtered(&decoded))
+    decode_base64_like_upstream(value).is_none_or(|decoded| ascii_entropy_filtered(&decoded))
 }
 
 fn value_bech32_filtered(value: &str) -> bool {
