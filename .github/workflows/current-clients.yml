@@ -200,6 +200,8 @@ jobs:
       - name: Verify installed client handle flows without OCR (Windows PR)
         if: github.event_name == 'pull_request' && runner.os == 'Windows'
         run: python tools/installed_agent_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}" --skip-image
+      - name: Verify OpenCode continues after rejected handles
+        run: python tools/opencode_handle_recovery_e2e.py --pentect "${{ env.PENTECT_AGENT_E2E_BINARY }}"
       - name: Verify installed Claude cleanup after parent exit (PR)
         if: github.event_name == 'pull_request'
         run: >-
