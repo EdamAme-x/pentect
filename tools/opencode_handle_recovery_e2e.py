@@ -105,7 +105,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_error(422)
                 return
             handle = handles.pop()
-            if self.server.rejected < 2:
+            if self.server.rejected < 3:
                 # A syntactically valid but unknown handle must be rejected.
                 hash_part = re.search(r"_[0-9a-f]{16}(?=\||_length_|>>)", handle)
                 if hash_part is None:
@@ -178,7 +178,7 @@ def main() -> int:
             thread.join(timeout=5)
         checks = {
             "client_succeeded": process.returncode == 0 and not timed_out,
-            "invalid_proposals_rejected": server.rejected >= 2 and not rejected_marker.exists(),
+            "invalid_proposals_rejected": server.rejected >= 3 and not rejected_marker.exists(),
             "fresh_read_executed": server.saw_result,
             "continued_work_executed": marker.read_text() == "continued" if marker.exists() else False,
             "finished": server.saw_final and "DONE" in stdout,
