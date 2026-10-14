@@ -154,7 +154,7 @@ def main() -> None:
     macos_step = re.search(
         r"      - name: Test macOS Claude supervisor boundaries\n"
         r"        if: .*claude_supervisor.*runner\.os == 'macOS'\n"
-        r"        timeout-minutes: 5\n"
+        r"        timeout-minutes: 10\n"
         r"        run: (?P<command>.+)\n",
         ci,
     )
