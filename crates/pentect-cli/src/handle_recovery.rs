@@ -9,7 +9,9 @@ use std::{error::Error, future::Future};
 
 type Body = UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>;
 const LIMIT: usize = 32 * 1024 * 1024;
-const ATTEMPTS: usize = 2;
+// A model can repeat the same stale handle after the first notice. Give it
+// several chances to switch to a fresh read before ending the client turn.
+const ATTEMPTS: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Dialect {
@@ -19,10 +21,22 @@ pub(crate) enum Dialect {
     CloudCode,
 }
 
-pub(crate) fn feedback(body: &[u8], dialect: Dialect, error: &str) -> Result<Bytes, String> {
+pub(crate) fn feedback(
+    body: &[u8],
+    dialect: Dialect,
+    error: &str,
+    attempt: usize,
+) -> Result<Bytes, String> {
     let mut value: Value =
         serde_json::from_slice(body).map_err(|_| "invalid protected recovery request")?;
-    let notice = crate::claude_http_proxy::recovery_notice(error);
+    let notice = if attempt == 1 {
+        crate::claude_http_proxy::recovery_notice(error).to_string()
+    } else {
+        format!(
+            "{} Your previous recovery also proposed an invalid tool batch. Do not call a tool with any protected handle in this response. First make one tool call to reread the original source through this protected session, without using the old handle. If that source cannot be read, explain the missing source to the user instead of retrying the rejected tool call.",
+            crate::claude_http_proxy::recovery_notice(error)
+        )
+    };
     let root = match dialect {
         Dialect::CloudCode => value
             .get_mut("request")
@@ -64,6 +78,11 @@ pub(crate) fn feedback(body: &[u8], dialect: Dialect, error: &str) -> Result<Byt
     if let Some(object) = root.as_object_mut() {
         if object.get("tool_choice").and_then(Value::as_str) != Some("none") {
             object.remove("tool_choice");
+        }
+        if matches!(dialect, Dialect::Responses | Dialect::Chat) {
+            // One fresh read must not be withheld because a second, stale-handle
+            // call in the same proposed batch failed validation.
+            object.insert("parallel_tool_calls".into(), json!(false));
         }
     }
     serde_json::to_vec(&value)
@@ -308,7 +327,7 @@ where
                     None,
                     false,
                 );
-                body = feedback(&original, dialect, &error)?;
+                body = feedback(&original, dialect, &error, attempt + 1)?;
             }
         }
     }
@@ -349,7 +368,7 @@ mod tests {
             ] {
                 let original = request(dialect);
                 let bytes =
-                    feedback(&serde_json::to_vec(&original).unwrap(), dialect, error).unwrap();
+                    feedback(&serde_json::to_vec(&original).unwrap(), dialect, error, 1).unwrap();
                 let text = String::from_utf8(bytes.to_vec()).unwrap();
                 assert!(!text.contains("secret-detail"));
                 assert!(text.contains("protected history"));
@@ -371,8 +390,29 @@ mod tests {
                     }
                     Dialect::CloudCode => assert_eq!(updated["project"], original["project"]),
                 }
+                if matches!(dialect, Dialect::Responses | Dialect::Chat) {
+                    assert_eq!(updated["parallel_tool_calls"], false);
+                }
             }
         }
+    }
+
+    #[test]
+    fn repeated_failure_requires_a_single_fresh_read_without_a_handle() {
+        let original = request(Dialect::Chat);
+        let bytes = feedback(
+            &serde_json::to_vec(&original).unwrap(),
+            Dialect::Chat,
+            "protected handle is unavailable in this session secret-detail",
+            2,
+        )
+        .unwrap();
+        let updated: Value = serde_json::from_slice(&bytes).unwrap();
+        let notice = updated["messages"][1]["content"].as_str().unwrap();
+        assert!(notice.contains("First make one tool call to reread"));
+        assert!(notice.contains("Do not call a tool with any protected handle"));
+        assert!(!notice.contains("secret-detail"));
+        assert_eq!(updated["parallel_tool_calls"], false);
     }
 
     #[tokio::test]
@@ -412,11 +452,11 @@ mod tests {
             Dialect::Gemini,
             Dialect::CloudCode,
         ] {
-            for exhaust in [false, true] {
+            for successful_attempt in [Some(1), Some(ATTEMPTS), None] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
                 let upstream = tokio::spawn(async move {
-                    for attempt in 0..if exhaust { 3 } else { 2 } {
+                    for attempt in 0..=successful_attempt.unwrap_or(ATTEMPTS) {
                         let (mut socket, _) = listener.accept().await.unwrap();
                         let mut bytes = Vec::new();
                         loop {
@@ -445,7 +485,7 @@ mod tests {
                         if attempt > 0 {
                             assert!(text.contains("Pentect could not restore"));
                         }
-                        let body = if exhaust || attempt == 0 {
+                        let body = if successful_attempt != Some(attempt) {
                             "rejected-private-body"
                         } else {
                             "validated"
@@ -473,7 +513,7 @@ mod tests {
                 .unwrap();
                 let body = collect(result.into_body()).await.unwrap();
                 assert!(!String::from_utf8_lossy(&body).contains("rejected-private-body"));
-                if !exhaust {
+                if successful_attempt.is_some() {
                     assert_eq!(body, "validated");
                 }
                 upstream.await.unwrap();
