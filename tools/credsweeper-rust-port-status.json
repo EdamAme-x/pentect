@@ -1,5 +1,5 @@
 {
-  "credsweeper_version": "1.19.0",
+  "credsweeper_version": "1.19.5",
   "filters": {
     "LineGitBinaryCheck": "exact",
     "LineSpecificKeyCheck": "exact",

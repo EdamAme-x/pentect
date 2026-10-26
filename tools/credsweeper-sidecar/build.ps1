@@ -42,7 +42,7 @@ New-Item -ItemType Directory -Force -Path $SourceRoot | Out-Null
 Assert-LastExit "git archive CredSweeper"
 & tar -xf $TarPath -C $SourceRoot
 Assert-LastExit "extract CredSweeper archive"
-& git -C $SourceRoot apply $PatchFile
+& git -C $SourceRoot apply --unidiff-zero $PatchFile
 Assert-LastExit "apply CredSweeper patch"
 
 & $Python -m venv $Venv

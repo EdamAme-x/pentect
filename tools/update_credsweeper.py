@@ -149,7 +149,7 @@ def sync_sidecar_patch(repo: Path, tag: str) -> None:
     if count != 1:
         raise RuntimeError("CredSweeper sidecar patch has no unique version context")
     patch.write_text(updated, encoding="utf-8", newline="\n")
-    run("git", "apply", "--check", str(patch.resolve()), cwd=repo / "crates/pentect-core/vendors/CredSweeper")
+    run("git", "apply", "--unidiff-zero", "--check", str(patch.resolve()), cwd=repo / "crates/pentect-core/vendors/CredSweeper")
 
 
 def sync_license_bundle(repo: Path) -> None:

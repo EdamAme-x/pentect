@@ -2,25 +2,27 @@ diff --git a/credsweeper/__init__.py b/credsweeper/__init__.py
 index 1cedfcf..e339c82 100644
 --- a/credsweeper/__init__.py
 +++ b/credsweeper/__init__.py
-@@ -1,14 +1,3 @@
+@@ -1,16 +1,3 @@
 -from credsweeper.app import CredSweeper
 -from credsweeper.common.constants import ThresholdPreset, Severity, Confidence
 -from credsweeper.file_handler.byte_content_provider import ByteContentProvider
 -from credsweeper.file_handler.content_provider import ContentProvider
 -from credsweeper.file_handler.data_content_provider import DataContentProvider
 -from credsweeper.file_handler.diff_content_provider import DiffContentProvider
+-from credsweeper.file_handler.files_provider import FilesProvider
+-from credsweeper.file_handler.patches_provider import PatchesProvider
 -from credsweeper.file_handler.string_content_provider import StringContentProvider
 -from credsweeper.file_handler.text_content_provider import TextContentProvider
 -
 -from credsweeper.ml_model.ml_validator import MlValidator
 -
  __all__ = [
-     "ByteContentProvider",  #
-     "Confidence",  #
-@@ -25,3 +14,35 @@ __all__ = [
+     "CredSweeper",  #
+     "FilesProvider",  #
+@@ -29,3 +16,41 @@ __all__ = [
  ]
  
- __version__ = "1.19.0"
+ __version__ = "1.19.5"
 +
 +
 +def __getattr__(name):
@@ -43,6 +45,12 @@ index 1cedfcf..e339c82 100644
 +    if name == "DiffContentProvider":
 +        from credsweeper.file_handler.diff_content_provider import DiffContentProvider
 +        return DiffContentProvider
++    if name == "FilesProvider":
++        from credsweeper.file_handler.files_provider import FilesProvider
++        return FilesProvider
++    if name == "PatchesProvider":
++        from credsweeper.file_handler.patches_provider import PatchesProvider
++        return PatchesProvider
 +    if name == "StringContentProvider":
 +        from credsweeper.file_handler.string_content_provider import StringContentProvider
 +        return StringContentProvider
@@ -57,12 +65,11 @@ diff --git a/credsweeper/app.py b/credsweeper/app.py
 index 0bf5def..713efa5 100644
 --- a/credsweeper/app.py
 +++ b/credsweeper/app.py
-@@ -11,4 +11,3 @@
+@@ -17,3 +17,2 @@
  
 -# Directory of credsweeper sources MUST be placed before imports to avoid circular import error
 -APP_PATH = Path(__file__).resolve().parent
 +from credsweeper.paths import APP_PATH
- 
 diff --git a/credsweeper/common/keyword_checklist.py b/credsweeper/common/keyword_checklist.py
 index 928f140..dd21e6e 100644
 --- a/credsweeper/common/keyword_checklist.py
@@ -80,31 +87,28 @@ diff --git a/credsweeper/logger/logger.py b/credsweeper/logger/logger.py
 index fad5815..1d51eda 100644
 --- a/credsweeper/logger/logger.py
 +++ b/credsweeper/logger/logger.py
-@@ -5,3 +5,3 @@
+@@ -5,2 +5,2 @@
  
 -from credsweeper.app import APP_PATH
 +from credsweeper.paths import APP_PATH
- from credsweeper.utils.util import Util
 diff --git a/credsweeper/scanner/scanner.py b/credsweeper/scanner/scanner.py
 index c84e093..ea7f410 100644
 --- a/credsweeper/scanner/scanner.py
 +++ b/credsweeper/scanner/scanner.py
-@@ -5,3 +5,3 @@
+@@ -5,2 +5,2 @@
  
 -from credsweeper.app import APP_PATH
 +from credsweeper.paths import APP_PATH
- from credsweeper.common.constants import RuleType, MIN_VARIABLE_LENGTH, MIN_SEPARATOR_LENGTH, MIN_VALUE_LENGTH, \
 diff --git a/credsweeper/utils/util.py b/credsweeper/utils/util.py
 index 77b72b2..b110d99 100644
 --- a/credsweeper/utils/util.py
 +++ b/credsweeper/utils/util.py
-@@ -1,3 +1,5 @@
+@@ -1,2 +1,4 @@
 +from __future__ import annotations
 +
- import ast
  import base64
  import contextlib
-@@ -14,23 +16,9 @@ from typing import Any, Dict, List, Tuple, Optional, Union
+@@ -13,24 +15,10 @@ from typing import Any, Dict, List, Tuple, Optional, Union
  
  import numpy as np
  import yaml
@@ -127,8 +131,9 @@ index 77b72b2..b110d99 100644
 -from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
 -from lxml import etree
  
- from credsweeper.common.constants import AVAILABLE_ENCODINGS, \
-     DEFAULT_ENCODING, LATIN_1, CHUNK_SIZE, MAX_LINE_LENGTH, CHUNK_STEP_SIZE, ASCII, UTF_16_LE, UTF_16_BE
+ from credsweeper.logger import TRACE
+ from credsweeper.common.constants import AVAILABLE_ENCODINGS, DEFAULT_ENCODING, LATIN_1, CHUNK_SIZE, MAX_LINE_LENGTH, \
+     CHUNK_STEP_SIZE, ASCII, UTF_16_LE, UTF_16_BE
 @@ -336,6 +324,8 @@ class Util:
              xml exception
  
