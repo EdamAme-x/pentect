@@ -9,7 +9,7 @@ BUNDLED DATA AND MODELS
 
 CredSweeper detection assets
 Source: https://github.com/Samsung/CredSweeper
-Version: v1.19.0 (commit b61303c9dc780be53c633954eb3f3062c33c4921)
+Version: v1.19.5 (commit 4a2aa3a28bea72364476d5d954ace1be8ce7eb85)
 Copyright (c) 2021 SAMSUNG
 License: MIT. The full MIT text appears below in the Cargo license documents.
 
@@ -435,7 +435,7 @@ Applies to:
 - md-5 0.10.6 (MIT OR Apache-2.0)
 - pbkdf2 0.13.0 (MIT OR Apache-2.0)
 - pem-rfc7468 1.0.0 (Apache-2.0 OR MIT)
-- pkcs1 0.8.0-rc.5 (Apache-2.0 OR MIT)
+- pkcs1 0.8.0-rc.4 (Apache-2.0 OR MIT)
 - pkcs12 0.2.0-pre.0 (Apache-2.0 OR MIT)
 - pkcs5 0.8.1 (Apache-2.0 OR MIT)
 - pkcs8 0.10.2 (Apache-2.0 OR MIT)
@@ -3829,7 +3829,7 @@ SOFTWARE.
 DOCUMENT 62
 ~~~~~~~~~~~
 Applies to:
-- CredSweeper v1.19.0 detection assets (MIT)
+- CredSweeper v1.19.5 detection assets (MIT)
 
 Copyright (c) 2021 SAMSUNG
 
@@ -12105,7 +12105,7 @@ DOCUMENT 196
 ~~~~~~~~~~~~
 Applies to:
 - pem-rfc7468 1.0.0 (Apache-2.0 OR MIT)
-- pkcs1 0.8.0-rc.5 (Apache-2.0 OR MIT)
+- pkcs1 0.8.0-rc.4 (Apache-2.0 OR MIT)
 - x509-cert 0.3.0 (Apache-2.0 OR MIT)
 
 Copyright (c) 2021-2025 The RustCrypto Project Developers

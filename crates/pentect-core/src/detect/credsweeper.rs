@@ -11,7 +11,7 @@ use data_encoding::{BASE32, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
 use num_bigint::BigUint;
 use p12_keystore::{KeyStore, Pkcs12ImportPolicy};
-use pkcs1::{der::Decode, RsaPrivateKeyRef};
+use pkcs1::{der::Decode, RsaPrivateKey};
 use pkcs8::der::{
     asn1::{AnyRef, OctetStringRef, UintRef},
     Reader, Tag, Tagged,
@@ -3743,7 +3743,7 @@ enum CredSweeperPrivateKey {
 }
 
 fn rsa_private_key_is_valid(data: &[u8]) -> bool {
-    let Ok(key) = RsaPrivateKeyRef::from_der(data) else {
+    let Ok(key) = RsaPrivateKey::from_der(data) else {
         return false;
     };
     let one = BigUint::from(1_u8);
@@ -6325,7 +6325,7 @@ fn token_base_range(len: usize, base: TokenBase) -> Option<TokenRange> {
             (2.1378378843992736, 0.6394596814295781),
         ),
         (TokenBase::Base64, 10) => (
-            (3.7617393333333333, 0.8327986018456262),
+            (3.7617393333333333, 0.8327986018456269),
             (2.168873183866972, 0.5605393324056347),
         ),
         (TokenBase::Base64, 15) => (
@@ -6358,7 +6358,7 @@ fn token_base_range(len: usize, base: TokenBase) -> Option<TokenRange> {
         ),
         (TokenBase::Base64, 50) => (
             (3.762087693877551, 0.3597404118023357),
-            (2.2533774425872956, 0.23384524947332655),
+            (2.2533774423872956, 0.23384524947332655),
         ),
         (TokenBase::Base64, 64) => (
             (3.7625271746031745, 0.31733579704946846),
