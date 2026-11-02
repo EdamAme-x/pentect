@@ -8,6 +8,7 @@
 //! - #1398: lone two-label config assignments for explicit service/key pairs.
 //! - #1399: the leading cookie pair in attribute-bearing `Set-Cookie` headers.
 //! - #1400: semicolon-delimited connection-string `Password`/`Pwd` fields.
+//! - Kaggle `KGAT_` API tokens missing from the current CredSweeper rules.
 //!
 //! These cases do not claim an upstream CredSweeper defect or implement the
 //! complete grammar of any of those formats.
@@ -24,6 +25,7 @@ impl Detector for PentectTempParser {
         let mut offset = 0;
         for line in view.text().split_inclusive('\n') {
             let content = line.trim_end_matches(['\r', '\n']);
+            kaggle_api_tokens(view, content, offset, &mut out);
             if cli_compatibility_candidate(content) {
                 cli_compatibility(view, content, offset, &mut out);
             }
@@ -40,6 +42,35 @@ impl Detector for PentectTempParser {
         }
         out
     }
+}
+
+fn kaggle_api_tokens(view: &NormalizedView, line: &str, offset: usize, out: &mut Vec<Span>) {
+    const PREFIX: &str = "KGAT_";
+    const BODY_LEN: usize = 32;
+    let bytes = line.as_bytes();
+    for (start, _) in line.match_indices(PREFIX) {
+        let end = start + PREFIX.len() + BODY_LEN;
+        let Some(body) = bytes.get(start + PREFIX.len()..end) else {
+            continue;
+        };
+        if !body.iter().all(u8::is_ascii_alphanumeric)
+            || start > 0 && is_token_char(bytes[start - 1])
+            || bytes.get(end).is_some_and(|&byte| is_token_char(byte))
+        {
+            continue;
+        }
+        out.push(Span {
+            range: view.to_raw(ByteRange::new(offset + start, offset + end)),
+            category: Category::Secret,
+            label: "KAGGLE_API_TOKEN".to_string(),
+            confidence: Confidence::High,
+            source: DetectorId::PentectTempParser,
+        });
+    }
+}
+
+fn is_token_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn cli_compatibility_candidate(line: &str) -> bool {
@@ -391,6 +422,20 @@ mod tests {
             .iter()
             .map(|span| raw[span.range.start..span.range.end].to_string())
             .collect()
+    }
+
+    #[test]
+    fn kaggle_api_token_is_detected_without_key_name() {
+        let token = concat!("KGAT", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456");
+        assert_eq!(values(token), [token]);
+        assert_eq!(values(&format!("Value: {token}, ID: :rc:")), [token]);
+        for sample in [
+            "KGAT_ABC",
+            "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ12345",
+            "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567",
+        ] {
+            assert!(values(sample).is_empty());
+        }
     }
 
     #[test]
