@@ -130,12 +130,6 @@ impl RuleDetector {
             // Classic GitHub token family (p/o/u/s/r) is one format, so one rule.
             (r"gh[oprsu]_[A-Za-z0-9]{36}", Secret, "GITHUB_TOKEN", High),
             (
-                r"\bKGAT_[A-Za-z0-9]{32}\b",
-                Secret,
-                "KAGGLE_API_TOKEN",
-                High,
-            ),
-            (
                 r"AC[0-9a-fA-F]{32}",
                 Identifier,
                 "TWILIO_ACCOUNT_SID",
@@ -516,7 +510,6 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "GRAFANA_SERVICE_ACCOUNT_TOKEN" => &["glsa_"],
         "GITHUB_PAT" => &["github_pat_"],
         "GITHUB_TOKEN" => &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"],
-        "KAGGLE_API_TOKEN" => &["KGAT_"],
         "SENDGRID_KEY" => &["SG."],
         "NPM_TOKEN" => &["npm_"],
         "DIGITALOCEAN_TOKEN" => &["dop_v1_", "doo_v1_", "dor_v1_"],
@@ -632,10 +625,6 @@ mod tests {
                 "GITHUB_TOKEN",
             ),
             (
-                concat!("KGAT", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"),
-                "KAGGLE_API_TOKEN",
-            ),
-            (
                 concat!("sk", "_live_ABCDEFGHIJ1234567890"),
                 "STRIPE_SECRET_KEY",
             ),
@@ -716,23 +705,6 @@ mod tests {
                 "{sample} should detect {label}, got {:?}",
                 spans.iter().map(|s| &s.label).collect::<Vec<_>>()
             );
-        }
-    }
-
-    #[test]
-    fn kaggle_rule_does_not_mask_incomplete_or_extended_tokens() {
-        let detector = RuleDetector::builtin();
-        for sample in [
-            "KGAT_ABC",
-            "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ12345",
-            "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567",
-        ] {
-            let region = region(sample);
-            let view = NormalizedView::build(&region, sample);
-            assert!(detector
-                .detect(&view)
-                .iter()
-                .all(|span| span.label != "KAGGLE_API_TOKEN"));
         }
     }
 
