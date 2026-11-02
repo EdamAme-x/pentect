@@ -749,6 +749,21 @@ fn exec_inherits_parent_environment_and_masks_output() {
 }
 
 #[test]
+fn standalone_kaggle_token_is_masked_in_browser_tool_output() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("kaggle-browser-token");
+
+    let raw = concat!("KGAT", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let output = masker
+        .mask_tool_output(&format!("8 text field API Token, Value: {raw}, ID: :rc:"))
+        .unwrap()
+        .unwrap();
+    assert!(!output.contains(raw));
+    assert!(output.contains("<<KAGGLE_API_TOKEN_"), "{output}");
+}
+
+#[test]
 fn active_tool_output_masker_reuses_in_memory_state() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-masker");
