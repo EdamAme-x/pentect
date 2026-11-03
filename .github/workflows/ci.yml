@@ -477,6 +477,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Validate required CI gate
         run: python -m unittest tools/test_ci_results.py
+      - name: Verify live benchmark harness (offline)
+        run: |
+          python -m unittest tools/test_benchmark_live_defense.py
+          python -m py_compile tools/benchmark_live_defense.py
       - name: Verify third-party licenses
         if: needs.changes.outputs.manifests == 'true'
         run: python tools/generate_licenses.py --check
