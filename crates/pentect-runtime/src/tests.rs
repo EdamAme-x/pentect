@@ -5142,7 +5142,8 @@ fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
         let masked_path = paths[1].as_str().unwrap();
         let masked_path_buf = PathBuf::from(masked_path);
         assert!(
-            masked_path_buf.starts_with(project.join(".pentect").join("read")),
+            masked_path_buf
+                .starts_with(std::fs::canonicalize(project.join(".pentect").join("read")).unwrap()),
             "{masked_path}"
         );
         assert!(masked_path_buf.ends_with(&env), "{masked_path}");
@@ -5331,7 +5332,8 @@ fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
     };
 
     assert_ne!(first_masked, second_masked);
-    let external_root = project.join(".pentect").join("read").join("_external");
+    let external_root =
+        std::fs::canonicalize(project.join(".pentect").join("read").join("_external")).unwrap();
     assert!(first_masked.starts_with(&external_root));
     assert!(second_masked.starts_with(&external_root));
     let first_text = std::fs::read_to_string(&first_masked).unwrap();

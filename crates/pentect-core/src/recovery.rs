@@ -23,10 +23,19 @@ const FORMAT_VERSION: u8 = 1;
 /// and ciphertext from the same live process.
 /// Deliberately not serializable — persisting it to disk is a separate, gated
 /// decision (a versioned, integrity-checked header), not a casual derive.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Recovery {
     memory_key: [u8; 32],
     map: HashMap<String, Vec<u8>>,
+}
+
+/// Prints only the entry count so a stray `{:?}` never logs the key.
+impl std::fmt::Debug for Recovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recovery")
+            .field("entries", &self.map.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Recovery {
@@ -1106,6 +1115,17 @@ mod tests {
         // but the stored bytes are not the plaintext secret.
         let stored = rec.map.get("<<AWS_AKID_0011223344556677>>").unwrap();
         assert_ne!(stored.as_slice(), secret.as_bytes());
+    }
+
+    #[test]
+    fn debug_output_omits_key_and_ciphertext() {
+        let rec = Recovery::seal(
+            HashMap::from([("<<X_0011223344556677>>".to_string(), "v".to_string())]),
+            &[7u8; 32],
+        );
+        let debug = format!("{rec:?}");
+        assert_eq!(debug, "Recovery { entries: 1, .. }");
+        assert!(!debug.contains(&format!("{:?}", rec.memory_key)));
     }
 
     #[test]
