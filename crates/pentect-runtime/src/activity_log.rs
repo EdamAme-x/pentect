@@ -1194,7 +1194,15 @@ fn same_file_identity(left: &std::fs::File, path: &Path) -> bool {
                 && left.nFileIndexHigh == right.nFileIndexHigh
                 && left.nFileIndexLow == right.nFileIndexLow
         }
-        _ => true,
+        // Without a file index, fall back to the creation time. NTFS tunneling
+        // can reuse it, but that only delays rotation detection.
+        _ => {
+            use std::os::windows::fs::MetadataExt;
+            match (left.metadata(), right.metadata()) {
+                (Ok(left), Ok(right)) => left.creation_time() == right.creation_time(),
+                _ => true,
+            }
+        }
     }
 }
 

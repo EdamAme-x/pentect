@@ -21,7 +21,10 @@ pub fn disable_crash_dumps() {
             libc::setrlimit(libc::RLIMIT_CORE, &limit);
         }
     }
-    // Windows: keep the heap out of Windows Error Reporting dumps.
+    // Windows: keep the heap, which holds the keys and recovery map, out of
+    // Windows Error Reporting dumps. Stacks are still captured; excluding the
+    // process entirely needs a persistent per-user registry entry, which a
+    // CLI should not write on its own.
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::ErrorReporting::{
