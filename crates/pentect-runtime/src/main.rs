@@ -21,6 +21,7 @@ mod memory_store;
 mod network_address;
 mod output_remask;
 mod plugin_middleware;
+mod process_hardening;
 mod secure_io;
 pub use handle_views::{
     classify_tool_input_field, process_recovery_tool_input, process_tool_input,
@@ -36,6 +37,7 @@ pub use plugin_middleware::{
     MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware, PluginRuntimeDirs,
     StopOutcome, DEFAULT_PUBLISHER_WORKFLOW, MAX_COMMAND_PLUGIN_STARTUP_TIMEOUT,
 };
+pub use process_hardening::disable_crash_dumps;
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
 

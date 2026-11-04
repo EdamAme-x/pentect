@@ -1125,9 +1125,7 @@ impl LifecycleSource {
         let path_replaced = self
             .file
             .as_ref()
-            .and_then(|file| file.metadata().ok())
-            .zip(std::fs::metadata(&self.path).ok())
-            .is_some_and(|(open, current)| !same_file_identity(&open, &current));
+            .is_some_and(|file| !same_file_identity(file, &self.path));
         if path_replaced {
             self.file = std::fs::OpenOptions::new().read(true).open(&self.path).ok();
             self.offset = 0;
@@ -1167,21 +1165,49 @@ impl LifecycleSource {
 }
 
 #[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+fn same_file_identity(left: &std::fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
+    let (Ok(left), Ok(right)) = (left.metadata(), std::fs::metadata(path)) else {
+        return true;
+    };
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    // Stable Rust does not expose the Windows file index. Pentect creates the
-    // replacement log itself, so its creation timestamp changes on rotation.
-    left.creation_time() == right.creation_time()
+fn same_file_identity(left: &std::fs::File, path: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let Ok(right) = std::fs::File::open(path) else {
+        return true;
+    };
+    let identity = |file: &std::fs::File| {
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+        (ok != 0).then(|| unsafe { info.assume_init() })
+    };
+    match (identity(left), identity(&right)) {
+        (Some(left), Some(right)) => {
+            left.dwVolumeSerialNumber == right.dwVolumeSerialNumber
+                && left.nFileIndexHigh == right.nFileIndexHigh
+                && left.nFileIndexLow == right.nFileIndexLow
+        }
+        // Without a file index, fall back to the creation time. NTFS tunneling
+        // can reuse it, but that only delays rotation detection.
+        _ => {
+            use std::os::windows::fs::MetadataExt;
+            match (left.metadata(), right.metadata()) {
+                (Ok(left), Ok(right)) => left.creation_time() == right.creation_time(),
+                _ => true,
+            }
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+fn same_file_identity(_left: &std::fs::File, _path: &Path) -> bool {
     true
 }
 

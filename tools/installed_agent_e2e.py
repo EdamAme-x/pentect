@@ -1876,10 +1876,14 @@ def linux_process_diagnostics(
             fields = suffix.split()
             if not separator or len(fields) <= 19:
                 raise RuntimeError("malformed stat")
-            executable = os.readlink(Path("/proc") / str(pid) / "exe")
+            try:
+                basename = Path(os.readlink(Path("/proc") / str(pid) / "exe")).name
+            except PermissionError:
+                # Pentect marks itself non-dumpable, which hides its exe link.
+                basename = (Path("/proc") / str(pid) / "comm").read_text(encoding="utf-8").strip()
             diagnostics.append({
                 "pid": pid,
-                "basename": Path(executable).name,
+                "basename": basename,
                 "ppid": int(fields[1]),
                 "pgid": int(fields[2]),
                 "sid": int(fields[3]),

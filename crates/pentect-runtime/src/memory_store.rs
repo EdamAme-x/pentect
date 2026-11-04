@@ -189,11 +189,19 @@ pub fn is_pentect_control_env_name(name: &str) -> bool {
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct MemoryStoreClient {
     addr: String,
     token: String,
     connection: Arc<Mutex<Option<BufReader<TcpStream>>>>,
+}
+
+impl std::fmt::Debug for MemoryStoreClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStoreClient")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct MemoryStoreSnapshot {
@@ -1056,6 +1064,18 @@ mod tests {
         assert!(ConnectionPermit::acquire(&active).is_none());
         drop(permits);
         assert!(ConnectionPermit::acquire(&active).is_some());
+    }
+
+    #[test]
+    fn client_debug_output_omits_token() {
+        let client = MemoryStoreClient {
+            addr: "127.0.0.1:9".to_string(),
+            token: "secret-store-token".to_string(),
+            connection: Arc::new(Mutex::new(None)),
+        };
+        let debug = format!("{client:?}");
+        assert!(debug.contains("127.0.0.1:9"));
+        assert!(!debug.contains("secret-store-token"));
     }
 
     #[test]

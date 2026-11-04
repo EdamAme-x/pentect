@@ -250,6 +250,7 @@ const COMMANDS: &[CommandSpec] = &[
 ];
 
 fn main() {
+    pentect_agent::disable_crash_dumps();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(windows)]
     if let Some(code) = claude_windows_supervisor::hidden_main(&args) {

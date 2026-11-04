@@ -15,9 +15,6 @@ supported local tool calls.
 Launch your agent through Pentect:<br />
 `pentect codex` · `pentect claude` · `pentect opencode` · `pentect pi`
 
-Detection runs locally, but may miss secrets.<br />
-Your agent's permissions and sandbox still apply. [Security limits](/protection/security-model/).
-
 <div class="home-demo">
   <video
     playsinline
