@@ -816,6 +816,16 @@ fn ocr_region_findings(
     let mut wrapped_from: Option<(String, Option<NormalizedImageRect>)> = None;
     for region in ocr_regions {
         let mut hits = image_text_secret_hits(&region.text, key)?;
+        // Only a detected value, never a carried tail, may continue further.
+        let content_end = region.text.trim_end().len();
+        let next_wrapped_from = hits
+            .iter()
+            .find(|hit| {
+                hit.range
+                    .as_ref()
+                    .is_some_and(|range| range.end == content_end)
+            })
+            .map(|hit| (hit.label.clone(), region.rect));
         if let Some((label, previous)) = wrapped_from.take() {
             hits.extend(ocr_wrapped_value_tail(
                 &region.text,
@@ -824,15 +834,7 @@ fn ocr_region_findings(
                 region.rect,
             ));
         }
-        let content_end = region.text.trim_end().len();
-        wrapped_from = hits
-            .iter()
-            .find(|hit| {
-                hit.range
-                    .as_ref()
-                    .is_some_and(|range| range.end == content_end)
-            })
-            .map(|hit| (hit.label.clone(), region.rect));
+        wrapped_from = next_wrapped_from;
         for hit in hits {
             let redaction = rect_for_text_secret_hit(region, &hit);
             findings.push(ImageSecretFinding {
@@ -857,7 +859,9 @@ fn ocr_wrapped_value_tail(
     previous: Option<NormalizedImageRect>,
     current: Option<NormalizedImageRect>,
 ) -> Option<ImageTextSecretHit> {
-    if let (Some(previous), Some(current)) = (previous, current) {
+    // Without its own bounds a tail would become a whole-image redaction.
+    let current = current?;
+    if let Some(previous) = previous {
         // Wrapped text sits directly under the line it continues; the next
         // paragraph or field starts after a visible gap.
         let line_height = previous.bottom - previous.top;
@@ -1848,6 +1852,8 @@ fn ocr_prefixed_token_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
     let underscored = |left: &std::ops::Range<usize>, right: &std::ops::Range<usize>| {
         left.end + 1 == right.start && bytes[left.end] == b'_'
     };
+    let value_fragment =
+        |word: &[u8]| (4..=64).contains(&word.len()) && word.iter().any(u8::is_ascii_digit);
     let mut ranges = Vec::new();
     let mut index = 0;
     while index < words.len() {
@@ -1859,21 +1865,27 @@ fn ocr_prefixed_token_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
             && underscored(&words[last], &words[last + 1])
         {
             last += 1;
-            if words[last].len() >= 20 && ocr_token_value(&bytes[words[last].clone()]) {
-                // OCR can also split the value itself (`b4cf...` + ` fed4035b9`);
-                // keep following fragments that still look like part of it.
-                while let Some(next) = words.get(last + 1) {
-                    let fragment = &bytes[next.clone()];
-                    if words[last].end + 1 != next.start
-                        || bytes[words[last].end] != b' '
-                        || !(4..=40).contains(&fragment.len())
-                        || !fragment.iter().any(u8::is_ascii_digit)
-                    {
-                        break;
-                    }
-                    last += 1;
+            if !value_fragment(&bytes[words[last].clone()]) {
+                continue;
+            }
+            // OCR can also split the value itself (`b4cf...` + ` fed4035b9`);
+            // keep following fragments that still look like part of it.
+            let mut end = last;
+            let mut value_len = words[end].len();
+            while let Some(next) = words.get(end + 1) {
+                if words[end].end + 1 != next.start
+                    || bytes[words[end].end] != b' '
+                    || !value_fragment(&bytes[next.clone()])
+                {
+                    break;
                 }
-                ranges.push(words[index].start..words[last].end);
+                end += 1;
+                value_len += words[end].len();
+            }
+            let value = &bytes[words[last].start..words[end].end];
+            if value_len >= 20 && value.iter().any(u8::is_ascii_alphabetic) {
+                ranges.push(words[index].start..words[end].end);
+                last = end;
                 found = true;
                 break;
             }
@@ -2100,12 +2112,68 @@ fn chrome_ocr_spaced_email_should_be_redacted() {
 
 #[cfg(all(test, feature = "ocr"))]
 #[test]
+fn wrapped_token_tail_is_redacted_only_directly_under_a_detected_token() {
+    let rect = |top: f32, bottom: f32| {
+        Some(NormalizedImageRect {
+            left: 0.1,
+            top,
+            right: 0.9,
+            bottom,
+        })
+    };
+    let region = |text: &str, rect| ImageTextRegion {
+        text: text.to_string(),
+        rect,
+    };
+    let regions = [
+        region(
+            "echo KGAT_8f3a91c2d7e64b05a1f9c3e7d2b84a6f",
+            rect(0.10, 0.12),
+        ),
+        region("f", rect(0.12, 0.14)),
+        region("ab", rect(0.14, 0.16)),
+        region("Next paragraph", rect(0.30, 0.32)),
+    ];
+    let findings = ocr_region_findings(&regions, &[7; 32]).unwrap();
+    let redacted_lines = |findings: &[ImageSecretFinding]| {
+        regions
+            .iter()
+            .filter(|region| {
+                let line = region.rect.unwrap();
+                findings.iter().any(|finding| {
+                    finding.rect.is_some_and(|rect| {
+                        let center = (rect.top + rect.bottom) / 2.0;
+                        line.top <= center && center <= line.bottom
+                    })
+                })
+            })
+            .map(|region| region.text.as_str())
+            .collect::<Vec<_>>()
+    };
+    // The tail is covered; a carried tail does not carry on to "ab".
+    assert_eq!(
+        redacted_lines(&findings),
+        ["echo KGAT_8f3a91c2d7e64b05a1f9c3e7d2b84a6f", "f"]
+    );
+    // A tail line without bounds must not become a whole-image redaction.
+    let unbounded = [regions[0].clone(), region("f", None)];
+    let findings = ocr_region_findings(&unbounded, &[7; 32]).unwrap();
+    assert!(findings.iter().all(|finding| finding.rect.is_some()));
+}
+
+#[cfg(all(test, feature = "ocr"))]
+#[test]
 fn ocr_dropped_underscores_still_redact_prefixed_tokens() {
     let engine = pii_test_engine();
     for (text, value) in [
         (
             "API Token\nKGAT 8f3a91c2d7e64b05a1f9c3e7d2b84a6f\n",
             "KGAT 8f3a91c2d7e64b05a1f9c3e7d2b84a6f",
+        ),
+        // OCR split the value after a short first fragment.
+        (
+            "KGAT 8f3a91c2d7 e64b05a1f9c3e7d2b84a6f\n",
+            "KGAT 8f3a91c2d7 e64b05a1f9c3e7d2b84a6f",
         ),
         (
             "echo sk live 51Qx7K9mN2pR8vT4wY6zB3cD5fG7hJ9kLaB2cD4eF6gH8iJ0kLmN > key\n",
@@ -3848,7 +3916,22 @@ mod tests {
             .unwrap();
         let left = token_like(&redacted);
         assert!(left.is_empty(), "token fragments still readable: {left:?}");
+        // The last character wraps to the start of the next code line.
+        let wrapped_tail_visible = |text: &str| {
+            text.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("f ") && line.contains("kaggle")
+            })
+        };
+        assert!(
+            wrapped_tail_visible(&image_regions_text(&regions)),
+            "fixture no longer wraps the token tail"
+        );
         let text = image_regions_text(&bundled_ocr_image_regions(&redacted, &cfg).unwrap());
+        assert!(
+            !wrapped_tail_visible(&text),
+            "wrapped token tail still readable"
+        );
         for prose in ["To use this token", "Or save it to"] {
             assert!(text.contains(prose), "over-redacted {prose:?}");
         }
