@@ -773,19 +773,7 @@ fn image_secret_findings(
             });
         }
     };
-    for region in &ocr_regions {
-        for hit in image_text_secret_hits(&region.text, key)? {
-            let redaction = rect_for_text_secret_hit(region, &hit);
-            findings.push(ImageSecretFinding {
-                labels: vec![hit.label.clone()],
-                secrets: secret_entries(&region.text, std::slice::from_ref(&hit), key),
-                rect: redaction.rect,
-                force_black: false,
-                pad_left: redaction.pad_left,
-                redact_pixels: true,
-            });
-        }
-    }
+    findings.extend(ocr_region_findings(&ocr_regions, key)?);
     let joined_text = image_regions_text(&ocr_regions);
     let joined_hits = image_text_secret_hits(&joined_text, key)?;
     let joined_labels = labels_from_text_hits(&joined_hits);
@@ -815,6 +803,86 @@ fn image_secret_findings(
     Ok(ImageSecretFindings {
         findings,
         scan_failure: None,
+    })
+}
+
+#[cfg(feature = "ocr")]
+fn ocr_region_findings(
+    ocr_regions: &[ImageTextRegion],
+    key: &[u8; 32],
+) -> Result<Vec<ImageSecretFinding>, String> {
+    let mut findings = Vec::new();
+    // A value that reaches the end of a line may wrap onto the next one.
+    let mut wrapped_from: Option<(String, Option<NormalizedImageRect>)> = None;
+    for region in ocr_regions {
+        let mut hits = image_text_secret_hits(&region.text, key)?;
+        if let Some((label, previous)) = wrapped_from.take() {
+            hits.extend(ocr_wrapped_value_tail(
+                &region.text,
+                &label,
+                previous,
+                region.rect,
+            ));
+        }
+        let content_end = region.text.trim_end().len();
+        wrapped_from = hits
+            .iter()
+            .find(|hit| {
+                hit.range
+                    .as_ref()
+                    .is_some_and(|range| range.end == content_end)
+            })
+            .map(|hit| (hit.label.clone(), region.rect));
+        for hit in hits {
+            let redaction = rect_for_text_secret_hit(region, &hit);
+            findings.push(ImageSecretFinding {
+                labels: vec![hit.label.clone()],
+                secrets: secret_entries(&region.text, std::slice::from_ref(&hit), key),
+                rect: redaction.rect,
+                force_black: false,
+                pad_left: redaction.pad_left,
+                redact_pixels: true,
+            });
+        }
+    }
+    Ok(findings)
+}
+
+/// The short leading fragment of a line that continues a value wrapped from
+/// the line above, such as the last character of a token in a code block.
+#[cfg(feature = "ocr")]
+fn ocr_wrapped_value_tail(
+    text: &str,
+    label: &str,
+    previous: Option<NormalizedImageRect>,
+    current: Option<NormalizedImageRect>,
+) -> Option<ImageTextSecretHit> {
+    if let (Some(previous), Some(current)) = (previous, current) {
+        // Wrapped text sits directly under the line it continues; the next
+        // paragraph or field starts after a visible gap.
+        let line_height = previous.bottom - previous.top;
+        if current.top < previous.top
+            || current.left > previous.right
+            || current.top - previous.bottom > line_height * 0.5
+        {
+            return None;
+        }
+    }
+    let start = text.len() - text.trim_start().len();
+    let rest = &text.as_bytes()[start..];
+    let len = rest
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric())
+        .count();
+    if !(1..=8).contains(&len) || rest.get(len).is_some_and(|b| *b == b'_') {
+        return None;
+    }
+    Some(ImageTextSecretHit {
+        label: label.to_string(),
+        range: Some(ByteRange {
+            start,
+            end: start + len,
+        }),
     })
 }
 
@@ -1678,7 +1746,10 @@ fn image_text_secret_hits_with_engine(
             hits.push(hit);
         }
     }
-    for hit in ocr_spaced_email_hits(text, engine) {
+    for hit in ocr_spaced_email_hits(text, engine)
+        .into_iter()
+        .chain(ocr_dropped_underscore_hits(text, engine))
+    {
         if !hits
             .iter()
             .any(|seen| seen.label == hit.label && seen.range == hit.range)
@@ -1687,6 +1758,187 @@ fn image_text_secret_hits_with_engine(
         }
     }
     Ok(hits)
+}
+
+/// OCR often reads `_` as a space, turning `sk_live_...` into `sk live ...`
+/// and `KAGGLE_API_TOKEN=` into `KAGGLE API TOKEN=`. Analyze a view with those
+/// spaces restored to `_`. Each replacement is one byte for one byte, so hit
+/// ranges stay valid in the original text. OCR also drops or adds characters,
+/// so a `prefix_value` token is redacted even when its length no longer
+/// matches the exact detector; image redaction recovers nothing, so a wider
+/// match costs only pixels.
+#[cfg(any(feature = "ocr", test))]
+fn ocr_dropped_underscore_hits(
+    text: &str,
+    engine: &pentect_core::Engine,
+) -> Vec<ImageTextSecretHit> {
+    let mut hits = Vec::new();
+    let mut line_offset = 0;
+    for line in text.split_inclusive('\n') {
+        let normalized = restore_ocr_underscores(line);
+        for range in ocr_prefixed_token_ranges(&normalized) {
+            hits.push(ImageTextSecretHit {
+                label: "TOKEN".to_string(),
+                range: Some(ByteRange {
+                    start: line_offset + range.start,
+                    end: line_offset + range.end,
+                }),
+            });
+        }
+        if normalized != line {
+            let result = engine.analyze_spans(pentect_core::Input {
+                kind: pentect_core::Kind::Text,
+                data: normalized,
+            });
+            for span in result.spans.into_iter().filter(|span| {
+                span.category == pentect_core::Category::Secret && span.range.start < span.range.end
+            }) {
+                hits.push(ImageTextSecretHit {
+                    label: span.label,
+                    range: Some(ByteRange {
+                        start: line_offset + span.range.start,
+                        end: line_offset + span.range.end,
+                    }),
+                });
+            }
+        }
+        line_offset += line.len();
+    }
+    hits
+}
+
+#[cfg(any(feature = "ocr", test))]
+fn ascii_word_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphanumeric() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            words.push(start..i);
+        } else {
+            i += 1;
+        }
+    }
+    words
+}
+
+#[cfg(any(feature = "ocr", test))]
+fn ocr_token_value(word: &[u8]) -> bool {
+    word.len() >= 16
+        && word.iter().any(u8::is_ascii_digit)
+        && word.iter().any(u8::is_ascii_alphabetic)
+}
+
+#[cfg(any(feature = "ocr", test))]
+fn ocr_token_prefix(word: &[u8]) -> bool {
+    (2..=12).contains(&word.len())
+        && word.iter().any(u8::is_ascii_alphabetic)
+        && !ocr_token_value(word)
+}
+
+/// `KGAT_8f3a...` or `sk_live_51Qx...`: one or two short prefixes joined by
+/// `_`, then a long mixed letter-and-digit value.
+#[cfg(any(feature = "ocr", test))]
+fn ocr_prefixed_token_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = line.as_bytes();
+    let words = ascii_word_ranges(bytes);
+    let underscored = |left: &std::ops::Range<usize>, right: &std::ops::Range<usize>| {
+        left.end + 1 == right.start && bytes[left.end] == b'_'
+    };
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let mut last = index;
+        let mut found = false;
+        while last + 1 < words.len()
+            && last - index < 2
+            && ocr_token_prefix(&bytes[words[last].clone()])
+            && underscored(&words[last], &words[last + 1])
+        {
+            last += 1;
+            if words[last].len() >= 20 && ocr_token_value(&bytes[words[last].clone()]) {
+                // OCR can also split the value itself (`b4cf...` + ` fed4035b9`);
+                // keep following fragments that still look like part of it.
+                while let Some(next) = words.get(last + 1) {
+                    let fragment = &bytes[next.clone()];
+                    if words[last].end + 1 != next.start
+                        || bytes[words[last].end] != b' '
+                        || !(4..=40).contains(&fragment.len())
+                        || !fragment.iter().any(u8::is_ascii_digit)
+                    {
+                        break;
+                    }
+                    last += 1;
+                }
+                ranges.push(words[index].start..words[last].end);
+                found = true;
+                break;
+            }
+        }
+        index = if found { last + 1 } else { index + 1 };
+    }
+    ranges
+}
+
+#[cfg(any(feature = "ocr", test))]
+fn restore_ocr_underscores(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let words = ascii_word_ranges(bytes);
+    // Look across an existing `_` too (`sk live_51Qx...`), but only rewrite spaces.
+    let joined = |left: &std::ops::Range<usize>, right: &std::ops::Range<usize>| {
+        left.end + 1 == right.start && matches!(bytes[left.end], b' ' | b'_')
+    };
+    // A shorter value is enough here: OCR may split it (`510x7k9mN2pR?VT4...`),
+    // and this view only feeds the detectors, which still decide what is secret.
+    let token_value = |word: &[u8]| {
+        word.len() >= 8
+            && word.iter().any(u8::is_ascii_digit)
+            && word.iter().any(u8::is_ascii_alphabetic)
+    };
+    let token_prefix = |word: &[u8]| ocr_token_prefix(word) && !token_value(word);
+    let env_word = |word: &[u8]| {
+        (2..=16).contains(&word.len())
+            && word
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && word.iter().any(u8::is_ascii_uppercase)
+    };
+    let mut out = bytes.to_vec();
+    for (index, pair) in words.windows(2).enumerate() {
+        let (left, right) = (&pair[0], &pair[1]);
+        if !joined(left, right) {
+            continue;
+        }
+        let (left_word, right_word) = (&bytes[left.clone()], &bytes[right.clone()]);
+        // `KGAT 8f3a...`, `sk live 51Qx...`: a short prefix chain ending in a long value.
+        let prefix = token_prefix(left_word)
+            && (token_value(right_word)
+                || token_prefix(right_word)
+                    && words.get(index + 2).is_some_and(|next| {
+                        joined(right, next) && token_value(&bytes[next.clone()])
+                    }));
+        // `KAGGLE API TOKEN=`: an upper-case name chain that ends in an assignment.
+        let env = env_word(left_word) && env_word(right_word) && {
+            let mut last = index + 1;
+            while words
+                .get(last + 1)
+                .is_some_and(|next| joined(&words[last], next) && env_word(&bytes[next.clone()]))
+            {
+                last += 1;
+            }
+            let after = words[last].end;
+            let rest = &bytes[after..];
+            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+            matches!(rest.first(), Some(b'=' | b':'))
+        };
+        if (prefix || env) && bytes[left.end] == b' ' {
+            out[left.end] = b'_';
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| line.to_string())
 }
 
 /// OCR may insert horizontal whitespace around email punctuation. Analyze a
@@ -1780,6 +2032,7 @@ pub(crate) fn ocr_text_spans(
     {
         Ok(ocr_spaced_email_hits(text, engine)
             .into_iter()
+            .chain(ocr_dropped_underscore_hits(text, engine))
             .chain(ocr_fragmented_secret_hits(text))
             .filter_map(|hit| {
                 Some(pentect_core::Span {
@@ -1843,6 +2096,64 @@ fn chrome_ocr_spaced_email_should_be_redacted() {
         hits.iter().any(|hit| hit.label == "EMAIL_ADDRESS"),
         "OCR-spaced email has no redaction hit"
     );
+}
+
+#[cfg(all(test, feature = "ocr"))]
+#[test]
+fn ocr_dropped_underscores_still_redact_prefixed_tokens() {
+    let engine = pii_test_engine();
+    for (text, value) in [
+        (
+            "API Token\nKGAT 8f3a91c2d7e64b05a1f9c3e7d2b84a6f\n",
+            "KGAT 8f3a91c2d7e64b05a1f9c3e7d2b84a6f",
+        ),
+        (
+            "echo sk live 51Qx7K9mN2pR8vT4wY6zB3cD5fG7hJ9kLaB2cD4eF6gH8iJ0kLmN > key\n",
+            "sk live 51Qx7K9mN2pR8vT4wY6zB3cD5fG7hJ9kLaB2cD4eF6gH8iJ0kLmN",
+        ),
+        (
+            "export KAGGLE API TOKEN=Zx81Qm4Lr7Tp2Wd9Hc5Vb3Nf6Ks0Jy\n",
+            "Zx81Qm4Lr7Tp2Wd9Hc5Vb3Nf6Ks0Jy",
+        ),
+        // OCR dropped two characters, so the exact 32-character rule misses it.
+        (
+            "mkdir -p w/.kaggle && echo KGAT 8f3a91c2d7e64b05a1f93e72h84a6f\n",
+            "KGAT 8f3a91c2d7e64b05a1f93e72h84a6f",
+        ),
+        (
+            "echo sk live_510x7K9mN2pR8vT4WY67R3cD5fG7hJ9k\n",
+            "sk live_510x7K9mN2pR8vT4WY67R3cD5fG7hJ9k",
+        ),
+        (
+            "echo sk 1ive 51Qx7K9mN2pR8vT4wY6z83cD5fG7hJ9k\n",
+            "sk 1ive 51Qx7K9mN2pR8vT4wY6z83cD5fG7hJ9k",
+        ),
+    ] {
+        let start = text.find(value).unwrap();
+        let hits = image_text_secret_hits_with_engine(text, &engine).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit
+                .range
+                .as_ref()
+                .is_some_and(|range| range.start <= start && start + value.len() <= range.end)),
+            "OCR text {text:?} left {value:?} visible: {hits:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ocr_underscore_restoration_leaves_prose_and_offsets_alone() {
+    assert_eq!(
+        restore_ocr_underscores("Generate New Token and copy it\n"),
+        "Generate New Token and copy it\n"
+    );
+    let line = "echo KGAT 8f3a91c2d7e64b05a1f9c3e7d2b84a6f > ~/.kaggle/access token";
+    let restored = restore_ocr_underscores(line);
+    assert_eq!(restored.len(), line.len());
+    assert!(restored.contains("KGAT_8f3a91c2d7e64b05a1f9c3e7d2b84a6f"));
+    assert!(restored.ends_with("access token"));
+    assert!(ocr_prefixed_token_ranges("see config_file_name and build_output_dir").is_empty());
 }
 
 #[cfg(all(test, feature = "ocr"))]
@@ -3491,6 +3802,55 @@ mod tests {
             max_image_bytes: 64 * 1024 * 1024,
             fetch_seconds: 8,
             unscanned_images: UnscannedImagePolicy::Allow,
+        }
+    }
+
+    #[cfg(all(feature = "ocr", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn bundled_ocr_redacts_every_copy_of_a_kaggle_token_dialog() {
+        // A real Kaggle "API Token is now available" dialog from Linux. OCR
+        // reads `_` as a space, splits the value, and wraps its last character
+        // onto the next line of the code block.
+        let png = data_encoding::BASE64
+            .decode(
+                include_str!("../../../tools/fixtures/kaggle-token-dialog.png.b64")
+                    .replace(['\n', '\r'], "")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let cfg = test_config();
+        let key = [7; 32];
+        let token_like = |bytes: &[u8]| {
+            let text = image_regions_text(&bundled_ocr_image_regions(bytes, &cfg).unwrap());
+            let mut found = text
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| {
+                    word.len() >= 6
+                        && word.chars().any(|c| c.is_ascii_digit())
+                        && word.chars().any(|c| c.is_ascii_alphabetic())
+                })
+                .map(str::len)
+                .collect::<Vec<_>>();
+            if text.contains("KGAT") {
+                found.push(0);
+            }
+            found
+        };
+        assert!(
+            !token_like(&png).is_empty(),
+            "fixture no longer shows the token"
+        );
+        let regions = bundled_ocr_image_regions(&png, &cfg).unwrap();
+        let findings = ocr_region_findings(&regions, &key).unwrap();
+        let payload = redacted_image_payload(&png, 1, &cfg, &findings).unwrap();
+        let redacted = data_encoding::BASE64
+            .decode(payload.base64.as_bytes())
+            .unwrap();
+        let left = token_like(&redacted);
+        assert!(left.is_empty(), "token fragments still readable: {left:?}");
+        let text = image_regions_text(&bundled_ocr_image_regions(&redacted, &cfg).unwrap());
+        for prose in ["To use this token", "Or save it to"] {
+            assert!(text.contains(prose), "over-redacted {prose:?}");
         }
     }
 
