@@ -2730,6 +2730,13 @@ mod tests {
     }
 
     #[test]
+    fn bare_resend_key_is_masked_without_a_key_name() {
+        let raw = concat!("\"re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2\"");
+        let r = Engine::default().mask(Input::text(raw), &Config::insecure_testing());
+        assert!(r.masked.contains("<<RESEND_API_KEY_"), "{}", r.masked);
+    }
+
+    #[test]
     fn env_placeholders_use_each_parsed_key_as_the_label() {
         let raw = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nKAGGLE_API_TOKEN=KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nrelease.flag=enabled\n9PATCH=value\n";
         let r = Engine::with_profile(Profile::Strict).mask(

@@ -764,6 +764,23 @@ fn standalone_kaggle_token_is_masked_in_browser_tool_output() {
 }
 
 #[test]
+fn bare_resend_key_from_browser_script_result_is_masked() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("resend-browser-key");
+
+    // A javascript_tool result carries only the JSON string, with no
+    // RESEND_API_KEY= context, so the key shape alone has to be detected.
+    let raw = concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let output = masker
+        .mask_tool_output(&format!("\"{raw}\""))
+        .unwrap()
+        .unwrap();
+    assert!(output.contains("<<RESEND_API_KEY_"), "{output}");
+    assert!(!output.contains(raw));
+}
+
+#[test]
 fn active_tool_output_masker_reuses_in_memory_state() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-masker");

@@ -9,6 +9,7 @@
 //! - #1399: the leading cookie pair in attribute-bearing `Set-Cookie` headers.
 //! - #1400: semicolon-delimited connection-string `Password`/`Pwd` fields.
 //! - Kaggle `KGAT_` API tokens missing from the current CredSweeper rules.
+//! - Resend `re_` API keys missing from the current CredSweeper rules.
 //!
 //! These cases do not claim an upstream CredSweeper defect or implement the
 //! complete grammar of any of those formats.
@@ -25,7 +26,7 @@ impl Detector for PentectTempParser {
         let mut offset = 0;
         for line in view.text().split_inclusive('\n') {
             let content = line.trim_end_matches(['\r', '\n']);
-            kaggle_api_tokens(view, content, offset, &mut out);
+            prefixed_tokens(view, content, offset, &mut out);
             if cli_compatibility_candidate(content) {
                 cli_compatibility(view, content, offset, &mut out);
             }
@@ -44,29 +45,51 @@ impl Detector for PentectTempParser {
     }
 }
 
-fn kaggle_api_tokens(view: &NormalizedView, line: &str, offset: usize, out: &mut Vec<Span>) {
-    const PREFIX: &str = "KGAT_";
-    const BODY_LEN: usize = 32;
+/// Fixed-shape vendor tokens: a literal prefix, then alphanumeric segments of
+/// exact lengths joined by `_`. The exact shape keeps short prefixes such as
+/// `re_` from matching ordinary identifiers.
+const PREFIXED_TOKENS: &[(&str, &[usize], &str)] = &[
+    ("KGAT_", &[32], "KAGGLE_API_TOKEN"),
+    ("re_", &[8, 24], "RESEND_API_KEY"),
+];
+
+fn prefixed_tokens(view: &NormalizedView, line: &str, offset: usize, out: &mut Vec<Span>) {
     let bytes = line.as_bytes();
-    for (start, _) in line.match_indices(PREFIX) {
-        let end = start + PREFIX.len() + BODY_LEN;
-        let Some(body) = bytes.get(start + PREFIX.len()..end) else {
-            continue;
-        };
-        if !body.iter().all(u8::is_ascii_alphanumeric)
-            || start > 0 && is_token_char(bytes[start - 1])
-            || bytes.get(end).is_some_and(|&byte| is_token_char(byte))
-        {
-            continue;
+    for &(prefix, segments, label) in PREFIXED_TOKENS {
+        for (start, _) in line.match_indices(prefix) {
+            let Some(end) = segmented_body_end(bytes, start + prefix.len(), segments) else {
+                continue;
+            };
+            if start > 0 && is_token_char(bytes[start - 1])
+                || bytes.get(end).is_some_and(|&byte| is_token_char(byte))
+            {
+                continue;
+            }
+            out.push(Span {
+                range: view.to_raw(ByteRange::new(offset + start, offset + end)),
+                category: Category::Secret,
+                label: label.to_string(),
+                confidence: Confidence::High,
+                source: DetectorId::PentectTempParser,
+            });
         }
-        out.push(Span {
-            range: view.to_raw(ByteRange::new(offset + start, offset + end)),
-            category: Category::Secret,
-            label: "KAGGLE_API_TOKEN".to_string(),
-            confidence: Confidence::High,
-            source: DetectorId::PentectTempParser,
-        });
     }
+}
+
+fn segmented_body_end(bytes: &[u8], mut at: usize, segments: &[usize]) -> Option<usize> {
+    for (index, &len) in segments.iter().enumerate() {
+        if index > 0 {
+            (bytes.get(at) == Some(&b'_')).then_some(())?;
+            at += 1;
+        }
+        let segment = bytes.get(at..at + len)?;
+        segment
+            .iter()
+            .all(u8::is_ascii_alphanumeric)
+            .then_some(())?;
+        at += len;
+    }
+    Some(at)
 }
 
 fn is_token_char(byte: u8) -> bool {
@@ -435,6 +458,24 @@ mod tests {
             "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567",
         ] {
             assert!(values(sample).is_empty());
+        }
+    }
+
+    #[test]
+    fn resend_api_key_is_detected_without_key_name() {
+        let key = concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2");
+        assert_eq!(values(key), [key]);
+        assert_eq!(values(&format!("\"{key}\"")), [key]);
+        assert_eq!(values(&format!("RESEND_API_KEY={key}")), [key]);
+        for sample in [
+            concat!("pre", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2"),
+            concat!("re", "_9xQ2mT7_pL4vR8nZ3wY6bH1cJ5dF0gS2"),
+            concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0g"),
+            concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2X"),
+            concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2_x"),
+            "re_render_the_component_when_props_change",
+        ] {
+            assert!(values(sample).is_empty(), "{sample}");
         }
     }
 
