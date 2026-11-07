@@ -60,8 +60,10 @@ fn prefixed_tokens(view: &NormalizedView, line: &str, offset: usize, out: &mut V
             let Some(end) = segmented_body_end(bytes, start + prefix.len(), segments) else {
                 continue;
             };
-            if start > 0 && is_token_char(bytes[start - 1])
-                || bytes.get(end).is_some_and(|&byte| is_token_char(byte))
+            // Unicode identifier characters such as `é` also continue a token.
+            let continues = |ch: char| ch.is_alphanumeric() || ch == '_';
+            if line[..start].chars().next_back().is_some_and(continues)
+                || line[end..].chars().next().is_some_and(continues)
             {
                 continue;
             }
@@ -90,10 +92,6 @@ fn segmented_body_end(bytes: &[u8], mut at: usize, segments: &[usize]) -> Option
         at += len;
     }
     Some(at)
-}
-
-fn is_token_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn cli_compatibility_candidate(line: &str) -> bool {
@@ -474,6 +472,8 @@ mod tests {
             concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2X"),
             concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2_x"),
             "re_render_the_component_when_props_change",
+            concat!("é", "re_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2"),
+            concat!("re", "_9xQ2mT7k_pL4vR8nZ3wY6bH1cJ5dF0gS2é"),
         ] {
             assert!(values(sample).is_empty(), "{sample}");
         }
