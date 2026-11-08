@@ -17027,7 +17027,7 @@ freely, subject to the following restrictions:
 DOCUMENT 286
 ~~~~~~~~~~~~
 Applies to:
-- tokio 1.52.3 (MIT)
+- tokio 1.54.1 (MIT)
 - tokio-util 0.7.18 (MIT)
 
 MIT License

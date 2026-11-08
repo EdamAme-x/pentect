@@ -11,6 +11,8 @@ const USER_AGENT: &str = "pentect-updater";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 4 * 1024;
+// GitHub release JSON grows with every asset; v0.0.101 is already 38 KiB.
+const MAX_RELEASE_JSON_BYTES: u64 = 1024 * 1024;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_CACHE: &str = "update-check.json";
@@ -108,7 +110,7 @@ fn refresh_update_check(path: &Path, now: u64) -> Result<(), String> {
         .user_agent(USER_AGENT)
         .build()
         .map_err(|error| format!("could not create update-check client: {error}"))?;
-    let release: UpdateCheckRelease = get_response(&client, RELEASE_API, MAX_CHECKSUM_BYTES * 4)?;
+    let release: UpdateCheckRelease = get_response(&client, RELEASE_API, MAX_RELEASE_JSON_BYTES)?;
     let cache = update_check_cache_for_release(&release, now)?;
     write_update_check_cache(path, &cache)?;
     if let Some(latest) = cache.latest.as_deref() {
@@ -273,7 +275,7 @@ fn update(options: UpdateOptions) -> Result<(), String> {
             format!("https://api.github.com/repos/EdamAme-x/pentect/releases/tags/v{version}")
         },
     );
-    let release: Release = get_response(&client, &release_api, MAX_CHECKSUM_BYTES * 16)?;
+    let release: Release = get_response(&client, &release_api, MAX_RELEASE_JSON_BYTES)?;
     let allow_prerelease =
         std::env::var("PENTECT_UPDATE_ALLOW_PRERELEASE").is_ok_and(|value| value == "1");
     validate_release_channel(
@@ -456,7 +458,7 @@ pub(crate) fn download_latest_release_asset(
         .build()
         .map_err(|e| format!("could not create release client: {e}"))?;
     let api = latest_release_api(repository);
-    let release: Release = get_response(&client, &api, MAX_CHECKSUM_BYTES * 16)?;
+    let release: Release = get_response(&client, &api, MAX_RELEASE_JSON_BYTES)?;
     if release.draft || release.prerelease {
         return Err("latest GitHub release is not a stable release".to_string());
     }
