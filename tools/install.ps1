@@ -105,7 +105,7 @@ function Write-PentectManagedInstallMarker {
     [System.IO.File]::WriteAllText($Path, $json, $utf8WithoutBom)
 }
 
-$repository = 'EdamAme-x/pentect'
+$repository = 'Akagumi-Inc/pentect'
 $requestedVersion = $Version
 if ($requestedVersion) {
     $requestedVersion = $requestedVersion.TrimStart('v')

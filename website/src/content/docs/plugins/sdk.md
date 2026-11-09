@@ -228,7 +228,7 @@ The main public types are:
 - `PluginResult`
 
 The SDK source and examples live in
-[`sdk/rust/pentect-plugin`](https://github.com/EdamAme-x/pentect/tree/main/sdk/rust/pentect-plugin).
+[`sdk/rust/pentect-plugin`](https://github.com/Akagumi-Inc/pentect/tree/main/sdk/rust/pentect-plugin).
 
 Copy complete patterns from [Plugin recipes](/plugins/recipes/).
 

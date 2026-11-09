@@ -176,11 +176,11 @@ export default defineConfig({
     outline: { level: [2, 3], label: 'On this page' },
     search: { provider: 'local' },
     editLink: {
-      pattern: 'https://github.com/EdamAme-x/pentect/edit/main/website/src/content/docs/:path',
+      pattern: 'https://github.com/Akagumi-Inc/pentect/edit/main/website/src/content/docs/:path',
       text: 'Edit this page on GitHub',
     },
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/EdamAme-x/pentect' },
+      { icon: 'github', link: 'https://github.com/Akagumi-Inc/pentect' },
     ],
     footer: {
       message: 'Pentect is open source.',

@@ -13,7 +13,7 @@ and Windows otherwise, and PyTorch's official default package on macOS. See the
 [setup guide](https://pentect.dev/plugins/official/#openai-privacy-filter).
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --profile cpu
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/openai-privacy-filter --profile cpu
 ```
 
 To change the profile later, run

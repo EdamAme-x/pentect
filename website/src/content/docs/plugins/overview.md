@@ -39,13 +39,13 @@ pentect plugins search privacy
 Inspect a released version before you add it:
 
 ```sh
-pentect plugins inspect github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
+pentect plugins inspect github:@Akagumi-Inc/pentect/plugins/example-regex@v0.1.0
 ```
 
 Add it for your user account on this computer:
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/example-regex@v0.1.0
 ```
 
 This writes the source to `~/.pentect/config.toml` and pins downloaded source

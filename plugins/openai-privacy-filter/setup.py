@@ -149,7 +149,7 @@ def controlled_fixture() -> bool:
     return (
         os.environ.get("GITHUB_ACTIONS") == "true"
         and os.environ.get("GITHUB_WORKFLOW") == "Release"
-        and os.environ.get("GITHUB_REPOSITORY") == "EdamAme-x/pentect"
+        and os.environ.get("GITHUB_REPOSITORY") == "Akagumi-Inc/pentect"
     )
 
 

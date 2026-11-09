@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   quarantine-incomplete-release:
-    if: github.repository == 'EdamAme-x/pentect' && github.event.release.prerelease == false
+    if: github.repository == 'Akagumi-Inc/pentect' && github.event.release.prerelease == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

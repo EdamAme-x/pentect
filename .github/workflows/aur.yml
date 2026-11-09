@@ -163,7 +163,7 @@ jobs:
   publish-bin:
     name: Publish pentect-bin
     needs: [changes, validate]
-    if: needs.changes.outputs.publish == 'true' && github.repository == 'EdamAme-x/pentect'
+    if: needs.changes.outputs.publish == 'true' && github.repository == 'Akagumi-Inc/pentect'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -178,7 +178,7 @@ jobs:
   publish-git:
     name: Publish pentect-git
     needs: [changes, validate]
-    if: needs.changes.outputs.publish == 'true' && github.repository == 'EdamAme-x/pentect'
+    if: needs.changes.outputs.publish == 'true' && github.repository == 'Akagumi-Inc/pentect'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:

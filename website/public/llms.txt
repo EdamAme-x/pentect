@@ -32,4 +32,4 @@ Important behavior:
 - CredSweeper compatibility is measured on named test corpora; it is not a
   general parity guarantee.
 
-Source: https://github.com/EdamAme-x/pentect
+Source: https://github.com/Akagumi-Inc/pentect

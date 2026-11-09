@@ -1,4 +1,4 @@
-module github.com/EdamAme-x/pentect/tools/alcatraz-helper
+module github.com/Akagumi-Inc/pentect/tools/alcatraz-helper
 
 go 1.24
 

@@ -91,7 +91,7 @@ class SetupTests(unittest.TestCase):
             {
                 "GITHUB_ACTIONS": "true",
                 "GITHUB_WORKFLOW": "Release",
-                "GITHUB_REPOSITORY": "EdamAme-x/pentect",
+                "GITHUB_REPOSITORY": "Akagumi-Inc/pentect",
             },
             clear=True,
         ):
@@ -115,7 +115,7 @@ class SetupTests(unittest.TestCase):
             {
                 "GITHUB_ACTIONS": "true",
                 "GITHUB_WORKFLOW": "CI",
-                "GITHUB_REPOSITORY": "EdamAme-x/pentect",
+                "GITHUB_REPOSITORY": "Akagumi-Inc/pentect",
             },
             clear=True,
         ):

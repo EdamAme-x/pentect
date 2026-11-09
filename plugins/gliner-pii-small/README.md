@@ -6,7 +6,7 @@ It adds local, primarily English PII detection. Installation is explicit opt-in;
 it does not enable Pentect's optional built-in PII rules or replace secret detection.
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/gliner-pii-small --profile cpu
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/gliner-pii-small --profile cpu
 ```
 
 Python 3.10–3.13 is required. Setup downloads pinned model weights and a managed Python

@@ -6,10 +6,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/EdamAme-x/pentect.git"
+    "url": "git+https://github.com/Akagumi-Inc/pentect.git"
   },
   "homepage": "https://pentect.dev",
-  "bugs": "https://github.com/EdamAme-x/pentect/issues",
+  "bugs": "https://github.com/Akagumi-Inc/pentect/issues",
   "bin": {
     "pentect": "packaging/npm/bin/pentect.js"
   },

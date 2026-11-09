@@ -43,7 +43,7 @@ Priority: optional
 Architecture: $architecture
 Maintainer: EdamAme-x <edame8080@gmail.com>
 Depends: $depends
-Homepage: https://github.com/EdamAme-x/pentect
+Homepage: https://github.com/Akagumi-Inc/pentect
 Description: Local secret masking boundary for AI agents
  Pentect masks secrets at AI tool and HTTP boundaries while keeping the
  original values local.
