@@ -11,7 +11,7 @@ package builds the Rust workspace on your machine.
 <HomeInstall />
 
 Pentect is currently distributed through its own flake, not as a package in
-Nixpkgs. Use `github:EdamAme-x/pentect#pentect`; `nix run nixpkgs#pentect`
+Nixpkgs. Use `github:Akagumi-Inc/pentect#pentect`; `nix run nixpkgs#pentect`
 cannot work until Pentect is accepted into the upstream Nixpkgs collection.
 
 ## Check the install
@@ -141,7 +141,7 @@ Add Pentect to your flake input and system packages:
 
 ```nix
 # flake.nix
-inputs.pentect.url = "github:EdamAme-x/pentect";
+inputs.pentect.url = "github:Akagumi-Inc/pentect";
 
 outputs = inputs@{ nixpkgs, ... }: {
   nixosConfigurations.HOSTNAME = nixpkgs.lib.nixosSystem {

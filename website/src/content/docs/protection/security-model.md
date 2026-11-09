@@ -130,4 +130,4 @@ turn it on only to hide an error that you have not checked.
 
 Do not open a public issue for a possible security problem. Use the private
 steps in the repository's
-[security policy](https://github.com/EdamAme-x/pentect/security/policy).
+[security policy](https://github.com/Akagumi-Inc/pentect/security/policy).

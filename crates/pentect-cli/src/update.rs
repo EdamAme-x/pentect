@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const RELEASE_API: &str = "https://api.github.com/repos/EdamAme-x/pentect/releases/latest";
+const RELEASE_API: &str = "https://api.github.com/repos/Akagumi-Inc/pentect/releases/latest";
 const USER_AGENT: &str = "pentect-updater";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -270,7 +270,7 @@ fn update(options: UpdateOptions) -> Result<(), String> {
     let release_api = options.target.as_ref().map_or_else(
         || RELEASE_API.to_string(),
         |version| {
-            format!("https://api.github.com/repos/EdamAme-x/pentect/releases/tags/v{version}")
+            format!("https://api.github.com/repos/Akagumi-Inc/pentect/releases/tags/v{version}")
         },
     );
     let release: Release = get_response(&client, &release_api, MAX_CHECKSUM_BYTES * 16)?;
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn validates_release_coordinates() {
-        assert!(validate_repository("EdamAme-x/pentect").is_ok());
+        assert!(validate_repository("Akagumi-Inc/pentect").is_ok());
         assert!(validate_repository("owner/repo/extra").is_err());
         assert!(validate_repository("owner/../repo").is_err());
     }

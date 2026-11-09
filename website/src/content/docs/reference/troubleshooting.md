@@ -270,7 +270,7 @@ default (`ignore` unless the other config requires `error`).
 
 ### Report a format Pentect should support
 
-Open a [compatibility report](https://github.com/EdamAme-x/pentect/issues/new?template=bug_report.yml).
+Open a [compatibility report](https://github.com/Akagumi-Inc/pentect/issues/new?template=bug_report.yml).
 Include the Pentect version, client version, command, gateway type, route, and
 full error. Replace credentials and private data with fake values before you
 attach a request sample.

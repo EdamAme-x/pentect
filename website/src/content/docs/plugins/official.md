@@ -31,11 +31,11 @@ pentect plugins search
 ## Example regex
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/example-regex
 ```
 
 Its
-[`plugin.toml`](https://github.com/EdamAme-x/pentect/blob/main/plugins/example-regex/plugin.toml)
+[`plugin.toml`](https://github.com/Akagumi-Inc/pentect/blob/main/plugins/example-regex/plugin.toml)
 is a complete one-file example.
 
 ## GLiNER PII Small
@@ -45,7 +45,7 @@ An experimental first-party bridge for
 Install it explicitly to add PII detection; it is not enabled by default.
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/gliner-pii-small --profile cpu
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/gliner-pii-small --profile cpu
 ```
 
 Setup downloads pinned weights and a managed Python environment. Runtime
@@ -64,7 +64,7 @@ request. An empty but incorrect prediction is still a possible false negative.
 The native process has the user's OS permissions; review it before approval.
 
 Bridge unit tests cover byte offsets and response validation, not real-model
-quality. See the [integration README](https://github.com/EdamAme-x/pentect/tree/main/plugins/gliner-pii-small)
+quality. See the [integration README](https://github.com/Akagumi-Inc/pentect/tree/main/plugins/gliner-pii-small)
 for setup, limitations, and removal.
 
 ## Local LLM Masking
@@ -117,7 +117,7 @@ This plugin is required: malformed output and inference failures block the
 request. A valid but incorrect prediction, including `[]`, can still miss
 secrets. Use it as supplemental detection, not your only protection.
 
-Pentect 0.0.94 has a [Command-plugin update issue](https://github.com/EdamAme-x/pentect/issues/1506).
+Pentect 0.0.94 has a [Command-plugin update issue](https://github.com/Akagumi-Inc/pentect/issues/1506).
 Use an explicitly reviewed, pinned revision rather than relying on a moving
 branch to refresh cached files; see the repository's installation instructions.
 
@@ -141,7 +141,7 @@ or mark safe text, so built-in detection stays enabled.
 ### Install
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/openai-privacy-filter
 ```
 
 Pentect shows the expected transfer and disk cost, asks once, detects a
@@ -156,7 +156,7 @@ an x86-only CUDA wheel.
 Force a profile when automatic selection is not what you want:
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --profile cpu
+pentect plugins add github:@Akagumi-Inc/pentect/plugins/openai-privacy-filter --profile cpu
 pentect plugins setup openai-privacy-filter --profile cuda
 ```
 
@@ -193,7 +193,7 @@ test CUDA, or sign in to an AI provider. A green pull request therefore does
 not claim that those heavyweight boundaries were exercised.
 
 The repository includes a separate
-[`live_e2e.py`](https://github.com/EdamAme-x/pentect/blob/main/plugins/openai-privacy-filter/tests/live_e2e.py)
+[`live_e2e.py`](https://github.com/Akagumi-Inc/pentect/blob/main/plugins/openai-privacy-filter/tests/live_e2e.py)
 for the real model. It verifies real setup and checkpoint state, the direct
 plugin protocol including a warm second request, cold and restarted Pentect
 masking, worker cleanup, removal, and an installed Codex flow against a

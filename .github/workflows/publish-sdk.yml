@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   rust-verify:
-    if: github.repository == 'EdamAme-x/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-rust-v'))
+    if: github.repository == 'Akagumi-Inc/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-rust-v'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,7 +47,7 @@ jobs:
         run: cargo publish --locked
 
   javascript-verify:
-    if: github.repository == 'EdamAme-x/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-js-v'))
+    if: github.repository == 'Akagumi-Inc/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-js-v'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -81,7 +81,7 @@ jobs:
         run: npm publish --access public
 
   python-verify:
-    if: github.repository == 'EdamAme-x/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-python-v'))
+    if: github.repository == 'Akagumi-Inc/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-python-v'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

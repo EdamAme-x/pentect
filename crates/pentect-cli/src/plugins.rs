@@ -27,8 +27,8 @@ const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const PLUGIN_CONFIGS_DIR: &str = "configs";
 const OFFICIAL_PLUGINS_DIR: &str = "plugins";
 const DEFAULT_REMOTE_PLUGINS_BASE: &str =
-    "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins";
-const DEFAULT_PLUGIN_REPOSITORY: &str = "EdamAme-x/pentect";
+    "https://raw.githubusercontent.com/Akagumi-Inc/pentect/main/plugins";
+const DEFAULT_PLUGIN_REPOSITORY: &str = "Akagumi-Inc/pentect";
 const REMOTE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REMOTE_PLUGIN_CACHE_BYTES: u64 = 128 * 1024 * 1024;
@@ -2281,14 +2281,14 @@ label = "INLINE_SECRET"
         assert!(parse_plugin_value("../x").is_err());
         assert!(parse_plugin_value("").is_err());
         assert_eq!(
-            parse_plugin_value("github:@EdamAme-x/pentect/plugins/pii-ner").unwrap(),
-            ["github:@EdamAme-x/pentect/plugins/pii-ner"]
+            parse_plugin_value("github:@Akagumi-Inc/pentect/plugins/pii-ner").unwrap(),
+            ["github:@Akagumi-Inc/pentect/plugins/pii-ner"]
         );
     }
 
     #[test]
     fn user_scoped_github_plugin_is_not_resolved_as_a_local_path() {
-        let spec = "github:@EdamAme-x/pentect/plugins/example-regex";
+        let spec = "github:@Akagumi-Inc/pentect/plugins/example-regex";
         assert_eq!(
             plugin_spec_for_scope(spec, PluginScope::User).unwrap(),
             spec
@@ -2813,32 +2813,32 @@ label = "INLINE_SECRET"
     fn github_plugin_urls_normalize_to_raw_urls() {
         assert_eq!(
             normalize_github_plugin_url(
-                "https://github.com/EdamAme-x/pentect/blob/main/plugins/company/config.toml"
+                "https://github.com/Akagumi-Inc/pentect/blob/main/plugins/company/config.toml"
             )
             .unwrap(),
-            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/company/config.toml"
+            "https://raw.githubusercontent.com/Akagumi-Inc/pentect/main/plugins/company/config.toml"
         );
         assert_eq!(
             normalize_github_plugin_url(
-                "https://github.com/EdamAme-x/pentect/tree/main/plugins/company"
+                "https://github.com/Akagumi-Inc/pentect/tree/main/plugins/company"
             )
             .unwrap(),
-            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/company"
+            "https://raw.githubusercontent.com/Akagumi-Inc/pentect/main/plugins/company"
         );
         assert_eq!(
             normalize_github_plugin_url(
-                "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/company/config.toml"
+                "https://raw.githubusercontent.com/Akagumi-Inc/pentect/main/plugins/company/config.toml"
             )
             .unwrap(),
-            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/company/config.toml"
+            "https://raw.githubusercontent.com/Akagumi-Inc/pentect/main/plugins/company/config.toml"
         );
         assert!(normalize_github_plugin_url("https://example.com/company/config.toml").is_err());
         assert!(
             normalize_github_plugin_url("https://raw.githubusercontent.com/owner/repo").is_err()
         );
         assert_eq!(
-            normalize_github_plugin_url("github:@EdamAme-x/pentect/plugins/pii-ner").unwrap(),
-            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/pii-ner"
+            normalize_github_plugin_url("github:@Akagumi-Inc/pentect/plugins/pii-ner").unwrap(),
+            "https://raw.githubusercontent.com/Akagumi-Inc/pentect/main/plugins/pii-ner"
         );
         assert!(normalize_github_plugin_url("github:@owner/repo").is_err());
         assert_eq!(

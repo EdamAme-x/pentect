@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository="EdamAme-x/pentect"
+repository="Akagumi-Inc/pentect"
 version=${PENTECT_VERSION:-}
 while [ "$#" -gt 0 ]; do
   case "$1" in

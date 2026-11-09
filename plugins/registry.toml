@@ -10,20 +10,20 @@ form = "command"
 [[plugin]]
 name = "gliner-pii-small"
 description = "Experimental offline PII detection with GLiNER PII small."
-source = "github:@EdamAme-x/pentect/plugins/gliner-pii-small"
-publisher = "EdamAme-x/pentect"
+source = "github:@Akagumi-Inc/pentect/plugins/gliner-pii-small"
+publisher = "Akagumi-Inc/pentect"
 form = "command"
 
 [[plugin]]
 name = "example-regex"
 description = "One-file example for regex detection."
-source = "github:@EdamAme-x/pentect/plugins/example-regex"
-publisher = "EdamAme-x/pentect"
+source = "github:@Akagumi-Inc/pentect/plugins/example-regex"
+publisher = "Akagumi-Inc/pentect"
 form = "manifest"
 
 [[plugin]]
 name = "openai-privacy-filter"
 description = "Local PII detection with OpenAI Privacy Filter."
-source = "github:@EdamAme-x/pentect/plugins/openai-privacy-filter"
-publisher = "EdamAme-x/pentect"
+source = "github:@Akagumi-Inc/pentect/plugins/openai-privacy-filter"
+publisher = "Akagumi-Inc/pentect"
 form = "command"

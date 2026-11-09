@@ -79,7 +79,7 @@ jobs:
   portable:
     name: Portable clients and apps (${{ matrix.os }})
     needs: changes
-    if: github.repository == 'EdamAme-x/pentect' && needs.changes.outputs.clients == 'true'
+    if: github.repository == 'Akagumi-Inc/pentect' && needs.changes.outputs.clients == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -117,7 +117,7 @@ jobs:
           Invoke-Expression $installer
           $binary = Join-Path $env:PENTECT_INSTALL_DIR 'pentect.exe'
           if (-not (Test-Path -LiteralPath $binary)) { throw 'public installer did not produce pentect.exe' }
-          $redirects = & curl.exe -fsSI 'https://github.com/EdamAme-x/pentect/releases/latest/download/pentect-windows-x86_64.exe.sha256'
+          $redirects = & curl.exe -fsSI 'https://github.com/Akagumi-Inc/pentect/releases/latest/download/pentect-windows-x86_64.exe.sha256'
           $location = @($redirects | Where-Object { $_ -match '^location:' })[-1]
           if ($location -notmatch '/download/v([^/]+)/') { throw 'could not resolve latest public release' }
           $latest = $Matches[1]
@@ -136,7 +136,7 @@ jobs:
             --proto '=https' --tlsv1.2 https://pentect.dev/install.sh -o "$installer"
           PENTECT_INSTALL_DIR="$install_dir" sh "$installer"
           test -x "$install_dir/pentect"
-          latest=$(curl -fsSI https://github.com/EdamAme-x/pentect/releases/latest/download/pentect-linux-x86_64.sha256 |
+          latest=$(curl -fsSI https://github.com/Akagumi-Inc/pentect/releases/latest/download/pentect-linux-x86_64.sha256 |
             sed -n 's#.*[Ll]ocation: .*/download/v\([^/]*\)/.*#\1#p' | tail -n 1 | tr -d '\r')
           test -n "$latest"
           installed=$("$install_dir/pentect" version | sed 's/^pentect //')

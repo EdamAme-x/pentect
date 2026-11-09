@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify:
-    if: github.repository == 'EdamAme-x/pentect'
+    if: github.repository == 'Akagumi-Inc/pentect'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -63,7 +63,7 @@ jobs:
           fi
       - name: Verify signed APT repository and key lifetime
         run: |
-          base=https://edamame-x.github.io/pentect/apt
+          base=https://pentect.dev/apt
           curl -fsSL --proto '=https' --tlsv1.2 "$base/pentect-archive-keyring.asc" -o "$RUNNER_TEMP/key.asc"
           cmp packaging/apt/pentect-archive-keyring.asc "$RUNNER_TEMP/key.asc"
           gpg --batch --dearmor --output "$RUNNER_TEMP/key.gpg" "$RUNNER_TEMP/key.asc"
@@ -83,7 +83,7 @@ jobs:
         run: |
           version=$(jq -r .version packaging/release.json)
           sudo install -m 0644 "$RUNNER_TEMP/key.asc" /usr/share/keyrings/pentect-archive-keyring.asc
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pentect-archive-keyring.asc] https://edamame-x.github.io/pentect/apt stable main" |
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pentect-archive-keyring.asc] https://pentect.dev/apt stable main" |
             sudo tee /etc/apt/sources.list.d/pentect.list >/dev/null
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pentect

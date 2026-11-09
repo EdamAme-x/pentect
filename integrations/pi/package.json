@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/EdamAme-x/pentect.git",
+    "url": "git+https://github.com/Akagumi-Inc/pentect.git",
     "directory": "integrations/pi"
   },
   "homepage": "https://pentect.dev/clients/pi/",
-  "bugs": "https://github.com/EdamAme-x/pentect/issues",
+  "bugs": "https://github.com/Akagumi-Inc/pentect/issues",
   "publishConfig": {
     "access": "public"
   },

@@ -49,7 +49,7 @@ file=$2; field=$3; name=${file##*/}; value=${name#pentect_}; version=${value%_*}
 case "$field" in Package) [ "${FAKE_MODE:-ok}" = wrong-package ] && echo other || echo pentect ;; Version) echo "$version" ;; Architecture) echo "$architecture" ;; *) exit 2 ;; esac
 EOF
 chmod +x "$root/bin/gh" "$root/bin/dpkg-deb"
-export PATH="$root/bin:$PATH" GITHUB_REPOSITORY=EdamAme-x/pentect
+export PATH="$root/bin:$PATH" GITHUB_REPOSITORY=Akagumi-Inc/pentect
 
 sh tools/prepare_stable_debs.sh "$root/out" v1.2.3 3
 test "$(find "$root/out" -name '*.deb' | wc -l)" -eq 6

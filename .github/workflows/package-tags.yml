@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   tag:
-    if: github.repository == 'EdamAme-x/pentect'
+    if: github.repository == 'Akagumi-Inc/pentect'
     runs-on: ubuntu-slim
     timeout-minutes: 5
     steps:

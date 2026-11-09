@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
-const repository = 'EdamAme-x/pentect';
+const repository = 'Akagumi-Inc/pentect';
 const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
 
 function cacheBase(environment = process.env, platform = process.platform, home = homedir()) {

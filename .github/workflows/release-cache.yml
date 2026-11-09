@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'EdamAme-x/pentect'
+    if: github.repository == 'Akagumi-Inc/pentect'
     strategy:
       fail-fast: false
       matrix:

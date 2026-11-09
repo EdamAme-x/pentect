@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'EdamAme-x/pentect'
+    if: github.repository == 'Akagumi-Inc/pentect'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     environment:

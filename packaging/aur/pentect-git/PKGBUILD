@@ -4,14 +4,14 @@ pkgver=0.0.53.r1062.g21ffa65
 pkgrel=1
 pkgdesc='Local secret masking boundary for AI agents (development version)'
 arch=('x86_64' 'aarch64')
-url='https://github.com/EdamAme-x/pentect'
+url='https://github.com/Akagumi-Inc/pentect'
 license=('MIT')
 depends=('ca-certificates' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'git' 'perl')
 provides=("pentect=$pkgver")
 conflicts=('pentect')
 options=('!lto')
-source=('pentect::git+https://github.com/EdamAme-x/pentect.git#branch=main')
+source=('pentect::git+https://github.com/Akagumi-Inc/pentect.git#branch=main')
 sha256sums=('SKIP')
 
 pkgver() {

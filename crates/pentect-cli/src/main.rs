@@ -83,7 +83,7 @@ const NATIVE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
 const NATIVE_REPEAT_INTERRUPT_WINDOW: Duration = Duration::from_secs(2);
 const NATIVE_CHILD_POLL: Duration = Duration::from_millis(20);
 const MAX_MEMORY_STORE_STARTUP_STDERR: usize = 64 * 1024;
-const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
+const ISSUE_NEW_URL: &str = "https://github.com/Akagumi-Inc/pentect/issues/new";
 static NATIVE_COMMAND_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_INTERRUPT_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 

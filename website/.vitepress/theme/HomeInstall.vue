@@ -48,24 +48,24 @@ const npmInstaller = {
 const nixInstaller: Installer = {
   id: 'nix',
   label: 'Nix',
-  command: '# Temporary environment; nothing is installed permanently\nnix shell github:EdamAme-x/pentect',
+  command: '# Temporary environment; nothing is installed permanently\nnix shell github:Akagumi-Inc/pentect',
   icon: 'nixos',
   tone: 'nix',
   variants: [
     {
       id: 'shell',
       label: 'Shell',
-      command: '# Temporary environment; nothing is installed permanently\nnix shell github:EdamAme-x/pentect',
+      command: '# Temporary environment; nothing is installed permanently\nnix shell github:Akagumi-Inc/pentect',
     },
     {
       id: 'profile',
       label: 'Profile',
-      command: '# Install once\nnix profile install github:EdamAme-x/pentect\n\n# Update later\nnix profile upgrade pentect',
+      command: '# Install once\nnix profile install github:Akagumi-Inc/pentect\n\n# Update later\nnix profile upgrade pentect',
     },
     {
       id: 'nixos',
       label: 'NixOS',
-      command: '# flake.nix\ninputs.pentect.url = "github:EdamAme-x/pentect";\n\n# In a module where `inputs` and `pkgs` are available\nenvironment.systemPackages = [\n  inputs.pentect.packages.${pkgs.system}.default\n];',
+      command: '# flake.nix\ninputs.pentect.url = "github:Akagumi-Inc/pentect";\n\n# In a module where `inputs` and `pkgs` are available\nenvironment.systemPackages = [\n  inputs.pentect.packages.${pkgs.system}.default\n];',
     },
   ],
 };
@@ -104,7 +104,7 @@ const installers: Record<OperatingSystem, Installer[]> = {
     {
       id: 'homebrew',
       label: 'Homebrew',
-      command: 'brew install EdamAme-x/pentect/pentect',
+      command: 'brew install Akagumi-Inc/pentect/pentect',
       icon: 'homebrew',
       tone: 'homebrew',
     },

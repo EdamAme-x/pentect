@@ -35,7 +35,7 @@
           '';
           meta = {
             description = "Local secret masking boundary for AI agents";
-            homepage = "https://github.com/EdamAme-x/pentect";
+            homepage = "https://github.com/Akagumi-Inc/pentect";
             license = pkgs.lib.licenses.mit;
             mainProgram = "pentect";
             sourceProvenance = [ pkgs.lib.sourceTypes.binaryNativeCode ];

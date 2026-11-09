@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/EdamAme-x/pentect/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/EdamAme-x/pentect/ci.yml?branch=main&label=CI" alt="CI"></a>
-  <a href="https://github.com/EdamAme-x/pentect/releases/latest"><img src="https://img.shields.io/github/v/release/EdamAme-x/pentect" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/EdamAme-x/pentect" alt="MIT License"></a>
+  <a href="https://github.com/Akagumi-Inc/pentect/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Akagumi-Inc/pentect/ci.yml?branch=main&label=CI" alt="CI"></a>
+  <a href="https://github.com/Akagumi-Inc/pentect/releases/latest"><img src="https://img.shields.io/github/v/release/Akagumi-Inc/pentect" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Akagumi-Inc/pentect" alt="MIT License"></a>
 </p>
 
 Pentect is a local security boundary between supported AI clients and their

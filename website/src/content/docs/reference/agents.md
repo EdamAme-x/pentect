@@ -19,4 +19,4 @@ Use `pentect doctor` to check the installation and `pentect log --once --tail
 100` for bounded diagnostics that do not contain secret values.
 
 The same instructions are available in the repository's
-[`AGENTS.md`](https://github.com/EdamAme-x/pentect/blob/main/AGENTS.md).
+[`AGENTS.md`](https://github.com/Akagumi-Inc/pentect/blob/main/AGENTS.md).

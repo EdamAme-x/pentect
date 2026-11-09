@@ -5,7 +5,7 @@ Thanks for contributing. Keep changes focused, explain the user problem, and avo
 ## Before opening a change
 
 - Use a bug report for reproducible incorrect behavior and a feature request for new behavior.
-- Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/EdamAme-x/pentect/security/advisories/new).
+- Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/Akagumi-Inc/pentect/security/advisories/new).
 - For larger design changes, open an issue before investing in an implementation.
 
 ## Pull requests

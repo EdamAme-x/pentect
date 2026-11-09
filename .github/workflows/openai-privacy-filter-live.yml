@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   live:
-    if: github.repository == 'EdamAme-x/pentect'
+    if: github.repository == 'Akagumi-Inc/pentect'
     runs-on: ${{ inputs.profile == 'cuda' && fromJSON('["self-hosted","linux","x64","gpu","nvidia"]') || 'ubuntu-22.04' }}
     timeout-minutes: 150
     env:
