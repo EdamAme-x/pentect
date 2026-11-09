@@ -69,3 +69,22 @@ objc2 = { version = "0.6.3", default-features = false }
 objc2-foundation = { version = "0.3.2", default-features = false }
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 objc2-vision = { version = "0.3.2", default-features = false }
+
+# OCR inference is unusably slow unoptimized: the bundled OCR tests outlast the
+# 40-minute CI budget on two-core runners. Optimize only the OCR stack.
+[profile.dev.package.ocrs]
+opt-level = 3
+[profile.dev.package.rten]
+opt-level = 3
+[profile.dev.package.rten-base]
+opt-level = 3
+[profile.dev.package.rten-gemm]
+opt-level = 3
+[profile.dev.package.rten-imageproc]
+opt-level = 3
+[profile.dev.package.rten-simd]
+opt-level = 3
+[profile.dev.package.rten-tensor]
+opt-level = 3
+[profile.dev.package.rten-vecmath]
+opt-level = 3
