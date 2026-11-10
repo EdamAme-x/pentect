@@ -34,6 +34,7 @@ families; additional client integrations are outside the current support scope.
 - [Plugins](PLUGINS.md)
 - [Security](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [Live defense and usability benchmark](benchmarks/live-defense-2026-10-14.md)
 - [Third-party notices](THIRD_PARTY_LICENSES.txt)
 
 > **Security scope:** Pentect does not protect a compromised operating system
